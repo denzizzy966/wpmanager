@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment & rahasia
+.env
+.env.*
+!.env.example
+
+# Database lokal
+*.sqlite3
+pgdata/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Riwayat sesi Claude Code
+.remember/
