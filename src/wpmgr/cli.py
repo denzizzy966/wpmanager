@@ -1,0 +1,70 @@
+import argparse
+import sys
+import uuid
+
+from argon2 import PasswordHasher
+from sqlalchemy import select
+
+from wpmgr.db import get_session
+from wpmgr.jobs.queue import buat_job
+from wpmgr.jobs.reaper import pulihkan_job_yatim
+from wpmgr.models import Job, JobStatus, JobType, Site, SiteStatus, User
+
+
+def enqueue_scans() -> int:
+    dibuat = 0
+    with get_session() as sesi:
+        sites = sesi.scalars(select(Site).where(Site.status == SiteStatus.active)).all()
+        for site in sites:
+            sudah_ada = sesi.scalar(
+                select(Job.id).where(
+                    Job.site_id == site.id,
+                    Job.tipe == JobType.scan_site,
+                    Job.status.in_([JobStatus.pending, JobStatus.running]),
+                )
+            )
+            if sudah_ada is None:
+                buat_job(sesi, site.id, JobType.scan_site)
+                dibuat += 1
+    print(f"{dibuat} job scan dibuat")
+    return dibuat
+
+
+def reap_jobs() -> int:
+    with get_session() as sesi:
+        n = pulihkan_job_yatim(sesi)
+    print(f"{n} job yatim dipulihkan")
+    return n
+
+
+def create_user(email: str, nama: str, password: str) -> None:
+    with get_session() as sesi:
+        sesi.add(
+            User(id=uuid.uuid4(), email=email, nama=nama,
+                 password_hash=PasswordHasher().hash(password))
+        )
+    print(f"User {email} dibuat")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="wpmgr")
+    sub = parser.add_subparsers(dest="perintah", required=True)
+    sub.add_parser("enqueue-scans")
+    sub.add_parser("reap-jobs")
+    p = sub.add_parser("create-user")
+    p.add_argument("--email", required=True)
+    p.add_argument("--nama", required=True)
+    p.add_argument("--password", required=True)
+
+    args = parser.parse_args(argv)
+    if args.perintah == "enqueue-scans":
+        enqueue_scans()
+    elif args.perintah == "reap-jobs":
+        reap_jobs()
+    elif args.perintah == "create-user":
+        create_user(args.email, args.nama, args.password)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

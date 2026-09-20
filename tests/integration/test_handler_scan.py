@@ -135,8 +135,15 @@ def test_scan_sukses_mengaktifkan_site_unreachable(sesi, site):
 def test_scan_sukses_tidak_mengaktifkan_site_disabled(sesi, site):
     site.status = SiteStatus.disabled
     sesi.commit()
-    buat_job(sesi, site.id, JobType.scan_site)
-    job = ambil_job(sesi, "w1")
+
+    # Job diambil langsung dari buat_job, bukan lewat ambil_job: sejak T12 SQL
+    # klaim menyaring site berstatus disabled, sehingga job ini memang tidak
+    # akan pernah terklaim. Yang diuji di sini adalah pertahanan lapis kedua —
+    # handler sendiri tidak boleh mengaktifkan site yang sengaja dimatikan,
+    # untuk kasus site dinonaktifkan setelah job terklaim tetapi sebelum
+    # handler sempat berjalan.
+    job = buat_job(sesi, site.id, JobType.scan_site)
     tangani_scan_site(sesi, job, klien_palsu(INVENTARIS))
+
     sesi.refresh(site)
     assert site.status == SiteStatus.disabled

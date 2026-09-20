@@ -24,6 +24,7 @@ SQL_AMBIL = text(
              JOIN sites s ON s.id = j.site_id
             WHERE j.status = 'pending'
               AND j.scheduled_for <= now()
+              AND s.status <> 'disabled'
               AND NOT EXISTS (
                     SELECT 1 FROM jobs j2
                      WHERE j2.site_id = j.site_id
