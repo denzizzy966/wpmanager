@@ -25,3 +25,7 @@ Thumbs.db
 
 # Riwayat sesi Claude Code
 .remember/
+
+# PHP (connector)
+connector/vendor/
+connector/.phpunit.result.cache
