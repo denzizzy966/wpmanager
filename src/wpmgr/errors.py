@@ -8,7 +8,10 @@ UNKNOWN = "unknown"
 
 DAPAT_DIULANG = frozenset({TRANSIENT, BAD_RESPONSE})
 
+import json
+
 _PENANDA_FIREWALL_BODY = ("wordfence", "cloudflare", "attention required")
+_PREFIX_KODE_PLUGIN = "wpmgr_"
 
 
 class SiteError(Exception):
@@ -20,6 +23,22 @@ class SiteError(Exception):
     @property
     def dapat_diulang(self) -> bool:
         return self.error_class in DAPAT_DIULANG
+
+
+def _dari_plugin(body: str) -> bool:
+    """True bila body ini adalah balasan JSON milik connector kita sendiri.
+
+    Connector selalu menyebut dirinya lewat field `code` berawalan `wpmgr_`.
+    Firewall tidak pernah melakukannya, sehingga inilah pembeda yang andal
+    antara penolakan dari origin dan blokir dari edge.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and str(data.get("code", "")).startswith(
+        _PREFIX_KODE_PLUGIN
+    )
 
 
 def _terlihat_firewall(headers: dict[str, str], body: str) -> bool:
@@ -34,13 +53,18 @@ def _terlihat_firewall(headers: dict[str, str], body: str) -> bool:
 
 def klasifikasi_respons(status: int, headers: dict[str, str], body: str) -> str | None:
     if status in (401, 403):
+        if _dari_plugin(body):
+            return AUTH_ERROR
         return BLOCKED if _terlihat_firewall(headers, body) else AUTH_ERROR
     if status == 404:
         return CONNECTOR_MISSING
+    if status == 429:
+        return TRANSIENT
     if status >= 500:
         return TRANSIENT
-    if status == 200 and body.lstrip()[:9].lower().startswith("<!doctype"):
-        return BAD_RESPONSE
-    if status == 200 and body.lstrip().startswith("<html"):
-        return BAD_RESPONSE
-    return None
+    if status == 200:
+        awal = body.lstrip()[:200].lower()
+        if awal.startswith(("<!doctype", "<html")):
+            return BAD_RESPONSE
+        return None
+    return BAD_RESPONSE
