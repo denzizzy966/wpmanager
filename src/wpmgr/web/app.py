@@ -28,6 +28,10 @@ def buat_app() -> FastAPI:
     async def _ke_login(request: Request, exc: ButuhLogin):
         return RedirectResponse("/login", status_code=303)
 
+    # SEMENTARA — Task 21 mendaftarkan "/" di routes_pages.py dan HARUS
+    # menghapus route ini. Starlette tidak mengeluh atas path ganda; ia
+    # mencocokkan yang terdaftar lebih dulu, sehingga halaman asli tidak akan
+    # pernah tercapai dan tidak ada pesan error apa pun yang muncul.
     @app.get("/", response_class=HTMLResponse)
     async def beranda(request: Request):
         pengguna = pengguna_saat_ini(request)

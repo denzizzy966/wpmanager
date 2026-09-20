@@ -33,8 +33,12 @@ def _ambil(request: Request) -> User | None:
     raw = request.session.get(KUNCI_SESI)
     if not raw:
         return None
+    try:
+        user_id = uuid.UUID(raw)
+    except ValueError:
+        return None
     with db.SessionLocal() as sesi:
-        return sesi.get(User, uuid.UUID(raw))
+        return sesi.get(User, user_id)
 
 
 def pengguna_saat_ini(request: Request) -> User:
