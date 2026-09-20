@@ -1,11 +1,21 @@
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import func as safunc
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from wpmgr.crypto import dekripsi_secret
-from wpmgr.models import Job, PackageType, Site, SitePackage, SiteStatus
+from wpmgr.jobs.queue import jeda_menit
+from wpmgr.models import (
+    Job,
+    JobStatus,
+    JobType,
+    PackageType,
+    Site,
+    SitePackage,
+    SiteStatus,
+)
 from wpmgr.site_client import SiteClient
 
 
@@ -103,3 +113,69 @@ def tangani_verify_site(sesi: Session, job: Job, klien: SiteClient) -> dict:
     site.status = SiteStatus.active
     sesi.commit()
     return data
+
+
+def tangani_update_package(sesi: Session, job: Job, klien: SiteClient) -> dict:
+    site = sesi.get(Site, job.site_id)
+    p = job.payload
+    hasil = klien.update(p["tipe"], p["slug"], p["ke_versi"])
+
+    versi_sesudah = hasil.get("versi_sesudah") or p["ke_versi"]
+    baris = sesi.scalar(
+        select(SitePackage).where(
+            SitePackage.site_id == site.id,
+            SitePackage.tipe == PackageType(p["tipe"]),
+            SitePackage.slug == p["slug"],
+        )
+    )
+    if baris is not None:
+        baris.versi_terpasang = versi_sesudah
+        if baris.versi_tersedia == versi_sesudah:
+            baris.versi_tersedia = None
+        baris.last_scan_at = datetime.now(timezone.utc)
+    site.last_seen_at = datetime.now(timezone.utc)
+    sesi.commit()
+    return hasil
+
+
+def resolusi_unknown(sesi: Session, job: Job, klien: SiteClient) -> str:
+    """Setelah timeout, tanyakan keadaan sebenarnya ke site alih-alih menebak."""
+    site = sesi.get(Site, job.site_id)
+    p = job.payload
+    simpan_inventaris(sesi, site, klien.inventory())
+
+    baris = sesi.scalar(
+        select(SitePackage).where(
+            SitePackage.site_id == site.id,
+            SitePackage.tipe == PackageType(p["tipe"]),
+            SitePackage.slug == p["slug"],
+        )
+    )
+    if baris is not None and baris.versi_terpasang == p["ke_versi"]:
+        job.status = JobStatus.success
+        job.hasil = {"versi_sesudah": baris.versi_terpasang,
+                     "pesan": "terverifikasi lewat scan ulang setelah timeout"}
+        job.error = None
+        job.error_class = None
+        job.finished_at = safunc.now()
+        sesi.commit()
+        return "success"
+
+    if job.attempts < job.max_attempts:
+        job.status = JobStatus.pending
+        job.scheduled_for = safunc.now() + timedelta(minutes=jeda_menit(job.attempts))
+        job.started_at = None
+        sesi.commit()
+        return "pending"
+
+    job.status = JobStatus.failed
+    job.finished_at = safunc.now()
+    sesi.commit()
+    return "failed"
+
+
+HANDLER = {
+    JobType.scan_site: tangani_scan_site,
+    JobType.update_package: tangani_update_package,
+    JobType.verify_site: tangani_verify_site,
+}
