@@ -1,0 +1,160 @@
+/* ============================================================
+ * themes.css — definisi tema DataGrid
+ *
+ * Cara kerja: komponen hanya membaca CSS variables (--dg-*).
+ * Ganti tema = ganti atribut data-theme di <html>:
+ *    document.documentElement.dataset.theme = 'dark';
+ *
+ * Membuat tema sendiri: salin salah satu blok di bawah,
+ * ganti nama [data-theme="..."] dan nilai variabelnya.
+ * Bisa juga menimpa variabel per-grid:
+ *    #gridSaya { --dg-accent: hotpink; }
+ * ============================================================ */
+
+/* ---------- Tema dasar / Light (default) ---------- */
+:root {
+  --dg-font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --dg-radius: 10px;
+
+  --dg-bg: #ffffff;
+  --dg-bg-alt: #f7f8fa;
+  --dg-text: #1f2430;
+  --dg-muted: #7a8194;
+  --dg-border: #d9dde5;
+  --dg-border-light: #eceef2;
+
+  --dg-header-bg: #f1f3f7;
+  --dg-header-text: #3c4356;
+  --dg-toolbar-bg: #ffffff;
+  --dg-filter-bg: #fafbfc;
+  --dg-group-panel-bg: #f7f8fa;
+  --dg-group-bg: #eef1f6;
+  --dg-summary-bg: #f1f3f7;
+  --dg-popup-bg: #ffffff;
+  --dg-input-bg: #ffffff;
+
+  --dg-accent: #e91e63;
+  --dg-accent-text: #ffffff;
+  --dg-hover: #f0f3f8;
+  --dg-selected-bg: #fde5ee;
+  --dg-chip-bg: #e91e63;
+  --dg-chip-text: #ffffff;
+
+  --dg-shadow: 0 2px 8px rgba(20, 30, 60, .06);
+}
+
+/* ---------- Dark ---------- */
+[data-theme="dark"] {
+  --dg-bg: #1e222b;
+  --dg-bg-alt: #232834;
+  --dg-text: #e3e7ef;
+  --dg-muted: #8b93a7;
+  --dg-border: #363d4d;
+  --dg-border-light: #2c3240;
+
+  --dg-header-bg: #262c39;
+  --dg-header-text: #cdd3e0;
+  --dg-toolbar-bg: #1e222b;
+  --dg-filter-bg: #21262f;
+  --dg-group-panel-bg: #21262f;
+  --dg-group-bg: #2a3040;
+  --dg-summary-bg: #262c39;
+  --dg-popup-bg: #262b36;
+  --dg-input-bg: #171a21;
+
+  --dg-accent: #4dabf7;
+  --dg-accent-text: #0c1420;
+  --dg-hover: #2b3140;
+  --dg-selected-bg: #1f3a57;
+  --dg-chip-bg: #4dabf7;
+  --dg-chip-text: #0c1420;
+
+  --dg-shadow: 0 2px 10px rgba(0, 0, 0, .4);
+}
+
+/* ---------- Ocean (biru-hijau segar) ---------- */
+[data-theme="ocean"] {
+  --dg-bg: #f5fbfc;
+  --dg-bg-alt: #e9f5f7;
+  --dg-text: #0e3a45;
+  --dg-muted: #5b8896;
+  --dg-border: #bcdde4;
+  --dg-border-light: #d7ecf0;
+
+  --dg-header-bg: #0f6e8c;
+  --dg-header-text: #eafcff;
+  --dg-toolbar-bg: #f5fbfc;
+  --dg-filter-bg: #e2f2f5;
+  --dg-group-panel-bg: #dbeef2;
+  --dg-group-bg: #cfe9ee;
+  --dg-summary-bg: #d5ecf1;
+  --dg-popup-bg: #ffffff;
+  --dg-input-bg: #ffffff;
+
+  --dg-accent: #0e9aa7;
+  --dg-accent-text: #ffffff;
+  --dg-hover: #dcf0f3;
+  --dg-selected-bg: #c2e8ec;
+  --dg-chip-bg: #0e9aa7;
+  --dg-chip-text: #ffffff;
+
+  --dg-shadow: 0 2px 8px rgba(14, 154, 167, .12);
+}
+
+/* ---------- Forest (hijau tenang) ---------- */
+[data-theme="forest"] {
+  --dg-bg: #fbfdf9;
+  --dg-bg-alt: #f0f6ec;
+  --dg-text: #1e3323;
+  --dg-muted: #6d8a72;
+  --dg-border: #cfe0cd;
+  --dg-border-light: #e3eee1;
+
+  --dg-header-bg: #2d6a4f;
+  --dg-header-text: #eaf7ef;
+  --dg-toolbar-bg: #fbfdf9;
+  --dg-filter-bg: #eef5ea;
+  --dg-group-panel-bg: #e7f1e3;
+  --dg-group-bg: #ddebd8;
+  --dg-summary-bg: #e2eedd;
+  --dg-popup-bg: #ffffff;
+  --dg-input-bg: #ffffff;
+
+  --dg-accent: #40916c;
+  --dg-accent-text: #ffffff;
+  --dg-hover: #e6f0e2;
+  --dg-selected-bg: #d3e8d8;
+  --dg-chip-bg: #40916c;
+  --dg-chip-text: #ffffff;
+
+  --dg-shadow: 0 2px 8px rgba(45, 106, 79, .10);
+}
+
+/* ---------- Amber (gelap-hangat) ---------- */
+[data-theme="amber"] {
+  --dg-bg: #241d12;
+  --dg-bg-alt: #2b2418;
+  --dg-text: #f2e5cf;
+  --dg-muted: #a8946f;
+  --dg-border: #4a3d26;
+  --dg-border-light: #382f1e;
+
+  --dg-header-bg: #33290f;
+  --dg-header-text: #ffd97a;
+  --dg-toolbar-bg: #241d12;
+  --dg-filter-bg: #292115;
+  --dg-group-panel-bg: #292115;
+  --dg-group-bg: #332a19;
+  --dg-summary-bg: #33290f;
+  --dg-popup-bg: #2e2617;
+  --dg-input-bg: #1b150c;
+
+  --dg-accent: #ffb703;
+  --dg-accent-text: #241d12;
+  --dg-hover: #352c1c;
+  --dg-selected-bg: #4d3c12;
+  --dg-chip-bg: #ffb703;
+  --dg-chip-text: #241d12;
+
+  --dg-shadow: 0 2px 10px rgba(0, 0, 0, .5);
+}

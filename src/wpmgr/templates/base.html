@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block judul %}WP Manager{% endblock %}</title>
+  <link rel="stylesheet" href="/static/vendor/datagrid/themes.css">
+  <link rel="stylesheet" href="/static/vendor/datagrid/datagrid.css">
+  <link rel="stylesheet" href="/static/app/app.css">
+  <script defer src="/static/vendor/alpine.min.js"></script>
+  <script src="/static/vendor/datagrid/datagrid.js"></script>
+</head>
+<body>
+  <nav class="bilah">
+    <strong>WP Manager</strong>
+    <a href="/">Semua Update</a>
+    <a href="/sites">Site</a>
+    <a href="/activity">Aktivitas</a>
+    <a href="/sites/new">Tambah Site</a>
+    <form method="post" action="/logout" class="kanan">
+      <button type="submit">Keluar</button>
+    </form>
+  </nav>
+  <main>{% block isi %}{% endblock %}</main>
+</body>
+</html>

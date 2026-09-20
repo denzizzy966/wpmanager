@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block judul %}Masuk — WP Manager{% endblock %}
+{% block isi %}
+<h1>Masuk</h1>
+{% if galat %}<p class="galat">{{ galat }}</p>{% endif %}
+<form method="post" action="/login">
+  <p><label>Email<br><input type="email" name="email" required autofocus></label></p>
+  <p><label>Kata sandi<br><input type="password" name="password" required></label></p>
+  <p><button type="submit">Masuk</button></p>
+</form>
+{% endblock %}

@@ -1,0 +1,4 @@
+.bilah{display:flex;gap:1rem;align-items:center;padding:.75rem 1rem;border-bottom:1px solid #ddd}
+.bilah .kanan{margin-left:auto}
+main{padding:1rem}
+.galat{color:#b00}
