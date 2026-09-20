@@ -3,6 +3,7 @@ from datetime import timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from wpmgr.errors import UNKNOWN
 from wpmgr.models import ActivityLog, Job, JobStatus
 
 BATAS_MENIT_DEFAULT = 15
@@ -11,7 +12,9 @@ BATAS_MENIT_DEFAULT = 15
 def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) -> int:
     batas = func.now() - timedelta(minutes=batas_menit)
     yatim = sesi.scalars(
-        select(Job).where(Job.status == JobStatus.running, Job.locked_at < batas)
+        select(Job)
+        .where(Job.status == JobStatus.running, Job.locked_at < batas)
+        .with_for_update(skip_locked=True)
     ).all()
 
     for job in yatim:
@@ -24,7 +27,7 @@ def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) ->
             pesan = f"Job dipulihkan dari worker yang mati ({pemegang}); dijadwalkan ulang"
         else:
             job.status = JobStatus.unknown
-            job.error_class = "unknown"
+            job.error_class = UNKNOWN
             job.error = f"Worker {pemegang} berhenti dan jatah percobaan habis"
             pesan = f"Job ditinggalkan worker {pemegang} tanpa sisa percobaan"
         sesi.add(

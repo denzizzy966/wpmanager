@@ -7,7 +7,7 @@ from sqlalchemy import func as safunc
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from wpmgr.errors import DAPAT_DIULANG
+from wpmgr.errors import DAPAT_DIULANG, UNKNOWN
 from wpmgr.models import Job, JobStatus, JobType
 
 SQL_AMBIL = text(
@@ -100,7 +100,7 @@ def selesai_gagal(sesi: Session, job: Job, error_class: str, pesan: str) -> None
 
 def tandai_unknown(sesi: Session, job: Job, pesan: str) -> None:
     job.status = JobStatus.unknown
-    job.error_class = "unknown"
+    job.error_class = UNKNOWN
     job.error = pesan[:2000]
     _lepas_kunci(job)
     sesi.commit()
