@@ -13,6 +13,8 @@ def _kunci(monkeypatch):
     from wpmgr.config import get_settings
 
     get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def test_bolak_balik():
