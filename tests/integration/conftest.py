@@ -18,6 +18,13 @@ def engine():
     adm = create_engine(dasar, isolation_level="AUTOCOMMIT", future=True)
     nama = DB_URL.rsplit("/", 1)[1]
     with adm.connect() as c:
+        c.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = :nama AND pid <> pg_backend_pid()"
+            ),
+            {"nama": nama},
+        )
         c.execute(text(f'DROP DATABASE IF EXISTS "{nama}"'))
         c.execute(text(f'CREATE DATABASE "{nama}"'))
     adm.dispose()
