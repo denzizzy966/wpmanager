@@ -167,3 +167,25 @@ def test_update_paket_tak_dikenal_menulis_activity_log_warning(sesi, site):
     assert hasil["versi_sesudah"] == "3.20.1"
     log = sesi.query(ActivityLog).filter_by(job_id=job.id).one()
     assert log.level == "warning"
+
+
+def test_sudah_mencapai_menolak_menebak_pada_versi_pra_rilis():
+    """Versi pra-rilis tidak dapat dibandingkan secara andal lintas bahasa,
+    jadi Python menjawab 'belum tercapai' dan membiarkan percobaan ulang
+    memutuskan. Percobaan ulang aman karena endpoint update idempoten."""
+    from wpmgr.jobs.handlers import _sudah_mencapai
+
+    assert _sudah_mencapai("1.0-beta", "1.0") is False
+    assert _sudah_mencapai("1.0", "1.0-beta") is False
+    assert _sudah_mencapai("1.0-beta", "1.0-beta") is True  # sama persis
+
+
+def test_sudah_mencapai_tetap_benar_untuk_versi_numerik():
+    from wpmgr.jobs.handlers import _sudah_mencapai
+
+    assert _sudah_mencapai("3.20.1", "3.20.1") is True
+    assert _sudah_mencapai("3.18.3", "3.20.1") is False
+    assert _sudah_mencapai("3.21.0", "3.20.1") is True
+    assert _sudah_mencapai("3.20", "3.20.1") is False
+    assert _sudah_mencapai("3.20.1", "3.20") is True
+    assert _sudah_mencapai("6.5", "6.5.2") is False

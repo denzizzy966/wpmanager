@@ -161,17 +161,30 @@ def _sudah_mencapai(terpasang: str, target: str) -> bool:
     """Apakah versi terpasang sudah di target atau melewatinya.
 
     Kesetaraan didahulukan karena itu kasus normal. Perbandingan komponen
-    menangani kasus client meng-update manual ke versi lebih baru selagi job
-    kita sedang berjalan; tanpa itu job tak pernah selesai meski tujuannya
-    sudah tercapai. Komponen non-numerik (mis. `beta`) menjadi -1 sehingga
-    pra-rilis diperlakukan lebih rendah dari rilisnya.
+    numerik menangani kasus client meng-update manual ke versi lebih baru
+    selagi job kita berjalan.
+
+    Bila salah satu versi memuat komponen non-numerik (mis. `1.0-beta`) dan
+    keduanya tidak sama persis, jawabannya adalah False -- bukan karena kita
+    tahu targetnya belum tercapai, melainkan karena kita TIDAK tahu. Sisi PHP
+    memakai version_compare() yang punya aturan urutan sendiri untuk pra-rilis,
+    dan menebak-nebak di sini berarti dua sisi bisa berbeda pendapat.
+
+    False adalah jawaban yang aman: ia menghasilkan percobaan ulang, dan
+    percobaan ulang aman secara konstruksi karena endpoint /update di sisi
+    connector bersifat idempoten. Menjawab True secara keliru berarti menandai
+    job sebagai sukses padahal update tidak pernah selesai.
     """
     if terpasang == target:
         return True
-    try:
-        return _komponen_versi(terpasang) >= _komponen_versi(target)
-    except (TypeError, ValueError):
+
+    komponen_terpasang = _komponen_versi(terpasang)
+    komponen_target = _komponen_versi(target)
+
+    if -1 in komponen_terpasang or -1 in komponen_target:
         return False
+
+    return komponen_terpasang >= komponen_target
 
 
 def _jadwalkan_ulang_atau_gagal(sesi: Session, job: Job) -> str:
