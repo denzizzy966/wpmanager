@@ -6,7 +6,7 @@ import pytest
 from wpmgr.errors import UNKNOWN, SiteError
 from wpmgr.jobs.handlers import resolusi_unknown, tangani_update_package
 from wpmgr.jobs.queue import ambil_job, buat_job
-from wpmgr.models import JobType, PackageType, SitePackage
+from wpmgr.models import ActivityLog, JobStatus, JobType, PackageType, SitePackage
 from wpmgr.site_client import SiteClient
 
 pytestmark = pytest.mark.integration
@@ -115,3 +115,55 @@ def test_resolusi_unknown_menjadi_failed_bila_jatah_habis(sesi, site):
         "themes": [],
     }))
     assert resolusi_unknown(sesi, job, klien) == "failed"
+
+
+def test_resolusi_unknown_menjadi_pending_bila_scan_ulang_gagal(sesi, site):
+    _paket(sesi, site, "3.18.3")
+    buat_job(sesi, site.id, JobType.update_package, PAYLOAD)
+    job = ambil_job(sesi, "w1")
+    sekarang = datetime.now(timezone.utc)
+
+    klien = klien_dari(lambda r: httpx.Response(500, text="boom"))
+    assert resolusi_unknown(sesi, job, klien) == "pending"
+    assert job.status == JobStatus.pending
+    assert job.scheduled_for > sekarang
+
+
+def test_resolusi_unknown_menjadi_failed_bila_scan_ulang_gagal_dan_jatah_habis(sesi, site):
+    _paket(sesi, site, "3.18.3")
+    buat_job(sesi, site.id, JobType.update_package, PAYLOAD)
+    job = ambil_job(sesi, "w1")
+    job.attempts = job.max_attempts
+    sesi.commit()
+
+    klien = klien_dari(lambda r: httpx.Response(500, text="boom"))
+    assert resolusi_unknown(sesi, job, klien) == "failed"
+    assert job.status == JobStatus.failed
+
+
+def test_resolusi_unknown_menjadi_success_bila_versi_melampaui_target(sesi, site):
+    _paket(sesi, site, "3.18.3")
+    buat_job(sesi, site.id, JobType.update_package, PAYLOAD)
+    job = ambil_job(sesi, "w1")
+
+    klien = klien_dari(lambda r: httpx.Response(200, json={
+        "core": None,
+        "plugins": [{"slug": "elementor/elementor.php", "nama": "Elementor",
+                     "versi_terpasang": "3.21.0", "versi_tersedia": None,
+                     "aktif": True, "auto_update": False}],
+        "themes": [],
+    }))
+    assert resolusi_unknown(sesi, job, klien) == "success"
+
+
+def test_update_paket_tak_dikenal_menulis_activity_log_warning(sesi, site):
+    buat_job(sesi, site.id, JobType.update_package, PAYLOAD)
+    job = ambil_job(sesi, "w1")
+
+    klien = klien_dari(lambda r: httpx.Response(200, json={
+        "ok": True, "versi_sesudah": "3.20.1"}))
+    hasil = tangani_update_package(sesi, job, klien)
+
+    assert hasil["versi_sesudah"] == "3.20.1"
+    log = sesi.query(ActivityLog).filter_by(job_id=job.id).one()
+    assert log.level == "warning"

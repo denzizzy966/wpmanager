@@ -1,3 +1,4 @@
+import re
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 
@@ -6,8 +7,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from wpmgr.crypto import dekripsi_secret
+from wpmgr.errors import SiteError
 from wpmgr.jobs.queue import jeda_menit
 from wpmgr.models import (
+    ActivityLog,
     Job,
     JobStatus,
     JobType,
@@ -133,34 +136,45 @@ def tangani_update_package(sesi: Session, job: Job, klien: SiteClient) -> dict:
         if baris.versi_tersedia == versi_sesudah:
             baris.versi_tersedia = None
         baris.last_scan_at = datetime.now(timezone.utc)
+    else:
+        sesi.add(
+            ActivityLog(
+                site_id=site.id,
+                job_id=job.id,
+                level="warning",
+                pesan=f"Update berhasil untuk paket yang tidak ada di inventaris: {p['slug']}",
+                detail={"tipe": p["tipe"], "slug": p["slug"], "ke_versi": p["ke_versi"]},
+            )
+        )
     site.last_seen_at = datetime.now(timezone.utc)
     sesi.commit()
     return hasil
 
 
-def resolusi_unknown(sesi: Session, job: Job, klien: SiteClient) -> str:
-    """Setelah timeout, tanyakan keadaan sebenarnya ke site alih-alih menebak."""
-    site = sesi.get(Site, job.site_id)
-    p = job.payload
-    simpan_inventaris(sesi, site, klien.inventory())
-
-    baris = sesi.scalar(
-        select(SitePackage).where(
-            SitePackage.site_id == site.id,
-            SitePackage.tipe == PackageType(p["tipe"]),
-            SitePackage.slug == p["slug"],
-        )
+def _komponen_versi(v: str) -> tuple[int, ...]:
+    return tuple(
+        int(p) if p.isdigit() else -1 for p in re.split(r"[.\-+_]", v.strip()) if p
     )
-    if baris is not None and baris.versi_terpasang == p["ke_versi"]:
-        job.status = JobStatus.success
-        job.hasil = {"versi_sesudah": baris.versi_terpasang,
-                     "pesan": "terverifikasi lewat scan ulang setelah timeout"}
-        job.error = None
-        job.error_class = None
-        job.finished_at = safunc.now()
-        sesi.commit()
-        return "success"
 
+
+def _sudah_mencapai(terpasang: str, target: str) -> bool:
+    """Apakah versi terpasang sudah di target atau melewatinya.
+
+    Kesetaraan didahulukan karena itu kasus normal. Perbandingan komponen
+    menangani kasus client meng-update manual ke versi lebih baru selagi job
+    kita sedang berjalan; tanpa itu job tak pernah selesai meski tujuannya
+    sudah tercapai. Komponen non-numerik (mis. `beta`) menjadi -1 sehingga
+    pra-rilis diperlakukan lebih rendah dari rilisnya.
+    """
+    if terpasang == target:
+        return True
+    try:
+        return _komponen_versi(terpasang) >= _komponen_versi(target)
+    except (TypeError, ValueError):
+        return False
+
+
+def _jadwalkan_ulang_atau_gagal(sesi: Session, job: Job) -> str:
     if job.attempts < job.max_attempts:
         job.status = JobStatus.pending
         job.scheduled_for = safunc.now() + timedelta(minutes=jeda_menit(job.attempts))
@@ -172,6 +186,40 @@ def resolusi_unknown(sesi: Session, job: Job, klien: SiteClient) -> str:
     job.finished_at = safunc.now()
     sesi.commit()
     return "failed"
+
+
+def resolusi_unknown(sesi: Session, job: Job, klien: SiteClient) -> str:
+    """Setelah timeout, tanyakan keadaan sebenarnya ke site alih-alih menebak."""
+    site = sesi.get(Site, job.site_id)
+    p = job.payload
+
+    try:
+        simpan_inventaris(sesi, site, klien.inventory())
+    except SiteError:
+        # Pemeriksaan realitasnya sendiri gagal. Kita tetap tidak tahu apa yang
+        # terjadi, jadi jadwalkan ulang seluruh percobaan alih-alih menebak.
+        # Membiarkannya sebagai `unknown` berarti tidak ada yang akan melihatnya
+        # lagi: SQL_AMBIL hanya mengklaim `pending`, reaper hanya `running`.
+        return _jadwalkan_ulang_atau_gagal(sesi, job)
+
+    baris = sesi.scalar(
+        select(SitePackage).where(
+            SitePackage.site_id == site.id,
+            SitePackage.tipe == PackageType(p["tipe"]),
+            SitePackage.slug == p["slug"],
+        )
+    )
+    if baris is not None and _sudah_mencapai(baris.versi_terpasang, p["ke_versi"]):
+        job.status = JobStatus.success
+        job.hasil = {"versi_sesudah": baris.versi_terpasang,
+                     "pesan": "terverifikasi lewat scan ulang setelah timeout"}
+        job.error = None
+        job.error_class = None
+        job.finished_at = safunc.now()
+        sesi.commit()
+        return "success"
+
+    return _jadwalkan_ulang_atau_gagal(sesi, job)
 
 
 HANDLER = {
