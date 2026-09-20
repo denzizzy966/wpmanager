@@ -37,6 +37,10 @@ final class SettingsTest extends TestCase {
     }
 
     public function test_empat_bagian_mengembalikan_wp_error(): void {
+        // Dengan explode(..., 3), segmen keempat ("ekstra") melebur ke dalam
+        // kandidat dashboard ("ekstra:https://dash.example.com"), sehingga
+        // penolakan di sini datang dari pemeriksaan prefiks https://, bukan
+        // dari pemeriksaan jumlah bagian.
         $secret = str_repeat( 'a1', 32 );
         $kunci  = $this->bungkus_kunci( 'site-42:' . $secret . ':ekstra:https://dash.example.com' );
         $hasil  = WPMGR_Settings::urai_kunci( $kunci );
@@ -55,6 +59,18 @@ final class SettingsTest extends TestCase {
         $kunci          = $this->bungkus_kunci( 'site-42:' . $secret_kapital . ':https://dash.example.com' );
         $hasil          = WPMGR_Settings::urai_kunci( $kunci );
         $this->assertInstanceOf( WP_Error::class, $hasil );
+    }
+
+    public function test_secret_hex_huruf_besar_ditolak(): void {
+        // Seluruh karakter di sini adalah digit hex yang sah ('A' dan '1'),
+        // hanya casing-nya yang salah. Itulah yang membuat test ini mampu
+        // mendeteksi regex yang tidak lagi peka huruf besar-kecil -- sesuatu
+        // yang tidak dapat dilakukan oleh secret yang memuat karakter
+        // non-hex, karena ia ditolak karena alasan lain.
+        $kunci = $this->bungkus_kunci(
+            'site-1:' . strtoupper( str_repeat( 'a1', 32 ) ) . ':https://dash.test'
+        );
+        $this->assertInstanceOf( WP_Error::class, WPMGR_Settings::urai_kunci( $kunci ) );
     }
 
     public function test_dashboard_http_mengembalikan_wp_error(): void {

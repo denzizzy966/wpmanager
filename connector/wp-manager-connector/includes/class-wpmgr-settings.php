@@ -90,7 +90,15 @@ class WPMGR_Settings {
         update_option( self::OPT_SITE_ID, $site_id, false );
         update_option( self::OPT_SECRET, $secret, false );
         update_option( self::OPT_DASHBOARD, $dashboard, false );
-        self::pastikan_user();
+
+        if ( ! self::pastikan_user() ) {
+            return new WP_Error(
+                'wpmgr_user_gagal',
+                'Kunci tersimpan, tetapi user wpmgr untuk SSO tidak dapat dibuat. '
+                . 'Scan dan update akan berjalan; tombol Masuk tidak akan berfungsi '
+                . 'sampai masalah ini diperbaiki.'
+            );
+        }
 
         return self::kirim_konfirmasi();
     }
