@@ -1,0 +1,46 @@
+[
+  {
+    "nama": "get_ping_body_kosong",
+    "secret_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "method": "GET",
+    "path": "/wp-json/wpmgr/v1/ping",
+    "timestamp": 1758387600,
+    "nonce": "0123456789abcdef0123456789abcdef",
+    "body": "",
+    "canonical": "GET\n/wp-json/wpmgr/v1/ping\n1758387600\n0123456789abcdef0123456789abcdef\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "signature": "6d1b25c55b0d5aa38e81592d734a5f1c9eea21f8755f237485910f881ca75fa1"
+  },
+  {
+    "nama": "get_inventory_body_kosong",
+    "secret_hex": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
+    "method": "GET",
+    "path": "/wp-json/wpmgr/v1/inventory",
+    "timestamp": 1700000000,
+    "nonce": "ffffffffffffffffffffffffffffffff",
+    "body": "",
+    "canonical": "GET\n/wp-json/wpmgr/v1/inventory\n1700000000\nffffffffffffffffffffffffffffffff\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "signature": "56117a8835cc9a09fea68841c2c257c8e3a84913cfb8e82ad83eba9ddc761d3a"
+  },
+  {
+    "nama": "post_update_dengan_body",
+    "secret_hex": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "method": "POST",
+    "path": "/wp-json/wpmgr/v1/update",
+    "timestamp": 1758387600,
+    "nonce": "00112233445566778899aabbccddeeff",
+    "body": "{\"tipe\":\"plugin\",\"slug\":\"elementor/elementor.php\",\"ke_versi\":\"3.20.1\"}",
+    "canonical": "POST\n/wp-json/wpmgr/v1/update\n1758387600\n00112233445566778899aabbccddeeff\n5db90276d163e8a30a3e54d4857b9c6d1bdf3ae74cc2a8807ed7b4db8c0504f8",
+    "signature": "398629dec4f098374790c9ac5ec78ede18fedec58f4284d16eb538fa5180a4f0"
+  },
+  {
+    "nama": "body_dengan_karakter_non_ascii",
+    "secret_hex": "1212121212121212121212121212121212121212121212121212121212121212",
+    "method": "POST",
+    "path": "/wp-json/wpmgr/v1/update",
+    "timestamp": 1758387601,
+    "nonce": "aabbccddeeff00112233445566778899",
+    "body": "{\"nama\":\"Tema Café — Ñandú\"}",
+    "canonical": "POST\n/wp-json/wpmgr/v1/update\n1758387601\naabbccddeeff00112233445566778899\naeb05dd725c6b32b1b871c80aa8c0ed7f643079187d5103b8787afe522a9f24f",
+    "signature": "d34105d76335901fde2037ea074ae5e0f06dcf8d058e2067535a61f8c4b76731"
+  }
+]
