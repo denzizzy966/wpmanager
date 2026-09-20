@@ -79,3 +79,42 @@ def test_urutan_berdasarkan_scheduled_for(sesi, site):
 
 def test_worker_id_berbentuk_host_titikdua_pid():
     assert ":" in worker_id()
+
+
+def test_klaim_bersamaan_tidak_melanggar_satu_job_per_site(engine, sesi, site):
+    """Dua klaim yang transaksinya tumpang-tindih tidak boleh sama-sama berhasil
+    untuk satu site. Ini satu-satunya test yang menjalankan interleaving nyata:
+    klaim pertama sengaja dibiarkan belum di-commit saat klaim kedua berjalan."""
+    from wpmgr.jobs.queue import SQL_AMBIL
+
+    buat_job(sesi, site.id, JobType.update_package, {"slug": "a"})
+    buat_job(sesi, site.id, JobType.update_package, {"slug": "b"})
+
+    c1 = engine.connect()
+    c2 = engine.connect()
+    try:
+        t1 = c1.begin()
+        r1 = c1.execute(SQL_AMBIL, {"worker": "w1"}).first()
+        assert r1 is not None
+
+        t2 = c2.begin()
+        r2 = c2.execute(SQL_AMBIL, {"worker": "w2"}).first()
+        assert r2 is None, (
+            "worker kedua mengklaim job untuk site yang sama "
+            "selagi klaim pertama belum di-commit"
+        )
+        t2.rollback()
+        t1.commit()
+    finally:
+        c1.close()
+        c2.close()
+
+
+def test_job_selesai_tidak_menghalangi_klaim_baru_untuk_site_yang_sama(sesi, site):
+    selesai = buat_job(sesi, site.id, JobType.scan_site)
+    selesai.status = JobStatus.success
+    sesi.commit()
+    buat_job(sesi, site.id, JobType.update_package, {"slug": "x"})
+    j = ambil_job(sesi, "w1")
+    assert j is not None
+    assert j.id != selesai.id

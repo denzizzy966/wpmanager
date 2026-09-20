@@ -19,6 +19,7 @@ SQL_AMBIL = text(
      WHERE id = (
            SELECT j.id
              FROM jobs j
+             JOIN sites s ON s.id = j.site_id
             WHERE j.status = 'pending'
               AND j.scheduled_for <= now()
               AND NOT EXISTS (
@@ -26,7 +27,7 @@ SQL_AMBIL = text(
                      WHERE j2.site_id = j.site_id
                        AND j2.status = 'running')
             ORDER BY j.scheduled_for
-              FOR UPDATE SKIP LOCKED
+              FOR UPDATE OF j, s SKIP LOCKED
             LIMIT 1)
     RETURNING id
     """
