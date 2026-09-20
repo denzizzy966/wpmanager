@@ -39,6 +39,23 @@ class WPMGR_Updater {
      * sampai" pasti terjadi cepat atau lambat, dan retry harus aman.
      */
     public static function jalankan( $tipe, $slug, $ke_versi ) {
+        if ( ! in_array( $tipe, array( 'core', 'plugin', 'theme' ), true ) ) {
+            // Divalidasi lebih dulu, sebelum versi_terpasang() dipanggil --
+            // fungsi itu mengembalikan null untuk tipe apa pun di luar
+            // core/plugin/theme, sehingga tanpa validasi ini permintaan
+            // dengan tipe salah akan salah dilaporkan sebagai 404 "paket
+            // tidak ditemukan" alih-alih 400 "tipe tidak dikenal". Keduanya
+            // berarti hal berbeda bagi pemanggil: 404 berarti site ini
+            // memang tidak punya paket tersebut (kondisi wajar, dashboard
+            // menangani dengan scan ulang); 400 berarti pemanggil mengirim
+            // sesuatu yang tidak dikenal (bug di pemanggil).
+            return new WP_Error(
+                'wpmgr_tipe_salah',
+                'Tipe paket tidak dikenal.',
+                array( 'status' => 400 )
+            );
+        }
+
         $sebelum = self::versi_terpasang( $tipe, $slug );
 
         if ( null === $sebelum ) {
@@ -60,8 +77,14 @@ class WPMGR_Updater {
         require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
         require_once ABSPATH . 'wp-admin/includes/update.php';
 
-        wp_update_plugins();
-        wp_update_themes();
+        // Hanya refresh yang relevan dengan tipe yang diminta -- endpoint ini
+        // hidup di dalam jendela 180 detik dashboard, dan permintaan core
+        // tidak butuh me-refresh plugin maupun tema.
+        if ( 'plugin' === $tipe ) {
+            wp_update_plugins();
+        } elseif ( 'theme' === $tipe ) {
+            wp_update_themes();
+        }
 
         $skin  = new Automatic_Upgrader_Skin();
         $hasil = null;
@@ -72,16 +95,27 @@ class WPMGR_Updater {
         } elseif ( 'theme' === $tipe ) {
             $upgrader = new Theme_Upgrader( $skin );
             $hasil    = $upgrader->upgrade( $slug );
-        } elseif ( 'core' === $tipe ) {
-            $cek = get_site_transient( 'update_core' );
-            if ( empty( $cek->updates[0] ) ) {
-                return new WP_Error( 'wpmgr_tidak_ada_update',
-                    'Tidak ada update core yang tersedia.', array( 'status' => 409 ) );
-            }
-            $upgrader = new Core_Upgrader( $skin );
-            $hasil    = $upgrader->upgrade( $cek->updates[0] );
         } else {
-            return new WP_Error( 'wpmgr_tipe_salah', 'Tipe paket tidak dikenal.', array( 'status' => 400 ) );
+            // $tipe sudah divalidasi di awal jalankan(), jadi cabang ini
+            // pasti 'core'.
+            wp_version_check( array(), true );
+
+            // find_core_update() memilih penawaran yang cocok dengan versi
+            // dan locale yang diminta. updates[0] hanyalah penawaran
+            // pertama yang kebetulan didaftarkan WordPress, dan memakainya
+            // berarti endpoint ini bisa memasang versi core yang berbeda
+            // dari yang diminta dashboard sambil tetap melapor sukses.
+            $penawaran = find_core_update( $ke_versi, get_locale() );
+            if ( ! $penawaran ) {
+                return new WP_Error(
+                    'wpmgr_tidak_ada_update',
+                    'Tidak ada penawaran update core untuk versi yang diminta.',
+                    array( 'status' => 409 )
+                );
+            }
+
+            $upgrader = new Core_Upgrader( $skin );
+            $hasil    = $upgrader->upgrade( $penawaran );
         }
 
         if ( is_wp_error( $hasil ) ) {

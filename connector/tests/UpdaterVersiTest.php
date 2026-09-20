@@ -42,4 +42,12 @@ final class UpdaterVersiTest extends TestCase {
         $this->assertFalse( WPMGR_Updater::sudah_di_versi( '1.0-beta', '1.0' ) );
         $this->assertTrue( WPMGR_Updater::sudah_di_versi( '1.0', '1.0-beta' ) );
     }
+
+    public function test_tipe_tidak_dikenal_mengembalikan_400(): void {
+        // Tipe divalidasi lebih dulu, sebelum versi_terpasang() dipanggil --
+        // itulah sebabnya ini dapat diuji tanpa WordPress sama sekali.
+        $hasil = WPMGR_Updater::jalankan( 'widget', 'apa-saja', '1.0' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_tipe_salah', $hasil->get_error_code() );
+    }
 }
