@@ -12,6 +12,17 @@ class WPMGR_Inventory {
      */
     private static function segarkan() {
         require_once ABSPATH . 'wp-admin/includes/update.php';
+
+        // wp_update_plugins() dan wp_update_themes() tidak menerima argumen
+        // pemaksa dan akan langsung kembali bila transient-nya belum berumur
+        // 12 jam. Menghapus transient lebih dulu adalah satu-satunya cara
+        // membuat ketiganya benar-benar memeriksa ulang. Tanpa ini, dashboard
+        // melaporkan ketersediaan update dari data yang bisa berumur hampir
+        // setengah hari — padahal ketepatan soal itu adalah inti produknya.
+        delete_site_transient( 'update_core' );
+        delete_site_transient( 'update_plugins' );
+        delete_site_transient( 'update_themes' );
+
         wp_version_check( array(), true );
         wp_update_plugins();
         wp_update_themes();
