@@ -2,6 +2,7 @@ import pytest
 
 from wpmgr.sso import (
     TokenTidakValid,
+    _tanda_tangan,
     b64url_decode,
     b64url_encode,
     baca_token,
@@ -62,3 +63,73 @@ def test_dua_token_punya_nonce_berbeda():
 def test_token_tanpa_titik_ditolak():
     with pytest.raises(TokenTidakValid):
         baca_token(SECRET, "tanpatitik", now=1_000_000)
+
+
+def test_payload_bukan_dict_ditolak():
+    """Validly-signed token whose payload decodes to non-dict raises TokenTidakValid."""
+    body = b64url_encode(b"5")
+    sig = _tanda_tangan(SECRET, body)
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, f"{body}.{sig}", now=1_000_000)
+
+
+def test_exp_non_numeric_ditolak():
+    """Validly-signed token whose exp is non-numeric string raises TokenTidakValid."""
+    body = b64url_encode(b'{"site_id":"test","exp":"not_a_number","nonce":"' + b"0" * 32 + b'"}')
+    sig = _tanda_tangan(SECRET, body)
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, f"{body}.{sig}", now=1_000_000)
+
+
+def test_nonce_hilang_ditolak():
+    """Validly-signed token with missing nonce raises TokenTidakValid."""
+    body = b64url_encode(b'{"site_id":"test","exp":9999999999}')
+    sig = _tanda_tangan(SECRET, body)
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, f"{body}.{sig}", now=1_000_000)
+
+
+def test_nonce_tidak_hex_ditolak():
+    """Validly-signed token with non-hex nonce raises TokenTidakValid."""
+    body = b64url_encode(b'{"site_id":"test","exp":9999999999,"nonce":"' + b"z" * 32 + b'"}')
+    sig = _tanda_tangan(SECRET, body)
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, f"{body}.{sig}", now=1_000_000)
+
+
+def test_nonce_panjang_salah_ditolak():
+    """Validly-signed token with wrong-length nonce raises TokenTidakValid."""
+    body = b64url_encode(b'{"site_id":"test","exp":9999999999,"nonce":"' + b"0" * 31 + b'"}')
+    sig = _tanda_tangan(SECRET, body)
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, f"{body}.{sig}", now=1_000_000)
+
+
+def test_token_titik_awal_ditolak():
+    """Token starting with dot raises TokenTidakValid."""
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, ".abc", now=1_000_000)
+
+
+def test_token_titik_akhir_ditolak():
+    """Token ending with dot raises TokenTidakValid."""
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, "abc.", now=1_000_000)
+
+
+def test_token_titik_ganda_ditolak():
+    """Token with extra dot raises TokenTidakValid."""
+    t = buat_token(SECRET, SITE, now=1_000_000)
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, f"{t}.extra", now=1_000_000)
+
+
+def test_signature_rusak_ditolak():
+    """Token with one hex character of signature flipped raises TokenTidakValid."""
+    t = buat_token(SECRET, SITE, now=1_000_000)
+    body, _, sig = t.partition(".")
+    # Flip first character of signature
+    flipped_char = chr((int(sig[0], 16) + 1) % 16)
+    rusak_sig = flipped_char + sig[1:]
+    with pytest.raises(TokenTidakValid):
+        baca_token(SECRET, f"{body}.{rusak_sig}", now=1_000_000)

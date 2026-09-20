@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
 
 from wpmgr.signing import new_nonce
@@ -49,7 +50,21 @@ def baca_token(secret_hex: str, token: str, now: int | None = None) -> dict:
         payload = json.loads(b64url_decode(body))
     except Exception as exc:
         raise TokenTidakValid("payload tidak dapat dibaca") from exc
+
+    if not isinstance(payload, dict):
+        raise TokenTidakValid("payload bukan objek")
+
+    nonce = payload.get("nonce")
+    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise TokenTidakValid("nonce tidak valid")
+
+    try:
+        exp = int(payload["exp"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TokenTidakValid("exp tidak valid") from exc
+
     sekarang = int(time.time()) if now is None else now
-    if sekarang > int(payload.get("exp", 0)):
+    if sekarang > exp:
         raise TokenTidakValid("token kedaluwarsa")
+
     return payload
