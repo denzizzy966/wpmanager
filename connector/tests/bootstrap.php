@@ -37,3 +37,4 @@ if ( ! function_exists( 'is_wp_error' ) ) {
 }
 
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-settings.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-rest.php';
