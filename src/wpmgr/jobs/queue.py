@@ -61,7 +61,7 @@ def ambil_job(sesi: Session, worker: str) -> Job | None:
     sesi.commit()
     if baris is None:
         return None
-    return sesi.get(Job, baris[0])
+    return sesi.get(Job, baris[0], populate_existing=True)
 
 
 def jeda_menit(attempts: int) -> int:

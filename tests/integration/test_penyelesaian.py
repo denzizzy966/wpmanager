@@ -73,3 +73,19 @@ def test_unknown_melepas_kunci_tapi_tidak_menjadwal_ulang(sesi, site):
     sesi.refresh(j)
     assert j.status == JobStatus.unknown
     assert j.locked_by is None
+
+
+def test_ambil_job_mengembalikan_state_terbaru_bukan_cache(sesi, site):
+    """ambil_job harus mengembalikan state yang baru saja ditulisnya, bukan
+    objek lama dari identity map sesi, bahkan ketika sesi sudah pernah
+    melihat baris job sebelumnya (mis. lewat klaim dan penyelesaian job lain)."""
+    buat_job(sesi, site.id, JobType.scan_site)
+    pertama = ambil_job(sesi, "w1")
+    selesai_sukses(sesi, pertama, {"selesai": True})
+
+    buat_job(sesi, site.id, JobType.scan_site)
+    kedua = ambil_job(sesi, "w2")
+    assert kedua is not None
+    assert kedua.status == JobStatus.running
+    assert kedua.attempts == 1
+    assert kedua.locked_by == "w2"
