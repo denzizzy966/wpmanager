@@ -1,4 +1,3 @@
-# src/wpmgr/config.py
 from functools import lru_cache
 
 from pydantic import Field, field_validator

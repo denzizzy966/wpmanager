@@ -1,4 +1,3 @@
-import pytest
 from wpmgr.config import Settings
 
 
