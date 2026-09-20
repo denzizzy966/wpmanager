@@ -23,9 +23,28 @@ def _item_inventaris(data: dict) -> Iterator[tuple[PackageType, dict]]:
         yield PackageType.theme, t
 
 
+def _tipe_dilaporkan(data: dict) -> set[PackageType]:
+    """Kategori mana yang benar-benar dilaporkan pada payload ini.
+
+    Pembedaannya penting: `themes: []` berarti "tema dilaporkan, tidak ada satu
+    pun" dan baris tema lama memang harus dihapus. `themes` yang tidak hadir
+    berarti "tidak ada informasi tentang tema", dan menghapus apa pun atas dasar
+    itu adalah kehilangan data, bukan sinkronisasi.
+    """
+    dilaporkan: set[PackageType] = set()
+    if data.get("core"):
+        dilaporkan.add(PackageType.core)
+    if isinstance(data.get("plugins"), list):
+        dilaporkan.add(PackageType.plugin)
+    if isinstance(data.get("themes"), list):
+        dilaporkan.add(PackageType.theme)
+    return dilaporkan
+
+
 def simpan_inventaris(sesi: Session, site: Site, data: dict) -> int:
     sekarang = datetime.now(timezone.utc)
     terlihat: set[tuple[PackageType, str]] = set()
+    dilaporkan = _tipe_dilaporkan(data)
 
     for tipe, item in _item_inventaris(data):
         kunci = (tipe, item["slug"])
@@ -50,15 +69,17 @@ def simpan_inventaris(sesi: Session, site: Site, data: dict) -> int:
     sesi.flush()
 
     lama = sesi.scalars(select(SitePackage).where(SitePackage.site_id == site.id)).all()
+    dihapus = 0
     for baris in lama:
-        if (baris.tipe, baris.slug) not in terlihat:
+        if baris.tipe in dilaporkan and (baris.tipe, baris.slug) not in terlihat:
             sesi.delete(baris)
+            dihapus += 1
 
     site.last_scan_at = sekarang
     site.last_seen_at = sekarang
     site.last_error = None
     sesi.commit()
-    return len(terlihat)
+    return len(lama) - dihapus
 
 
 def tangani_scan_site(sesi: Session, job: Job, klien: SiteClient) -> dict:
