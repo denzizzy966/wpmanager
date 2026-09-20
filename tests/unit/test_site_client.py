@@ -129,6 +129,22 @@ def test_respons_bukan_json_menjadi_bad_response():
     assert exc.value.error_class == "bad_response"
 
 
+def test_warning_php_sebelum_json_menjadi_bad_response():
+    """Kegagalan rutin di shared hosting: plugin lain mencetak warning sebelum
+    body JSON. Body ini bukan HTML, sehingga klasifikasi_respons meloloskannya
+    sebagai sehat — yang menangkapnya adalah json.loads di dalam SiteClient."""
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content='<br />\n<b>Warning</b>: fopen(): failed in /x.php on line 3<br />\n{"ok":true}',
+        )
+
+    with pytest.raises(SiteError) as exc:
+        buat_klien(handler).ping()
+    assert exc.value.error_class == "bad_response"
+
+
 def test_url_http_ditolak_saat_konstruksi():
     with pytest.raises(ValueError):
         SiteClient("http://tidak-aman.test", SITE_ID, SECRET)
