@@ -1,12 +1,14 @@
 import os
 import socket
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from sqlalchemy import func as safunc
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from wpmgr.models import Job, JobType
+from wpmgr.errors import DAPAT_DIULANG
+from wpmgr.models import Job, JobStatus, JobType
 
 SQL_AMBIL = text(
     """
@@ -60,3 +62,45 @@ def ambil_job(sesi: Session, worker: str) -> Job | None:
     if baris is None:
         return None
     return sesi.get(Job, baris[0])
+
+
+def jeda_menit(attempts: int) -> int:
+    return 2**attempts
+
+
+def _lepas_kunci(job: Job) -> None:
+    job.locked_at = None
+    job.locked_by = None
+
+
+def selesai_sukses(sesi: Session, job: Job, hasil: dict) -> None:
+    job.status = JobStatus.success
+    job.hasil = hasil
+    job.error = None
+    job.error_class = None
+    job.finished_at = safunc.now()
+    _lepas_kunci(job)
+    sesi.commit()
+
+
+def selesai_gagal(sesi: Session, job: Job, error_class: str, pesan: str) -> None:
+    job.error_class = error_class
+    job.error = pesan[:2000]
+    _lepas_kunci(job)
+    boleh_ulang = error_class in DAPAT_DIULANG and job.attempts < job.max_attempts
+    if boleh_ulang:
+        job.status = JobStatus.pending
+        job.scheduled_for = safunc.now() + timedelta(minutes=jeda_menit(job.attempts))
+        job.started_at = None
+    else:
+        job.status = JobStatus.failed
+        job.finished_at = safunc.now()
+    sesi.commit()
+
+
+def tandai_unknown(sesi: Session, job: Job, pesan: str) -> None:
+    job.status = JobStatus.unknown
+    job.error_class = "unknown"
+    job.error = pesan[:2000]
+    _lepas_kunci(job)
+    sesi.commit()
