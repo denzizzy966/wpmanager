@@ -27,6 +27,27 @@ def buat_klien(site: Site) -> SiteClient:
     return SiteClient(site.url, str(site.id), dekripsi_secret(site.secret_terenkripsi))
 
 
+MODE_PENANGKAP_SAH = frozenset({"penuh", "terbatas"})
+
+
+def simpan_kemampuan(site: Site, data: dict) -> None:
+    """Catat apa yang diumumkan connector tentang dirinya sendiri.
+
+    Connector 1.x tidak mengirim `fitur`; nilainya dikosongkan, bukan
+    dibiarkan, supaya site yang di-downgrade berhenti dijadwalkan untuk
+    endpoint yang tidak lagi ia punya.
+    """
+    fitur = data.get("fitur")
+    site.fitur = sorted({str(f) for f in fitur}) if isinstance(fitur, list) else []
+    mode = data.get("mode_penangkap")
+    site.mode_penangkap = mode if mode in MODE_PENANGKAP_SAH else None
+    if "percayai_xff" in data:
+        site.percayai_xff = bool(data.get("percayai_xff"))
+    versi = data.get("connector_version")
+    if isinstance(versi, str) and versi:
+        site.connector_version = versi
+
+
 def _item_inventaris(data: dict) -> Iterator[tuple[PackageType, dict]]:
     inti = data.get("core")
     if inti:
@@ -100,20 +121,21 @@ def tangani_scan_site(sesi: Session, job: Job, klien: SiteClient) -> dict:
     site = sesi.get(Site, job.site_id)
     data = klien.inventory()
     jumlah = simpan_inventaris(sesi, site, data)
+    simpan_kemampuan(site, data)
     if site.status in (SiteStatus.unreachable, SiteStatus.needs_reconnect, SiteStatus.blocked):
         site.status = SiteStatus.active
-        sesi.commit()
+    sesi.commit()
     return {"jumlah_paket": jumlah}
 
 
 def tangani_verify_site(sesi: Session, job: Job, klien: SiteClient) -> dict:
     site = sesi.get(Site, job.site_id)
     data = klien.ping()
-    site.connector_version = data.get("connector_version")
     site.wp_version = data.get("wp_version")
     site.php_version = data.get("php_version")
     site.last_seen_at = datetime.now(timezone.utc)
     site.last_error = None
+    simpan_kemampuan(site, data)
     if site.status != SiteStatus.disabled:
         site.status = SiteStatus.active
     sesi.commit()

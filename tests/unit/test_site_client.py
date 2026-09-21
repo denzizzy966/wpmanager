@@ -214,3 +214,79 @@ def test_warning_php_sebelum_json_menjadi_bad_response():
 def test_url_http_ditolak_saat_konstruksi():
     with pytest.raises(ValueError):
         SiteClient("http://tidak-aman.test", SITE_ID, SECRET)
+
+
+def _tangkap(tampung, balasan=None):
+    def handler(request):
+        tampung.append(request)
+        return httpx.Response(200, json=balasan if balasan is not None else {"ok": True})
+
+    return handler
+
+
+def _tanda_tangan_sah(request, path):
+    return verify(
+        SECRET, request.headers["X-Wpmgr-Signature"], request.method, path,
+        int(request.headers["X-Wpmgr-Timestamp"]), request.headers["X-Wpmgr-Nonce"],
+        request.content,
+    )
+
+
+def test_events_membawa_kursor_di_query_tetapi_tidak_di_tanda_tangan():
+    tampung = []
+    buat_klien(_tangkap(tampung)).events("e=10:2;l=0:0;g=0:0", batas=200)
+    r = tampung[0]
+    assert r.url.path == "/wp-json/wpmgr/v1/events"
+    assert r.url.params["kursor"] == "e=10:2;l=0:0;g=0:0"
+    assert r.url.params["batas"] == "200"
+    assert _tanda_tangan_sah(r, "/wp-json/wpmgr/v1/events")
+
+
+def test_events_tanpa_kursor_tidak_mengirim_parameter_kursor():
+    tampung = []
+    buat_klien(_tangkap(tampung)).events(None)
+    assert "kursor" not in tampung[0].url.params
+
+
+def test_traffic_tanpa_dari_tanpa_query():
+    tampung = []
+    buat_klien(_tangkap(tampung)).traffic()
+    assert tampung[0].url.query == b""
+    assert _tanda_tangan_sah(tampung[0], "/wp-json/wpmgr/v1/traffic")
+
+
+def test_traffic_dengan_dari():
+    tampung = []
+    buat_klien(_tangkap(tampung)).traffic("2026-09-01")
+    assert tampung[0].url.params["dari"] == "2026-09-01"
+
+
+def test_self_update_mengirim_zip_base64_bertanda_tangan():
+    import base64
+
+    tampung = []
+    buat_klien(_tangkap(tampung)).self_update("2.0.1", "ab" * 32, b"PK\x03\x04isi")
+    r = tampung[0]
+    body = json.loads(r.content)
+    assert body == {"versi": "2.0.1", "sha256": "ab" * 32,
+                    "zip_b64": base64.b64encode(b"PK\x03\x04isi").decode()}
+    assert r.method == "POST"
+    assert _tanda_tangan_sah(r, "/wp-json/wpmgr/v1/self-update")
+
+
+def test_self_update_timeout_baca_menjadi_unknown():
+    def handler(request):
+        raise httpx.ReadTimeout("lambat", request=request)
+
+    with pytest.raises(SiteError) as exc:
+        buat_klien(handler).self_update("2.0.1", "ab" * 32, b"x")
+    assert exc.value.error_class == UNKNOWN
+
+
+def test_events_timeout_baca_menjadi_transient():
+    def handler(request):
+        raise httpx.ReadTimeout("lambat", request=request)
+
+    with pytest.raises(SiteError) as exc:
+        buat_klien(handler).events(None)
+    assert exc.value.error_class == TRANSIENT

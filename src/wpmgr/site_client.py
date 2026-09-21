@@ -1,5 +1,7 @@
+import base64
 import json
 import time
+from urllib.parse import urlencode
 
 import httpx
 
@@ -18,6 +20,8 @@ PREFIX = "/wp-json/wpmgr/v1"
 TIMEOUT_PING = 15.0
 TIMEOUT_INVENTORY = 60.0
 TIMEOUT_UPDATE = 180.0
+TIMEOUT_KOLEKSI = 30.0
+TIMEOUT_SELF_UPDATE = 180.0
 
 
 class SiteClient:
@@ -32,7 +36,8 @@ class SiteClient:
         self._client = client or httpx.Client(follow_redirects=False)
 
     def _panggil(
-        self, method: str, path: str, body: bytes, timeout: float, berefek: bool = False
+        self, method: str, path: str, body: bytes, timeout: float, berefek: bool = False,
+        query: str = "",
     ) -> dict:
         """Satu panggilan bertanda tangan ke connector.
 
@@ -40,6 +45,7 @@ class SiteClient:
         /update). Hanya pada panggilan seperti itu timeout berarti "tidak
         diketahui": request mungkin sudah sampai dan upgrade mungkin sedang
         berjalan. Panggilan read-only aman diulang menurut konstruksinya.
+        Query string tidak ikut ditandatangani: connector memverifikasi tanda tangan atas "/wp-json" + route, dan route WordPress tidak memuat query.
         """
         timestamp = int(time.time())
         nonce = new_nonce()
@@ -55,7 +61,7 @@ class SiteClient:
 
         try:
             resp = self._client.request(
-                method, f"{self.base_url}{path}", content=body or None,
+                method, f"{self.base_url}{path}{query}", content=body or None,
                 headers=headers, timeout=timeout,
             )
         except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
@@ -103,3 +109,27 @@ class SiteClient:
             {"tipe": tipe, "slug": slug, "ke_versi": ke_versi}, separators=(",", ":")
         ).encode("utf-8")
         return self._panggil("POST", f"{PREFIX}/update", body, timeout, berefek=True)
+
+    def events(self, kursor: str | None, batas: int = 500,
+               timeout: float = TIMEOUT_KOLEKSI) -> dict:
+        param = {"batas": str(batas)}
+        if kursor:
+            param["kursor"] = kursor
+        return self._panggil("GET", f"{PREFIX}/events", b"", timeout,
+                             query="?" + urlencode(param))
+
+    def traffic(self, dari: str | None = None, timeout: float = TIMEOUT_KOLEKSI) -> dict:
+        query = "?" + urlencode({"dari": dari}) if dari else ""
+        return self._panggil("GET", f"{PREFIX}/traffic", b"", timeout, query=query)
+
+    def self_update(self, versi: str, sha256: str, isi_zip: bytes,
+                    timeout: float = TIMEOUT_SELF_UPDATE) -> dict:
+        body = json.dumps(
+            {"versi": versi, "sha256": sha256,
+             "zip_b64": base64.b64encode(isi_zip).decode("ascii")},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        # berefek: connector mungkin sedang menimpa dirinya ketika koneksi
+        # terputus. Mengulang aman karena versi yang sama dibalas "sudah di
+        # versi tersebut".
+        return self._panggil("POST", f"{PREFIX}/self-update", body, timeout, berefek=True)
