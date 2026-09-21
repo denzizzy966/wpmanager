@@ -1,12 +1,17 @@
+import json
+
 from wpmgr.errors import (
     AUTH_ERROR,
     BAD_RESPONSE,
     BLOCKED,
     CONNECTOR_MISSING,
     DAPAT_DIULANG,
+    PACKAGE_MISSING,
     TRANSIENT,
+    UPGRADE_FAILED,
     SiteError,
     klasifikasi_respons,
+    pesan_plugin,
 )
 
 
@@ -112,3 +117,86 @@ def test_403_dengan_attention_required_dan_tanpa_plugin_code_adalah_blocked():
     """'Attention Required!' marker tanpa plugin code adalah blocked."""
     body = "<html><body>Attention Required! Please enable JavaScript and disable ad blockers.</body></html>"
     assert klasifikasi_respons(403, {}, body) == BLOCKED
+
+
+# --- R53: kode milik connector sendiri menentukan kelas ---------------------
+# Connector membalas dengan WP_Error ber-`code` wpmgr_*; WordPress
+# menyerialkannya sebagai {"code": ..., "message": ..., "data": {"status": N}}.
+
+
+def _galat_connector(kode: str, pesan: str = "pesan dari connector", status: int = 0) -> str:
+    return json.dumps({"code": kode, "message": pesan, "data": {"status": status}})
+
+
+def test_404_wpmgr_tidak_ditemukan_adalah_package_missing():
+    body = _galat_connector("wpmgr_tidak_ditemukan", "Paket tidak ditemukan di site ini.", 404)
+    assert klasifikasi_respons(404, {}, body) == PACKAGE_MISSING
+
+
+def test_404_rest_no_route_tetap_connector_missing():
+    """Plugin nonaktif: WordPress sendiri yang menjawab, dengan kode `rest_*`."""
+    body = '{"code":"rest_no_route","message":"No route was found","data":{"status":404}}'
+    assert klasifikasi_respons(404, {}, body) == CONNECTOR_MISSING
+
+
+def test_404_html_tetap_connector_missing():
+    assert klasifikasi_respons(404, {}, "<html>Not Found</html>") == CONNECTOR_MISSING
+
+
+def test_404_dengan_kode_wpmgr_lain_bukan_connector_missing():
+    """Connector-nya jelas hidup (ia menjawab dengan kodenya sendiri), jadi
+    menandai site needs_reconnect adalah diagnosis yang salah."""
+    assert klasifikasi_respons(404, {}, _galat_connector("wpmgr_entah", status=404)) == BAD_RESPONSE
+
+
+def test_409_wpmgr_tidak_ada_update_adalah_upgrade_failed():
+    body = _galat_connector("wpmgr_tidak_ada_update", status=409)
+    assert klasifikasi_respons(409, {}, body) == UPGRADE_FAILED
+
+
+def test_409_wpmgr_sibuk_adalah_transient():
+    assert klasifikasi_respons(409, {}, _galat_connector("wpmgr_sibuk", status=409)) == TRANSIENT
+
+
+def test_409_tanpa_kode_wpmgr_tetap_bad_response():
+    assert klasifikasi_respons(409, {}, "Conflict") == BAD_RESPONSE
+
+
+def test_500_wpmgr_upgrade_gagal_adalah_upgrade_failed():
+    body = _galat_connector("wpmgr_upgrade_gagal", "Could not copy file.", 500)
+    assert klasifikasi_respons(500, {}, body) == UPGRADE_FAILED
+
+
+def test_503_wpmgr_upgrade_gagal_juga_upgrade_failed():
+    body = _galat_connector("wpmgr_upgrade_gagal", status=503)
+    assert klasifikasi_respons(503, {}, body) == UPGRADE_FAILED
+
+
+def test_500_json_bukan_wpmgr_tetap_transient():
+    body = '{"code":"internal_server_error","message":"There has been a critical error."}'
+    assert klasifikasi_respons(500, {}, body) == TRANSIENT
+
+
+def test_401_dan_403_tidak_berubah_oleh_kode_connector():
+    assert klasifikasi_respons(401, {}, _galat_connector("wpmgr_ditolak", status=401)) == AUTH_ERROR
+    assert klasifikasi_respons(403, {"CF-RAY": "x"}, _galat_connector("wpmgr_ditolak")) == AUTH_ERROR
+
+
+def test_package_missing_dan_upgrade_failed_tidak_diulang():
+    assert PACKAGE_MISSING not in DAPAT_DIULANG
+    assert UPGRADE_FAILED not in DAPAT_DIULANG
+
+
+def test_pesan_plugin_mengambil_message_apa_adanya():
+    """upgrade_failed mencatat pesan WordPress apa adanya (spec §9), bukan
+    body JSON mentah -- yang meng-escape '/' menjadi '\\/', sehingga URL di
+    pesan WordPress tidak lagi sama dengan aslinya."""
+    body = json.dumps({"code": "wpmgr_upgrade_gagal",
+                       "message": "Gagal unduh https://downloads.wordpress.org/x.zip"}).replace("/", "\\/")
+    assert pesan_plugin(body) == "Gagal unduh https://downloads.wordpress.org/x.zip"
+
+
+def test_pesan_plugin_none_untuk_body_bukan_connector():
+    assert pesan_plugin("<html>boom</html>") is None
+    assert pesan_plugin('{"code":"rest_no_route","message":"x"}') is None
+    assert pesan_plugin('["bukan", "objek"]') is None

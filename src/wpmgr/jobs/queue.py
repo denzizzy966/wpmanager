@@ -7,8 +7,11 @@ from sqlalchemy import func as safunc
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from wpmgr.errors import DAPAT_DIULANG, UNKNOWN
+from wpmgr.errors import BAD_RESPONSE, DAPAT_DIULANG, UNKNOWN
 from wpmgr.models import Job, JobStatus, JobType
+
+# Percobaan pertama ditambah satu ulangan.
+BATAS_PERCOBAAN_BAD_RESPONSE = 2
 
 SQL_AMBIL = text(
     """
@@ -84,11 +87,24 @@ def selesai_sukses(sesi: Session, job: Job, hasil: dict) -> None:
     sesi.commit()
 
 
+def _batas_percobaan(job: Job, error_class: str) -> int:
+    # Spec §9: bad_response diulang sekali. Penyebab umumnya -- plugin lain
+    # mencetak warning sebelum JSON, cache mengembalikan HTML -- tidak hilang
+    # dalam hitungan menit, jadi percobaan ketiga hanya menunda operator
+    # melihat masalahnya. Dihitung dari `attempts`: bad_response hanya diulang
+    # bila ia terjadi pada percobaan pertama.
+    if error_class == BAD_RESPONSE:
+        return min(job.max_attempts, BATAS_PERCOBAAN_BAD_RESPONSE)
+    return job.max_attempts
+
+
 def selesai_gagal(sesi: Session, job: Job, error_class: str, pesan: str) -> None:
     job.error_class = error_class
     job.error = pesan[:2000]
     _lepas_kunci(job)
-    boleh_ulang = error_class in DAPAT_DIULANG and job.attempts < job.max_attempts
+    boleh_ulang = (
+        error_class in DAPAT_DIULANG and job.attempts < _batas_percobaan(job, error_class)
+    )
     if boleh_ulang:
         job.status = JobStatus.pending
         job.scheduled_for = safunc.now() + timedelta(minutes=jeda_menit(job.attempts))

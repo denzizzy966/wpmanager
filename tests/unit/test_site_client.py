@@ -7,8 +7,10 @@ from wpmgr.errors import (
     AUTH_ERROR,
     BLOCKED,
     CONNECTOR_MISSING,
+    PACKAGE_MISSING,
     TRANSIENT,
     UNKNOWN,
+    UPGRADE_FAILED,
     SiteError,
 )
 from wpmgr.signing import verify
@@ -109,6 +111,70 @@ def test_timeout_menjadi_unknown():
     with pytest.raises(SiteError) as exc:
         buat_klien(handler).update("plugin", "a/a.php", "1.0")
     assert exc.value.error_class == UNKNOWN
+
+
+def _panggil(klien, metode):
+    if metode == "update":
+        return klien.update("plugin", "a/a.php", "1.0")
+    return getattr(klien, metode)()
+
+
+@pytest.mark.parametrize(
+    "metode,pengecualian,diharapkan",
+    [
+        # R55: koneksi yang tidak pernah terbentuk tidak menjalankan apa pun di
+        # site, jadi aman diulang -- untuk panggilan apa pun.
+        ("ping", httpx.ConnectTimeout, TRANSIENT),
+        ("ping", httpx.PoolTimeout, TRANSIENT),
+        ("inventory", httpx.ConnectTimeout, TRANSIENT),
+        ("inventory", httpx.PoolTimeout, TRANSIENT),
+        ("update", httpx.ConnectTimeout, TRANSIENT),
+        ("update", httpx.PoolTimeout, TRANSIENT),
+        # ping dan inventory read-only: timeout jenis apa pun aman diulang.
+        ("ping", httpx.ReadTimeout, TRANSIENT),
+        ("ping", httpx.WriteTimeout, TRANSIENT),
+        ("inventory", httpx.ReadTimeout, TRANSIENT),
+        ("inventory", httpx.WriteTimeout, TRANSIENT),
+        # Hanya pada update, request mungkin sudah sampai dan upgrade mungkin
+        # sedang berjalan: kita tidak tahu, jadi unknown (spec §7.4).
+        ("update", httpx.ReadTimeout, UNKNOWN),
+        ("update", httpx.WriteTimeout, UNKNOWN),
+    ],
+)
+def test_klasifikasi_timeout_per_panggilan(metode, pengecualian, diharapkan):
+    def handler(request):
+        raise pengecualian("kehabisan waktu", request=request)
+
+    with pytest.raises(SiteError) as exc:
+        _panggil(buat_klien(handler), metode)
+    assert exc.value.error_class == diharapkan
+
+
+def test_upgrade_failed_mencatat_pesan_wordpress_apa_adanya():
+    def handler(request):
+        return httpx.Response(500, json={
+            "code": "wpmgr_upgrade_gagal",
+            "message": "Download failed. https://downloads.wordpress.org/x.zip",
+            "data": {"status": 500},
+        })
+
+    with pytest.raises(SiteError) as exc:
+        buat_klien(handler).update("plugin", "a/a.php", "1.0")
+    assert exc.value.error_class == UPGRADE_FAILED
+    assert exc.value.pesan == "Download failed. https://downloads.wordpress.org/x.zip"
+
+
+def test_package_missing_dari_404_connector():
+    def handler(request):
+        return httpx.Response(404, json={
+            "code": "wpmgr_tidak_ditemukan",
+            "message": "Paket tidak ditemukan di site ini.",
+            "data": {"status": 404},
+        })
+
+    with pytest.raises(SiteError) as exc:
+        buat_klien(handler).update("plugin", "a/a.php", "1.0")
+    assert exc.value.error_class == PACKAGE_MISSING
 
 
 def test_koneksi_gagal_menjadi_transient():

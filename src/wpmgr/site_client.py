@@ -7,8 +7,10 @@ from wpmgr.errors import (
     BAD_RESPONSE,
     TRANSIENT,
     UNKNOWN,
+    UPGRADE_FAILED,
     SiteError,
     klasifikasi_respons,
+    pesan_plugin,
 )
 from wpmgr.signing import new_nonce, sign
 
@@ -29,7 +31,16 @@ class SiteClient:
         self.secret_hex = secret_hex
         self._client = client or httpx.Client(follow_redirects=False)
 
-    def _panggil(self, method: str, path: str, body: bytes, timeout: float) -> dict:
+    def _panggil(
+        self, method: str, path: str, body: bytes, timeout: float, berefek: bool = False
+    ) -> dict:
+        """Satu panggilan bertanda tangan ke connector.
+
+        `berefek` menandai panggilan yang mengubah sesuatu di site (hanya
+        /update). Hanya pada panggilan seperti itu timeout berarti "tidak
+        diketahui": request mungkin sudah sampai dan upgrade mungkin sedang
+        berjalan. Panggilan read-only aman diulang menurut konstruksinya.
+        """
         timestamp = int(time.time())
         nonce = new_nonce()
         headers = {
@@ -47,8 +58,14 @@ class SiteClient:
                 method, f"{self.base_url}{path}", content=body or None,
                 headers=headers, timeout=timeout,
             )
+        except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # Koneksi ke site tidak pernah terbentuk (atau tidak pernah
+            # mendapat slot di pool), jadi tidak ada yang berjalan di sana.
+            raise SiteError(TRANSIENT, f"timeout koneksi setelah {timeout} detik") from exc
         except httpx.TimeoutException as exc:
-            raise SiteError(UNKNOWN, f"timeout setelah {timeout} detik") from exc
+            if berefek:
+                raise SiteError(UNKNOWN, f"timeout setelah {timeout} detik") from exc
+            raise SiteError(TRANSIENT, f"timeout setelah {timeout} detik") from exc
         except httpx.HTTPError as exc:
             raise SiteError(TRANSIENT, f"kesalahan koneksi: {exc}") from exc
 
@@ -56,6 +73,9 @@ class SiteClient:
         kelas = klasifikasi_respons(resp.status_code, dict(resp.headers), teks)
         if kelas is not None:
             pesan = teks[:500]
+            if kelas == UPGRADE_FAILED:
+                # Spec §9: pesan asli WordPress dicatat apa adanya.
+                pesan = (pesan_plugin(teks) or teks)[:500]
             if 300 <= resp.status_code < 400:
                 tujuan = resp.headers.get("location", "(tanpa header Location)")
                 pesan = (
@@ -82,4 +102,4 @@ class SiteClient:
         body = json.dumps(
             {"tipe": tipe, "slug": slug, "ke_versi": ke_versi}, separators=(",", ":")
         ).encode("utf-8")
-        return self._panggil("POST", f"{PREFIX}/update", body, timeout)
+        return self._panggil("POST", f"{PREFIX}/update", body, timeout, berefek=True)

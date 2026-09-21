@@ -1,6 +1,13 @@
 import pytest
 
-from wpmgr.errors import AUTH_ERROR, TRANSIENT
+from wpmgr.errors import (
+    AUTH_ERROR,
+    BAD_RESPONSE,
+    INTERNAL_ERROR,
+    PACKAGE_MISSING,
+    TRANSIENT,
+    UPGRADE_FAILED,
+)
 from wpmgr.jobs.queue import (
     ambil_job,
     buat_job,
@@ -64,6 +71,36 @@ def test_transient_menjadi_failed_setelah_jatah_habis(sesi, site):
             sesi.commit()
     assert j.status == JobStatus.failed
     assert j.attempts == 3
+
+
+def test_bad_response_diulang_sekali_saja(sesi, site):
+    """Spec §9: bad_response diulang "Ya, sekali" -- bukan sampai max_attempts.
+    Penyebab umumnya (plugin lain mencetak warning, cache mengembalikan HTML)
+    tidak hilang dengan sendirinya dalam hitungan menit."""
+    buat_job(sesi, site.id, JobType.scan_site)
+    j = ambil_job(sesi, "w1")
+    selesai_gagal(sesi, j, BAD_RESPONSE, "<html>")
+    sesi.refresh(j)
+    assert j.status == JobStatus.pending
+
+    j.scheduled_for = j.dibuat_pada
+    sesi.commit()
+    j = ambil_job(sesi, "w1")
+    selesai_gagal(sesi, j, BAD_RESPONSE, "<html>")
+    sesi.refresh(j)
+    assert j.status == JobStatus.failed
+    assert j.attempts == 2
+    assert j.max_attempts == 3
+
+
+@pytest.mark.parametrize("kelas", [UPGRADE_FAILED, PACKAGE_MISSING, INTERNAL_ERROR])
+def test_kelas_final_langsung_failed_tanpa_retry(sesi, site, kelas):
+    buat_job(sesi, site.id, JobType.update_package, {"slug": "a"})
+    j = ambil_job(sesi, "w1")
+    selesai_gagal(sesi, j, kelas, "gagal")
+    sesi.refresh(j)
+    assert j.status == JobStatus.failed
+    assert j.attempts == 1
 
 
 def test_unknown_melepas_kunci_tapi_tidak_menjadwal_ulang(sesi, site):
