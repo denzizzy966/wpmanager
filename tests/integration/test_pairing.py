@@ -237,3 +237,21 @@ def test_body_bukan_json_dengan_tanda_tangan_sah_mendapat_400(sesi, klien):
         "X-Wpmgr-Signature": sign(secret, "POST", PATH, ts, nonce, body),
     })
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize("body", [b"[1,2]", b'"teks"', b"42", b"null"])
+def test_body_json_bukan_objek_dengan_tanda_tangan_sah_mendapat_400(sesi, klien, body):
+    """JSON sah tetapi bukan objek dulu meledak sebagai 500 di muatan.get()."""
+    site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
+    secret = dekripsi_secret(site.secret_terenkripsi)
+    ts, nonce = int(time.time()), uuid.uuid4().hex
+    r = klien.post(PATH, content=body, headers={
+        "Content-Type": "application/json",
+        "X-Wpmgr-Site": str(site.id),
+        "X-Wpmgr-Timestamp": str(ts),
+        "X-Wpmgr-Nonce": nonce,
+        "X-Wpmgr-Signature": sign(secret, "POST", PATH, ts, nonce, body),
+    })
+    assert r.status_code == 400
+    assert r.json() == {"detail": "Body bukan objek JSON"}
+    assert sesi.query(Job).filter_by(site_id=site.id).count() == 0

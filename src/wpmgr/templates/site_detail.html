@@ -28,7 +28,7 @@
 </ul>
 
 <h2>Cabut site</h2>
-<div x-data="{ konfirmasi: false }">
+<div x-data="{ konfirmasi: false, galat: '' }">
   <p>Mencabut site menghapus datanya dari dashboard berikut secret-nya, sehingga
      dashboard ini tidak lagi dapat memerintah site tersebut. Plugin
      <code>wp-manager-connector</code> dan user <code>wpmgr</code> di site itu
@@ -36,10 +36,19 @@
   <button x-show="!konfirmasi" @click="konfirmasi = true">Cabut site ini</button>
   <div x-show="konfirmasi">
     <p><strong>Yakin mencabut {{ site.nama }}?</strong></p>
+    {# Pindah ke /sites HANYA bila penghapusan berhasil: dulu kegagalan pun
+       mengarahkan ke daftar site, dan operator mengira secret-nya sudah
+       dicabut padahal site itu masih bisa diperintah. #}
     <button @click="
+      galat = '';
       fetch('/api/sites/{{ site.id }}', { method: 'DELETE' })
-        .then(() => window.location = '/sites')">Ya, cabut</button>
+        .then(async (r) => {
+          if (r.ok) { window.location = '/sites'; return; }
+          galat = 'Site tidak dicabut. ' + await pesanGalat(r);
+        })
+        .catch((e) => { galat = 'Gagal menghubungi server: ' + e.message; })">Ya, cabut</button>
     <button @click="konfirmasi = false">Batal</button>
+    <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
   </div>
 </div>
 {% endblock %}

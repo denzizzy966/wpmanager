@@ -2,14 +2,28 @@
 {% block judul %}Aktivitas — WP Manager{% endblock %}
 {% block isi %}
 <h1>Aktivitas</h1>
+{# Isi `detail` sebagian berasal dari site client (pesan WordPress, string
+   versi) -- site yang mungkin sudah disusupi. Semuanya lewat autoescape
+   Jinja; jangan pernah memakai |safe di sini. #}
 <table>
-  <tr><th>Waktu</th><th>Site</th><th>Level</th><th>Pesan</th></tr>
+  <tr><th>Waktu</th><th>Site</th><th>Level</th><th>Pesan</th><th>Rincian</th></tr>
   {% for log, site_nama in baris %}
+  {% set d = log.detail if log.detail is mapping else {} %}
   <tr>
     <td>{{ log.dibuat_pada.strftime('%Y-%m-%d %H:%M') }}</td>
     <td>{{ site_nama or '—' }}</td>
     <td>{{ log.level }}</td>
     <td>{{ log.pesan }}</td>
+    <td class="rincian">
+      {% if d.versi_sebelum or d.versi_sesudah %}
+        <div>{{ d.slug ~ ': ' if d.slug }}{{ d.versi_sebelum or '?' }} → {{ d.versi_sesudah or '?' }}</div>
+      {% endif %}
+      {% if d.email %}<div>oleh {{ d.email }}</div>{% endif %}
+      {% if d.pesan %}<div class="pesan-detail">{{ d.pesan }}</div>{% endif %}
+      {% for kunci, nilai in d.items() if kunci not in ('slug', 'tipe', 'versi_sebelum', 'versi_sesudah', 'email', 'pesan', 'dibuat_oleh') %}
+        <div class="redup">{{ kunci }}: {{ nilai }}</div>
+      {% endfor %}
+    </td>
   </tr>
   {% endfor %}
 </table>

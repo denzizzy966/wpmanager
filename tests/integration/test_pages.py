@@ -118,6 +118,53 @@ def test_activity_menampilkan_baris_log(klien, sesi):
     assert "Pesan uji aktivitas" in r.text
 
 
+def test_activity_menampilkan_isi_detail(klien, sesi):
+    """R57: versi sebelum/sesudah dan pesan WordPress hidup di `detail`; tanpa
+    ditampilkan, jejak audit hanya bisa dibaca lewat psql."""
+    from wpmgr.models import ActivityLog
+    from wpmgr.pairing import buat_site
+
+    site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
+    sesi.add(ActivityLog(
+        site_id=site.id, level="info", pesan="Update plugin",
+        detail={"tipe": "plugin", "slug": "elementor/elementor.php",
+                "versi_sebelum": "3.18.3", "versi_sesudah": "3.20.1",
+                "email": "op@contoh.test", "pesan": "Plugin berhasil diperbarui."},
+    ))
+    sesi.add(ActivityLog(
+        site_id=site.id, level="error", pesan="update_package gagal: upgrade_failed",
+        detail={"pesan": "Could not copy file.", "worker": "host:1"},
+    ))
+    sesi.commit()
+
+    r = klien.get("/activity")
+    assert "3.18.3" in r.text
+    assert "3.20.1" in r.text
+    assert "Plugin berhasil diperbarui." in r.text
+    assert "op@contoh.test" in r.text
+    assert "Could not copy file." in r.text
+
+
+def test_activity_meng_escape_isi_detail(klien, sesi):
+    """Isi `detail` datang dari site client (pesan WordPress, versi) -- site
+    yang justru mungkin sudah disusupi. Harus lewat autoescape Jinja."""
+    from wpmgr.models import ActivityLog
+    from wpmgr.pairing import buat_site
+
+    site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
+    sesi.add(ActivityLog(
+        site_id=site.id, level="error", pesan="gagal",
+        detail={"pesan": "<script>alert(1)</script>",
+                "versi_sebelum": "<img src=x onerror=alert(2)>", "versi_sesudah": "1.0"},
+    ))
+    sesi.commit()
+
+    r = klien.get("/activity")
+    assert "<script>alert(1)</script>" not in r.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in r.text
+    assert "<img src=x" not in r.text
+
+
 def test_halaman_menolak_tanpa_login():
     from wpmgr.web.app import buat_app
 

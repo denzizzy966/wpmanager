@@ -2,3 +2,6 @@
 .bilah .kanan{margin-left:auto}
 main{padding:1rem}
 .galat{color:#b00}
+.rincian{font-size:.9em}
+.rincian .pesan-detail{white-space:pre-wrap;word-break:break-word}
+.redup{color:#666}

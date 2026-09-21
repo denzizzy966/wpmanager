@@ -11,6 +11,8 @@
     <button @click="muat()" :disabled="berjalan">Muat ulang</button>
   </div>
 
+  <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+
   <div x-show="progres.length" class="progres">
     <template x-for="j in progres" :key="j.id">
       <div>

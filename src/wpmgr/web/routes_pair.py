@@ -1,6 +1,5 @@
 import time
 import uuid
-from collections import defaultdict, deque
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -9,6 +8,7 @@ from wpmgr.crypto import dekripsi_secret
 from wpmgr.jobs.queue import buat_job
 from wpmgr.models import ActivityLog, Job, JobStatus, JobType, Site
 from wpmgr.signing import JENDELA_DETIK, verify
+from wpmgr.web.pembatas import PembatasLaju, ip_klien
 
 router = APIRouter()
 PATH = "/api/pair/confirm"
@@ -20,52 +20,15 @@ PATH = "/api/pair/confirm"
 TOLAK = "Tidak sah"
 
 BATAS_PER_MENIT = 10
-_pembatas: dict[str, deque] = defaultdict(deque)
+_pembatas_pairing = PembatasLaju(BATAS_PER_MENIT)
+# Nama-nama lama tetap diekspor: test (dan siapa pun yang mengosongkan
+# pembatas di antara test) memegang dict jejaknya secara langsung.
+_pembatas = _pembatas_pairing.jejak
+_lolos_rate_limit = _pembatas_pairing.lolos
+_ip_klien = ip_klien
 
 NONCE_TTL = 600
 _nonce_terpakai: dict[str, float] = {}
-
-_PEER_TEPERCAYA = frozenset({"127.0.0.1", "::1"})
-
-
-def _ip_klien(request: Request) -> str:
-    """IP klien sesungguhnya, dengan header proxy hanya dipercaya dari loopback.
-
-    Membaca X-Real-IP tanpa syarat berarti siapa pun yang dapat menjangkau
-    aplikasi secara langsung dapat mengarang identitas dan melewati pembatas
-    laju. Mempercayainya hanya ketika peer TCP adalah loopback -- satu-satunya
-    tempat nginx berada -- menutup itu.
-    """
-    peer = request.client.host if request.client else ""
-    if peer in _PEER_TEPERCAYA:
-        nyata = request.headers.get("X-Real-IP", "").strip()
-        if nyata:
-            return nyata
-        diteruskan = request.headers.get("X-Forwarded-For", "")
-        if diteruskan:
-            # nginx menambahkan IP peer di posisi paling KANAN, sehingga entri
-            # itulah yang tidak dapat dipalsukan klien.
-            return diteruskan.split(",")[-1].strip()
-    return peer or "tidak-diketahui"
-
-
-def _lolos_rate_limit(ip: str) -> bool:
-    sekarang = time.monotonic()
-
-    # Buang IP yang jendelanya sudah lewat sebelum mengakses _pembatas[ip],
-    # karena akses itu sendiri akan membuat entri baru (defaultdict). Tanpa
-    # ini, setiap IP berbeda yang pernah mampir meninggalkan entri selamanya.
-    basi = [k for k, v in _pembatas.items() if not v or sekarang - v[-1] > 60]
-    for k in basi:
-        del _pembatas[k]
-
-    jejak = _pembatas[ip]
-    while jejak and sekarang - jejak[0] > 60:
-        jejak.popleft()
-    if len(jejak) >= BATAS_PER_MENIT:
-        return False
-    jejak.append(sekarang)
-    return True
 
 
 def _nonce_baru(nonce: str) -> bool:
@@ -118,6 +81,10 @@ async def konfirmasi_pairing(request: Request):
             muatan = await request.json() if body else {}
         except ValueError:
             raise HTTPException(status_code=400, detail="Body bukan JSON") from None
+        if not isinstance(muatan, dict):
+            # JSON sah tetapi berupa array/angka/null: tanpa ini muatan.get()
+            # di bawah meledak sebagai 500.
+            raise HTTPException(status_code=400, detail="Body bukan objek JSON")
 
         site.connector_version = muatan.get("connector_version")
         site.wp_version = muatan.get("wp_version")

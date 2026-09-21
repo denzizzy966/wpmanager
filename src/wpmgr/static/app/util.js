@@ -12,3 +12,26 @@ function esc(nilai) {
   if (nilai === null || nilai === undefined) return "";
   return String(nilai).replace(/[&<>"']/g, (c) => _ESC[c]);
 }
+
+/**
+ * Pesan yang bisa dibaca manusia dari respons HTTP yang gagal.
+ *
+ * FastAPI membalas {"detail": "..."} untuk HTTPException dan
+ * {"detail": [{msg: ...}, ...]} untuk galat validasi. Hasilnya teks polos:
+ * pemanggil WAJIB menyisipkannya lewat textContent/x-text, bukan innerHTML --
+ * detail bisa memuat nilai yang berasal dari site client.
+ */
+async function pesanGalat(respons) {
+  let rincian = "";
+  try {
+    const data = await respons.json();
+    if (typeof data.detail === "string") {
+      rincian = data.detail;
+    } else if (Array.isArray(data.detail)) {
+      rincian = data.detail.map((d) => d.msg).join("; ");
+    }
+  } catch (e) {
+    // Body bukan JSON (mis. halaman error proxy); status saja sudah cukup.
+  }
+  return `HTTP ${respons.status}${rincian ? ": " + rincian : ""}`;
+}

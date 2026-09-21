@@ -4,6 +4,7 @@ function layarUpdate() {
     terpilih: [],
     berjalan: false,
     progres: [],
+    galat: '',
     _timer: null,
 
     async muat() {
@@ -44,15 +45,32 @@ function layarUpdate() {
 
     async jalankanUpdate() {
       if (!this.terpilih.length) return;
+      this.galat = '';
       this.berjalan = true;
       const items = this.terpilih.map((b) => ({
         site_id: b.site_id, tipe: b.tipe, slug: b.slug, ke_versi: b.versi_tersedia,
       }));
-      await fetch('/api/jobs/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items }),
-      });
+      // Tanpa pemeriksaan ini, POST yang ditolak (sesi habis, site sudah
+      // dicabut, 403 asal) terlihat persis seperti antrean yang langsung
+      // selesai: strip progres kosong, grid dimuat ulang, dan operator
+      // menyimpulkan update berjalan padahal tidak ada satu job pun dibuat.
+      let respons;
+      try {
+        respons = await fetch('/api/jobs/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+      } catch (e) {
+        this.berjalan = false;
+        this.galat = `Gagal menghubungi server: ${e.message}`;
+        return;
+      }
+      if (!respons.ok) {
+        this.berjalan = false;
+        this.galat = `Update tidak dijalankan. ${await pesanGalat(respons)}`;
+        return;
+      }
       this.pantau();
     },
 

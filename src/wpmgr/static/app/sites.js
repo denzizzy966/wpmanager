@@ -10,6 +10,7 @@ const WARNA_STATUS = {
 function layarSite() {
   return {
     grid: null,
+    galat: '',
 
     async muat() {
       const data = await (await fetch('/api/sites')).json();
@@ -65,16 +66,33 @@ function layarSite() {
       document.getElementById('grid').addEventListener('click', async (ev) => {
         const sso = ev.target.getAttribute('data-sso');
         const scan = ev.target.getAttribute('data-scan');
-        if (sso) {
-          const r = await (await fetch(`/api/sso/${sso}`)).json();
-          window.open(r.url, '_blank', 'noopener');
-        } else if (scan) {
-          await fetch('/api/jobs/scan', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ site_id: scan }),
-          });
-          ev.target.textContent = 'Antre…';
+        if (!sso && !scan) return;
+        this.galat = '';
+        // Kegagalan ditampilkan di halaman, bukan ditelan: dulu SSO yang
+        // gagal membuka tab "undefined", dan Scan yang ditolak tetap
+        // menampilkan "Antre…" untuk job yang tidak pernah dibuat.
+        try {
+          if (sso) {
+            const r = await fetch(`/api/sso/${sso}`);
+            if (!r.ok) {
+              this.galat = `SSO gagal. ${await pesanGalat(r)}`;
+              return;
+            }
+            window.open((await r.json()).url, '_blank', 'noopener');
+          } else {
+            const r = await fetch('/api/jobs/scan', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ site_id: scan }),
+            });
+            if (!r.ok) {
+              this.galat = `Scan tidak diantrekan. ${await pesanGalat(r)}`;
+              return;
+            }
+            ev.target.textContent = 'Antre…';
+          }
+        } catch (e) {
+          this.galat = `Gagal menghubungi server: ${e.message}`;
         }
       });
     },
