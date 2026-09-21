@@ -209,7 +209,6 @@ Tambahkan ke akhir `.env.example`:
 
 File: `tests/integration/test_models_lapis2.py`
 ```python
-import uuid
 from datetime import date, datetime, timezone
 
 import pytest
@@ -324,9 +323,6 @@ def test_hapus_site_ikut_menghapus_data_monitoring(sesi, site):
     sesi.commit()
     assert sesi.query(CatatanError).count() == 0
 
-
-def test_id_site_acak_tidak_mengganggu(sesi):
-    assert uuid.uuid4()
 ```
 
 - [ ] **Step 7: Jalankan dan pastikan gagal.** Run: `.venv/Scripts/python -m pytest tests/integration/test_models_lapis2.py -q`. Expected: error koleksi `ImportError: cannot import name 'CatatanError' from 'wpmgr.models'`.
