@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timezone
 
 import httpx
@@ -6,7 +7,14 @@ import pytest
 from wpmgr.errors import UNKNOWN, SiteError
 from wpmgr.jobs.handlers import resolusi_unknown, tangani_update_package
 from wpmgr.jobs.queue import ambil_job, buat_job
-from wpmgr.models import ActivityLog, JobStatus, JobType, PackageType, SitePackage
+from wpmgr.models import (
+    ActivityLog,
+    JobStatus,
+    JobType,
+    PackageType,
+    SitePackage,
+    User,
+)
 from wpmgr.site_client import SiteClient
 
 pytestmark = pytest.mark.integration
@@ -165,8 +173,76 @@ def test_update_paket_tak_dikenal_menulis_activity_log_warning(sesi, site):
     hasil = tangani_update_package(sesi, job, klien)
 
     assert hasil["versi_sesudah"] == "3.20.1"
-    log = sesi.query(ActivityLog).filter_by(job_id=job.id).one()
+    # Difilter per level: sejak R57 setiap update sukses juga menulis baris
+    # info, termasuk yang ini.
+    log = sesi.query(ActivityLog).filter_by(job_id=job.id, level="warning").one()
     assert log.level == "warning"
+
+
+def _pembuat(sesi):
+    u = User(id=uuid.uuid4(), email="op@contoh.test", nama="Op", password_hash="x")
+    sesi.add(u)
+    sesi.commit()
+    return u
+
+
+def test_update_sukses_menulis_jejak_audit(sesi, site):
+    """R57: siapa meng-update apa, dari versi berapa ke versi berapa."""
+    _paket(sesi, site, "3.18.3")
+    pembuat = _pembuat(sesi)
+    buat_job(sesi, site.id, JobType.update_package, PAYLOAD, dibuat_oleh=pembuat.id)
+    job = ambil_job(sesi, "w1")
+
+    klien = klien_dari(lambda r: httpx.Response(200, json={
+        "ok": True, "versi_sebelum": "3.18.3", "versi_sesudah": "3.20.1", "pesan": "Plugin updated."}))
+    tangani_update_package(sesi, job, klien)
+
+    log = sesi.query(ActivityLog).filter_by(job_id=job.id).one()
+    assert log.level == "info"
+    assert log.user_id == pembuat.id
+    assert log.detail["tipe"] == "plugin"
+    assert log.detail["slug"] == "elementor/elementor.php"
+    assert log.detail["versi_sebelum"] == "3.18.3"
+    assert log.detail["versi_sesudah"] == "3.20.1"
+    assert log.detail["dibuat_oleh"] == str(pembuat.id)
+    assert log.detail["email"] == "op@contoh.test"
+    assert log.detail["pesan"] == "Plugin updated."
+
+
+def test_update_tanpa_pembuat_tetap_menulis_jejak_audit(sesi, site):
+    _paket(sesi, site, "3.18.3")
+    buat_job(sesi, site.id, JobType.update_package, PAYLOAD)
+    job = ambil_job(sesi, "w1")
+    tangani_update_package(sesi, job, klien_dari(lambda r: httpx.Response(200, json={
+        "ok": True, "versi_sesudah": "3.20.1"})))
+
+    log = sesi.query(ActivityLog).filter_by(job_id=job.id).one()
+    assert log.level == "info"
+    # Connector tidak mengirim versi_sebelum: pakai dari_versi payload.
+    assert log.detail["versi_sebelum"] == "3.18.3"
+    assert log.detail["dibuat_oleh"] is None
+
+
+def test_resolusi_unknown_sukses_menulis_jejak_audit(sesi, site):
+    _paket(sesi, site, "3.18.3")
+    pembuat = _pembuat(sesi)
+    buat_job(sesi, site.id, JobType.update_package, PAYLOAD, dibuat_oleh=pembuat.id)
+    job = ambil_job(sesi, "w1")
+
+    klien = klien_dari(lambda r: httpx.Response(200, json={
+        "core": None,
+        "plugins": [{"slug": "elementor/elementor.php", "nama": "Elementor",
+                     "versi_terpasang": "3.20.1", "versi_tersedia": None,
+                     "aktif": True, "auto_update": False}],
+        "themes": [],
+    }))
+    assert resolusi_unknown(sesi, job, klien) == "success"
+
+    log = sesi.query(ActivityLog).filter_by(job_id=job.id).one()
+    assert log.level == "info"
+    assert log.detail["versi_sebelum"] == "3.18.3"
+    assert log.detail["versi_sesudah"] == "3.20.1"
+    assert log.detail["email"] == "op@contoh.test"
 
 
 def test_sudah_mencapai_menolak_menebak_pada_versi_pra_rilis():

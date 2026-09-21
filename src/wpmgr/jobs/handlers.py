@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from wpmgr.crypto import dekripsi_secret
 from wpmgr.errors import SiteError
-from wpmgr.jobs.queue import jeda_menit
+from wpmgr.jobs.queue import antrekan_scan, jeda_menit
 from wpmgr.models import (
     ActivityLog,
     Job,
@@ -18,6 +18,7 @@ from wpmgr.models import (
     Site,
     SitePackage,
     SiteStatus,
+    User,
 )
 from wpmgr.site_client import SiteClient
 
@@ -113,9 +114,56 @@ def tangani_verify_site(sesi: Session, job: Job, klien: SiteClient) -> dict:
     site.php_version = data.get("php_version")
     site.last_seen_at = datetime.now(timezone.utc)
     site.last_error = None
-    site.status = SiteStatus.active
+    if site.status != SiteStatus.disabled:
+        site.status = SiteStatus.active
     sesi.commit()
+    # Site yang baru terpasang langsung mendapat inventarisnya, bukan
+    # menunggu cron jam berikutnya atau operator ingat menekan Scan.
+    antrekan_scan(sesi, site.id)
     return data
+
+
+def _catat_update_sukses(
+    sesi: Session,
+    site: Site,
+    job: Job,
+    versi_sebelum: str | None,
+    versi_sesudah: str,
+    pesan: str | None = None,
+) -> None:
+    """Jejak audit update yang berhasil: siapa, apa, dari versi berapa ke berapa.
+
+    Tanpa ini, satu-satunya bukti sebuah update pernah terjadi adalah baris
+    job -- yang kelak dibersihkan -- dan tidak ada jawaban untuk "siapa yang
+    meng-update WooCommerce di site client X minggu lalu".
+    """
+    p = job.payload
+    email = None
+    if job.dibuat_oleh is not None:
+        pembuat = sesi.get(User, job.dibuat_oleh)
+        email = pembuat.email if pembuat is not None else None
+
+    detail = {
+        "tipe": p["tipe"],
+        "slug": p["slug"],
+        "versi_sebelum": versi_sebelum,
+        "versi_sesudah": versi_sesudah,
+        "dibuat_oleh": str(job.dibuat_oleh) if job.dibuat_oleh is not None else None,
+        "email": email,
+    }
+    if pesan:
+        detail["pesan"] = pesan[:500]
+    oleh = f" oleh {email}" if email else ""
+    sesi.add(
+        ActivityLog(
+            site_id=site.id,
+            job_id=job.id,
+            user_id=job.dibuat_oleh,
+            level="info",
+            pesan=f"Update {p['tipe']} {p['slug']}: {versi_sebelum or '?'} → {versi_sesudah}{oleh}",
+            detail=detail,
+        )
+    )
 
 
 def tangani_update_package(sesi: Session, job: Job, klien: SiteClient) -> dict:
@@ -123,7 +171,9 @@ def tangani_update_package(sesi: Session, job: Job, klien: SiteClient) -> dict:
     p = job.payload
     hasil = klien.update(p["tipe"], p["slug"], p["ke_versi"])
 
+    versi_sebelum = hasil.get("versi_sebelum") or p.get("dari_versi")
     versi_sesudah = hasil.get("versi_sesudah") or p["ke_versi"]
+    _catat_update_sukses(sesi, site, job, versi_sebelum, versi_sesudah, hasil.get("pesan"))
     baris = sesi.scalar(
         select(SitePackage).where(
             SitePackage.site_id == site.id,
@@ -223,12 +273,13 @@ def resolusi_unknown(sesi: Session, job: Job, klien: SiteClient) -> str:
         )
     )
     if baris is not None and _sudah_mencapai(baris.versi_terpasang, p["ke_versi"]):
+        pesan = "terverifikasi lewat scan ulang setelah timeout"
         job.status = JobStatus.success
-        job.hasil = {"versi_sesudah": baris.versi_terpasang,
-                     "pesan": "terverifikasi lewat scan ulang setelah timeout"}
+        job.hasil = {"versi_sesudah": baris.versi_terpasang, "pesan": pesan}
         job.error = None
         job.error_class = None
         job.finished_at = safunc.now()
+        _catat_update_sukses(sesi, site, job, p.get("dari_versi"), baris.versi_terpasang, pesan)
         sesi.commit()
         return "success"
 

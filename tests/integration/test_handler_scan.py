@@ -7,7 +7,7 @@ from wpmgr.jobs.handlers import (
     tangani_verify_site,
 )
 from wpmgr.jobs.queue import ambil_job, buat_job
-from wpmgr.models import JobType, PackageType, SitePackage, SiteStatus
+from wpmgr.models import Job, JobStatus, JobType, PackageType, SitePackage, SiteStatus
 from wpmgr.site_client import SiteClient
 
 pytestmark = pytest.mark.integration
@@ -145,5 +145,40 @@ def test_scan_sukses_tidak_mengaktifkan_site_disabled(sesi, site):
     job = buat_job(sesi, site.id, JobType.scan_site)
     tangani_scan_site(sesi, job, klien_palsu(INVENTARIS))
 
+    sesi.refresh(site)
+    assert site.status == SiteStatus.disabled
+
+
+PING = {"connector_version": "1.0", "wp_version": "6.5.2", "php_version": "8.1"}
+
+
+def test_verify_sukses_membuat_scan_pertama(sesi, site):
+    """R59-d: tanpa ini site baru tidak punya inventaris sampai cron jam
+    berikutnya, atau sampai operator ingat menekan Scan."""
+    site.status = SiteStatus.pending_pair
+    sesi.commit()
+    buat_job(sesi, site.id, JobType.verify_site)
+    job = ambil_job(sesi, "w1")
+    tangani_verify_site(sesi, job, klien_palsu(PING))
+
+    scan = sesi.query(Job).filter_by(site_id=site.id, tipe=JobType.scan_site).one()
+    assert scan.status == JobStatus.pending
+
+
+def test_verify_sukses_tidak_menggandakan_scan_tertunda(sesi, site):
+    buat_job(sesi, site.id, JobType.verify_site)
+    job = ambil_job(sesi, "w1")
+    buat_job(sesi, site.id, JobType.scan_site)
+    tangani_verify_site(sesi, job, klien_palsu(PING))
+    assert sesi.query(Job).filter_by(site_id=site.id, tipe=JobType.scan_site).count() == 1
+
+
+def test_verify_sukses_tidak_mengaktifkan_site_disabled(sesi, site):
+    # Pasangan dari test scan di atas (R27): verify dulu memasang `active`
+    # tanpa syarat, termasuk pada site yang sengaja dimatikan operator.
+    site.status = SiteStatus.disabled
+    sesi.commit()
+    job = buat_job(sesi, site.id, JobType.verify_site)
+    tangani_verify_site(sesi, job, klien_palsu(PING))
     sesi.refresh(site)
     assert site.status == SiteStatus.disabled

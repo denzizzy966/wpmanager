@@ -6,25 +6,25 @@ from argon2 import PasswordHasher
 from sqlalchemy import select
 
 from wpmgr.db import get_session
-from wpmgr.jobs.queue import buat_job
+from wpmgr.jobs.queue import antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
-from wpmgr.models import Job, JobStatus, JobType, Site, SiteStatus, User
+from wpmgr.models import Site, SiteStatus, User
+
+# Deviasi sadar dari spec §7.5 ("setiap site berstatus active", Ruling R54):
+# `unreachable` menurut definisinya sementara, dan tanpa scan terjadwal satu
+# gangguan jaringan membuat site keluar dari pemantauan selamanya -- tidak ada
+# yang akan pernah mencobanya lagi. `needs_reconnect` dan `blocked` tetap
+# dikecualikan karena keduanya menunggu tindakan manusia (tempel ulang kunci,
+# allowlist IP); tombol Scan tetap jalur pemulihannya.
+STATUS_DISCAN = (SiteStatus.active, SiteStatus.unreachable)
 
 
 def enqueue_scans() -> int:
     dibuat = 0
     with get_session() as sesi:
-        sites = sesi.scalars(select(Site).where(Site.status == SiteStatus.active)).all()
+        sites = sesi.scalars(select(Site).where(Site.status.in_(STATUS_DISCAN))).all()
         for site in sites:
-            sudah_ada = sesi.scalar(
-                select(Job.id).where(
-                    Job.site_id == site.id,
-                    Job.tipe == JobType.scan_site,
-                    Job.status.in_([JobStatus.pending, JobStatus.running]),
-                )
-            )
-            if sudah_ada is None:
-                buat_job(sesi, site.id, JobType.scan_site)
+            if antrekan_scan(sesi, site.id) is not None:
                 dibuat += 1
     print(f"{dibuat} job scan dibuat")
     return dibuat

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from sqlalchemy import func as safunc
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from wpmgr.errors import BAD_RESPONSE, DAPAT_DIULANG, UNKNOWN
@@ -58,6 +58,26 @@ def buat_job(
     sesi.add(job)
     sesi.commit()
     return job
+
+
+def antrekan_scan(sesi: Session, site_id: uuid.UUID) -> Job | None:
+    """Buat scan_site untuk site ini, kecuali sudah ada yang tertunda/berjalan.
+
+    Periksa-lalu-sisipkan tidak atomik: dua pemanggil bersamaan bisa sama-sama
+    membuat scan. Itu dibiarkan -- scan ganda hanya membaca inventaris dua
+    kali, sedangkan kunci advisory demi mencegahnya menambah bagian bergerak
+    tanpa melindungi apa pun yang berharga.
+    """
+    sudah_ada = sesi.scalar(
+        select(Job.id).where(
+            Job.site_id == site_id,
+            Job.tipe == JobType.scan_site,
+            Job.status.in_([JobStatus.pending, JobStatus.running]),
+        )
+    )
+    if sudah_ada is not None:
+        return None
+    return buat_job(sesi, site_id, JobType.scan_site)
 
 
 def ambil_job(sesi: Session, worker: str) -> Job | None:

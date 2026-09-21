@@ -1,15 +1,45 @@
+import subprocess
+import time
 import uuid
 
 import pytest
 
 from wpmgr.crypto import dekripsi_secret, secret_baru
+from wpmgr.errors import TRANSIENT, UPGRADE_FAILED, SiteError
 from wpmgr.jobs.queue import buat_job
-from wpmgr.models import JobType, PackageType, SitePackage
+from wpmgr.models import JobStatus, JobType, PackageType, SitePackage, SiteStatus
 from wpmgr.pairing import buat_site, kunci_koneksi
 from wpmgr.site_client import SiteClient
 from wpmgr.worker import proses_satu
 
-from .conftest import wpcli
+from .conftest import _wpcli_status, wpcli
+
+MU_PLUGIN_BLOKIR = "/var/www/html/wp-content/mu-plugins/wpmgr-uji-blokir-wporg.php"
+ISI_MU_PLUGIN_BLOKIR = """<?php
+// Dipasang test e2e: mensimulasikan wordpress.org tidak terjangkau selama
+// option wpmgr_uji_blokir_wporg bernilai truthy.
+add_filter( 'pre_http_request', function ( $pre, $args, $url ) {
+    if ( get_option( 'wpmgr_uji_blokir_wporg' ) && false !== strpos( $url, 'api.wordpress.org' ) ) {
+        return new WP_Error( 'http_request_failed', 'diblokir test e2e' );
+    }
+    return $pre;
+}, 10, 3 );
+"""
+
+
+def _tulis_di_kontainer(path: str, isi: str) -> None:
+    subprocess.run(
+        ["docker", "compose", "exec", "-T", "wpcli", "sh", "-c",
+         f"mkdir -p \"$(dirname '{path}')\" && cat > '{path}'"],
+        input=isi, text=True, capture_output=True, check=True,
+    )
+
+
+def _hapus_di_kontainer(path: str) -> None:
+    subprocess.run(
+        ["docker", "compose", "exec", "-T", "wpcli", "rm", "-f", path],
+        capture_output=True, check=False,
+    )
 
 pytestmark = pytest.mark.e2e
 
@@ -96,21 +126,21 @@ def test_scan_mengisi_inventaris(sesi, site_terpasang):
 
 
 def test_scan_memaksa_refresh_transient_update_plugins(sesi, site_terpasang):
-    """segarkan() menghapus site transient update_plugins sebelum memanggil
-    wp_update_plugins(), tepatnya karena fungsi itu sendiri tidak menerima
-    argumen paksa dan langsung kembali tanpa berbuat apa pun bila transient-nya
-    berumur kurang dari 12 jam.
+    """segarkan() menyetel `last_checked` site transient update_plugins ke 0
+    sebelum memanggil wp_update_plugins(), tepatnya karena fungsi itu sendiri
+    tidak menerima argumen paksa dan langsung kembali tanpa berbuat apa pun
+    bila transient-nya berumur kurang dari 12 jam.
 
     test_scan_mengisi_inventaris hanya membuktikan sebuah inventaris kembali --
-    itu akan tetap terjadi bahkan bila segarkan() tidak menghapus apa pun sama
+    itu akan tetap terjadi bahkan bila segarkan() tidak memaksa apa pun sama
     sekali, semata-mata karena instalasi ini baru dan transient-nya belum ada.
     Properti yang benar-benar menjadi taruhan adalah: pemindaian KEDUA, yang
     dijalankan segera setelah yang pertama (jauh di bawah jendela 12 jam),
-    tetap memicu pemeriksaan ulang yang nyata. Tanpa penghapusan transient di
-    segarkan(), wp_update_plugins() pada pemindaian kedua akan diam-diam
-    kembali lebih awal dan `last_checked` tidak akan pernah maju -- gejala
-    yang tidak akan pernah terlihat lewat balasan API kita sendiri, hanya
-    lewat transient WordPress yang sebenarnya.
+    tetap memicu pemeriksaan ulang yang nyata. Tanpa pemaksaan di segarkan(),
+    wp_update_plugins() pada pemindaian kedua akan diam-diam kembali lebih
+    awal dan `last_checked` tidak akan pernah maju -- gejala yang tidak akan
+    pernah terlihat lewat balasan API kita sendiri, hanya lewat transient
+    WordPress yang sebenarnya.
     """
     import time
 
@@ -129,6 +159,40 @@ def test_scan_memaksa_refresh_transient_update_plugins(sesi, site_terpasang):
     )
 
     assert diperiksa_kedua > diperiksa_pertama
+
+
+def test_scan_saat_wordpress_org_tak_terjangkau_mempertahankan_versi_tersedia(
+    sesi, site_terpasang
+):
+    """R58: pemeriksaan update yang gagal tidak boleh menghapus apa yang sudah
+    diketahui.
+
+    Dulu segarkan() menghapus transient update_plugins lebih dulu. Bila
+    permintaan ke api.wordpress.org lalu gagal, wp_update_plugins() kembali
+    lebih awal dan transient tertinggal tanpa `response` sama sekali -- setiap
+    plugin di site itu dilaporkan "tidak ada update". Itu bukan data basi,
+    itu data salah: dashboard menyembunyikan update keamanan yang tertunda
+    justru pada saat koneksi site ke wordpress.org sedang bermasalah.
+    """
+    wpcli("plugin", "install", "hello-dolly", "--version=1.6", "--force")
+    _tulis_di_kontainer(MU_PLUGIN_BLOKIR, ISI_MU_PLUGIN_BLOKIR)
+    try:
+        buat_job(sesi, site_terpasang.id, JobType.scan_site)
+        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+        baris = sesi.query(SitePackage).filter_by(
+            site_id=site_terpasang.id, slug="hello-dolly/hello.php").one()
+        tersedia = baris.versi_tersedia
+        assert tersedia is not None
+
+        wpcli("option", "update", "wpmgr_uji_blokir_wporg", "1")
+        buat_job(sesi, site_terpasang.id, JobType.scan_site)
+        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+
+        sesi.refresh(baris)
+        assert baris.versi_tersedia == tersedia
+    finally:
+        _wpcli_status("option", "delete", "wpmgr_uji_blokir_wporg")
+        _hapus_di_kontainer(MU_PLUGIN_BLOKIR)
 
 
 def test_redirect_permalink_plain_menghasilkan_pesan_yang_bisa_didiagnosis(sesi, site_terpasang):
@@ -188,6 +252,121 @@ def test_update_plugin_versi_lama_benar_benar_naik(sesi, site_terpasang):
 
     sesi.refresh(baris)
     assert baris.versi_terpasang == target
+
+
+def test_update_plugin_aktif_tetap_aktif(sesi, site_terpasang):
+    """R52 (C1): update lewat dashboard tidak boleh menonaktifkan plugin.
+
+    Plugin_Upgrader::upgrade() memasang deactivate_plugin_before_upgrade,
+    yang menonaktifkan plugin untuk setiap request yang bukan WP-cron dan
+    tidak pernah mengaktifkannya kembali (layar update wp-admin melakukannya
+    lewat redirect terpisah yang tidak ada di jalur REST). Setiap update
+    plugin aktif lewat dashboard dulu mematikan plugin itu di site client
+    produksi -- WooCommerce, plugin keamanan, apa pun -- sambil melapor
+    sukses.
+    """
+    wpcli("plugin", "install", "hello-dolly", "--version=1.6", "--force")
+    wpcli("plugin", "activate", "hello-dolly")
+    try:
+        buat_job(sesi, site_terpasang.id, JobType.scan_site)
+        proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi))
+        baris = sesi.query(SitePackage).filter_by(
+            site_id=site_terpasang.id, slug="hello-dolly/hello.php").one()
+        assert baris.versi_tersedia is not None
+        target = baris.versi_tersedia
+
+        job = buat_job(sesi, site_terpasang.id, JobType.update_package, {
+            "tipe": "plugin", "slug": "hello-dolly/hello.php",
+            "dari_versi": "1.6", "ke_versi": target,
+        })
+        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+
+        sesi.refresh(job)
+        assert job.status == JobStatus.success, job.error
+        assert wpcli("plugin", "get", "hello-dolly", "--field=version") == target
+        assert _wpcli_status("plugin", "is-active", "hello-dolly") == 0, (
+            "hello-dolly dinonaktifkan oleh update"
+        )
+        # Lock R56 dilepas di `finally`; bila tertinggal, update dan scan
+        # berikutnya untuk site ini tertahan 15 menit.
+        assert _wpcli_status("option", "get", "wpmgr_update.lock") != 0
+    finally:
+        _wpcli_status("plugin", "deactivate", "hello-dolly")
+
+
+def test_update_ke_versi_yang_tidak_ditawarkan_menjadi_upgrade_failed(sesi, site_terpasang):
+    """R59-c: upgrader yang "berhasil" tanpa memasang versi yang diminta
+    bukan sukses.
+
+    hello-dolly sudah di versi terbaru dari test sebelumnya, jadi
+    wordpress.org tidak menawarkan apa pun untuknya. bulk_upgrade()
+    mengembalikan `true` untuk plugin seperti itu -- nilai yang sama yang
+    secara sekilas terlihat seperti sukses. Dashboard harus menerima 409
+    `wpmgr_tidak_ada_update` dan menandai job gagal final, bukan sukses
+    dengan versi karangan dan bukan diulang tiga kali.
+    """
+    job = buat_job(sesi, site_terpasang.id, JobType.update_package, {
+        "tipe": "plugin", "slug": "hello-dolly/hello.php",
+        "dari_versi": None, "ke_versi": "99.0",
+    })
+    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+
+    sesi.refresh(job)
+    assert job.status == JobStatus.failed
+    assert job.error_class == UPGRADE_FAILED
+    assert "99.0" in job.error
+    assert job.attempts == 1
+    assert _wpcli_status("option", "get", "wpmgr_update.lock") != 0
+
+
+def test_lock_update_membuat_scan_dan_update_dijadwal_ulang(sesi, site_terpasang):
+    """R56: selama lock `wpmgr_update` dipegang, /inventory dan /update sama-
+    sama membalas 409 `wpmgr_sibuk`, yang dashboard perlakukan sebagai
+    transient.
+
+    Lock-nya dipasang lewat wp-cli dengan format yang sama yang ditulis
+    WP_Upgrader::create_lock() (timestamp Unix), mensimulasikan proses PHP
+    lain yang sedang menjalankan upgrade -- mis. permintaan /update yang
+    koneksinya sudah diputus dashboard setelah 180 detik tetapi PHP-nya
+    masih menyalin berkas.
+    """
+    status_awal = site_terpasang.status
+    wpcli("option", "update", "wpmgr_update.lock", str(int(time.time())))
+    try:
+        job = buat_job(sesi, site_terpasang.id, JobType.scan_site)
+        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+        sesi.refresh(job)
+        assert job.status == JobStatus.pending
+        assert job.error_class == TRANSIENT
+        assert "wpmgr_sibuk" in job.error
+        # R54: percobaan pertama yang masih akan diulang tidak menandai site
+        # unreachable.
+        sesi.refresh(site_terpasang)
+        assert site_terpasang.status == status_awal
+        assert site_terpasang.status != SiteStatus.unreachable
+
+        with pytest.raises(SiteError) as exc:
+            _klien_http(site_terpasang, sesi).update("plugin", "hello-dolly/hello.php", "99.0")
+        assert exc.value.error_class == TRANSIENT
+        assert "wpmgr_sibuk" in exc.value.pesan
+    finally:
+        _wpcli_status("option", "delete", "wpmgr_update.lock")
+
+    # Lock yang sudah kedaluwarsa (lebih tua dari 15 menit) tidak menahan
+    # apa pun -- persis seperti create_lock() menafsirkannya.
+    wpcli("option", "update", "wpmgr_update.lock", str(int(time.time()) - 16 * 60))
+    try:
+        assert "plugins" in _klien_http(site_terpasang, sesi).inventory()
+    finally:
+        _wpcli_status("option", "delete", "wpmgr_update.lock")
+
+
+def test_versi_core_di_disk_sama_dengan_versi_terpasang(wp_site):
+    """Update core membaca ulang versinya dari wp-includes/version.php, bukan
+    dari global $wp_version yang tidak pernah diperbarui update_core() di
+    request yang sama. Test ini memastikan pembaca berkas itu sendiri benar.
+    """
+    assert wpcli("eval", "echo WPMGR_Updater::versi_core_di_disk();") == wpcli("core", "version")
 
 
 def test_update_kedua_kalinya_adalah_no_op(sesi, site_terpasang):
