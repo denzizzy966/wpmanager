@@ -12,8 +12,9 @@ from wpmgr.connector_paket import bangun_paket, sumber_bawaan
 from wpmgr.db import get_session
 from wpmgr.jobs.queue import antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
-from wpmgr.kunci import KUNCI_UPTIME, kunci_advisory
+from wpmgr.kunci import KUNCI_SSL, KUNCI_UPTIME, kunci_advisory
 from wpmgr.models import Site, SiteStatus, User
+from wpmgr.ssl_cek import cek_semua_ssl
 from wpmgr.uptime import buat_klien_http, cek_satu, jalankan_putaran
 
 # Deviasi sadar dari spec §7.5 ("setiap site berstatus active", Ruling R54):
@@ -78,6 +79,17 @@ def check_uptime() -> int:
     return putaran.jumlah_site
 
 
+def check_ssl() -> int:
+    with kunci_advisory(db.engine, KUNCI_SSL) as dapat:
+        if not dapat:
+            print("Pemeriksaan SSL lain masih berjalan; dilewati")
+            return 0
+        with get_session() as sesi:
+            n = cek_semua_ssl(sesi)
+    print(f"{n} sertifikat dicek")
+    return n
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wpmgr")
     sub = parser.add_subparsers(dest="perintah", required=True)
@@ -90,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("build-connector")
     b.add_argument("--sumber", default=None)
     sub.add_parser("check-uptime")
+    sub.add_parser("check-ssl")
 
     args = parser.parse_args(argv)
     if args.perintah == "enqueue-scans":
@@ -102,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         build_connector(args.sumber)
     elif args.perintah == "check-uptime":
         check_uptime()
+    elif args.perintah == "check-ssl":
+        check_ssl()
     return 0
 
 
