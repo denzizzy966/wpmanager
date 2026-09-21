@@ -9656,12 +9656,14 @@ git commit -m "feat: retensi data monitoring, jadwal cron Lapis 2, dan dokumenta
 
 **Files:**
 - Create: `tests/e2e/test_monitoring.py`
-- Modify: `README.md` (angka test)
+- Modify: `README.md` (angka test), `tests/e2e/conftest.py`, `tests/e2e/test_self_update.py`
 
 **Interfaces:**
 - Consumes: semua task sebelumnya; fixture dan helper e2e dari Task 3.
 
 Test di bawah berjalan terhadap WordPress 6.5 di Docker, dengan WordPress yang **sama** dipakai lintas sesi e2e. Karena itu asersi traffic dan login memakai selisih sebelum/sesudah atau penanda unik per run, bukan angka mutlak.
+
+- [ ] **Step 0: Pindahkan helper antrean ke conftest (Ruling R5).** Task 7 menambahkan `_jalankan_sampai_selesai(sesi, job, batas=10)` di `tests/e2e/test_self_update.py`: helper itu memanggil `proses_satu(sesi, "uji-e2e", buat_klien_fn=klien_http)` sampai `job` keluar dari `pending`/`running`, karena handler menjadwalkan job susulan yang lebih tua dan satu panggilan belum tentu mengambil job sasaran. Pindahkan helper itu ke `tests/e2e/conftest.py` sebagai `jalankan_sampai_selesai(sesi, job, batas: int = 10) -> None` (docstring ikut pindah), lalu ganti pemakaiannya di `test_self_update.py`. Pastikan `test_self_update.py` tetap lulus.
 
 - [ ] **Step 1: Tulis test e2e.**
 
@@ -9688,12 +9690,12 @@ from wpmgr.models import (
     UptimeStatus,
 )
 from wpmgr.uptime import buat_klien_http, cek_satu, jalankan_putaran
-from wpmgr.worker import proses_satu
 
 from .conftest import (
     WP_URL,
     _wpcli_status,
     hapus_di_kontainer,
+    jalankan_sampai_selesai,
     klien_http,
     permintaan_bertanda,
     tulis_di_kontainer,
@@ -9716,14 +9718,11 @@ add_action( 'init', function () {
 """
 
 
-def _jalankan(sesi):
-    return proses_satu(sesi, "uji-e2e", buat_klien_fn=klien_http)
-
-
 def _job(sesi, site, tipe):
     job = buat_job(sesi, site.id, tipe, max_attempts=1)
-    assert _jalankan(sesi)
-    sesi.refresh(job)
+    # verify_site menjadwalkan scan_site susulan yang lebih tua; satu panggilan
+    # proses_satu() belum tentu mengambil job ini (Ruling R5).
+    jalankan_sampai_selesai(sesi, job)
     assert job.status == JobStatus.success, job.error
     sesi.refresh(site)
     return job
