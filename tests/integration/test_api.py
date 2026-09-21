@@ -95,6 +95,49 @@ def test_update_menolak_site_yang_tidak_ada(klien):
     assert r.status_code == 404
 
 
+def test_update_batch_campuran_tidak_membuat_job(klien, site_aktif, sesi):
+    # Item pertama sah, item kedua menunjuk site yang tidak ada. Sebelum
+    # perbaikan, buat_job() untuk item pertama sudah commit sebelum item kedua
+    # ditolak, sehingga job sungguhan tertinggal walau pemanggil menerima 404.
+    r = klien.post("/api/jobs/update", json={"items": [
+        {"site_id": str(site_aktif.id), "tipe": "plugin",
+         "slug": "elementor/elementor.php", "ke_versi": "3.20.1"},
+        {"site_id": str(uuid.uuid4()), "tipe": "plugin", "slug": "a", "ke_versi": "1"},
+    ]})
+    assert r.status_code == 404
+    assert sesi.query(Job).filter_by(tipe=JobType.update_package).count() == 0
+
+
+def test_update_tipe_tidak_valid_membalas_422(klien, site_aktif, sesi):
+    r = klien.post("/api/jobs/update", json={"items": [
+        {"site_id": str(site_aktif.id), "tipe": "plugin",
+         "slug": "elementor/elementor.php", "ke_versi": "3.20.1"},
+        {"site_id": str(site_aktif.id), "tipe": "widget", "slug": "x", "ke_versi": "1"},
+    ]})
+    assert r.status_code == 422
+    assert sesi.query(Job).filter_by(tipe=JobType.update_package).count() == 0
+
+
+def test_update_dua_item_valid_membuat_dua_job(klien, site_aktif, sesi):
+    site_lain, _ = buat_site(sesi, "Lain", "https://lain.test", None, None)
+    site_lain.status = SiteStatus.active
+    sesi.add(SitePackage(
+        site_id=site_lain.id, tipe=PackageType.plugin, slug="woocommerce/woocommerce.php",
+        nama="WooCommerce", versi_terpasang="8.0", versi_tersedia="8.5",
+        last_scan_at=datetime.now(timezone.utc)))
+    sesi.commit()
+
+    r = klien.post("/api/jobs/update", json={"items": [
+        {"site_id": str(site_aktif.id), "tipe": "plugin",
+         "slug": "elementor/elementor.php", "ke_versi": "3.20.1"},
+        {"site_id": str(site_lain.id), "tipe": "plugin",
+         "slug": "woocommerce/woocommerce.php", "ke_versi": "8.5"},
+    ]})
+    assert r.status_code == 200
+    assert len(r.json()["job_ids"]) == 2
+    assert sesi.query(Job).filter_by(tipe=JobType.update_package).count() == 2
+
+
 def test_buat_job_scan(klien, site_aktif, sesi):
     r = klien.post("/api/jobs/scan", json={"site_id": str(site_aktif.id)})
     assert r.status_code == 200

@@ -34,7 +34,7 @@ PenggunaApi = Annotated[User, Depends(pengguna_api)]
 
 class ItemUpdate(BaseModel):
     site_id: uuid.UUID
-    tipe: str
+    tipe: PackageType
     slug: str
     ke_versi: str
 
@@ -115,24 +115,39 @@ def daftar_site(pengguna: PenggunaApi):
 
 @router.post("/api/jobs/update")
 def buat_job_update(req: PermintaanUpdate, pengguna: PenggunaApi):
-    ids = []
+    ids: list[int] = []
     with db.SessionLocal() as sesi:
+        # Lewatan pertama: seluruh item divalidasi sebelum satu job pun dibuat.
+        # buat_job() melakukan commit sendiri untuk setiap job, sehingga
+        # memvalidasi sambil membuat berarti item yang sah sudah tersimpan
+        # permanen pada saat item berikutnya ditolak. Pemanggil menerima 404
+        # dan menyimpulkan tidak terjadi apa-apa, sementara worker menjalankan
+        # update sungguhan terhadap site client yang hidup.
         for item in req.items:
-            site = sesi.get(Site, item.site_id)
-            if site is None:
-                raise HTTPException(status_code=404, detail=f"Site {item.site_id} tidak ditemukan")
+            if sesi.get(Site, item.site_id) is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Site {item.site_id} tidak ditemukan"
+                )
 
+        # Lewatan kedua: seluruh batch sudah terbukti sah.
+        for item in req.items:
             terpasang = sesi.scalar(
                 select(SitePackage.versi_terpasang).where(
                     SitePackage.site_id == item.site_id,
-                    SitePackage.tipe == PackageType(item.tipe),
+                    SitePackage.tipe == item.tipe,
                     SitePackage.slug == item.slug,
                 )
             )
             job = buat_job(
-                sesi, item.site_id, JobType.update_package,
-                {"tipe": item.tipe, "slug": item.slug,
-                 "dari_versi": terpasang, "ke_versi": item.ke_versi},
+                sesi,
+                item.site_id,
+                JobType.update_package,
+                {
+                    "tipe": item.tipe.value,
+                    "slug": item.slug,
+                    "dari_versi": terpasang,
+                    "ke_versi": item.ke_versi,
+                },
                 dibuat_oleh=pengguna.id,
             )
             ids.append(job.id)
