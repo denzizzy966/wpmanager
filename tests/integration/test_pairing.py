@@ -4,6 +4,7 @@ import time
 import uuid
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from wpmgr.crypto import dekripsi_secret
@@ -14,6 +15,21 @@ from wpmgr.signing import sign
 pytestmark = pytest.mark.integration
 
 PATH = "/api/pair/confirm"
+
+
+@pytest.fixture(autouse=True)
+def _bersihkan_status_modul():
+    # _pembatas dan _nonce_terpakai adalah state mutable level-modul; tanpa
+    # ini, urutan test yang tidak disengaja (mis. test rate-limit berjalan
+    # sebelum test replay) bisa membuat test lain gagal atau lolos secara
+    # kebetulan alih-alih karena benar.
+    from wpmgr.web.routes_pair import _nonce_terpakai, _pembatas
+
+    _pembatas.clear()
+    _nonce_terpakai.clear()
+    yield
+    _pembatas.clear()
+    _nonce_terpakai.clear()
 
 
 @pytest.fixture
@@ -29,6 +45,15 @@ def klien(engine, monkeypatch):
     # Secure, dan httpx diam-diam menolak mengirim balik cookie Secure di atas
     # permintaan berskema http meski cookie itu ada di jar-nya.
     return TestClient(buat_app(), follow_redirects=False, base_url="https://testserver")
+
+
+def _permintaan(peer_host: str, headers: dict[str, str] | None = None) -> Request:
+    scope = {
+        "type": "http",
+        "client": (peer_host, 12345),
+        "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
+    }
+    return Request(scope)
 
 
 def test_kunci_koneksi_dapat_diurai_kembali():
@@ -89,6 +114,7 @@ def test_confirm_dengan_tanda_tangan_salah_ditolak(sesi, klien):
     site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
     r = _kirim(klien, site, "f" * 64, {"connector_version": "1.0"})
     assert r.status_code == 401
+    assert r.json() == {"detail": "Tidak sah"}
 
 
 def test_confirm_dengan_timestamp_kedaluwarsa_ditolak(sesi, klien):
@@ -108,6 +134,28 @@ def test_confirm_untuk_site_tidak_dikenal_ditolak(klien):
         "X-Wpmgr-Signature": sign("a" * 64, "POST", PATH, ts, nonce, body),
     })
     assert r.status_code == 401
+    assert r.json() == {"detail": "Tidak sah"}
+
+
+def test_site_tidak_dikenal_dan_tanda_tangan_salah_tidak_dapat_dibedakan(sesi, klien):
+    # Keduanya 401, tetapi jika body-nya berbeda, siapa pun yang dapat
+    # menjangkau endpoint ini bisa memakai perbedaan itu sebagai oracle untuk
+    # menebak site_id mana yang terdaftar -- persis yang coba dicegah rate
+    # limit di bawah. Body harus identik byte demi byte.
+    site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
+    r_salah = _kirim(klien, site, "f" * 64, {"x": 1})
+
+    body = json.dumps({"x": 1}, separators=(",", ":")).encode()
+    ts, nonce = int(time.time()), uuid.uuid4().hex
+    r_asing = klien.post(PATH, content=body, headers={
+        "X-Wpmgr-Site": str(uuid.uuid4()),
+        "X-Wpmgr-Timestamp": str(ts),
+        "X-Wpmgr-Nonce": nonce,
+        "X-Wpmgr-Signature": sign("a" * 64, "POST", PATH, ts, nonce, body),
+    })
+
+    assert r_salah.status_code == r_asing.status_code == 401
+    assert r_salah.json() == r_asing.json()
 
 
 def test_confirm_tidak_butuh_sesi_login(sesi, klien):
@@ -117,12 +165,75 @@ def test_confirm_tidak_butuh_sesi_login(sesi, klien):
 
 
 def test_rate_limit_menolak_percobaan_berlebihan(sesi, klien):
-    from wpmgr.web.routes_pair import _pembatas
-
-    _pembatas.clear()
     site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
 
     kode = [_kirim(klien, site, "f" * 64, {"x": 1}).status_code for _ in range(12)]
     assert kode[:10] == [401] * 10
     assert kode[10] == 429
     assert kode[11] == 429
+
+
+def test_ip_klien_mempercayai_x_real_ip_dari_loopback():
+    from wpmgr.web.routes_pair import _ip_klien
+
+    r = _permintaan("127.0.0.1", {"X-Real-IP": "9.9.9.9"})
+    assert _ip_klien(r) == "9.9.9.9"
+
+
+def test_ip_klien_mengabaikan_x_real_ip_dari_bukan_loopback():
+    from wpmgr.web.routes_pair import _ip_klien
+
+    r = _permintaan("203.0.113.5", {"X-Real-IP": "9.9.9.9"})
+    assert _ip_klien(r) == "203.0.113.5"
+
+
+def test_ip_klien_memakai_entri_terkanan_x_forwarded_for_dari_loopback():
+    from wpmgr.web.routes_pair import _ip_klien
+
+    r = _permintaan("127.0.0.1", {"X-Forwarded-For": "1.1.1.1, 2.2.2.2"})
+    assert _ip_klien(r) == "2.2.2.2"
+
+
+def test_pembatas_membuang_entri_basi():
+    from collections import deque
+
+    from wpmgr.web.routes_pair import _lolos_rate_limit, _pembatas
+
+    _pembatas["ip-lama"] = deque([time.monotonic() - 120])
+    assert _lolos_rate_limit("ip-baru")
+    assert "ip-lama" not in _pembatas
+
+
+def test_replay_nonce_ditolak(sesi, klien):
+    site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
+    secret = dekripsi_secret(site.secret_terenkripsi)
+    ts = int(time.time())
+    nonce = uuid.uuid4().hex
+    body = json.dumps({"connector_version": "1.0"}, separators=(",", ":")).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Wpmgr-Site": str(site.id),
+        "X-Wpmgr-Timestamp": str(ts),
+        "X-Wpmgr-Nonce": nonce,
+        "X-Wpmgr-Signature": sign(secret, "POST", PATH, ts, nonce, body),
+    }
+
+    r1 = klien.post(PATH, content=body, headers=headers)
+    r2 = klien.post(PATH, content=body, headers=headers)
+
+    assert r1.status_code == 200
+    assert r2.status_code == 401
+
+
+def test_body_bukan_json_dengan_tanda_tangan_sah_mendapat_400(sesi, klien):
+    site, _ = buat_site(sesi, "Contoh", "https://contoh.test", None, None)
+    secret = dekripsi_secret(site.secret_terenkripsi)
+    body = b"bukan-json"
+    ts, nonce = int(time.time()), uuid.uuid4().hex
+    r = klien.post(PATH, content=body, headers={
+        "X-Wpmgr-Site": str(site.id),
+        "X-Wpmgr-Timestamp": str(ts),
+        "X-Wpmgr-Nonce": nonce,
+        "X-Wpmgr-Signature": sign(secret, "POST", PATH, ts, nonce, body),
+    })
+    assert r.status_code == 400
