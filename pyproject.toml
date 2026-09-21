@@ -15,6 +15,9 @@ dependencies = [
     "jinja2>=3.1",
     "itsdangerous>=2.2",
     "python-multipart>=0.0.9",
+    "maxminddb>=2.6",
+    "google-auth>=2.30",
+    "requests>=2.32",
 ]
 
 [project.optional-dependencies]
