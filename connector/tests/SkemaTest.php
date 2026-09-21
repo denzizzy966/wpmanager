@@ -3,9 +3,10 @@ use PHPUnit\Framework\TestCase;
 
 final class SkemaTest extends TestCase {
 
-    public function test_belum_ada_fitur_yang_diumumkan(): void {
-        $this->assertSame( array(), WPMGR_Skema::fitur( false ) );
-        $this->assertSame( array(), WPMGR_Skema::fitur( true ) );
+    public function test_fitur_yang_diumumkan(): void {
+        $this->assertSame( array( 'self_update' ), WPMGR_Skema::fitur( false ) );
+        // Self-update bukan pemantauan: tetap tersedia walau pemantauan dimatikan.
+        $this->assertSame( array( 'self_update' ), WPMGR_Skema::fitur( true ) );
     }
 
     public function test_perlu_migrasi_hanya_bila_versi_berbeda(): void {

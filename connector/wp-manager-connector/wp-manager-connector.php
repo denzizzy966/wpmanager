@@ -26,6 +26,7 @@ require_once WPMGR_DIR . 'includes/class-wpmgr-settings.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-skema.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-inventory.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-updater.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-selfupdate.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-rest.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-sso.php';
 
