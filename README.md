@@ -68,10 +68,11 @@ Lalu siapkan skema database dan akun pengguna dashboard pertama:
 ```
 
 Catatan: `--password` di atas singgah sebentar di riwayat shell dan daftar
-proses lokal mesin Anda selama perintah berjalan. Untuk pembuatan user rutin
-di server produksi, pertimbangkan menjalankannya dari sesi yang tidak
-disimpan riwayatnya, atau ganti password lewat fitur dashboard setelah akun
-pertama dibuat.
+proses lokal mesin Anda selama perintah berjalan. Untuk pembuatan user di
+server produksi, jalankan dari sesi yang tidak disimpan riwayatnya.
+Lapis 1 **tidak punya** fitur ganti password — tidak di dashboard, tidak
+sebagai perintah CLI, dan `create-user` menolak email yang sudah terdaftar.
+Cara merotasinya ada di bagian [Mengganti password akun dashboard](#mengganti-password-akun-dashboard).
 
 ## Menjalankan web dan worker
 
@@ -93,25 +94,25 @@ proses harus berjalan bersamaan; tanpa worker, job hanya menumpuk sebagai
 Proyek ini punya tiga lapis test Python plus satu suite PHP, masing-masing
 butuh prasyarat berbeda. **Jangan jalankan `pytest -m "not integration"` saja**
 — marker itu hanya menyingkirkan test integrasi, bukan test e2e, sehingga ia
-tetap mengumpulkan 84 dari 193 test, termasuk 11 test e2e yang butuh
+tetap mengumpulkan 117 dari 275 test, termasuk 16 test e2e yang butuh
 kontainer WordPress menyala. Di clone segar tanpa Docker jalan, ini gagal
 dengan cara yang tidak ada hubungannya dengan perubahan yang sedang diuji.
 Gunakan tiga perintah berikut, sesuai apa yang tersedia:
 
 ```bash
-# Unit — tidak butuh service apa pun (73 test)
+# Unit — tidak butuh service apa pun (101 test)
 .venv/Scripts/python -m pytest -m "not integration and not e2e"
 
-# Integrasi — butuh PostgreSQL (109 test)
+# Integrasi — butuh PostgreSQL (158 test)
 docker compose up -d db
 .venv/Scripts/python -m pytest tests/integration -m integration
 
-# End-to-end — butuh kontainer WordPress + MariaDB (11 test)
+# End-to-end — butuh kontainer WordPress + MariaDB (16 test)
 docker compose up -d db wp wpdb wpcli
 .venv/Scripts/python -m pytest tests/e2e -m e2e
 ```
 
-Dan untuk plugin connector PHP (44 test):
+Dan untuk plugin connector PHP (68 test):
 
 ```bash
 cd connector && php vendor/bin/phpunit
@@ -210,9 +211,9 @@ cron, dan reverse proxy:
 # sebagai root
 mkdir -p /var/log/wpmgr && chown wpmgr:wpmgr /var/log/wpmgr
 
-cp deploy/wpmgr-web.service deploy/wpmgr-worker.service /etc/systemd/system/
+cp deploy/wpmgr-web.service deploy/wpmgr-worker@.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now wpmgr-web wpmgr-worker
+systemctl enable --now wpmgr-web wpmgr-worker@1 wpmgr-worker@2
 
 crontab -u wpmgr deploy/crontab
 
@@ -227,27 +228,93 @@ jalankan `certbot` (atau setara) untuk menerbitkan sertifikat sebelum
 
 Beberapa detail di berkas-berkas ini tidak kosmetik:
 
-- **`wpmgr-worker.service` mengatur `TimeoutStopSec=240`**, sengaja lebih
+- **`wpmgr-worker@.service` adalah unit template.** Setiap instans
+  (`wpmgr-worker@1`, `wpmgr-worker@2`, …) adalah satu proses worker; dua
+  instans berarti dua site bisa di-update bersamaan. Aturan maksimum satu
+  job berjalan per site ditegakkan oleh query klaim di PostgreSQL, bukan
+  oleh jumlah proses, jadi menambah instans aman. Merestart semuanya
+  sekaligus: `systemctl restart 'wpmgr-worker@*'`.
+- **Unit worker mengatur `TimeoutStopSec=240`**, sengaja lebih
   panjang dari `TIMEOUT_UPDATE` (180 detik) yang dipakai `SiteClient` untuk
-  request update. Saat `systemctl restart wpmgr-worker` dikirim di tengah
+  request update. Saat restart dikirim di tengah
   worker sedang mengeksekusi update, worker perlu waktu untuk sampai ke titik
   aman (commit/rollback) sebelum systemd kehabisan sabar dan mengirim
   `SIGKILL`. Memotongnya lebih pendek dari 180 detik berarti restart bisa
   membunuh worker persis di tengah panggilan HTTP ke site, meninggalkan site
   dalam keadaan yang harus ditebak-tebak oleh reaper berikutnya.
-- **`nginx.conf` mengirim header `X-Real-IP`.** Rate limiter di
-  `/api/pair/confirm` (10 percobaan/menit) membaca header ini, dan hanya
-  mempercayainya ketika koneksi TCP datang dari loopback — yaitu dari nginx
-  sendiri. Kalau reverse proxy di depan aplikasi tidak mengirim header ini,
-  limiter melihat `127.0.0.1` untuk setiap request yang masuk, dan batas
-  yang seharusnya per-penyerang berubah jadi kuota global bersama: satu
-  penyerang yang sengaja memicu 429 berulang bisa mengunci semua percobaan
-  pairing site lain yang sah.
+- **`WPMGR_BASE_URL` harus persis origin publik dashboard** (skema dan
+  host yang diketik di browser, mis. `https://wpmgr.example.com`). Setiap
+  POST/PUT/PATCH/DELETE yang membawa header `Origin` (atau `Referer`)
+  dengan origin lain ditolak 403 sebagai perlindungan CSRF — termasuk login.
+  Nilai yang salah di sini membuat dashboard terbuka tetapi setiap tombolnya
+  gagal.
+- **IP klien untuk pembatas laju datang dari `X-Forwarded-For`.** Pembatas
+  laju di `/api/pair/confirm` dan `POST /login` (masing-masing 10
+  percobaan/menit per IP) memakai `request.client.host`. Uvicorn secara
+  bawaan (`proxy_headers` aktif; `forwarded_allow_ips` berisi `127.0.0.1`,
+  ditambah `::1` di uvicorn 0.53 yang terpasang, kecuali
+  `FORWARDED_ALLOW_IPS` disetel) mempercayai `X-Forwarded-For` hanya
+  dari peer loopback, lalu mengganti `client.host` dengan entri paling kanan
+  yang bukan alamat tepercaya — yaitu alamat yang ditambahkan nginx sendiri
+  lewat `$proxy_add_x_forwarded_for`. Entri yang dikarang klien selalu
+  berada di kiri entri itu, jadi tidak dapat dipalsukan. Yang menjaga ini:
+  `wpmgr-web.service` mengikat uvicorn ke `127.0.0.1` (tidak ada yang bisa
+  melewati nginx), dan `nginx.conf` mengirim `X-Forwarded-For`. Jangan
+  menyetel `FORWARDED_ALLOW_IPS='*'`: dengan itu uvicorn mengambil entri
+  paling **kiri**, yang sepenuhnya dikendalikan klien, dan setiap penyerang
+  mendapat kuota baru per permintaan. `X-Real-IP` yang juga dikirim
+  `nginx.conf` hanya cadangan: aplikasi membacanya bila `client.host` masih
+  loopback, yang hanya terjadi bila uvicorn dijalankan dengan
+  `--no-proxy-headers`. Bila nginx tidak mengirim `X-Forwarded-For` maupun
+  `X-Real-IP`, setiap permintaan terlihat datang dari
+  `127.0.0.1` dan batas per-penyerang berubah jadi kuota global bersama: satu
+  penyerang yang sengaja memicu 429 berulang bisa mengunci login dan pairing
+  semua orang.
 - **`deploy/crontab` menjalankan `enqueue-scans` setiap jam** (membuat job
-  scan inventaris untuk site yang belum punya job scan tertunda) **dan
+  scan inventaris untuk setiap site berstatus `active` atau `unreachable`
+  yang belum punya job scan tertunda; `unreachable` ikut discan supaya site
+  pulih sendiri setelah gangguan sementara, sedangkan `needs_reconnect` dan
+  `blocked` menunggu tindakan manusia dan dipulihkan lewat tombol Scan) **dan
   `reap-jobs` setiap 5 menit** (memulihkan job yang worker-nya mati di
   tengah jalan). Keduanya lewat Python di virtualenv yang sama dengan
   service, output ditambahkan ke `/var/log/wpmgr/cron.log`.
+
+### Mengganti password akun dashboard
+
+Lapis 1 tidak punya fitur ini, dan `create-user` menolak email yang sudah
+ada (pelanggaran unik di `users.email`). Rotasi dilakukan dengan menulis
+hash argon2 baru langsung ke baris user-nya. Dari `/opt/wpmgr` (supaya
+`.env` terbaca), sebagai root atau user `wpmgr`:
+
+```bash
+.venv/bin/python -c '
+import getpass, sys
+from argon2 import PasswordHasher
+from sqlalchemy import update
+from wpmgr.db import get_session
+from wpmgr.models import User
+
+hash_baru = PasswordHasher().hash(getpass.getpass("Password baru: "))
+with get_session() as sesi:
+    n = sesi.execute(
+        update(User).where(User.email == sys.argv[1]).values(password_hash=hash_baru)
+    ).rowcount
+print(f"{n} user diperbarui")
+' admin@example.com
+```
+
+Password dibaca lewat `getpass`, jadi tidak tercatat di riwayat shell
+maupun daftar proses. `0 user diperbarui` berarti email itu tidak
+terdaftar. Cara ini mempertahankan `id` user, sehingga jejak di
+`activity_log` dan `jobs.dibuat_oleh` tetap menunjuk ke akun yang sama —
+berbeda dari menghapus lalu membuat ulang user, yang membuat kolom-kolom
+itu menjadi `NULL` (`ON DELETE SET NULL`).
+
+Mengganti password **tidak** mengakhiri sesi login yang sudah ada: cookie
+sesi hanya menyimpan id user, dan Lapis 1 tidak punya pencabutan sesi. Bila
+password lama mungkin bocor, ganti juga `WPMGR_SESSION_SECRET` di `.env`
+lalu `systemctl restart wpmgr-web` — setiap cookie sesi yang ada menjadi
+tidak sah dan semua orang harus login ulang.
 
 ## Keterbatasan yang diketahui
 

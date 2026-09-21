@@ -1,0 +1,20 @@
+# Unit template: satu instans per worker, mis. wpmgr-worker@1 dan
+# wpmgr-worker@2. Worker yang berbeda memproses site yang berbeda secara
+# paralel; aturan satu-job-per-site ditegakkan oleh query klaim di database,
+# bukan oleh jumlah proses (spec §7.1).
+[Unit]
+Description=WP Manager worker %i
+After=network.target postgresql.service
+
+[Service]
+User=wpmgr
+WorkingDirectory=/opt/wpmgr
+EnvironmentFile=/opt/wpmgr/.env
+ExecStart=/opt/wpmgr/.venv/bin/python -m wpmgr.worker
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=240
+
+[Install]
+WantedBy=multi-user.target
