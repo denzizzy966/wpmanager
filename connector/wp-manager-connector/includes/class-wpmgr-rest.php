@@ -46,6 +46,26 @@ class WPMGR_REST {
         return '/wp-json' . $route;
     }
 
+    public static function perlu_anti_cache( $route ) {
+        return 0 === strpos( (string) $route, '/' . self::NS . '/' );
+    }
+
+    /**
+     * LiteSpeed Cache secara bawaan ikut meng-cache respons REST GET. Tanpa
+     * header ini /events, /traffic, bahkan /ping bisa dijawab dari cache:
+     * data basi yang tampak sah bagi dashboard. Dipasang di rest_post_dispatch
+     * supaya juga berlaku untuk penolakan 401 dari guard().
+     */
+    public static function tambah_header_anti_cache( $result, $server, $request ) {
+        if ( $result instanceof WP_HTTP_Response && self::perlu_anti_cache( $request->get_route() ) ) {
+            $result->header( 'Cache-Control', 'no-store, private' );
+            $result->header( 'Pragma', 'no-cache' );
+            $result->header( 'Expires', 'Wed, 11 Jan 1984 05:00:00 GMT' );
+            $result->header( 'X-LiteSpeed-Cache-Control', 'no-cache' );
+        }
+        return $result;
+    }
+
     public static function guard( $request ) {
         if ( ! WPMGR_Settings::terpasang() ) {
             return self::tolak( 'Connector belum dipasangkan.' );
@@ -92,6 +112,10 @@ class WPMGR_REST {
             'wp_version'        => get_bloginfo( 'version' ),
             'php_version'       => PHP_VERSION,
             'site_url'          => home_url(),
+            'fitur'             => WPMGR_Skema::fitur( WPMGR_Skema::monitoring_mati() ),
+            'mode_penangkap'    => WPMGR_Skema::mode_penangkap(),
+            'percayai_xff'      => WPMGR_Settings::percayai_xff(),
+            'versi_skema'       => (int) get_option( WPMGR_Skema::OPT_VERSI, 0 ),
         ) );
     }
 
@@ -103,7 +127,10 @@ class WPMGR_REST {
         if ( WPMGR_Updater::sedang_sibuk() ) {
             return WPMGR_Updater::galat_sibuk();
         }
-        return rest_ensure_response( WPMGR_Inventory::kumpulkan() );
+        $data                      = WPMGR_Inventory::kumpulkan();
+        $data['fitur']             = WPMGR_Skema::fitur( WPMGR_Skema::monitoring_mati() );
+        $data['connector_version'] = WPMGR_VERSION;
+        return rest_ensure_response( $data );
     }
 
     public static function update( $request ) {

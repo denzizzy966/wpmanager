@@ -8,6 +8,7 @@ class WPMGR_Settings {
     const OPT_SITE_ID   = 'wpmgr_site_id';
     const OPT_SECRET    = 'wpmgr_secret';
     const OPT_DASHBOARD = 'wpmgr_dashboard_url';
+    const OPT_XFF       = 'wpmgr_percayai_xff';
 
     public static function site_id() {
         return (string) get_option( self::OPT_SITE_ID, '' );
@@ -19,6 +20,10 @@ class WPMGR_Settings {
 
     public static function dashboard_url() {
         return (string) get_option( self::OPT_DASHBOARD, '' );
+    }
+
+    public static function percayai_xff() {
+        return '1' === (string) get_option( self::OPT_XFF, '0' );
     }
 
     public static function terpasang() {
@@ -153,7 +158,19 @@ class WPMGR_Settings {
     }
 
     public static function tangani_simpan() {
-        if ( ! isset( $_POST['wpmgr_kunci'] ) || ! current_user_can( 'manage_options' ) ) {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return;
+        }
+
+        if ( isset( $_POST['wpmgr_simpan_setelan'] ) ) {
+            check_admin_referer( 'wpmgr_setelan' );
+            update_option( self::OPT_XFF, empty( $_POST['wpmgr_percayai_xff'] ) ? '0' : '1', false );
+            set_transient( 'wpmgr_pesan', 'Pengaturan pemantauan disimpan.', 30 );
+            wp_safe_redirect( admin_url( 'options-general.php?page=wpmgr' ) );
+            exit;
+        }
+
+        if ( ! isset( $_POST['wpmgr_kunci'] ) ) {
             return;
         }
         check_admin_referer( 'wpmgr_simpan' );
@@ -191,6 +208,24 @@ class WPMGR_Settings {
                     <textarea id="wpmgr_kunci" name="wpmgr_kunci" rows="3" cols="80"></textarea>
                 </p>
                 <?php submit_button( 'Simpan dan hubungkan' ); ?>
+            </form>
+
+            <h2>Pemantauan</h2>
+            <form method="post">
+                <?php wp_nonce_field( 'wpmgr_setelan' ); ?>
+                <input type="hidden" name="wpmgr_simpan_setelan" value="1">
+                <p>
+                    <label>
+                        <input type="checkbox" name="wpmgr_percayai_xff" value="1" <?php checked( self::percayai_xff() ); ?>>
+                        Site ini berada di balik proxy atau load balancer (percayai header <code>X-Forwarded-For</code>)
+                    </label>
+                </p>
+                <p class="description">
+                    Aktifkan hanya bila server ini benar-benar berada di belakang proxy yang Anda
+                    kendalikan. Bila diaktifkan tanpa proxy, pengunjung dapat memalsukan IP mereka
+                    di riwayat login. Site di balik Cloudflare tidak perlu mengaktifkan ini.
+                </p>
+                <?php submit_button( 'Simpan pengaturan' ); ?>
             </form>
         </div>
         <?php
