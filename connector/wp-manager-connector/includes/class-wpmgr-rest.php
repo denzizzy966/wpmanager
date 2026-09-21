@@ -96,6 +96,13 @@ class WPMGR_REST {
     }
 
     public static function inventory() {
+        // Selama /update memegang lock, direktori paket bisa sedang kosong
+        // atau setengah terekstrak. Inventaris yang dibaca saat itu bukan
+        // keadaan site yang sebenarnya, dan scan ulang setelah timeout update
+        // akan memutuskan nasib job berdasarkan keadaan palsu itu.
+        if ( WPMGR_Updater::sedang_sibuk() ) {
+            return WPMGR_Updater::galat_sibuk();
+        }
         return rest_ensure_response( WPMGR_Inventory::kumpulkan() );
     }
 

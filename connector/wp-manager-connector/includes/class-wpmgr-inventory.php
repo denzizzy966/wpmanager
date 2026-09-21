@@ -9,23 +9,44 @@ class WPMGR_Inventory {
      * Memaksa WordPress memeriksa update lebih dulu, karena transient update
      * bisa berumur belasan jam dan dashboard yang menampilkan data basi sama
      * saja dengan dashboard yang salah.
+     *
+     * Transient TIDAK dihapus. wp_update_plugins() dan wp_update_themes()
+     * menyimpan ulang transient lama (dengan last_checked baru) sebelum
+     * menghubungi api.wordpress.org, lalu kembali lebih awal bila permintaan
+     * itu gagal. Transient yang dihapus lebih dulu tertinggal tanpa
+     * `response` sama sekali, dan setiap plugin dilaporkan "tidak ada update"
+     * -- bukan basi, melainkan salah, justru ketika koneksi site ke
+     * wordpress.org sedang bermasalah. Harga pilihan ini: pada pemeriksaan
+     * yang gagal, versi tersedia yang dilaporkan berasal dari pemeriksaan
+     * sebelumnya.
      */
     private static function segarkan() {
         require_once ABSPATH . 'wp-admin/includes/update.php';
 
-        // wp_update_plugins() dan wp_update_themes() tidak menerima argumen
-        // pemaksa dan akan langsung kembali bila transient-nya belum berumur
-        // 12 jam. Menghapus transient lebih dulu adalah satu-satunya cara
-        // membuat ketiganya benar-benar memeriksa ulang. Tanpa ini, dashboard
-        // melaporkan ketersediaan update dari data yang bisa berumur hampir
-        // setengah hari — padahal ketepatan soal itu adalah inti produknya.
-        delete_site_transient( 'update_core' );
-        delete_site_transient( 'update_plugins' );
-        delete_site_transient( 'update_themes' );
+        // Kedua fungsi ini tidak menerima argumen pemaksa dan langsung
+        // kembali bila last_checked lebih baru dari 12 jam (lihat
+        // wp-includes/update.php). last_checked = 0 membuat pemeriksaan itu
+        // gagal tanpa menyentuh isi transient lainnya.
+        self::paksa_cek_ulang( 'update_plugins' );
+        self::paksa_cek_ulang( 'update_themes' );
 
+        // Core tidak butuh trik ini: argumen kedua wp_version_check() memang
+        // pemaksa, dan fungsinya juga menyimpan ulang transient lama sebelum
+        // menghubungi wordpress.org.
         wp_version_check( array(), true );
         wp_update_plugins();
         wp_update_themes();
+    }
+
+    private static function paksa_cek_ulang( $nama_transient ) {
+        $lama = get_site_transient( $nama_transient );
+        // Bukan objek berarti belum pernah ada pemeriksaan (atau isinya
+        // rusak); fungsi update WordPress sendiri menggantinya dengan objek
+        // baru tanpa last_checked, yang juga memaksa pemeriksaan.
+        if ( is_object( $lama ) ) {
+            $lama->last_checked = 0;
+            set_site_transient( $nama_transient, $lama );
+        }
     }
 
     public static function kumpulkan() {
