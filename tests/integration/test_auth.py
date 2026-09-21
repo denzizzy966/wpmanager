@@ -43,12 +43,10 @@ def test_halaman_dilindungi_mengarahkan_ke_login(klien):
     assert r.headers["location"] == "/login"
 
 
-@pytest.mark.xfail(reason="menunggu Task 20", strict=False)
 def test_api_dilindungi_membalas_401(klien):
     assert klien.get("/api/sites").status_code == 401
 
 
-@pytest.mark.xfail(reason="menunggu Task 20", strict=False)
 def test_login_dengan_sandi_benar(klien, pengguna):
     r = klien.post("/login", data={"email": "a@b.test", "password": "sandi-benar"})
     assert r.status_code == 303
@@ -68,10 +66,6 @@ def test_email_tidak_dikenal_ditolak(klien, pengguna):
     assert "tidak cocok" in r.text.lower()
 
 
-# Sama seperti dua test di atas, test ini juga bergantung pada /api/sites
-# (dibuat Task 20). Tanpa endpoint itu, permintaan tak dikenal membalas 404,
-# bukan 401, sehingga assert di bawah gagal walau logout-nya sendiri benar.
-@pytest.mark.xfail(reason="menunggu Task 20", strict=False)
 def test_logout_mengakhiri_sesi(klien, pengguna):
     klien.post("/login", data={"email": "a@b.test", "password": "sandi-benar"})
     klien.post("/logout")
