@@ -63,3 +63,27 @@ def test_scan_juga_mencatat_fitur(sesi, site):
     sesi.refresh(site)
     assert site.fitur == ["traffic"]
     assert site.connector_version == "2.0.0"
+
+
+def test_mode_penangkap_sebagai_list_diabaikan(sesi, site):
+    """Site JSON tidak terpercaya: mode_penangkap bisa berisi tipe apa saja."""
+    job = buat_job(sesi, site.id, JobType.verify_site)
+    tangani_verify_site(sesi, job, klien_palsu({**PING, "mode_penangkap": ["penuh"]}))
+    sesi.refresh(site)
+    assert site.mode_penangkap is None
+
+
+def test_mode_penangkap_sebagai_dict_diabaikan(sesi, site):
+    """Site JSON tidak terpercaya: mode_penangkap bisa berisi tipe apa saja."""
+    job = buat_job(sesi, site.id, JobType.verify_site)
+    tangani_verify_site(sesi, job, klien_palsu({**PING, "mode_penangkap": {"mode": "penuh"}}))
+    sesi.refresh(site)
+    assert site.mode_penangkap is None
+
+
+def test_fitur_mengandung_non_string_disaring(sesi, site):
+    """Site JSON tidak terpercaya: fitur bisa berisi tipe apa saja, hanya string yang disimpan."""
+    job = buat_job(sesi, site.id, JobType.verify_site)
+    tangani_verify_site(sesi, job, klien_palsu({**PING, "fitur": ["events", 1, ["x"], {"a": 1}]}))
+    sesi.refresh(site)
+    assert site.fitur == ["events"]

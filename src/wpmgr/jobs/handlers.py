@@ -38,9 +38,9 @@ def simpan_kemampuan(site: Site, data: dict) -> None:
     endpoint yang tidak lagi ia punya.
     """
     fitur = data.get("fitur")
-    site.fitur = sorted({str(f) for f in fitur}) if isinstance(fitur, list) else []
+    site.fitur = sorted({f for f in fitur if isinstance(f, str)}) if isinstance(fitur, list) else []
     mode = data.get("mode_penangkap")
-    site.mode_penangkap = mode if mode in MODE_PENANGKAP_SAH else None
+    site.mode_penangkap = mode if isinstance(mode, str) and mode in MODE_PENANGKAP_SAH else None
     if "percayai_xff" in data:
         site.percayai_xff = bool(data.get("percayai_xff"))
     versi = data.get("connector_version")
