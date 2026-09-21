@@ -55,7 +55,17 @@ class SiteClient:
         teks = resp.text
         kelas = klasifikasi_respons(resp.status_code, dict(resp.headers), teks)
         if kelas is not None:
-            raise SiteError(kelas, teks[:500])
+            pesan = teks[:500]
+            if 300 <= resp.status_code < 400:
+                tujuan = resp.headers.get("location", "(tanpa header Location)")
+                pesan = (
+                    f"HTTP {resp.status_code} mengalihkan ke {tujuan}. Site "
+                    f"mengalihkan permintaan REST sebelum plugin menerimanya; "
+                    f"penyebab paling umum adalah permalink masih disetel "
+                    f"'Plain' di Pengaturan -> Permalink. "
+                    f"{pesan}"
+                ).strip()
+            raise SiteError(kelas, pesan)
 
         try:
             return json.loads(teks)

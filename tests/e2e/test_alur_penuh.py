@@ -95,6 +95,76 @@ def test_scan_mengisi_inventaris(sesi, site_terpasang):
     assert any(p.slug == "wp-manager-connector/wp-manager-connector.php" for p in paket)
 
 
+def test_scan_memaksa_refresh_transient_update_plugins(sesi, site_terpasang):
+    """segarkan() menghapus site transient update_plugins sebelum memanggil
+    wp_update_plugins(), tepatnya karena fungsi itu sendiri tidak menerima
+    argumen paksa dan langsung kembali tanpa berbuat apa pun bila transient-nya
+    berumur kurang dari 12 jam.
+
+    test_scan_mengisi_inventaris hanya membuktikan sebuah inventaris kembali --
+    itu akan tetap terjadi bahkan bila segarkan() tidak menghapus apa pun sama
+    sekali, semata-mata karena instalasi ini baru dan transient-nya belum ada.
+    Properti yang benar-benar menjadi taruhan adalah: pemindaian KEDUA, yang
+    dijalankan segera setelah yang pertama (jauh di bawah jendela 12 jam),
+    tetap memicu pemeriksaan ulang yang nyata. Tanpa penghapusan transient di
+    segarkan(), wp_update_plugins() pada pemindaian kedua akan diam-diam
+    kembali lebih awal dan `last_checked` tidak akan pernah maju -- gejala
+    yang tidak akan pernah terlihat lewat balasan API kita sendiri, hanya
+    lewat transient WordPress yang sebenarnya.
+    """
+    import time
+
+    buat_job(sesi, site_terpasang.id, JobType.scan_site)
+    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+    diperiksa_pertama = int(
+        wpcli("eval", "echo get_site_transient('update_plugins')->last_checked;")
+    )
+
+    time.sleep(2)
+
+    buat_job(sesi, site_terpasang.id, JobType.scan_site)
+    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+    diperiksa_kedua = int(
+        wpcli("eval", "echo get_site_transient('update_plugins')->last_checked;")
+    )
+
+    assert diperiksa_kedua > diperiksa_pertama
+
+
+def test_redirect_permalink_plain_menghasilkan_pesan_yang_bisa_didiagnosis(sesi, site_terpasang):
+    """Site klien berpermalink 'Plain' (bawaan instalasi WordPress mana pun)
+    membuat setiap permintaan /wp-json/... di-301 oleh WordPress sendiri
+    sebelum pernah sampai ke WPMGR_REST::guard(). klasifikasi_respons()
+    memetakan 3xx yang tak tertangani menjadi bad_response, dan badan respons
+    redirect semacam itu nyaris selalu kosong -- tanpa penanganan khusus,
+    operator hanya melihat "bad_response" tanpa isi apa pun, lalu mencurigai
+    tiga tempat yang salah (secret, firewall, plugin nonaktif), masing-masing
+    berharga satu putaran dukungan dengan klien sebelum permalink bahkan
+    terpikirkan.
+
+    Test ini membuktikan _panggil() di site_client.py menyisipkan tujuan
+    redirect yang sesungguhnya dan penyebab paling mungkin ke pesan error itu
+    sendiri, ketimbang membiarkan operator menebak dari body yang kosong.
+    """
+    from wpmgr.errors import SiteError
+
+    wpcli("rewrite", "structure", "", "--hard")
+    wpcli("rewrite", "flush", "--hard")
+    try:
+        with pytest.raises(SiteError) as exc:
+            _klien_http(site_terpasang, sesi).ping()
+        pesan = exc.value.pesan
+        assert "permalink" in pesan.lower()
+        assert f"{site_terpasang.url}/wp-json/wpmgr/v1/ping/" in pesan
+    finally:
+        # Harus terjadi bahkan bila asersi di atas gagal -- kalau tidak,
+        # setiap test sesudah ini di file yang sama akan ikut gagal dengan
+        # redirect yang sama, menyamarkan kegagalan test ini sendiri di
+        # balik kegagalan berantai yang tidak berhubungan.
+        wpcli("rewrite", "structure", "/%postname%/", "--hard")
+        wpcli("rewrite", "flush", "--hard")
+
+
 def test_update_plugin_versi_lama_benar_benar_naik(sesi, site_terpasang):
     wpcli("plugin", "install", "hello-dolly", "--version=1.6", "--force")
 
