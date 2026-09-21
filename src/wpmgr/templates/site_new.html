@@ -13,9 +13,9 @@
      status site akan berubah di halaman <a href="/sites">Site</a>.</p>
 {% else %}
   <form method="post" action="/sites">
-    <p><label>Nama<br><input name="nama" required></label></p>
+    <p><label>Nama<br><input name="nama" value="{{ nama or '' }}" required></label></p>
     <p><label>URL (wajib https)<br>
-       <input name="url" required placeholder="https://client.example.com"></label></p>
+       <input name="url" value="{{ url or '' }}" required placeholder="https://client.example.com"></label></p>
     <p><button type="submit">Buat dan tampilkan kunci</button></p>
   </form>
 {% endif %}

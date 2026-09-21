@@ -60,6 +60,27 @@ def test_buat_site_http_menampilkan_galat(klien):
     assert "https" in r.text.lower()
 
 
+def test_buat_site_gagal_mempertahankan_input(klien):
+    # Kegagalan validasi tidak boleh membuang apa yang sudah diketik operator
+    # — itu justru saat orang paling malas mengetik ulang URL yang panjang.
+    r = klien.post("/sites", data={"nama": "Client Y", "url": "http://tidak-aman.test"})
+    assert r.status_code == 200
+    assert "https" in r.text.lower()
+    assert "Client Y" in r.text
+    assert "http://tidak-aman.test" in r.text
+
+
+def test_buat_site_url_duplikat_menampilkan_galat_bukan_500(klien, sesi):
+    from wpmgr.pairing import buat_site
+
+    buat_site(sesi, "Awal", "https://dup.test", None, None)
+    r = klien.post("/sites", data={"nama": "Client Z", "url": "https://dup.test"})
+    assert r.status_code == 200
+    assert "sudah terdaftar" in r.text.lower()
+    assert "Client Z" in r.text
+    assert "https://dup.test" in r.text
+
+
 def test_detail_site_terbuka(klien, sesi):
     from wpmgr.pairing import buat_site
 

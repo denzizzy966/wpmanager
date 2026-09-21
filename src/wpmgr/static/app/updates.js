@@ -29,7 +29,11 @@ function layarUpdate() {
           {
             dataField: 'versi_tersedia',
             caption: 'Tersedia',
-            cellTemplate: (nilai) => `<span class="dg-badge-warning">${nilai}</span>`,
+            // nilai berasal dari string versi yang dibaca connector dari site
+            // client — site yang justru sedang diawasi karena mungkin sudah
+            // disusupi. cellTemplate tidak di-escape otomatis oleh DataGrid
+            // (berbeda dari sel biasa), jadi esc() wajib di sini.
+            cellTemplate: (nilai) => `<span class="dg-badge-warning">${esc(nilai)}</span>`,
           },
           { dataField: 'last_scan_at', caption: 'Terakhir Scan', dataType: 'date' },
         ],

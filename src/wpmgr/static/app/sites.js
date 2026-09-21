@@ -28,7 +28,15 @@ function layarSite() {
           {
             dataField: 'status',
             caption: 'Status',
-            cellTemplate: (v) => `<span class="${WARNA_STATUS[v] || ''}">${v}</span>`,
+            // WARNA_STATUS[v] hanya pernah menghasilkan salah satu kelas CSS
+            // tetap di atas atau string kosong, jadi bagian itu sendiri aman.
+            // v yang ditampilkan sebagai teks tetap dilewatkan lewat esc() —
+            // status hari ini memang cuma enam nilai enum yang tidak bisa
+            // disuntik, tapi cellTemplate tidak di-escape otomatis oleh
+            // DataGrid, dan kolom Aksi di bawah membuktikan tidak semua nilai
+            // di grid ini seaman itu. Konsistensi di sini mencegah baris
+            // berikutnya menyalin pola yang salah.
+            cellTemplate: (v) => `<span class="${WARNA_STATUS[v] || ''}">${esc(v)}</span>`,
           },
           { dataField: 'wp_version', caption: 'WP' },
           { dataField: 'php_version', caption: 'PHP' },
@@ -37,10 +45,14 @@ function layarSite() {
           {
             caption: 'Aksi',
             calculateCellValue: (baris) => baris.id,
+            // id adalah UUID yang dibuat server (uuid.uuid4()), bukan input
+            // bebas dari site client — tapi tetap dilewatkan lewat esc()
+            // demi konsistensi: pembaca kode tidak bisa langsung menebak
+            // interpolasi mana yang "aman" dari sekadar membaca satu baris.
             cellTemplate: (id) =>
-              `<button data-sso="${id}">Masuk</button> ` +
-              `<button data-scan="${id}">Scan</button> ` +
-              `<a href="/sites/${id}">Detail</a>`,
+              `<button data-sso="${esc(id)}">Masuk</button> ` +
+              `<button data-scan="${esc(id)}">Scan</button> ` +
+              `<a href="/sites/${esc(id)}">Detail</a>`,
           },
         ],
       });

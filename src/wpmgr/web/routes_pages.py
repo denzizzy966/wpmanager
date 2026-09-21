@@ -3,6 +3,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from wpmgr import db
 from wpmgr.models import ActivityLog, Site, SitePackage, User
@@ -51,7 +52,8 @@ def halaman_activity(request: Request, pengguna: PenggunaHalaman):
 @router.get("/sites/new")
 def form_site_baru(request: Request, pengguna: PenggunaHalaman):
     return _tpl().TemplateResponse(
-        request, "site_new.html", {"pengguna": pengguna, "kunci": None, "galat": None}
+        request, "site_new.html",
+        {"pengguna": pengguna, "kunci": None, "galat": None, "nama": "", "url": ""},
     )
 
 
@@ -65,9 +67,31 @@ def simpan_site(
     try:
         with db.SessionLocal() as sesi:
             site, kunci = buat_site(sesi, nama, url, None, pengguna.id)
-            konteks = {"pengguna": pengguna, "kunci": kunci, "galat": None, "site": site}
+            konteks = {
+                "pengguna": pengguna, "kunci": kunci, "galat": None,
+                "site": site, "nama": nama, "url": url,
+            }
     except ValueError as exc:
-        konteks = {"pengguna": pengguna, "kunci": None, "galat": str(exc)}
+        # URL tanpa https:// atau nilai tak sah lain — pesannya berasal dari
+        # buat_site() sendiri. Input yang sudah diketik operator dikembalikan
+        # ke form; menghapusnya justru menghukum kesalahan kecil di momen
+        # orang paling malas mengetik ulang URL yang panjang.
+        konteks = {
+            "pengguna": pengguna, "kunci": None, "galat": str(exc),
+            "nama": nama, "url": url,
+        }
+    except IntegrityError:
+        # Site.url unik: pengiriman kedua untuk URL yang sama meledak di
+        # commit() sebagai IntegrityError, bukan ValueError, karena buat_site()
+        # sendiri tidak memeriksa keunikan lebih dulu. Tanpa except ini,
+        # operator yang tidak sengaja mengirim form dua kali (atau memang
+        # sudah pernah menambah site itu) akan melihat 500 polos untuk
+        # sesuatu yang sama sekali biasa.
+        konteks = {
+            "pengguna": pengguna, "kunci": None,
+            "galat": "URL tersebut sudah terdaftar sebagai site lain.",
+            "nama": nama, "url": url,
+        }
     return _tpl().TemplateResponse(request, "site_new.html", konteks)
 
 
