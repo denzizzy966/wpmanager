@@ -14,14 +14,27 @@ mengekspos endpoint REST yang diverifikasi dengan HMAC.
 - **Python 3.10+** (proyek ini dikembangkan dan diuji dengan 3.10.6; lihat `requires-python` di `pyproject.toml`)
 - **PostgreSQL 16** — versi yang dipakai `docker-compose.yml` untuk dev lokal; produksi boleh memakai instance PostgreSQL 16 mana pun
 - **Docker + Docker Compose** — untuk menjalankan PostgreSQL dan (untuk test e2e) WordPress + MariaDB di lokal. Tidak dibutuhkan di server produksi dashboard itu sendiri.
-- **PHP 8.1+ dan Composer** — untuk menjalankan test PHPUnit plugin connector (`connector/`)
+- **PHP 7.4+ dan Composer** — untuk menjalankan plugin connector dan test
+  PHPUnit-nya (`connector/`). Angka ini berasal dari `Requires PHP: 7.4` di
+  header `connector/wp-manager-connector/wp-manager-connector.php`, bukan
+  dari perkiraan. Kontainer WordPress yang dipakai test e2e (lihat
+  `docker-compose.yml`) kebetulan memakai PHP 8.1, tapi itu properti image
+  Docker tersebut, bukan syarat minimum plugin ini.
 - **Site WordPress klien harus memakai permalink "cantik"** (bukan "Plain"). Lihat catatan di bawah — ini bukan sekadar preferensi kosmetik.
 
 ## Setup lokal
 
+**Konvensi path virtualenv dalam dokumen ini:** semua contoh perintah di
+bagian "Setup lokal", "Menjalankan web dan worker", dan "Menjalankan test"
+di bawah ditulis untuk Windows, tempat `venv` menaruh binernya di
+`.venv/Scripts/`. Di Linux atau macOS, `venv` menaruh biner yang sama di
+`.venv/bin/` — ganti setiap `.venv/Scripts/x` di bawah menjadi `.venv/bin/x`.
+Bagian **Deploy ke VPS** nanti sudah ditulis untuk Linux dan memakai
+`.venv/bin/` secara konsisten; perintah di sana tidak perlu diterjemahkan.
+
 ```bash
 python -m venv .venv
-.venv/Scripts/pip install -e ".[dev]"      # Windows; di Linux/macOS: .venv/bin/pip
+.venv/Scripts/pip install -e ".[dev]"
 docker compose up -d db                     # PostgreSQL saja cukup untuk kerja sehari-hari
 cp .env.example .env
 ```
@@ -149,12 +162,52 @@ sepenuhnya, bukan hanya diputus dari sisi dashboard.
 
 ## Deploy ke VPS
 
-Berkas siap pakai ada di `deploy/`:
+Berkas siap pakai ada di `deploy/`. Bagian ini ditulis untuk Linux — target
+deploy sesungguhnya — sehingga setiap path venv di bawah memakai
+`.venv/bin/`, bukan `.venv/Scripts/` seperti bagian setup lokal di atas.
+
+**Bootstrap awal.** Ini belum ada cara otomatis; server baru tidak punya
+clone, virtualenv, skema database, atau akun dashboard sampai langkah-langkah
+berikut dijalankan sekali secara manual:
 
 ```bash
-# sebagai root, setelah /opt/wpmgr berisi clone repo + .venv + .env terisi
-useradd -r -s /usr/sbin/nologin wpmgr    # jika user sistem belum ada
+# sebagai root
+adduser --system --group --home /opt/wpmgr wpmgr
+git clone <url-repo-ini> /opt/wpmgr
+cd /opt/wpmgr
+python3 -m venv .venv
+.venv/bin/pip install -e .
+cp .env.example .env
+# isi DATABASE_URL dan WPMGR_BASE_URL di .env secara langsung. WPMGR_SECRET_KEY
+# dan WPMGR_SESSION_SECRET harus dibangkitkan, bukan diketik sembarangan
+# (WPMGR_SECRET_KEY mengenkripsi setiap secret site di database — lihat
+# catatan di bagian "Setup lokal" di atas soal apa yang terjadi jika hilang):
+.venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"  # -> WPMGR_SECRET_KEY
+.venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"                                # -> WPMGR_SESSION_SECRET
+
+.venv/bin/python -m alembic upgrade head
+.venv/bin/python -m wpmgr.cli create-user --email admin@example.com --nama "Admin" --password "ganti-ini"
+
 chown -R wpmgr:wpmgr /opt/wpmgr
+```
+
+Kedua perintah terakhir sebelum `chown` — `alembic upgrade head` dan
+`create-user` — butuh `DATABASE_URL` dkk. yang baru saja diisi di `.env`.
+Keduanya membaca setting lewat `wpmgr.config.Settings`
+(`pydantic_settings.BaseSettings` dengan `env_file=".env"`), dan
+pydantic-settings mencari berkas itu relatif terhadap **direktori kerja saat
+proses dijalankan**, bukan relatif terhadap lokasi modul. Karena kedua
+perintah di atas dijalankan dari `/opt/wpmgr` (sesuai `cd /opt/wpmgr` di
+awal blok) dan `.env` ada persis di situ, isinya terbaca otomatis — tidak
+perlu `export` manual satu per satu. Menjalankan salah satu perintah ini
+dari direktori lain membuat `.env` tidak ditemukan, dan Pydantic akan gagal
+dengan error "field required" untuk tiap variabel yang tidak terbaca.
+
+Baru setelah skema database ada dan akun pertama bisa login, pasang service,
+cron, dan reverse proxy:
+
+```bash
+# sebagai root
 mkdir -p /var/log/wpmgr && chown wpmgr:wpmgr /var/log/wpmgr
 
 cp deploy/wpmgr-web.service deploy/wpmgr-worker.service /etc/systemd/system/
