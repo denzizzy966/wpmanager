@@ -1,13 +1,19 @@
 import os
+import re
 import subprocess
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from wpmgr.crypto import dekripsi_secret
 from wpmgr.models import Base
+from wpmgr.pairing import buat_site
+from wpmgr.signing import new_nonce, sign
+from wpmgr.site_client import SiteClient
 
 WP_URL = "http://localhost:8081"
 pytestmark = pytest.mark.e2e
@@ -15,6 +21,79 @@ pytestmark = pytest.mark.e2e
 DB_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+psycopg://wpmgr:wpmgr@localhost:5433/wpmgr_test"
 )
+
+AKAR_REPO = Path(__file__).resolve().parents[2]
+SUMBER_DI_KONTAINER = "/opt/wpmgr-connector-src"
+PLUGIN_DI_KONTAINER = "/var/www/html/wp-content/plugins/wp-manager-connector"
+
+
+def versi_connector_sumber() -> str:
+    teks = (AKAR_REPO / "connector" / "wp-manager-connector" / "wp-manager-connector.php").read_text(
+        encoding="utf-8"
+    )
+    return re.search(r"^\s*\*\s*Version:\s*(\S+)", teks, re.MULTILINE).group(1)
+
+
+def sinkronkan_connector() -> None:
+    """Salin connector dari sumber read-only ke direktori plugin container.
+
+    Dipanggil di awal setiap sesi e2e (dan oleh test yang menimpa connector),
+    sehingga yang diuji selalu kode di checkout ini, dan self-update bisa
+    menimpa direktori plugin tanpa menyentuh repo.
+    """
+    subprocess.run(
+        ["docker", "compose", "exec", "-T", "wpcli", "sh", "-c",
+         f"rm -rf '{PLUGIN_DI_KONTAINER}' && cp -r '{SUMBER_DI_KONTAINER}' '{PLUGIN_DI_KONTAINER}'"],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def tulis_di_kontainer(path: str, isi: str) -> None:
+    subprocess.run(
+        ["docker", "compose", "exec", "-T", "wpcli", "sh", "-c",
+         f"mkdir -p \"$(dirname '{path}')\" && cat > '{path}'"],
+        input=isi, text=True, capture_output=True, check=True,
+    )
+
+
+def hapus_di_kontainer(path: str) -> None:
+    subprocess.run(
+        ["docker", "compose", "exec", "-T", "wpcli", "rm", "-rf", path],
+        capture_output=True, check=False,
+    )
+
+
+def permintaan_bertanda(site, secret: str, method: str, route: str,
+                        body: bytes = b"", query: str = "") -> httpx.Response:
+    """Permintaan HMAC mentah, untuk test yang perlu melihat header respons."""
+    path = f"/wp-json{route}"
+    ts, nonce = int(time.time()), new_nonce()
+    headers = {
+        "X-Wpmgr-Site": str(site.id),
+        "X-Wpmgr-Timestamp": str(ts),
+        "X-Wpmgr-Nonce": nonce,
+        "X-Wpmgr-Signature": sign(secret, method, path, ts, nonce, body),
+    }
+    if body:
+        headers["Content-Type"] = "application/json"
+    return httpx.request(method, f"{site.url}{path}{query}", content=body or None,
+                         headers=headers, timeout=60)
+
+
+def klien_http(site) -> SiteClient:
+    """SiteClient untuk WordPress lokal yang memakai http, bukan https.
+
+    SiteClient menolak base_url non-https di konstruktor -- sengaja, karena
+    tanpa TLS body respons dan token SSO yang lewat bisa dibaca di jalan.
+    Kontainer WordPress di lingkungan test ini bicara HTTP polos di
+    localhost:8081, jadi klien dibangun dengan URL https palsu lalu
+    base_url-nya ditimpa setelah konstruksi. Pemeriksaan di konstruktor
+    sendiri TIDAK dilonggarkan; workaround ini dikurung di sini saja.
+    """
+    klien = SiteClient("https://placeholder.test", str(site.id),
+                       dekripsi_secret(site.secret_terenkripsi))
+    klien.base_url = site.url
+    return klien
 
 
 def wpcli(*args: str) -> str:
@@ -112,5 +191,22 @@ def wp_site():
     wpcli("rewrite", "structure", "/%postname%/", "--hard")
     wpcli("rewrite", "flush", "--hard")
 
+    sinkronkan_connector()
     wpcli("plugin", "activate", "wp-manager-connector")
     return WP_URL
+
+
+@pytest.fixture
+def site_terpasang(sesi, wp_site):
+    site, _kunci = buat_site(sesi, "Uji E2E", "https://uji.test", None, None)
+    site.url = wp_site  # http://localhost:8081
+    sesi.commit()
+
+    # Ditulis langsung lewat `wp option update`, BUKAN lewat
+    # WPMGR_Settings::simpan_kunci() -- fixture ini hanya perlu WordPress
+    # dalam keadaan "sudah terpasang" secepat mungkin. Jalur simpan_kunci()
+    # sungguhan diuji terpisah di test_alur_penuh.py.
+    wpcli("option", "update", "wpmgr_site_id", str(site.id))
+    wpcli("option", "update", "wpmgr_secret", dekripsi_secret(site.secret_terenkripsi))
+    wpcli("option", "update", "wpmgr_dashboard_url", "http://host.docker.internal:8000")
+    return site

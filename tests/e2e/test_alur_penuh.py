@@ -1,4 +1,3 @@
-import subprocess
 import time
 import uuid
 
@@ -8,11 +7,18 @@ from wpmgr.crypto import dekripsi_secret, secret_baru
 from wpmgr.errors import TRANSIENT, UPGRADE_FAILED, SiteError
 from wpmgr.jobs.queue import buat_job
 from wpmgr.models import JobStatus, JobType, PackageType, SitePackage, SiteStatus
-from wpmgr.pairing import buat_site, kunci_koneksi
+from wpmgr.pairing import kunci_koneksi
 from wpmgr.site_client import SiteClient
 from wpmgr.worker import proses_satu
 
-from .conftest import _wpcli_status, wpcli
+from .conftest import (
+    _wpcli_status,
+    hapus_di_kontainer,
+    klien_http,
+    tulis_di_kontainer,
+    versi_connector_sumber,
+    wpcli,
+)
 
 MU_PLUGIN_BLOKIR = "/var/www/html/wp-content/mu-plugins/wpmgr-uji-blokir-wporg.php"
 ISI_MU_PLUGIN_BLOKIR = """<?php
@@ -26,62 +32,12 @@ add_filter( 'pre_http_request', function ( $pre, $args, $url ) {
 }, 10, 3 );
 """
 
-
-def _tulis_di_kontainer(path: str, isi: str) -> None:
-    subprocess.run(
-        ["docker", "compose", "exec", "-T", "wpcli", "sh", "-c",
-         f"mkdir -p \"$(dirname '{path}')\" && cat > '{path}'"],
-        input=isi, text=True, capture_output=True, check=True,
-    )
-
-
-def _hapus_di_kontainer(path: str) -> None:
-    subprocess.run(
-        ["docker", "compose", "exec", "-T", "wpcli", "rm", "-f", path],
-        capture_output=True, check=False,
-    )
-
 pytestmark = pytest.mark.e2e
 
 
-def _klien_http(site, sesi):
-    """SiteClient untuk WordPress lokal yang memakai http, bukan https.
-
-    SiteClient menolak base_url non-https di konstruktor -- sengaja, karena
-    tanpa TLS body respons dan token SSO yang lewat bisa dibaca di jalan.
-    Kontainer WordPress di lingkungan test ini bicara HTTP polos di
-    localhost:8081, jadi klien dibangun dengan URL https palsu lalu
-    base_url-nya ditimpa setelah konstruksi. Pemeriksaan di konstruktor
-    sendiri TIDAK dilonggarkan; workaround ini dikurung di sini saja.
-    """
-    secret = dekripsi_secret(site.secret_terenkripsi)
-    klien = SiteClient("https://placeholder.test", str(site.id), secret)
-    klien.base_url = site.url  # lewati pemeriksaan https khusus lingkungan test
-    return klien
-
-
-@pytest.fixture
-def site_terpasang(sesi, wp_site):
-    site, _kunci = buat_site(sesi, "Uji E2E", "https://uji.test", None, None)
-    site.url = wp_site  # http://localhost:8081
-    sesi.commit()
-
-    # Ditulis langsung lewat `wp option update`, BUKAN lewat
-    # WPMGR_Settings::simpan_kunci() -- fixture ini hanya perlu WordPress
-    # dalam keadaan "sudah terpasang" secepat mungkin untuk mayoritas test
-    # di bawah. Jalur simpan_kunci() sungguhan diuji terpisah oleh
-    # test_simpan_kunci_lewat_wpcli_menembus_pintu_masuk_asli di akhir file
-    # ini, karena bypass ini sendiri tidak akan pernah menyentuh bug pada
-    # parsernya.
-    wpcli("option", "update", "wpmgr_site_id", str(site.id))
-    wpcli("option", "update", "wpmgr_secret", dekripsi_secret(site.secret_terenkripsi))
-    wpcli("option", "update", "wpmgr_dashboard_url", "http://host.docker.internal:8000")
-    return site
-
-
 def test_ping_menjawab_dengan_versi(sesi, site_terpasang):
-    data = _klien_http(site_terpasang, sesi).ping()
-    assert data["connector_version"] == "1.0.0"
+    data = klien_http(site_terpasang).ping()
+    assert data["connector_version"] == versi_connector_sumber()
     assert data["wp_version"].startswith("6.")
 
 
@@ -118,7 +74,7 @@ def test_nonce_yang_diulang_ditolak(sesi, site_terpasang):
 
 def test_scan_mengisi_inventaris(sesi, site_terpasang):
     buat_job(sesi, site_terpasang.id, JobType.scan_site)
-    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+    assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
 
     paket = sesi.query(SitePackage).filter_by(site_id=site_terpasang.id).all()
     assert any(p.tipe == PackageType.core for p in paket)
@@ -145,7 +101,7 @@ def test_scan_memaksa_refresh_transient_update_plugins(sesi, site_terpasang):
     import time
 
     buat_job(sesi, site_terpasang.id, JobType.scan_site)
-    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+    assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
     diperiksa_pertama = int(
         wpcli("eval", "echo get_site_transient('update_plugins')->last_checked;")
     )
@@ -153,7 +109,7 @@ def test_scan_memaksa_refresh_transient_update_plugins(sesi, site_terpasang):
     time.sleep(2)
 
     buat_job(sesi, site_terpasang.id, JobType.scan_site)
-    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+    assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
     diperiksa_kedua = int(
         wpcli("eval", "echo get_site_transient('update_plugins')->last_checked;")
     )
@@ -175,10 +131,10 @@ def test_scan_saat_wordpress_org_tak_terjangkau_mempertahankan_versi_tersedia(
     justru pada saat koneksi site ke wordpress.org sedang bermasalah.
     """
     wpcli("plugin", "install", "hello-dolly", "--version=1.6", "--force")
-    _tulis_di_kontainer(MU_PLUGIN_BLOKIR, ISI_MU_PLUGIN_BLOKIR)
+    tulis_di_kontainer(MU_PLUGIN_BLOKIR, ISI_MU_PLUGIN_BLOKIR)
     try:
         buat_job(sesi, site_terpasang.id, JobType.scan_site)
-        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+        assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
         baris = sesi.query(SitePackage).filter_by(
             site_id=site_terpasang.id, slug="hello-dolly/hello.php").one()
         tersedia = baris.versi_tersedia
@@ -186,13 +142,13 @@ def test_scan_saat_wordpress_org_tak_terjangkau_mempertahankan_versi_tersedia(
 
         wpcli("option", "update", "wpmgr_uji_blokir_wporg", "1")
         buat_job(sesi, site_terpasang.id, JobType.scan_site)
-        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+        assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
 
         sesi.refresh(baris)
         assert baris.versi_tersedia == tersedia
     finally:
         _wpcli_status("option", "delete", "wpmgr_uji_blokir_wporg")
-        _hapus_di_kontainer(MU_PLUGIN_BLOKIR)
+        hapus_di_kontainer(MU_PLUGIN_BLOKIR)
 
 
 def test_redirect_permalink_plain_menghasilkan_pesan_yang_bisa_didiagnosis(sesi, site_terpasang):
@@ -216,7 +172,7 @@ def test_redirect_permalink_plain_menghasilkan_pesan_yang_bisa_didiagnosis(sesi,
     wpcli("rewrite", "flush", "--hard")
     try:
         with pytest.raises(SiteError) as exc:
-            _klien_http(site_terpasang, sesi).ping()
+            klien_http(site_terpasang).ping()
         pesan = exc.value.pesan
         assert "permalink" in pesan.lower()
         assert f"{site_terpasang.url}/wp-json/wpmgr/v1/ping/" in pesan
@@ -233,7 +189,7 @@ def test_update_plugin_versi_lama_benar_benar_naik(sesi, site_terpasang):
     wpcli("plugin", "install", "hello-dolly", "--version=1.6", "--force")
 
     buat_job(sesi, site_terpasang.id, JobType.scan_site)
-    proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi))
+    proses_satu(sesi, "e2e", lambda s: klien_http(s))
 
     baris = sesi.query(SitePackage).filter_by(
         site_id=site_terpasang.id, slug="hello-dolly/hello.php").one()
@@ -245,7 +201,7 @@ def test_update_plugin_versi_lama_benar_benar_naik(sesi, site_terpasang):
         "tipe": "plugin", "slug": "hello-dolly/hello.php",
         "dari_versi": "1.6", "ke_versi": target,
     })
-    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+    assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
 
     terpasang = wpcli("plugin", "get", "hello-dolly", "--field=version")
     assert terpasang == target
@@ -269,7 +225,7 @@ def test_update_plugin_aktif_tetap_aktif(sesi, site_terpasang):
     wpcli("plugin", "activate", "hello-dolly")
     try:
         buat_job(sesi, site_terpasang.id, JobType.scan_site)
-        proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi))
+        proses_satu(sesi, "e2e", lambda s: klien_http(s))
         baris = sesi.query(SitePackage).filter_by(
             site_id=site_terpasang.id, slug="hello-dolly/hello.php").one()
         assert baris.versi_tersedia is not None
@@ -279,7 +235,7 @@ def test_update_plugin_aktif_tetap_aktif(sesi, site_terpasang):
             "tipe": "plugin", "slug": "hello-dolly/hello.php",
             "dari_versi": "1.6", "ke_versi": target,
         })
-        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+        assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
 
         sesi.refresh(job)
         assert job.status == JobStatus.success, job.error
@@ -309,7 +265,7 @@ def test_update_ke_versi_yang_tidak_ditawarkan_menjadi_upgrade_failed(sesi, site
         "tipe": "plugin", "slug": "hello-dolly/hello.php",
         "dari_versi": None, "ke_versi": "99.0",
     })
-    assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+    assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
 
     sesi.refresh(job)
     assert job.status == JobStatus.failed
@@ -334,7 +290,7 @@ def test_lock_update_membuat_scan_dan_update_dijadwal_ulang(sesi, site_terpasang
     wpcli("option", "update", "wpmgr_update.lock", str(int(time.time())))
     try:
         job = buat_job(sesi, site_terpasang.id, JobType.scan_site)
-        assert proses_satu(sesi, "e2e", lambda s: _klien_http(s, sesi)) is True
+        assert proses_satu(sesi, "e2e", lambda s: klien_http(s)) is True
         sesi.refresh(job)
         assert job.status == JobStatus.pending
         assert job.error_class == TRANSIENT
@@ -346,7 +302,7 @@ def test_lock_update_membuat_scan_dan_update_dijadwal_ulang(sesi, site_terpasang
         assert site_terpasang.status != SiteStatus.unreachable
 
         with pytest.raises(SiteError) as exc:
-            _klien_http(site_terpasang, sesi).update("plugin", "hello-dolly/hello.php", "99.0")
+            klien_http(site_terpasang).update("plugin", "hello-dolly/hello.php", "99.0")
         assert exc.value.error_class == TRANSIENT
         assert "wpmgr_sibuk" in exc.value.pesan
     finally:
@@ -356,7 +312,7 @@ def test_lock_update_membuat_scan_dan_update_dijadwal_ulang(sesi, site_terpasang
     # apa pun -- persis seperti create_lock() menafsirkannya.
     wpcli("option", "update", "wpmgr_update.lock", str(int(time.time()) - 16 * 60))
     try:
-        assert "plugins" in _klien_http(site_terpasang, sesi).inventory()
+        assert "plugins" in klien_http(site_terpasang).inventory()
     finally:
         _wpcli_status("option", "delete", "wpmgr_update.lock")
 
@@ -371,7 +327,7 @@ def test_versi_core_di_disk_sama_dengan_versi_terpasang(wp_site):
 
 def test_update_kedua_kalinya_adalah_no_op(sesi, site_terpasang):
     versi = wpcli("plugin", "get", "hello-dolly", "--field=version")
-    klien = _klien_http(site_terpasang, sesi)
+    klien = klien_http(site_terpasang)
     hasil = klien.update("plugin", "hello-dolly/hello.php", versi)
     assert hasil["ok"] is True
     assert "sudah di versi tersebut" in hasil["pesan"]

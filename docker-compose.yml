@@ -35,7 +35,11 @@ services:
       WORDPRESS_DB_NAME: wp
     ports: ["8081:80"]
     volumes:
-      - ./connector/wp-manager-connector:/var/www/html/wp-content/plugins/wp-manager-connector
+      # Sumber connector dipasang read-only di luar direktori plugin, lalu
+      # disalin ke direktori plugin oleh fixture e2e. Bind mount langsung ke
+      # wp-content/plugins membuat self-update WordPress menghapus dan menulis
+      # ulang berkas di checkout repo.
+      - ./connector/wp-manager-connector:/opt/wpmgr-connector-src:ro
 
   wpcli:
     image: wordpress:cli-php8.1
