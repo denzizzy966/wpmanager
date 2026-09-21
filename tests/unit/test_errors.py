@@ -200,3 +200,20 @@ def test_pesan_plugin_none_untuk_body_bukan_connector():
     assert pesan_plugin("<html>boom</html>") is None
     assert pesan_plugin('{"code":"rest_no_route","message":"x"}') is None
     assert pesan_plugin('["bukan", "objek"]') is None
+
+
+# --- Task 7: klasifikasi galat self-update ---------------------------------
+
+
+def test_pasang_connector_gagal_menjadi_upgrade_failed():
+    from wpmgr.errors import UPGRADE_FAILED, klasifikasi_respons
+
+    body = '{"code":"wpmgr_pasang_gagal","message":"Could not create directory."}'
+    assert klasifikasi_respons(500, {}, body) == UPGRADE_FAILED
+
+
+def test_paket_connector_rusak_menjadi_bad_response():
+    from wpmgr.errors import BAD_RESPONSE, klasifikasi_respons
+
+    body = '{"code":"wpmgr_paket_rusak","message":"Hash paket tidak cocok dengan isinya."}'
+    assert klasifikasi_respons(400, {}, body) == BAD_RESPONSE

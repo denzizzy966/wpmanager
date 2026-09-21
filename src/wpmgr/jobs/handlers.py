@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from wpmgr.crypto import dekripsi_secret
 from wpmgr.errors import SiteError
+from wpmgr.jobs.monitoring import tangani_update_connector
 from wpmgr.jobs.queue import antrekan_scan, jeda_menit
 from wpmgr.models import (
     ActivityLog,
@@ -312,4 +313,5 @@ HANDLER = {
     JobType.scan_site: tangani_scan_site,
     JobType.update_package: tangani_update_package,
     JobType.verify_site: tangani_verify_site,
+    JobType.update_connector: tangani_update_connector,
 }

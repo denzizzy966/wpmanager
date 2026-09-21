@@ -51,33 +51,43 @@ def buat_job(
     payload: dict | None = None,
     dibuat_oleh: uuid.UUID | None = None,
     scheduled_for: datetime | None = None,
+    max_attempts: int | None = None,
 ) -> Job:
     job = Job(site_id=site_id, tipe=tipe, payload=payload or {}, dibuat_oleh=dibuat_oleh)
     if scheduled_for is not None:
         job.scheduled_for = scheduled_for
+    if max_attempts is not None:
+        job.max_attempts = max_attempts
     sesi.add(job)
     sesi.commit()
     return job
 
 
-def antrekan_scan(sesi: Session, site_id: uuid.UUID) -> Job | None:
-    """Buat scan_site untuk site ini, kecuali sudah ada yang tertunda/berjalan.
+def antrekan_jika_belum(
+    sesi: Session, site_id: uuid.UUID, tipe: JobType, max_attempts: int | None = None
+) -> Job | None:
+    """Buat job bertipe ini untuk site, kecuali sudah ada yang tertunda/berjalan.
 
     Periksa-lalu-sisipkan tidak atomik: dua pemanggil bersamaan bisa sama-sama
-    membuat scan. Itu dibiarkan -- scan ganda hanya membaca inventaris dua
-    kali, sedangkan kunci advisory demi mencegahnya menambah bagian bergerak
-    tanpa melindungi apa pun yang berharga.
+    membuat job. Itu dibiarkan -- semua pemakainya (scan, verify, pengambilan
+    berkala) hanya membaca, jadi job ganda tidak merusak apa pun, sedangkan
+    kunci advisory demi mencegahnya menambah bagian bergerak tanpa
+    melindungi apa pun yang berharga.
     """
     sudah_ada = sesi.scalar(
         select(Job.id).where(
             Job.site_id == site_id,
-            Job.tipe == JobType.scan_site,
+            Job.tipe == tipe,
             Job.status.in_([JobStatus.pending, JobStatus.running]),
         )
     )
     if sudah_ada is not None:
         return None
-    return buat_job(sesi, site_id, JobType.scan_site)
+    return buat_job(sesi, site_id, tipe, max_attempts=max_attempts)
+
+
+def antrekan_scan(sesi: Session, site_id: uuid.UUID) -> Job | None:
+    return antrekan_jika_belum(sesi, site_id, JobType.scan_site)
 
 
 def ambil_job(sesi: Session, worker: str) -> Job | None:

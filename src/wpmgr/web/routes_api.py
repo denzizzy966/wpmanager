@@ -6,7 +6,10 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from wpmgr import db
+from wpmgr.config import get_settings
+from wpmgr.connector_paket import baca_manifest
 from wpmgr.crypto import dekripsi_secret
+from wpmgr.fitur import SELF_UPDATE, punya_fitur
 from wpmgr.jobs.queue import buat_job
 from wpmgr.models import (
     ActivityLog,
@@ -20,6 +23,7 @@ from wpmgr.models import (
     User,
 )
 from wpmgr.sso import buat_token
+from wpmgr.versi import lebih_lama
 from wpmgr.web.auth import pengguna_api
 
 router = APIRouter()
@@ -45,6 +49,10 @@ class PermintaanUpdate(BaseModel):
 
 class PermintaanScan(BaseModel):
     site_id: uuid.UUID
+
+
+class PermintaanUpdateConnector(BaseModel):
+    site_ids: list[uuid.UUID]
 
 
 def _waktu(nilai):
@@ -82,6 +90,7 @@ def daftar_paket(pengguna: PenggunaApi, semua: int = 0):
 
 @router.get("/api/sites")
 def daftar_site(pengguna: PenggunaApi):
+    versi_terbaru = (baca_manifest(get_settings().jalur_connector) or {}).get("versi")
     with db.SessionLocal() as sesi:
         jumlah = (
             select(SitePackage.site_id, func.count().label("n"))
@@ -108,6 +117,9 @@ def daftar_site(pengguna: PenggunaApi):
                 "last_seen_at": _waktu(s.last_seen_at),
                 "last_scan_at": _waktu(s.last_scan_at),
                 "last_error": s.last_error,
+                "connector_version": s.connector_version,
+                "connector_usang": lebih_lama(s.connector_version, versi_terbaru),
+                "bisa_self_update": punya_fitur(s, SELF_UPDATE),
             }
             for s, client_nama, n in sesi.execute(q).all()
         ]
@@ -161,6 +173,38 @@ def buat_job_scan(req: PermintaanScan, pengguna: PenggunaApi):
             raise HTTPException(status_code=404, detail="Site tidak ditemukan")
         job = buat_job(sesi, req.site_id, JobType.scan_site, dibuat_oleh=pengguna.id)
     return {"job_id": job.id}
+
+
+@router.post("/api/jobs/update-connector")
+def buat_job_update_connector(req: PermintaanUpdateConnector, pengguna: PenggunaApi):
+    manifest = baca_manifest(get_settings().jalur_connector)
+    if manifest is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Paket connector belum dibangun di server dashboard. "
+                   "Jalankan: python -m wpmgr.cli build-connector",
+        )
+    with db.SessionLocal() as sesi:
+        # Semua divalidasi sebelum satu job pun dibuat (R46 Lapis 1).
+        sites = []
+        for site_id in req.site_ids:
+            site = sesi.get(Site, site_id)
+            if site is None:
+                raise HTTPException(status_code=404, detail=f"Site {site_id} tidak ditemukan")
+            if not punya_fitur(site, SELF_UPDATE):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Site '{site.nama}' memakai connector yang belum bisa diperbarui "
+                           f"dari dashboard. Pasang connector {manifest['versi']} sekali secara "
+                           f"manual lewat wp-admin.",
+                )
+            sites.append(site)
+        ids = [
+            buat_job(sesi, s.id, JobType.update_connector, {"versi": manifest["versi"]},
+                     dibuat_oleh=pengguna.id).id
+            for s in sites
+        ]
+    return {"job_ids": ids}
 
 
 @router.get("/api/jobs/active")

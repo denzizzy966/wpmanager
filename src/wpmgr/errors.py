@@ -25,6 +25,8 @@ KODE_TIDAK_DITEMUKAN = "wpmgr_tidak_ditemukan"
 KODE_TIDAK_ADA_UPDATE = "wpmgr_tidak_ada_update"
 KODE_SIBUK = "wpmgr_sibuk"
 KODE_UPGRADE_GAGAL = "wpmgr_upgrade_gagal"
+KODE_PASANG_GAGAL = "wpmgr_pasang_gagal"
+KODE_PAKET_RUSAK = "wpmgr_paket_rusak"
 
 
 class SiteError(Exception):
@@ -109,7 +111,7 @@ def klasifikasi_respons(status: int, headers: dict[str, str], body: str) -> str 
     if status == 429:
         return TRANSIENT
     if status >= 500:
-        if kode == KODE_UPGRADE_GAGAL:
+        if kode in (KODE_UPGRADE_GAGAL, KODE_PASANG_GAGAL):
             # Upgrader WordPress sendiri yang menolak (izin berkas, unduhan
             # gagal, PHP terlalu lama). Mengulang tiga kali hanya menghasilkan
             # tiga pesan yang sama.

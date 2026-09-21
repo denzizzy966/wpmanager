@@ -3,6 +3,12 @@
 {% block isi %}
 <div x-data="layarSite()" x-init="muat()">
   <h1>Site</h1>
+  <div class="toolbar">
+    <button @click="perbaruiConnector()" :disabled="terpilih.length === 0 || mengirim">
+      <span x-text="`Perbarui connector (${terpilih.length} terpilih)`"></span>
+    </button>
+  </div>
+  <p class="info" x-show="info" x-text="info" role="status"></p>
   <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
   <div id="grid" style="height: 70vh"></div>
 </div>

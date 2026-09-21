@@ -11,6 +11,9 @@ function layarSite() {
   return {
     grid: null,
     galat: '',
+    terpilih: [],
+    mengirim: false,
+    info: '',
 
     async muat() {
       const data = await (await fetch('/api/sites')).json();
@@ -41,6 +44,14 @@ function layarSite() {
           },
           { dataField: 'wp_version', caption: 'WP' },
           { dataField: 'php_version', caption: 'PHP' },
+          {
+            dataField: 'connector_version',
+            caption: 'Connector',
+            // Versi dilaporkan site client, jadi tetap lewat esc(); kelas
+            // badge hanya salah satu dari dua string tetap.
+            cellTemplate: (v, baris) =>
+              `${esc(v || '—')}${baris.connector_usang ? ' <span class="dg-badge-warning">usang</span>' : ''}`,
+          },
           { dataField: 'jumlah_update', caption: 'Update' },
           { dataField: 'last_seen_at', caption: 'Terakhir Terlihat', dataType: 'date' },
           {
@@ -56,6 +67,7 @@ function layarSite() {
               `<a href="/sites/${esc(id)}">Detail</a>`,
           },
         ],
+        onSelectionChanged: (e) => { this.terpilih = e.rows; },
       });
 
       // Delegasi event pada wadah grid, bukan pada tiap tombol: DataGrid
@@ -95,6 +107,35 @@ function layarSite() {
           this.galat = `Gagal menghubungi server: ${e.message}`;
         }
       });
+    },
+
+    async perbaruiConnector() {
+      this.galat = '';
+      this.info = '';
+      const tidakBisa = this.terpilih.filter((b) => !b.bisa_self_update);
+      if (tidakBisa.length) {
+        this.galat = `${tidakBisa.length} site memakai connector lama yang harus diperbarui ` +
+          'manual sekali lewat wp-admin: ' + tidakBisa.map((b) => b.nama).join(', ');
+        return;
+      }
+      this.mengirim = true;
+      try {
+        const r = await fetch('/api/jobs/update-connector', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ site_ids: this.terpilih.map((b) => b.id) }),
+        });
+        if (!r.ok) {
+          this.galat = `Pembaruan tidak dijadwalkan. ${await pesanGalat(r)}`;
+          return;
+        }
+        const data = await r.json();
+        this.info = `${data.job_ids.length} pembaruan connector dijadwalkan. Pantau hasilnya di halaman Aktivitas.`;
+      } catch (e) {
+        this.galat = `Gagal menghubungi server: ${e.message}`;
+      } finally {
+        this.mengirim = false;
+      }
     },
   };
 }
