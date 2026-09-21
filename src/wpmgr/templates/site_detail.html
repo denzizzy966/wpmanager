@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block judul %}{{ site.nama }} — WP Manager{% endblock %}
+{% block isi %}
+<h1>{{ site.nama }}</h1>
+<p><a href="{{ site.url }}" target="_blank" rel="noopener">{{ site.url }}</a></p>
+<p>Status: <strong>{{ site.status.value }}</strong> ·
+   WP {{ site.wp_version or '—' }} · PHP {{ site.php_version or '—' }} ·
+   Connector {{ site.connector_version or '—' }}</p>
+{% if site.last_error %}<p class="galat">{{ site.last_error }}</p>{% endif %}
+
+<h2>Inventaris ({{ paket|length }})</h2>
+<table>
+  <tr><th>Tipe</th><th>Nama</th><th>Terpasang</th><th>Tersedia</th><th>Aktif</th></tr>
+  {% for p in paket %}
+  <tr>
+    <td>{{ p.tipe.value }}</td><td>{{ p.nama }}</td>
+    <td>{{ p.versi_terpasang }}</td><td>{{ p.versi_tersedia or '—' }}</td>
+    <td>{{ 'ya' if p.aktif else 'tidak' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Riwayat</h2>
+<ul>
+  {% for r in riwayat %}
+  <li>{{ r.dibuat_pada.strftime('%Y-%m-%d %H:%M') }} — [{{ r.level }}] {{ r.pesan }}</li>
+  {% endfor %}
+</ul>
+
+<h2>Cabut site</h2>
+<div x-data="{ konfirmasi: false }">
+  <p>Mencabut site menghapus datanya dari dashboard berikut secret-nya, sehingga
+     dashboard ini tidak lagi dapat memerintah site tersebut. Plugin
+     <code>wp-manager-connector</code> dan user <code>wpmgr</code> di site itu
+     harus dihapus manual lewat wp-admin.</p>
+  <button x-show="!konfirmasi" @click="konfirmasi = true">Cabut site ini</button>
+  <div x-show="konfirmasi">
+    <p><strong>Yakin mencabut {{ site.nama }}?</strong></p>
+    <button @click="
+      fetch('/api/sites/{{ site.id }}', { method: 'DELETE' })
+        .then(() => window.location = '/sites')">Ya, cabut</button>
+    <button @click="konfirmasi = false">Batal</button>
+  </div>
+</div>
+{% endblock %}

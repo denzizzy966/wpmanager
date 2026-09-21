@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block judul %}Aktivitas — WP Manager{% endblock %}
+{% block isi %}
+<h1>Aktivitas</h1>
+<table>
+  <tr><th>Waktu</th><th>Site</th><th>Level</th><th>Pesan</th></tr>
+  {% for log, site_nama in baris %}
+  <tr>
+    <td>{{ log.dibuat_pada.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td>{{ site_nama or '—' }}</td>
+    <td>{{ log.level }}</td>
+    <td>{{ log.pesan }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

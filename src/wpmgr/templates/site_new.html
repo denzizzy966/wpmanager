@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block judul %}Tambah Site — WP Manager{% endblock %}
+{% block isi %}
+<h1>Tambah Site</h1>
+{% if galat %}<p class="galat">{{ galat }}</p>{% endif %}
+
+{% if kunci %}
+  <h2>Kunci koneksi</h2>
+  <p>Pasang plugin <code>wp-manager-connector</code> di site tersebut, buka
+     <strong>Pengaturan → WP Manager</strong>, lalu tempel kunci ini:</p>
+  <textarea rows="4" cols="90" readonly>{{ kunci }}</textarea>
+  <p>Kunci ini hanya ditampilkan sekali. Setelah connector mengonfirmasi,
+     status site akan berubah di halaman <a href="/sites">Site</a>.</p>
+{% else %}
+  <form method="post" action="/sites">
+    <p><label>Nama<br><input name="nama" required></label></p>
+    <p><label>URL (wajib https)<br>
+       <input name="url" required placeholder="https://client.example.com"></label></p>
+    <p><button type="submit">Buat dan tampilkan kunci</button></p>
+  </form>
+{% endif %}
+{% endblock %}

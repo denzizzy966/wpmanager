@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block judul %}Semua Update — WP Manager{% endblock %}
+{% block isi %}
+<div x-data="layarUpdate()" x-init="muat()">
+  <h1>Semua Update</h1>
+
+  <div class="toolbar">
+    <button @click="jalankanUpdate()" :disabled="terpilih.length === 0 || berjalan">
+      <span x-text="berjalan ? 'Sedang berjalan…' : `Update ${terpilih.length} item terpilih`"></span>
+    </button>
+    <button @click="muat()" :disabled="berjalan">Muat ulang</button>
+  </div>
+
+  <div x-show="progres.length" class="progres">
+    <template x-for="j in progres" :key="j.id">
+      <div>
+        <span x-text="j.site_nama"></span> —
+        <span x-text="j.slug || j.tipe"></span> —
+        <span x-text="j.status"></span>
+      </div>
+    </template>
+  </div>
+
+  <div id="grid" style="height: 70vh"></div>
+</div>
+<script src="/static/app/updates.js"></script>
+{% endblock %}

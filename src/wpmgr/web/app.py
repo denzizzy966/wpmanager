@@ -1,13 +1,13 @@
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from wpmgr.config import get_settings
-from wpmgr.web.auth import KUNCI_SESI, ButuhLogin, pengguna_saat_ini, periksa_sandi
+from wpmgr.web.auth import KUNCI_SESI, ButuhLogin, periksa_sandi
 
 AKAR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(AKAR / "templates"))
@@ -27,15 +27,6 @@ def buat_app() -> FastAPI:
     @app.exception_handler(ButuhLogin)
     async def _ke_login(request: Request, exc: ButuhLogin):
         return RedirectResponse("/login", status_code=303)
-
-    # SEMENTARA — Task 21 mendaftarkan "/" di routes_pages.py dan HARUS
-    # menghapus route ini. Starlette tidak mengeluh atas path ganda; ia
-    # mencocokkan yang terdaftar lebih dulu, sehingga halaman asli tidak akan
-    # pernah tercapai dan tidak ada pesan error apa pun yang muncul.
-    @app.get("/", response_class=HTMLResponse)
-    async def beranda(request: Request):
-        pengguna = pengguna_saat_ini(request)
-        return f"<p>Masuk sebagai {pengguna.email}</p>"
 
     @app.get("/login")
     async def form_login(request: Request):

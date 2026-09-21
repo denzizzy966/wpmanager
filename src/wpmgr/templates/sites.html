@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block judul %}Site — WP Manager{% endblock %}
+{% block isi %}
+<div x-data="layarSite()" x-init="muat()">
+  <h1>Site</h1>
+  <div id="grid" style="height: 70vh"></div>
+</div>
+<script src="/static/app/sites.js"></script>
+{% endblock %}
