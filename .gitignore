@@ -26,6 +26,12 @@ Thumbs.db
 # Riwayat sesi Claude Code
 .remember/
 
+# Ruang kerja superpowers (ledger SDD, mockup brainstorming)
+.superpowers/
+
+# Artefak runtime dashboard (zip connector, database GeoIP)
+var/
+
 # PHP (connector)
 connector/vendor/
 connector/.phpunit.result.cache
