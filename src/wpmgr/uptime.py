@@ -4,11 +4,25 @@ Bagian penilaian murni (tanpa jaringan dan database) supaya aturan yang
 menentukan kapan sebuah site dinyatakan mati bisa diuji langsung.
 """
 
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from wpmgr.models import UptimeHasil, UptimeStatus
+from wpmgr.models import (
+    Site,
+    SiteStatus,
+    UptimeCheck,
+    UptimeHasil,
+    UptimeInsiden,
+    UptimePutaran,
+    UptimeStatus,
+)
 
 GAGAL_UNTUK_MATI = 2
 MIN_SITE_ATURAN_GANGGUAN = 5
@@ -102,3 +116,96 @@ def terapkan(status_lama: UptimeStatus, gagal_beruntun: int, hasil: UptimeHasil)
     if baru >= GAGAL_UNTUK_MATI:
         return Transisi(UptimeStatus.mati, baru, status_lama != UptimeStatus.mati, False)
     return Transisi(status_lama, baru, False, False)
+
+
+UA = "WPManager-Uptime/2.0"
+TIMEOUT = 15.0
+MAKS_REDIRECT = 5
+MAKS_PARALEL = 10
+
+
+def buat_klien_http(transport: httpx.BaseTransport | None = None) -> httpx.Client:
+    return httpx.Client(
+        follow_redirects=True, max_redirects=MAKS_REDIRECT, timeout=TIMEOUT,
+        headers={"User-Agent": UA}, transport=transport,
+    )
+
+
+def cek_satu(client: httpx.Client, url: str) -> HasilCek:
+    mulai = time.monotonic()
+    try:
+        r = client.get(url)
+    except httpx.HTTPError as exc:
+        return nilai_kesalahan(exc)
+    return nilai_respons(r.status_code, dict(r.headers), r.text,
+                         int((time.monotonic() - mulai) * 1000))
+
+
+def _awal_deret_gagal(sesi: Session, site_id, sekarang: datetime) -> datetime:
+    """Waktu kegagalan pertama dalam deret yang baru mencapai ambang."""
+    waktu = sesi.scalars(
+        select(UptimeCheck.dicek_pada)
+        .join(UptimePutaran, UptimePutaran.id == UptimeCheck.putaran_id)
+        .where(
+            UptimeCheck.site_id == site_id,
+            UptimeCheck.hasil == UptimeHasil.gagal,
+            UptimeCheck.dicek_pada < sekarang,
+            UptimePutaran.gangguan_dashboard.is_(False),
+        )
+        .order_by(UptimeCheck.dicek_pada.desc())
+        .limit(GAGAL_UNTUK_MATI - 1)
+    ).all()
+    return waktu[-1] if waktu else sekarang
+
+
+def _terapkan_ke_site(sesi: Session, site: Site, h: HasilCek, sekarang: datetime) -> None:
+    t = terapkan(site.uptime_status, site.uptime_gagal_beruntun, h.hasil)
+    terbuka = sesi.scalar(
+        select(UptimeInsiden).where(
+            UptimeInsiden.site_id == site.id, UptimeInsiden.selesai.is_(None)
+        )
+    )
+    sejak = sekarang
+    if t.buka_insiden and terbuka is None:
+        sejak = _awal_deret_gagal(sesi, site.id, sekarang)
+        sesi.add(UptimeInsiden(
+            site_id=site.id, mulai=sejak,
+            penyebab=h.pesan or f"HTTP {h.http_status}", http_status=h.http_status,
+        ))
+    if t.tutup_insiden and terbuka is not None:
+        terbuka.selesai = sekarang
+    if t.status != site.uptime_status:
+        site.uptime_sejak = sejak
+    site.uptime_status = t.status
+    site.uptime_gagal_beruntun = t.gagal_beruntun
+
+
+def jalankan_putaran(
+    sesi: Session, cek_fn: Callable[[str], HasilCek], sekarang: datetime | None = None
+) -> UptimePutaran | None:
+    sites = sesi.scalars(
+        select(Site).where(Site.status != SiteStatus.disabled).order_by(Site.nama)
+    ).all()
+    if not sites:
+        return None
+
+    with ThreadPoolExecutor(max_workers=MAKS_PARALEL) as ex:
+        hasil = list(ex.map(cek_fn, [s.url for s in sites]))
+
+    sekarang = sekarang or datetime.now(timezone.utc)
+    jumlah_gagal = sum(1 for h in hasil if h.hasil == UptimeHasil.gagal)
+    gangguan = gangguan_dashboard(len(sites), jumlah_gagal)
+    putaran = UptimePutaran(mulai=sekarang, jumlah_site=len(sites),
+                            jumlah_gagal=jumlah_gagal, gangguan_dashboard=gangguan)
+    sesi.add(putaran)
+    sesi.flush()
+
+    for site, h in zip(sites, hasil):
+        sesi.add(UptimeCheck(
+            putaran_id=putaran.id, site_id=site.id, dicek_pada=sekarang, hasil=h.hasil,
+            http_status=h.http_status, waktu_ms=h.waktu_ms, pesan=h.pesan,
+        ))
+        if not gangguan:
+            _terapkan_ke_site(sesi, site, h, sekarang)
+    sesi.commit()
+    return putaran
