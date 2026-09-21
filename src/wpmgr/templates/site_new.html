@@ -2,6 +2,10 @@
 {% block judul %}Tambah Site — WP Manager{% endblock %}
 {% block isi %}
 <h1>Tambah Site</h1>
+<p>
+  <a href="/connector/unduh">Unduh plugin connector</a>{% if versi_connector %} (versi {{ versi_connector }}){% endif %}.
+  Pasang di site klien lewat <strong>Plugin → Tambah Baru → Unggah Plugin</strong>.
+</p>
 {% if galat %}<p class="galat">{{ galat }}</p>{% endif %}
 
 {% if kunci %}

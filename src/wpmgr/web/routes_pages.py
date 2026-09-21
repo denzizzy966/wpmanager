@@ -2,10 +2,13 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from wpmgr import db
+from wpmgr.config import get_settings
+from wpmgr.connector_paket import NAMA_ZIP, baca_manifest
 from wpmgr.models import ActivityLog, Site, SitePackage, User
 from wpmgr.pairing import buat_site
 from wpmgr.web.auth import pengguna_saat_ini
@@ -23,6 +26,11 @@ def _tpl():
     from wpmgr.web.app import templates
 
     return templates
+
+
+def _versi_connector() -> str | None:
+    manifest = baca_manifest(get_settings().jalur_connector)
+    return manifest["versi"] if manifest else None
 
 
 @router.get("/")
@@ -49,11 +57,26 @@ def halaman_activity(request: Request, pengguna: PenggunaHalaman):
     )
 
 
+@router.get("/connector/unduh")
+def unduh_connector(pengguna: PenggunaHalaman):
+    folder = get_settings().jalur_connector
+    manifest = baca_manifest(folder)
+    if manifest is None or not (folder / NAMA_ZIP).exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Paket connector belum dibangun. Jalankan: python -m wpmgr.cli build-connector",
+        )
+    return FileResponse(
+        folder / NAMA_ZIP, media_type="application/zip",
+        filename=f"wp-manager-connector-{manifest['versi']}.zip",
+    )
+
+
 @router.get("/sites/new")
 def form_site_baru(request: Request, pengguna: PenggunaHalaman):
     return _tpl().TemplateResponse(
         request, "site_new.html",
-        {"pengguna": pengguna, "kunci": None, "galat": None, "nama": "", "url": ""},
+        {"pengguna": pengguna, "kunci": None, "galat": None, "nama": "", "url": "", "versi_connector": _versi_connector()},
     )
 
 
@@ -69,7 +92,7 @@ def simpan_site(
             site, kunci = buat_site(sesi, nama, url, None, pengguna.id)
             konteks = {
                 "pengguna": pengguna, "kunci": kunci, "galat": None,
-                "site": site, "nama": nama, "url": url,
+                "site": site, "nama": nama, "url": url, "versi_connector": _versi_connector(),
             }
     except ValueError as exc:
         # URL tanpa https:// atau nilai tak sah lain — pesannya berasal dari
@@ -78,7 +101,7 @@ def simpan_site(
         # orang paling malas mengetik ulang URL yang panjang.
         konteks = {
             "pengguna": pengguna, "kunci": None, "galat": str(exc),
-            "nama": nama, "url": url,
+            "nama": nama, "url": url, "versi_connector": _versi_connector(),
         }
     except IntegrityError:
         # Site.url unik: pengiriman kedua untuk URL yang sama meledak di
@@ -90,7 +113,7 @@ def simpan_site(
         konteks = {
             "pengguna": pengguna, "kunci": None,
             "galat": "URL tersebut sudah terdaftar sebagai site lain.",
-            "nama": nama, "url": url,
+            "nama": nama, "url": url, "versi_connector": _versi_connector(),
         }
     return _tpl().TemplateResponse(request, "site_new.html", konteks)
 

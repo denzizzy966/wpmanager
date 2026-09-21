@@ -59,3 +59,42 @@ def site(sesi):
     sesi.add(s)
     sesi.commit()
     return s
+
+
+@pytest.fixture
+def pengguna_uji(sesi):
+    from argon2 import PasswordHasher
+
+    from wpmgr.models import User
+
+    u = User(id=uuid.uuid4(), email="a@b.test", nama="Uji",
+             password_hash=PasswordHasher().hash("sandi"))
+    sesi.add(u)
+    sesi.commit()
+    return u
+
+
+@pytest.fixture
+def klien_web(engine, monkeypatch, pengguna_uji):
+    """TestClient yang sudah login. base_url https: cookie sesi bertanda Secure."""
+    from fastapi.testclient import TestClient
+
+    from wpmgr import db
+    from wpmgr.web.app import buat_app
+
+    monkeypatch.setattr(
+        db, "SessionLocal", sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    )
+    c = TestClient(buat_app(), follow_redirects=False, base_url="https://testserver")
+    c.post("/login", data={"email": "a@b.test", "password": "sandi"})
+    return c
+
+
+@pytest.fixture
+def var_sementara(tmp_path, monkeypatch):
+    """WPMGR_VAR_DIR diarahkan ke direktori sementara untuk satu test."""
+    from wpmgr.config import get_settings
+
+    monkeypatch.setenv("WPMGR_VAR_DIR", str(tmp_path / "var"))
+    get_settings.cache_clear()
+    return tmp_path / "var"

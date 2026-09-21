@@ -1,10 +1,13 @@
 import argparse
 import sys
 import uuid
+from pathlib import Path
 
 from argon2 import PasswordHasher
 from sqlalchemy import select
 
+from wpmgr.config import get_settings
+from wpmgr.connector_paket import bangun_paket, sumber_bawaan
 from wpmgr.db import get_session
 from wpmgr.jobs.queue import antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
@@ -46,6 +49,17 @@ def create_user(email: str, nama: str, password: str) -> None:
     print(f"User {email} dibuat")
 
 
+def build_connector(sumber: str | None = None) -> dict:
+    manifest = bangun_paket(
+        Path(sumber) if sumber else sumber_bawaan(), get_settings().jalur_connector
+    )
+    print(
+        f"Connector {manifest['versi']} dibangun ({manifest['ukuran']} byte), "
+        f"sha256 {manifest['sha256']}"
+    )
+    return manifest
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wpmgr")
     sub = parser.add_subparsers(dest="perintah", required=True)
@@ -55,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--email", required=True)
     p.add_argument("--nama", required=True)
     p.add_argument("--password", required=True)
+    b = sub.add_parser("build-connector")
+    b.add_argument("--sumber", default=None)
 
     args = parser.parse_args(argv)
     if args.perintah == "enqueue-scans":
@@ -63,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
         reap_jobs()
     elif args.perintah == "create-user":
         create_user(args.email, args.nama, args.password)
+    elif args.perintah == "build-connector":
+        build_connector(args.sumber)
     return 0
 
 
