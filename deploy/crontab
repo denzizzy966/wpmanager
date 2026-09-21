@@ -1,0 +1,3 @@
+# deploy/crontab — pasang dengan: crontab -u wpmgr deploy/crontab
+0   *  * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli enqueue-scans >> /var/log/wpmgr/cron.log 2>&1
+*/5 *  * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli reap-jobs     >> /var/log/wpmgr/cron.log 2>&1

@@ -1,0 +1,14 @@
+[Unit]
+Description=WP Manager web
+After=network.target postgresql.service
+
+[Service]
+User=wpmgr
+WorkingDirectory=/opt/wpmgr
+EnvironmentFile=/opt/wpmgr/.env
+ExecStart=/opt/wpmgr/.venv/bin/uvicorn wpmgr.web.app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
