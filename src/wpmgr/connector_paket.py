@@ -24,7 +24,7 @@ def sumber_bawaan() -> Path:
 
 def versi_dari_header(berkas_utama: Path) -> str:
     teks = berkas_utama.read_text(encoding="utf-8")
-    cocok = re.search(r"^\s*\*\s*Version:\s*(\S+)", teks, re.M)
+    cocok = re.search(r"^\s*\*\s*Version:\s*(\S+)", teks, re.MULTILINE)
     if cocok is None:
         raise ValueError(f"Header 'Version:' tidak ditemukan di {berkas_utama}")
     return cocok.group(1)

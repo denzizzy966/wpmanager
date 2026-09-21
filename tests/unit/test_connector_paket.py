@@ -7,8 +7,8 @@ import pytest
 from wpmgr.connector_paket import (
     NAMA_MANIFEST,
     NAMA_ZIP,
-    bangun_paket,
     baca_manifest,
+    bangun_paket,
     versi_dari_header,
 )
 
