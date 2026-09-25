@@ -47,4 +47,14 @@ final class SkemaTest extends TestCase {
         $this->assertFalse( WPMGR_REST::perlu_anti_cache( '/wpmgr/v10/ping' ) );
         $this->assertFalse( WPMGR_REST::perlu_anti_cache( '' ) );
     }
+
+    public function test_isi_mu_plugin_punya_semua_penjaga(): void {
+        $isi = WPMGR_Skema::isi_mu_plugin();
+        $this->assertStringStartsWith( '<?php', $isi );
+        $this->assertStringContainsString( 'WPMGR_DISABLE_MONITORING', $isi );
+        $this->assertStringContainsString( "'active_plugins'", $isi );
+        $this->assertStringContainsString( "'wp-manager-connector/wp-manager-connector.php'", $isi );
+        $this->assertStringContainsString( 'is_readable', $isi );
+        $this->assertStringContainsString( 'WPMGR_Penangkap::pasang()', $isi );
+    }
 }

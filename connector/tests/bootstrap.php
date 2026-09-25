@@ -51,6 +51,7 @@ if ( ! function_exists( 'is_wp_error' ) ) {
 }
 
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-skema.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-penangkap.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-settings.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-rest.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-updater.php';

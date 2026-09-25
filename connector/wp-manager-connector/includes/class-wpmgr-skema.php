@@ -36,9 +36,50 @@ class WPMGR_Skema {
         return array( 'self_update' );
     }
 
-    /** Belum ada penangkap error di versi ini; dilaporkan null. */
     public static function mode_penangkap() {
-        return null;
+        if ( self::monitoring_mati() ) {
+            return null;
+        }
+        return ( defined( 'WPMU_PLUGIN_DIR' ) && file_exists( WPMU_PLUGIN_DIR . '/' . self::MU_PLUGIN ) )
+            ? 'penuh' : 'terbatas';
+    }
+
+    /**
+     * Isi mu-plugin pemuat. Tetap diam bila connector dinonaktifkan atau
+     * dihapus: menghentikan connector berarti menghentikan pemantauan.
+     */
+    public static function isi_mu_plugin() {
+        return <<<'PHP'
+<?php
+/**
+ * Plugin Name: WP Manager — penangkap error
+ * Description: Dipasang otomatis oleh WP Manager Connector supaya fatal error dari plugin lain ikut tertangkap. Aman dihapus; connector akan memasangnya lagi saat pembaruan skema berikutnya.
+ */
+if ( defined( 'WPMGR_DISABLE_MONITORING' ) && WPMGR_DISABLE_MONITORING ) {
+    return;
+}
+if ( ! in_array( 'wp-manager-connector/wp-manager-connector.php', (array) get_option( 'active_plugins', array() ), true ) ) {
+    return;
+}
+$wpmgr_penangkap = WP_PLUGIN_DIR . '/wp-manager-connector/includes/class-wpmgr-penangkap.php';
+if ( ! is_readable( $wpmgr_penangkap ) ) {
+    return;
+}
+require_once $wpmgr_penangkap;
+WPMGR_Penangkap::pasang();
+PHP;
+    }
+
+    public static function tulis_mu_plugin() {
+        if ( ! defined( 'WPMU_PLUGIN_DIR' ) || self::monitoring_mati() ) {
+            return false;
+        }
+        if ( ! is_dir( WPMU_PLUGIN_DIR ) && ! wp_mkdir_p( WPMU_PLUGIN_DIR ) ) {
+            return false;
+        }
+        // Gagal menulis (hosting mengunci mu-plugins) bukan kesalahan: connector
+        // memasang penangkap dari dirinya sendiri dan melaporkan mode 'terbatas'.
+        return false !== @file_put_contents( WPMU_PLUGIN_DIR . '/' . self::MU_PLUGIN, self::isi_mu_plugin() ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
     }
 
     public static function perlu_migrasi( $versi_tersimpan, $versi_kode ) {
@@ -131,6 +172,7 @@ class WPMGR_Skema {
         global $wpdb;
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         dbDelta( self::sql_tabel( $wpdb->prefix, $wpdb->get_charset_collate() ) );
+        self::tulis_mu_plugin();
         if ( ! wp_next_scheduled( self::HOOK_PANGKAS ) ) {
             wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::HOOK_PANGKAS );
         }

@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 define( 'WPMGR_VERSION', '2.0.0' );
-define( 'WPMGR_VERSI_SKEMA', 1 );
+define( 'WPMGR_VERSI_SKEMA', 2 );
 define( 'WPMGR_JENDELA_DETIK', 300 );
 define( 'WPMGR_NONCE_TTL', 600 );
 define( 'WPMGR_SSO_TTL', 120 );
@@ -24,6 +24,7 @@ define( 'WPMGR_DIR', plugin_dir_path( __FILE__ ) );
 require_once WPMGR_DIR . 'includes/class-wpmgr-signing.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-settings.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-skema.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-penangkap.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-inventory.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-updater.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-selfupdate.php';
@@ -37,3 +38,10 @@ add_filter( 'rest_post_dispatch', array( 'WPMGR_REST', 'tambah_header_anti_cache
 add_action( 'admin_menu', array( 'WPMGR_Settings', 'daftarkan_menu' ) );
 add_action( 'admin_init', array( 'WPMGR_Settings', 'tangani_simpan' ) );
 add_action( 'init', array( 'WPMGR_SSO', 'tangani_permintaan' ), 1 );
+
+// Pemasang pemantauan. Bila mu-plugin sudah memasang penangkap, panggilan
+// pertama tidak melakukan apa-apa; bila belum (mu-plugins terkunci), inilah
+// pemasangan paling awal yang bisa dilakukan dari plugin biasa.
+if ( ! WPMGR_Skema::monitoring_mati() ) {
+    WPMGR_Penangkap::pasang();
+}
