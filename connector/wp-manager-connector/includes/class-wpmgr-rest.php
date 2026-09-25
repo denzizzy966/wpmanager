@@ -39,6 +39,20 @@ class WPMGR_REST {
             'callback'            => array( __CLASS__, 'events' ),
             'permission_callback' => $guard,
         ) );
+
+        // Satu-satunya route tanpa HMAC: dipanggil browser pengunjung. Tidak
+        // pernah membaca atau mengembalikan data.
+        register_rest_route( self::NS, '/hit', array(
+            'methods'             => 'POST',
+            'callback'            => array( 'WPMGR_Traffic', 'tangani_hit' ),
+            'permission_callback' => '__return_true',
+        ) );
+
+        register_rest_route( self::NS, '/traffic', array(
+            'methods'             => 'GET',
+            'callback'            => array( __CLASS__, 'traffic' ),
+            'permission_callback' => $guard,
+        ) );
     }
 
     private static function tolak( $pesan ) {
@@ -165,5 +179,9 @@ class WPMGR_REST {
         return rest_ensure_response(
             WPMGR_Events::kumpulkan( $request->get_param( 'kursor' ), $request->get_param( 'batas' ) )
         );
+    }
+
+    public static function traffic( $request ) {
+        return rest_ensure_response( WPMGR_Traffic::kumpulkan( $request->get_param( 'dari' ) ) );
     }
 }

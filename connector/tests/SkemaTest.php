@@ -4,7 +4,7 @@ use PHPUnit\Framework\TestCase;
 final class SkemaTest extends TestCase {
 
     public function test_fitur_yang_diumumkan(): void {
-        $this->assertSame( array( 'self_update', 'events' ), WPMGR_Skema::fitur( false ) );
+        $this->assertSame( array( 'self_update', 'events', 'traffic' ), WPMGR_Skema::fitur( false ) );
         // Self-update bukan pemantauan: tetap tersedia walau pemantauan dimatikan.
         $this->assertSame( array( 'self_update' ), WPMGR_Skema::fitur( true ) );
     }

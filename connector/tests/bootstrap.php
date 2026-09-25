@@ -93,6 +93,7 @@ require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-settings.p
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-ip.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-login.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-events.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-traffic.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-rest.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-updater.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-selfupdate.php';

@@ -36,6 +36,7 @@ class WPMGR_Skema {
         $fitur = array( 'self_update' );
         if ( ! $monitoring_mati ) {
             $fitur[] = 'events';
+            $fitur[] = 'traffic';
         }
         return $fitur;
     }

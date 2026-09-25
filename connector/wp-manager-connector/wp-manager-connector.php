@@ -26,6 +26,7 @@ require_once WPMGR_DIR . 'includes/class-wpmgr-settings.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-ip.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-login.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-events.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-traffic.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-skema.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-penangkap.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-inventory.php';
@@ -48,4 +49,5 @@ add_action( 'init', array( 'WPMGR_SSO', 'tangani_permintaan' ), 1 );
 if ( ! WPMGR_Skema::monitoring_mati() ) {
     WPMGR_Penangkap::pasang();
     WPMGR_Login::pasang();
+    WPMGR_Traffic::pasang();
 }
