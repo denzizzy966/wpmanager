@@ -241,6 +241,28 @@ final class PenangkapTest extends TestCase {
         $this->assertCount( 1, $sisipan );
     }
 
+    public function test_insert_sidik_baru_adalah_upsert_untuk_menangani_race_kunci_unik(): void {
+        // sidik_jari punya UNIQUE KEY. UPDATE-dulu tidak menemukan baris
+        // (rows_affected 0, sidik belum ada di 'ada'), tapi request lain bisa
+        // saja menang menyisipkan sidik yang sama sebelum INSERT kita
+        // sendiri berjalan -- burst fatal error serentak adalah persis kasus
+        // yang ditangkap fitur ini. INSERT polos akan gagal kena kunci unik
+        // dan kejadian itu hilang diam-diam; INSERT harus berupa upsert.
+        $wpdb            = new WPMGR_FakeWpdbPenangkap( 0 );
+        $GLOBALS['wpdb'] = $wpdb;
+
+        WPMGR_Penangkap::reset_untuk_test( null );
+        WPMGR_Penangkap::catat_fatal( array( 'type' => E_ERROR, 'message' => 'baru', 'file' => '/tmp/baru.php', 'line' => 1 ) );
+        WPMGR_Penangkap::saat_shutdown();
+
+        $sisipan = array_values( array_filter( $wpdb->queries, function ( $q ) {
+            return false !== strpos( $q['sql'], 'INSERT' );
+        } ) );
+        $this->assertCount( 1, $sisipan );
+        $this->assertStringContainsString( 'ON DUPLICATE KEY UPDATE', $sisipan[0]['sql'] );
+        $this->assertStringContainsString( 'jumlah = jumlah + VALUES(jumlah)', $sisipan[0]['sql'] );
+    }
+
     public function test_tulis_tidak_menulis_saat_koneksi_terputus(): void {
         $wpdb            = new WPMGR_FakeWpdbPenangkap( 0, array(), false );
         $GLOBALS['wpdb'] = $wpdb;

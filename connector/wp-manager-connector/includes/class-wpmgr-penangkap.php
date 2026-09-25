@@ -269,9 +269,22 @@ class WPMGR_Penangkap {
                     // Tabel penuh: sidik baru menunggu pemangkasan harian.
                     continue;
                 }
+                // ON DUPLICATE KEY UPDATE, bukan INSERT polos: sidik_jari punya
+                // UNIQUE KEY, dan UPDATE di atas baru saja tidak menemukan
+                // baris ini -- tapi request lain yang mencatat sidik baru yang
+                // sama bisa saja menang duluan di antara UPDATE dan INSERT
+                // kita (burst fatal error serentak, kasus utama fitur ini).
+                // Tanpa upsert, INSERT kedua itu gagal karena kunci unik dan
+                // wpdb::query() melaporkannya sebagai false -- kejadian itu
+                // hilang diam-diam. Dengan upsert ia melebur ke baris yang
+                // menang, dengan semantik yang sama seperti UPDATE di atas
+                // (jumlah bertambah, terakhir/diubah ikut baris terbaru).
+                // Batas keras tidak terpengaruh: race hanya bisa melebur ke
+                // baris yang sudah ada, tidak pernah menambah baris baru.
                 $wpdb->query( $wpdb->prepare(
                     "INSERT INTO {$tabel} (sidik_jari, tingkat, komponen_tipe, komponen_slug, pesan, file, baris, konteks, jumlah, pertama, terakhir, diubah)
-                     VALUES (%s, %s, %s, %s, %s, %s, %d, %s, %d, %d, %d, %d)",
+                     VALUES (%s, %s, %s, %s, %s, %s, %d, %s, %d, %d, %d, %d)
+                     ON DUPLICATE KEY UPDATE jumlah = jumlah + VALUES(jumlah), terakhir = VALUES(terakhir), diubah = VALUES(diubah)",
                     $sidik, $k['tingkat'], $k['komponen_tipe'], (string) $k['komponen_slug'], $k['pesan'],
                     $k['file'], $k['baris'], $konteks, $k['jumlah'], $sekarang, $sekarang, $sekarang
                 ) );
