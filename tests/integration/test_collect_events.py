@@ -1,10 +1,14 @@
 import copy
+import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from wpmgr.errors import BAD_RESPONSE, SiteError
+from wpmgr.jobs import monitoring
 from wpmgr.jobs.monitoring import tangani_collect_events
 from wpmgr.jobs.queue import buat_job
 from wpmgr.models import (
@@ -187,3 +191,153 @@ def test_enqueue_monitoring_hanya_site_aktif_berfitur(sesi, site, engine, monkey
     job = sesi.query(Job).filter_by(tipe=JobType.collect_events).one()
     assert job.site_id == site.id
     assert job.max_attempts == 1
+
+
+# --- Fix round 1: baris beracun tidak boleh menggagalkan seluruh halaman. ---
+
+
+def test_pesan_dengan_nul_byte_dibersihkan(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["pesan"] = "Uncaught Error: \x00 x()"
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil["errors"] == 1
+    e = sesi.query(CatatanError).one()
+    assert "\x00" not in e.pesan
+    sesi.refresh(site)
+    assert site.events_kursor == payload["kursor"]
+
+
+def test_baris_overflow_disimpan_sebagai_none(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["baris"] = 2**40
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil["errors"] == 1
+    assert sesi.query(CatatanError).one().baris is None
+
+
+def test_konteks_dengan_nul_dibersihkan(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["konteks"] = {"path": "/a\x00b", "jenis": "depan"}
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil["errors"] == 1
+    e = sesi.query(CatatanError).one()
+    assert e.konteks["path"] == "/ab"
+
+
+def test_lone_surrogate_dibersihkan(sesi, site):
+    """httpx menolak meng-encode surrogate lepas lewat kwarg `json=` (ia
+    memakai ensure_ascii=False), padahal justru itulah yang senyatanya
+    diterima dari site: JSON teks aman-ASCII (escape `\\udc00`) yang oleh
+    json.loads dibaca ulang menjadi satu code point surrogate lepas. Body
+    respons di sini ditulis manual dengan json.dumps(ensure_ascii=True) milik
+    stdlib supaya skenario itu tereproduksi apa adanya."""
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["pesan"] = "abc\udc00def"
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+
+    def handler(request):
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+
+    klien = SiteClient("https://contoh.test", "s", "f" * 64,
+                       client=httpx.Client(transport=httpx.MockTransport(handler)))
+    job = buat_job(sesi, site.id, JobType.collect_events)
+    hasil = tangani_collect_events(sesi, job, klien)
+    assert hasil["errors"] == 1
+    e = sesi.query(CatatanError).one()
+    assert "\udc00" not in e.pesan
+
+
+def test_kegagalan_db_dilewati_via_savepoint(sesi, site, monkeypatch):
+    """Validator sendiri dianggap bisa punya bug: nilai yang lolos validasi
+    tetapi tetap ditolak database harus melewati baris itu saja, bukan
+    menggagalkan seluruh halaman -- ini membuktikan jalur savepoint bekerja
+    dengan sendirinya, terlepas dari validasi di 1a."""
+    asli = monitoring._baris_kolom
+
+    def _baris_bocor(nilai):
+        if nilai == 999999999999:
+            return 2**40  # lolos validasi kita, tetap di luar jangkauan `integer`
+        return asli(nilai)
+
+    monkeypatch.setattr(monitoring, "_baris_kolom", _baris_bocor)
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["baris"] = 999999999999
+    payload["errors"].append({**PAYLOAD["errors"][0], "sidik_jari": "b" * 32, "baris": 12})
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil["errors"] == 1
+    sisa = sesi.query(CatatanError).one()
+    assert sisa.sidik_jari == "b" * 32
+    sesi.refresh(site)
+    assert site.events_kursor == payload["kursor"]
+
+
+def test_respons_bukan_dict_menimbulkan_bad_response(sesi, site):
+    with pytest.raises(SiteError) as exc:
+        jalankan(sesi, site, [[]])
+    assert exc.value.error_class == BAD_RESPONSE
+
+
+def test_jumlah_negatif_dijepit_ke_satu(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["jumlah"] = -5
+    payload["login_gagal"][0]["jumlah"] = -10
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil == {"errors": 1, "logins": 1, "login_gagal": 1, "halaman": 1}
+    assert sesi.query(CatatanError).one().jumlah == 1
+    assert sesi.query(LoginGagal).one().jumlah == 1
+
+
+def test_login_gagal_jumlah_overflow_dijepit(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["login_gagal"][0]["jumlah"] = 2**40
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil["login_gagal"] == 1
+    assert sesi.query(LoginGagal).one().jumlah == 2**31 - 1
+
+
+def test_id_login_di_luar_jangkauan_bigint_dilewati(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["logins"][0]["id"] = 2**70
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil["logins"] == 0
+    assert sesi.query(KejadianLogin).count() == 0
+
+
+def test_item_bukan_dict_dalam_daftar_dilewati(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"] = [None, "bukan-dict", 42, [], PAYLOAD["errors"][0]]
+    payload["logins"] = [None, "x", 7, PAYLOAD["logins"][0]]
+    payload["login_gagal"] = [None, 3.5, PAYLOAD["login_gagal"][0]]
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil == {"errors": 1, "logins": 1, "login_gagal": 1, "halaman": 1}
+
+
+def test_gagal_di_halaman_kedua_mempertahankan_kursor_halaman_pertama(sesi, site):
+    halaman_pertama = {**PAYLOAD, "lagi": True}
+    with pytest.raises(SiteError):
+        jalankan(sesi, site, [halaman_pertama, "bukan-dict"])
+    sesi.refresh(site)
+    assert site.events_kursor == "e=10:1;l=10:5;g=10:1"
+    assert sesi.query(CatatanError).count() == 1
+    assert sesi.query(KejadianLogin).count() == 1
+    assert sesi.query(LoginGagal).count() == 1
+
+
+def test_konteks_terlalu_besar_disimpan_none(sesi, site):
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["konteks"] = {"path": "/" + "a" * 9000, "jenis": "depan"}
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil["errors"] == 1
+    assert sesi.query(CatatanError).one().konteks is None
+
+
+def test_timestamp_masa_depan_dilewati(sesi, site):
+    depan = int(time.time()) + 2 * 86400
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["terakhir"] = depan
+    payload["logins"][0]["waktu"] = depan
+    payload["login_gagal"][0]["jam"] = depan
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil == {"errors": 0, "logins": 0, "login_gagal": 0, "halaman": 1}
+    sesi.refresh(site)
+    assert site.events_kursor == payload["kursor"]
