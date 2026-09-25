@@ -16,7 +16,32 @@ final class WPMGR_FakeWpdbEvents {
         $this->tabel = $tabel;
     }
 
+    private function normalisasi( $sql ) {
+        return trim( preg_replace( '/\s+/', ' ', $sql ) );
+    }
+
+    /**
+     * Bentuk SQL PERSIS yang harus dikirim kumpulkan() untuk sebuah tabel.
+     * prepare() menyematkan teks ini sebagai kebenaran: bila kumpulkan()
+     * pernah berubah jadi memakai `>` alih-alih `>=`, kurang tanda kurung,
+     * atau `<` alih-alih `<=` pada cakrawala, tes manapun yang memanggil
+     * kumpulkan() akan gagal di sini -- bukan cuma lolos diam-diam lewat
+     * penyaringan tiruan di get_results() yang menerka ulang dari posisi
+     * argumen.
+     */
+    private function sql_diharapkan( $tabel ) {
+        return "SELECT * FROM {$tabel}
+                  WHERE diubah >= %d AND (diubah > %d OR id > %d) AND diubah <= %d
+                  ORDER BY diubah ASC, id ASC LIMIT %d";
+    }
+
     public function prepare( $sql ) {
+        preg_match( '/FROM\s+(\S+)/', $sql, $m );
+        \PHPUnit\Framework\Assert::assertSame(
+            $this->normalisasi( $this->sql_diharapkan( $m[1] ) ),
+            $this->normalisasi( $sql ),
+            'Bentuk query kumpulkan() berubah -- perbarui sql_diharapkan() bila memang disengaja.'
+        );
         return array( 'sql' => $sql, 'args' => array_slice( func_get_args(), 1 ) );
     }
 
@@ -202,6 +227,47 @@ final class EventsTest extends TestCase {
 
         $kedua = WPMGR_Events::kumpulkan( $pertama['kursor'], 10 );
         $this->assertSame( array( 1 ), array_column( $kedua['logins'], 'id' ) );
+    }
+
+    public function test_kumpulkan_baris_lama_berid_rendah_muncul_setelah_diperbarui_bukan_dobel(): void {
+        // Regresi Ruling review Task 14 putaran 1 finding 1: baris berid
+        // RENDAH yang "diubah"-nya dibumbui ke detik yang sama dengan baris
+        // lain yang sudah lebih dulu di dalam jendela cakrawala tidak boleh
+        // terlewat permanen -- dan begitu ia tuntas, ia tidak boleh muncul
+        // dobel dengan baris yang sudah pernah dikembalikan sebelumnya.
+        // Jam disuntikkan (parameter ketiga kumpulkan()) supaya skenario ini
+        // deterministik, bukan bergantung pada jam dinding sungguhan.
+        $T    = 2000000000;
+        $wpdb = new WPMGR_FakeWpdbEvents( array(
+            'wp_wpmgr_logins' => array(
+                $this->baris_login( 3, $T - 20 ), // sudah lama, langsung tuntas.
+                $this->baris_login( 5, $T ),       // baru saja terjadi, masih di dalam cakrawala.
+            ),
+        ) );
+        $GLOBALS['wpdb'] = $wpdb;
+
+        // Panggilan 1 pada T: hanya id 3 yang tuntas; id 5 masih di dalam cakrawala.
+        $pertama = WPMGR_Events::kumpulkan( '', 10, $T );
+        $this->assertSame( array( 3 ), array_column( $pertama['logins'], 'id' ) );
+
+        // Penulis lain membumbui id 3 ke detik T yang sama (mis. login
+        // berulang dari akun yang sama), persis skenario yang dulu membuat
+        // baris ini terlewat permanen tanpa cakrawala.
+        $wpdb->ubah_baris( 'wp_wpmgr_logins', 3, $T );
+
+        // Panggilan 2, masih pada T: id 3 sekarang juga bernilai T -- masih
+        // di dalam cakrawala untuk keduanya. Kosong bukan berarti terlewat;
+        // ia memang belum tuntas.
+        $kedua = WPMGR_Events::kumpulkan( $pertama['kursor'], 10, $T );
+        $this->assertSame( array(), $kedua['logins'] );
+
+        // Panggilan 3, sepuluh detik kemudian: T sudah lewat cakrawala. Baik
+        // id 3 (baru dibumbui ke T) maupun id 5 (juga di T) kini tuntas, dan
+        // keduanya harus muncul masing-masing PERSIS SEKALI -- id 3 tidak
+        // boleh terlewat permanen karena idnya lebih rendah dari kursor lama,
+        // dan tidak boleh dobel dengan kemunculannya di panggilan 1.
+        $ketiga = WPMGR_Events::kumpulkan( $kedua['kursor'], 10, $T + 10 );
+        $this->assertSame( array( 3, 5 ), array_column( $ketiga['logins'], 'id' ) );
     }
 
     public function test_kumpulkan_tidak_mengembalikan_baris_yang_lebih_baru_dari_cakrawala(): void {

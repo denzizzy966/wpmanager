@@ -130,13 +130,15 @@ class WPMGR_Events {
         );
     }
 
-    public static function kumpulkan( $kursor, $batas ) {
+    public static function kumpulkan( $kursor, $batas, $sekarang = null ) {
         global $wpdb;
         // Satu cakrawala untuk ketiga tabel dalam satu request: dihitung
         // sekali dari time() (bukan NOW() SQL) karena penulis juga memakai
         // time() PHP untuk kolom diubah -- menyamakan sumber jam mencegah
         // selisih jam antara PHP dan MySQL menggeser batas tuntas ini.
-        $sekarang = time();
+        // $sekarang bisa disuntikkan (lihat urai_kursor()) supaya skenario
+        // yang bergantung pada jam bisa diuji secara deterministik.
+        $sekarang = null === $sekarang ? time() : (int) $sekarang;
         $horizon  = $sekarang - self::CAKRAWALA;
         $posisi   = self::urai_kursor( $kursor, $sekarang );
         $batas    = self::batas( $batas );
