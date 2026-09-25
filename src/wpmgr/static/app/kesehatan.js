@@ -36,6 +36,7 @@ function layarKesehatan() {
     galat: '',
     diperbarui: '',
     urutanChip: URUTAN_CHIP,
+    _sedangMemuat: false,
 
     label(k) { return LABEL_CHIP[k]; },
     kelasChip(k) { return KELAS_TINGKAT[TINGKAT_CHIP[k]]; },
@@ -49,6 +50,12 @@ function layarKesehatan() {
     },
 
     async muat() {
+      // Tanpa penjagaan ini, penyegaran otomatis tiap 60 detik bisa saling
+      // menumpuk kalau satu permintaan lebih lambat dari interval-nya
+      // (koneksi lambat, server sibuk): beberapa fetch berjalan bersamaan dan
+      // baris terakhir yang tiba yang menang, bukan yang paling baru diminta.
+      if (this._sedangMemuat) return;
+      this._sedangMemuat = true;
       try {
         const r = await fetch('/api/kesehatan');
         if (!r.ok) {
@@ -63,6 +70,8 @@ function layarKesehatan() {
         this.terapkan();
       } catch (e) {
         this.galat = `Gagal menghubungi server: ${e.message}`;
+      } finally {
+        this._sedangMemuat = false;
       }
     },
 

@@ -6,7 +6,8 @@ menentukan kapan sebuah site dinyatakan mati bisa diuji langsung.
 
 import logging
 import time
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -221,14 +222,29 @@ def jalankan_putaran(
     return putaran
 
 
-def persen_uptime_per_site(sesi: Session, sejak: datetime) -> dict:
-    """Persen cek `naik` per site, tanpa putaran gangguan dashboard dan tanpa hasil terblokir."""
+def persen_uptime_per_site(
+    sesi: Session, sejak: datetime, site_ids: Sequence[uuid.UUID] | None = None
+) -> dict[uuid.UUID, float | None]:
+    """Persen cek `naik` per site, tanpa putaran gangguan dashboard dan tanpa hasil terblokir.
+
+    `site_ids` membatasi query ke site yang memang akan ditampilkan (mis. halaman
+    Kesehatan). Tanpa itu, satu-satunya indeks (`site_id, dicek_pada`) tidak membantu
+    kalau hanya `dicek_pada` yang difilter -- setiap penyegaran (tiap 60 detik per tab
+    yang terbuka) akan seq-scan seluruh riwayat `uptime_checks`. `None` berarti tanpa
+    filter site (perilaku lama, untuk pemanggil lain kalau ada); daftar kosong berarti
+    tidak ada site yang perlu dicari sama sekali, jadi query dilewati.
+    """
+    if site_ids is not None and not site_ids:
+        return {}
     naik = func.count().filter(UptimeCheck.hasil == UptimeHasil.naik)
     gagal = func.count().filter(UptimeCheck.hasil == UptimeHasil.gagal)
+    kondisi = [UptimeCheck.dicek_pada >= sejak, UptimePutaran.gangguan_dashboard.is_(False)]
+    if site_ids is not None:
+        kondisi.append(UptimeCheck.site_id.in_(site_ids))
     baris = sesi.execute(
         select(UptimeCheck.site_id, naik, gagal)
         .join(UptimePutaran, UptimePutaran.id == UptimeCheck.putaran_id)
-        .where(UptimeCheck.dicek_pada >= sejak, UptimePutaran.gangguan_dashboard.is_(False))
+        .where(*kondisi)
         .group_by(UptimeCheck.site_id)
     ).all()
     return {

@@ -40,10 +40,13 @@ def _iso(nilai):
     return nilai.isoformat() if nilai else None
 
 
-def _error_per_site(sesi: Session, sekarang: datetime) -> dict:
+def _error_per_site(sesi: Session, sekarang: datetime, site_ids: list) -> dict:
     hasil: dict = {}
+    if not site_ids:
+        return hasil
     kandidat = sesi.scalars(
         select(CatatanError).where(
+            CatatanError.site_id.in_(site_ids),
             CatatanError.tingkat.in_(("fatal", "database")),
             CatatanError.terakhir_terlihat >= sekarang - JENDELA_ERROR_BARU,
         )
@@ -57,14 +60,17 @@ def _error_per_site(sesi: Session, sekarang: datetime) -> dict:
     return hasil
 
 
-def _traffic_kemarin(sesi: Session, kemarin) -> dict:
+def _traffic_kemarin(sesi: Session, kemarin, site_ids: list) -> dict:
     hasil: dict = {}
+    if not site_ids:
+        return hasil
     # ga4 dibaca lebih dulu lalu ditimpa plugin: plugin tersedia di semua site
     # dan menjadi angka utama bila keduanya ada.
     for sumber in ("ga4", "plugin"):
         for site_id, n in sesi.execute(
             select(TrafficHarian.site_id, TrafficHarian.kunjungan).where(
-                TrafficHarian.tanggal == kemarin, TrafficHarian.sumber == sumber
+                TrafficHarian.site_id.in_(site_ids),
+                TrafficHarian.tanggal == kemarin, TrafficHarian.sumber == sumber,
             )
         ).all():
             hasil[site_id] = n
@@ -78,9 +84,10 @@ def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
     sites = sesi.scalars(
         select(Site).where(Site.status != SiteStatus.disabled).order_by(Site.nama)
     ).all()
-    persen = persen_uptime_per_site(sesi, sekarang - timedelta(hours=24))
-    errors = _error_per_site(sesi, sekarang)
-    traffic = _traffic_kemarin(sesi, hari_ini - timedelta(days=1))
+    site_ids = [s.id for s in sites]
+    persen = persen_uptime_per_site(sesi, sekarang - timedelta(hours=24), site_ids)
+    errors = _error_per_site(sesi, sekarang, site_ids)
+    traffic = _traffic_kemarin(sesi, hari_ini - timedelta(days=1), site_ids)
 
     semua = []
     for site in sites:

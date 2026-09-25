@@ -8,6 +8,7 @@ from wpmgr.kesehatan import susun_kesehatan
 from wpmgr.models import (
     CatatanError,
     KejadianLogin,
+    LoginGagal,
     Site,
     SiteStatus,
     TrafficHarian,
@@ -37,7 +38,11 @@ def baris(hasil, site):
 
 
 def test_urutan_keparahan_dan_chip(sesi):
-    sehat = buat(sesi, "Sehat")
+    # "Aaa" alfabetis lebih dulu dari ketiga nama lain, tetapi site ini sehat
+    # (tingkat 4): kalau urutan hasil ternyata cuma sort nama biasa (bukan
+    # (tingkat, nama)), "Aaa" akan muncul PERTAMA, bukan TERAKHIR seperti yang
+    # diharapkan di sini.
+    sehat = buat(sesi, "Aaa")
     mati = buat(sesi, "Mati", uptime_status=UptimeStatus.mati)
     serang = buat(sesi, "Diserang")
     sesi.add(KejadianLogin(site_id=serang.id, id_di_site=1, waktu=SEKARANG - timedelta(hours=1),
@@ -45,7 +50,7 @@ def test_urutan_keparahan_dan_chip(sesi):
     sesi.commit()
 
     hasil = susun_kesehatan(sesi, SEKARANG)
-    assert [b["nama"] for b in hasil["baris"]] == ["Diserang", "Mati", "Sehat"]
+    assert [b["nama"] for b in hasil["baris"]] == ["Diserang", "Mati", "Aaa"]
     assert baris(hasil, mati)["masalah"] == ["mati"]
     assert baris(hasil, mati)["tab"] == "uptime"
     assert baris(hasil, serang)["keamanan"] == "perlu_diperiksa"
@@ -117,6 +122,50 @@ def test_traffic_kemarin_dan_anomali(sesi):
     assert b["traffic_kemarin"] == 20
     assert b["anomali"] == "anjlok"
     assert "traffic_anjlok" in b["masalah"]
+
+
+def test_diserang_masuk_chip(sesi):
+    s = buat(sesi, "Digempur")
+    sesi.add(LoginGagal(site_id=s.id, jam=SEKARANG - timedelta(minutes=10), ip="1.2.3.4",
+                        username="admin", jalur="wp-login", jumlah=60))
+    sesi.commit()
+    b = baris(susun_kesehatan(sesi, SEKARANG), s)
+    assert b["keamanan"] == "diserang"
+    assert "diserang" in b["masalah"]
+    assert b["tab"] == "login"
+
+
+def test_traffic_melonjak_masuk_chip(sesi):
+    s = buat(sesi, "Melonjak")
+    kemarin = date(2026, 9, 21)
+    for i in range(1, 15):
+        sesi.add(TrafficHarian(site_id=s.id, tanggal=kemarin - timedelta(days=i), sumber="plugin",
+                               kunjungan=100, pengunjung=50))
+    sesi.add(TrafficHarian(site_id=s.id, tanggal=kemarin, sumber="plugin", kunjungan=500, pengunjung=300))
+    sesi.commit()
+    b = baris(susun_kesehatan(sesi, SEKARANG), s)
+    assert b["anomali"] == "melonjak"
+    assert "traffic_melonjak" in b["masalah"]
+
+
+def test_tab_menang_error_baru_atas_ssl(sesi):
+    # error_baru dan ssl sama-sama tingkat 2, tetapi error_baru lebih dulu di
+    # URUTAN_CHIP: tab hasil akhirnya harus "error", bukan "uptime".
+    s = buat(sesi, "SslDanError", ssl_error="Sertifikat tidak valid")
+    sesi.add(CatatanError(site_id=s.id, sidik_jari="c" * 32, tingkat="fatal", komponen_tipe="core",
+                          pesan="fatal", jumlah=1, pertama_terlihat=SEKARANG - timedelta(hours=1),
+                          terakhir_terlihat=SEKARANG - timedelta(minutes=30)))
+    sesi.commit()
+    b = baris(susun_kesehatan(sesi, SEKARANG), s)
+    assert set(b["masalah"]) >= {"ssl", "error_baru"}
+    assert b["tab"] == "error"
+
+
+def test_site_pending_masuk_koneksi(sesi):
+    s = buat(sesi, "BelumPasang", status=SiteStatus.pending_pair)
+    b = baris(susun_kesehatan(sesi, SEKARANG), s)
+    assert "koneksi" in b["masalah"]
+    assert b["koneksi"] == "pending_pair"
 
 
 def test_site_disabled_tidak_ditampilkan(sesi):

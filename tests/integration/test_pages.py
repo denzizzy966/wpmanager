@@ -37,10 +37,10 @@ def test_halaman_terbuka_dan_memuat_datagrid(klien, jalur):
 
 
 def test_halaman_update_menyajikan_layar_update(klien):
-    # Regresi terhadap placeholder GET "/" yang harus dihapus Task 21: jika
-    # placeholder itu masih terdaftar, Starlette akan mencocokkannya lebih
-    # dulu (ia terdaftar sebelum router halaman) dan "/" tak pernah benar-benar
-    # menyajikan updates.html walau status code-nya tetap 200.
+    # Regresi terhadap Task 21, yang memindahkan updates.html dari "/" ke
+    # "/updates" supaya "/" bisa dipakai halaman Kesehatan: rute lama harus
+    # tetap menyajikan updates.html yang sama persis di path barunya, bukan
+    # ikut terhapus atau diam-diam menjadi placeholder.
     r = klien.get("/updates")
     assert r.status_code == 200
     assert "layarUpdate()" in r.text
