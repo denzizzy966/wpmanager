@@ -115,6 +115,12 @@ class WPMGR_SSO {
             wp_die( 'User wpmgr tidak dapat dibuat.', 'SSO gagal', array( 'response' => 500 ) );
         }
 
+        // wp_set_auth_cookie() tidak memicu wp_login, jadi login lewat SSO
+        // dicatat eksplisit supaya riwayat login site tetap lengkap.
+        if ( class_exists( 'WPMGR_Login' ) ) {
+            WPMGR_Login::catat_berhasil( get_userdata( $user_id ), 'sso' );
+        }
+
         wp_set_current_user( $user_id );
         wp_set_auth_cookie( $user_id, false );
 

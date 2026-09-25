@@ -24,6 +24,7 @@ define( 'WPMGR_DIR', plugin_dir_path( __FILE__ ) );
 require_once WPMGR_DIR . 'includes/class-wpmgr-signing.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-settings.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-ip.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-login.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-skema.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-penangkap.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-inventory.php';
@@ -45,4 +46,5 @@ add_action( 'init', array( 'WPMGR_SSO', 'tangani_permintaan' ), 1 );
 // pemasangan paling awal yang bisa dilakukan dari plugin biasa.
 if ( ! WPMGR_Skema::monitoring_mati() ) {
     WPMGR_Penangkap::pasang();
+    WPMGR_Login::pasang();
 }
