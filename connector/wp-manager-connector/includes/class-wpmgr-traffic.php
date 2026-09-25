@@ -231,9 +231,9 @@ class WPMGR_Traffic {
     }
 
     /**
-     * Nama opsi disisipi tanggal supaya add_option() (bukan update_option())
-     * bisa dipakai sebagai insert-if-absent yang atomik per hari: opsi
-     * tunggal yang ditimpa lewat update_option() (versi sebelumnya) rentan
+     * Nama opsi disisipi tanggal supaya insert-if-absent per hari bisa
+     * dilakukan langsung ke tabel wp_options (lihat garam()) -- opsi
+     * tunggal yang ditimpa lewat update_option() (versi paling awal) rentan
      * race dua request pertama-hari-ini yang sama-sama menemukan "belum ada
      * garam hari ini", lalu sama-sama menulis garam BERBEDA -- pengunjung
      * yang sama pun terhitung dua kali karena hash-nya ikut berbeda.
@@ -242,30 +242,78 @@ class WPMGR_Traffic {
         return 'wpmgr_garam_' . $tanggal;
     }
 
-    private static function garam( $tanggal ) {
+    /**
+     * Garam harian, dibaca/ditulis LANGSUNG ke tabel wp_options lewat
+     * $wpdb, bukan lewat get_option()/add_option(): add_option() WordPress
+     * sendiri memakai "INSERT ... ON DUPLICATE KEY UPDATE option_value =
+     * VALUES(option_value)" (wp-includes/option.php:1142) -- itu UPSERT,
+     * bukan insert-if-absent. Dua request yang bersamaan-sama memanggil
+     * add_option() untuk opsi yang sama-sama belum ada DUA-DUANYA berhasil
+     * (nilai baliknya selalu true) dan salinan yang terakhir ditulis
+     * menimpa yang pertama secara diam-diam dan acak -- persis race yang
+     * ingin dihindari, cuma sekarang tak kelihatan dari nilai balik
+     * add_option() sama sekali. get_option() juga tak dipakai di sini:
+     * begitu get_option() sekali gagal menemukan sebuah opsi, WordPress
+     * mengingatnya di cache "notoptions" untuk sisa request ini
+     * (wp-includes/option.php:213) -- add_option() lalu mempercayai cache
+     * itu dan melewati pengecekan keberadaannya sendiri (option.php:1119-
+     * 1126), membuat masalah di atas makin parah. INSERT IGNORE benar-benar
+     * menolak baris kedua (UNIQUE KEY option_name, 0 rows_affected untuk
+     * yang kalah) -- tapi siapa menang TETAP tak diputuskan dari
+     * rows_affected: baris yang tersimpan selalu dibaca ULANG langsung dari
+     * tabel sesudahnya, supaya kedua racer (menang atau kalah) berakhir
+     * dengan garam yang SAMA PERSIS.
+     */
+    public static function garam( $tanggal ) {
+        global $wpdb;
         $nama  = self::nama_opsi_garam( $tanggal );
-        $garam = get_option( $nama );
+        $garam = self::baca_opsi( $nama );
         if ( is_string( $garam ) && '' !== $garam ) {
             return $garam;
         }
+
         $baru = bin2hex( random_bytes( 32 ) );
-        // option_name punya UNIQUE KEY: kalau request lain menang menyisipkan
-        // opsi hari ini di antara get_option() dan add_option() kita,
-        // add_option() KITA yang gagal (false) -- nilai yang benar adalah
-        // milik pemenang, dibaca ULANG, bukan $baru milik kita sendiri.
-        if ( ! add_option( $nama, $baru, '', false ) ) {
-            $garam = get_option( $nama );
-            return is_string( $garam ) && '' !== $garam ? $garam : $baru;
+        $wpdb->query( $wpdb->prepare(
+            "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+            $nama, $baru
+        ) );
+        $kita_yang_menyisipkan = 1 === (int) $wpdb->rows_affected;
+
+        $garam = self::baca_opsi( $nama );
+        if ( ! is_string( $garam ) || '' === $garam ) {
+            // Semestinya tak pernah terjadi -- baris barusan pasti ada,
+            // milik kita atau milik racer lain. Jaga-jaga murni.
+            return $baru;
         }
-        self::hapus_garam_kemarin( $tanggal );
-        return $baru;
+
+        if ( $kita_yang_menyisipkan ) {
+            // Hanya pemenang yang membersihkan: berjalan sekali per hari
+            // (persis saat garam hari ini pertama kali dibuat), bukan di
+            // setiap hit.
+            self::hapus_garam_lama( $nama );
+        }
+        return $garam;
     }
 
-    /** Opsi garam lama tak boleh menumpuk selamanya: satu per hari sudah cukup. */
-    private static function hapus_garam_kemarin( $tanggal_ini ) {
-        $kemarin = new DateTime( $tanggal_ini );
-        $kemarin->modify( '-1 day' );
-        delete_option( self::nama_opsi_garam( $kemarin->format( 'Y-m-d' ) ) );
+    private static function baca_opsi( $nama ) {
+        global $wpdb;
+        return $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $nama
+        ) );
+    }
+
+    /**
+     * Opsi garam lama tak boleh menumpuk: hapus SEMUA wpmgr_garam_* selain
+     * hari ini, bukan cuma "kemarin" -- site yang nol hit selama beberapa
+     * hari (monitoring nonaktif sementara, dsb.) tetap menyisakan opsi lama
+     * kalau hanya "kemarin" yang dihapus setiap kali.
+     */
+    private static function hapus_garam_lama( $nama_hari_ini ) {
+        global $wpdb;
+        $wpdb->query( $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name <> %s",
+            $wpdb->esc_like( 'wpmgr_garam_' ) . '%', $nama_hari_ini
+        ) );
     }
 
     /**
@@ -280,9 +328,19 @@ class WPMGR_Traffic {
      * permanen dan sebanding jumlah worker PHP yang bersamaan. Begitu status
      * "penuh" tersimpan di sini, ia tak pernah dihitung ulang untuk sisa
      * hari itu (tak ada lagi query COUNT(*) sampai tanggal berganti).
+     *
+     * Dibandingkan dengan false !== ..., BUKAN true === ...: wp_options.
+     * option_value adalah kolom TEKS. set_transient(true) tersimpan sebagai
+     * string '1' dan get_transient() SELALU mengembalikannya sebagai string
+     * '1', tak pernah sebagai bool PHP asli -- true === get_transient(...)
+     * gagal SELALU di lingkungan sungguhan (hanya kebetulan lolos di test
+     * kalau stub-nya menyimpan nilai PHP mentah tanpa meniru pembulatan
+     * tipe basis data). Akibatnya batas "penuh" tak pernah benar-benar
+     * ter-cache: COUNT(*) plus dua penulisan opsi transient terulang di
+     * SETIAP hit setelah batas tercapai, bukan cuma sekali.
      */
     private static function batas_kunci_penuh( $kunci_cache ) {
-        return true === get_transient( $kunci_cache );
+        return false !== get_transient( $kunci_cache );
     }
 
     /**
@@ -325,7 +383,7 @@ class WPMGR_Traffic {
         $jumlah = (int) $wpdb->get_var( $wpdb->prepare( $sql, ...$arg ) );
 
         if ( ! self::dalam_batas( false, $jumlah, $batas ) ) {
-            set_transient( $kunci_cache, true, DAY_IN_SECONDS );
+            set_transient( $kunci_cache, 1, DAY_IN_SECONDS );
             return $lainnya;
         }
         return $kunci;
@@ -346,7 +404,7 @@ class WPMGR_Traffic {
         $jumlah = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->prefix}wpmgr_pengunjung WHERE tanggal = %s", $tanggal ) );
         if ( ! self::dalam_batas( false, $jumlah, self::BATAS_PENGUNJUNG_PER_HARI ) ) {
-            set_transient( $kunci_cache, true, DAY_IN_SECONDS );
+            set_transient( $kunci_cache, 1, DAY_IN_SECONDS );
             return false;
         }
         return true;

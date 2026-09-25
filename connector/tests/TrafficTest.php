@@ -16,7 +16,13 @@ if ( ! function_exists( 'get_transient' ) ) {
 }
 if ( ! function_exists( 'set_transient' ) ) {
     function set_transient( $kunci, $nilai, $ttl = 0 ) {
-        $GLOBALS['wpmgr_test_transient'][ $kunci ] = $nilai;
+        // wp_options.option_value adalah kolom TEKS: get_transient() di
+        // WordPress sungguhan TAK PERNAH mengembalikan bool/int PHP asli,
+        // selalu string (ronde 2, temuan #2) -- meng-cast di sini juga,
+        // bukan menyimpan $nilai mentah, supaya bug "true === get_transient(...)"
+        // benar-benar tertangkap test, bukan kebetulan lolos karena stub
+        // ini terlalu baik hati.
+        $GLOBALS['wpmgr_test_transient'][ $kunci ] = (string) $nilai;
         return true;
     }
 }
@@ -51,19 +57,24 @@ final class WPMGR_FakeWpdbTraffic {
     public $pengunjung = array();
     // "tanggal|dimensi|kunci" => array( kunjungan, pengunjung )
     public $traffic = array();
+    // option_name => option_value -- dipakai menguji WPMGR_Traffic::garam().
+    public $opsi = array();
 
     private $tersambung;
     /** @var callable|null dijalankan sekali, tepat setelah UPDATE pengunjung diproses. */
     private $suntik_setelah_update_pengunjung;
+    /** @var callable|null dijalankan sekali, tepat sebelum INSERT IGNORE opsi garam diperiksa. */
+    private $suntik_saat_insert_opsi;
 
     public function __construct(
         array $pengunjung = array(), array $traffic = array(), $tersambung = true,
-        callable $suntik_setelah_update_pengunjung = null
+        callable $suntik_setelah_update_pengunjung = null, callable $suntik_saat_insert_opsi = null
     ) {
         $this->pengunjung = $pengunjung;
         $this->traffic    = $traffic;
         $this->tersambung = $tersambung;
         $this->suntik_setelah_update_pengunjung = $suntik_setelah_update_pengunjung;
+        $this->suntik_saat_insert_opsi          = $suntik_saat_insert_opsi;
     }
 
     public function check_connection( $allow_bail = true ) {
@@ -101,6 +112,11 @@ final class WPMGR_FakeWpdbTraffic {
         $sql             = $disiapkan['sql'];
         $args            = $disiapkan['args'];
 
+        if ( false !== strpos( $sql, 'SELECT option_value FROM' ) ) {
+            // Ditiru seperti kolom teks sungguhan: null kalau baris tak ada,
+            // string apa pun yang tersimpan (tak pernah tipe PHP mentah).
+            return isset( $this->opsi[ $args[0] ] ) ? (string) $this->opsi[ $args[0] ] : null;
+        }
         if ( false !== strpos( $sql, 'SELECT hit FROM' ) ) {
             $k = $args[0] . '|' . $args[1];
             return isset( $this->pengunjung[ $k ] ) ? $this->pengunjung[ $k ] : 0;
@@ -146,6 +162,40 @@ final class WPMGR_FakeWpdbTraffic {
         $this->queries[] = $disiapkan;
         $sql             = $disiapkan['sql'];
         $args            = $disiapkan['args'];
+
+        if ( 0 === strpos( $sql, 'INSERT IGNORE' ) && false !== strpos( $sql, $this->options ) ) {
+            list( $nama, $nilai ) = $args;
+            if ( null !== $this->suntik_saat_insert_opsi ) {
+                // Mensimulasikan request lain yang menang menyisipkan opsi
+                // yang sama TEPAT sebelum INSERT IGNORE kita sendiri
+                // diproses (jendela race yang sama seperti UPDATE-pengunjung
+                // di atas, tapi untuk garam harian -- lihat WPMGR_Traffic::garam()).
+                $cb = $this->suntik_saat_insert_opsi;
+                $this->suntik_saat_insert_opsi = null; // sekali saja
+                $cb( $this );
+            }
+            if ( isset( $this->opsi[ $nama ] ) ) {
+                // UNIQUE KEY option_name: IGNORE menolak baris kedua diam-diam,
+                // nilai yang sudah tersimpan TIDAK ditimpa (beda dari
+                // add_option()'s ON DUPLICATE KEY UPDATE, yang justru menimpa).
+                $this->rows_affected = 0;
+            } else {
+                $this->opsi[ $nama ]  = $nilai;
+                $this->rows_affected  = 1;
+            }
+            return true;
+        }
+
+        if ( 0 === strpos( $sql, 'DELETE' ) && false !== strpos( $sql, $this->options ) ) {
+            list( $awalan_like, $kecuali ) = $args;
+            $awalan = stripslashes( rtrim( $awalan_like, '%' ) );
+            foreach ( array_keys( $this->opsi ) as $nama ) {
+                if ( 0 === strpos( $nama, $awalan ) && $nama !== $kecuali ) {
+                    unset( $this->opsi[ $nama ] );
+                }
+            }
+            return true;
+        }
 
         // Dicek lewat AWALAN (0 === strpos), bukan sekadar "mengandung":
         // "INSERT ... ON DUPLICATE KEY UPDATE" JUGA mengandung substring
@@ -423,36 +473,94 @@ final class TrafficTest extends TestCase {
         $this->assertCount( 0, $hitung_halaman, 'COUNT(*) tak boleh diulang setelah status penuh ter-cache' );
     }
 
-    public function test_batas_tak_percaya_transient_angka_lama_selalu_hitung_ulang_dari_tabel(): void {
-        // Mensimulasikan desain yang direview di ronde 1: meng-cache ANGKA
-        // hitungan di transient lalu mempercayainya tanpa hitung ulang. Di
-        // bawah beban bersamaan angka itu basi -- worker lain sudah
-        // menyisipkan lebih banyak baris tanpa transient ini pernah
-        // diperbarui. Implementasi sekarang tak pernah mempercayai angka
-        // ter-cache: ia hanya percaya status "penuh" di bawah nama
-        // transient-nya SENDIRI, dan selalu menghitung ulang langsung dari
-        // tabel untuk kunci yang benar-benar baru selama status itu belum
-        // tersimpan -- jadi transient "gaya lama" mana pun yang kebetulan
-        // ada tak berpengaruh sama sekali.
-        $tanggal = '2026-09-22';
-        $traffic = array();
-        for ( $i = 0; $i < 200; $i++ ) {
-            $traffic[ $tanggal . '|asal|site_lain:s' . $i . '.test' ] = array( 1, 0 );
-        }
-        // Batas sungguhan (200) sudah tercapai di tabel, tapi transient
-        // "gaya lama" ini menyimpan angka jauh di bawahnya.
-        set_transient( 'wpmgr_jml_asal_' . $tanggal, 50, DAY_IN_SECONDS );
+    // --- garam(): insert-if-absent atomik, bukan add_option() (ronde 2) ---
 
-        $wpdb            = new WPMGR_FakeWpdbTraffic( array(), $traffic );
+    public function test_garam_pertama_kali_menyisipkan_dan_bertahan_di_panggilan_kedua(): void {
+        $wpdb            = new WPMGR_FakeWpdbTraffic();
+        $GLOBALS['wpdb'] = $wpdb;
+        $tanggal         = '2026-09-22';
+
+        $garam = WPMGR_Traffic::garam( $tanggal );
+        $this->assertSame( 64, strlen( $garam ) );
+        $this->assertTrue( ctype_xdigit( $garam ) );
+
+        // Panggilan kedua di hari yang sama: jalur cepat (SELECT saja),
+        // mengembalikan garam yang SAMA, bukan membuat yang baru.
+        $this->assertSame( $garam, WPMGR_Traffic::garam( $tanggal ) );
+    }
+
+    public function test_garam_race_insert_ignore_kalah_pakai_nilai_pemenang(): void {
+        // add_option() WordPress sendiri memakai INSERT ... ON DUPLICATE KEY
+        // UPDATE (upsert) -- KEDUA racer akan "berhasil" dan yang terakhir
+        // menulis menang secara diam-diam dan acak. INSERT IGNORE benar-benar
+        // menolak baris kedua: di sini disimulasikan lewat callback yang
+        // membuat request "lain" menang menyisipkan garamnya sendiri TEPAT
+        // sebelum INSERT IGNORE kita berjalan -- baris yang tersimpan
+        // ujung-ujungnya harus dibaca ulang dari tabel, bukan dipercaya dari
+        // garam yang kita buat sendiri di memori.
+        $tanggal = '2026-09-22';
+        $nama    = 'wpmgr_garam_' . $tanggal;
+        $wpdb    = new WPMGR_FakeWpdbTraffic( array(), array(), true, null, function ( WPMGR_FakeWpdbTraffic $w ) use ( $nama ) {
+            $w->opsi[ $nama ] = 'garam-milik-pemenang';
+        } );
         $GLOBALS['wpdb'] = $wpdb;
 
-        WPMGR_Traffic::simpan_hit( $tanggal, 'h1', '/x', 'UA', 'site_lain:baru-sekali.test' );
+        $garam = WPMGR_Traffic::garam( $tanggal );
 
-        $this->assertArrayNotHasKey(
-            $tanggal . '|asal|site_lain:baru-sekali.test', $wpdb->traffic,
-            'batas sungguhan (200) sudah tercapai di tabel -- transient angka basi tak boleh meloloskan baris ke-201'
+        $this->assertSame(
+            'garam-milik-pemenang', $garam,
+            'INSERT IGNORE kita kalah (0 rows_affected) -- nilai yang dipakai HARUS dibaca ulang dari tabel'
         );
-        $this->assertArrayHasKey( $tanggal . '|asal|(lainnya)', $wpdb->traffic );
+    }
+
+    public function test_garam_membersihkan_opsi_lama_hanya_saat_benar_benar_menyisipkan(): void {
+        $tanggal         = '2026-09-22';
+        $wpdb            = new WPMGR_FakeWpdbTraffic();
+        $GLOBALS['wpdb'] = $wpdb;
+        // Opsi lama dari hari-hari sebelumnya (bukan cuma "kemarin" --
+        // site yang nol hit selama beberapa hari tetap harus dibersihkan).
+        $wpdb->opsi['wpmgr_garam_2026-09-01'] = 'lama1';
+        $wpdb->opsi['wpmgr_garam_2026-09-15'] = 'lama2';
+
+        WPMGR_Traffic::garam( $tanggal );
+
+        $this->assertArrayNotHasKey( 'wpmgr_garam_2026-09-01', $wpdb->opsi );
+        $this->assertArrayNotHasKey( 'wpmgr_garam_2026-09-15', $wpdb->opsi );
+        $this->assertArrayHasKey( 'wpmgr_garam_' . $tanggal, $wpdb->opsi );
+
+        // Panggilan kedua di hari yang sama (jalur cepat, tak menyisipkan
+        // apa pun): pembersihan tak boleh berjalan lagi.
+        $jumlah_delete = function () use ( $wpdb ) {
+            return count( array_filter( $wpdb->queries, function ( $q ) {
+                return 0 === strpos( $q['sql'], 'DELETE' );
+            } ) );
+        };
+        $sebelum = $jumlah_delete();
+        WPMGR_Traffic::garam( $tanggal );
+        $this->assertSame( $sebelum, $jumlah_delete(), 'pembersihan cuma boleh berjalan sekali, saat garam hari ini benar-benar baru dibuat' );
+    }
+
+    // --- batas_kunci_penuh(): status di-cache sebagai string, bukan bool (ronde 2) ---
+
+    public function test_batas_penuh_terdeteksi_walau_get_transient_mengembalikan_string(): void {
+        // wp_options.option_value adalah kolom TEKS: get_transient() di
+        // WordPress sungguhan TAK PERNAH mengembalikan bool PHP asli, cuma
+        // string '1' -- stub set_transient() di berkas ini meniru itu
+        // (lihat atas). "true === get_transient(...)" gagal SELALU pada
+        // kondisi ini; kode sekarang harus tetap mendeteksi status penuh.
+        $tanggal = '2026-09-22';
+        $wpdb    = new WPMGR_FakeWpdbTraffic();
+        $GLOBALS['wpdb'] = $wpdb;
+        set_transient( 'wpmgr_penuh_pengunjung_' . $tanggal, true, DAY_IN_SECONDS );
+        $this->assertSame( '1', get_transient( 'wpmgr_penuh_pengunjung_' . $tanggal ), 'stub harus menyimpan sebagai string, bukan bool' );
+
+        WPMGR_Traffic::simpan_hit( $tanggal, 'hash-baru', '/a', 'UA', 'langsung:' );
+
+        foreach ( $wpdb->queries as $q ) {
+            $hitung_pengunjung = false !== strpos( $q['sql'], 'COUNT(*)' ) && false !== strpos( $q['sql'], 'wpmgr_pengunjung' );
+            $this->assertFalse( $hitung_pengunjung, 'status penuh (string "1") harus terdeteksi -- COUNT(*) tak boleh dijalankan' );
+        }
+        $this->assertArrayNotHasKey( $tanggal . '|hash-baru', $wpdb->pengunjung );
     }
 
     public function test_asal_site_lain_dibatasi_tapi_kategori_tetap_selalu_tercatat(): void {
