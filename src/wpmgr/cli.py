@@ -16,9 +16,10 @@ from wpmgr.fitur import EVENTS, TRAFFIC
 from wpmgr.geoip import unduh_geoip
 from wpmgr.jobs.queue import antrekan_jika_belum, antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
-from wpmgr.kunci import KUNCI_GEOIP, KUNCI_SSL, KUNCI_UPTIME, kunci_advisory
+from wpmgr.kunci import KUNCI_GA4, KUNCI_GEOIP, KUNCI_SSL, KUNCI_UPTIME, kunci_advisory
 from wpmgr.models import JobType, Site, SiteStatus, User
 from wpmgr.ssl_cek import cek_semua_ssl
+from wpmgr.traffic import kumpulkan_ga4
 from wpmgr.uptime import buat_klien_http, cek_satu, jalankan_putaran
 
 # Deviasi sadar dari spec §7.5 ("setiap site berstatus active", Ruling R54):
@@ -136,6 +137,21 @@ def update_geoip() -> str | None:
     return url
 
 
+def collect_ga4() -> dict | None:
+    jalur = get_settings().ga4_credentials
+    if not jalur:
+        print("GA4 tidak dikonfigurasi (WPMGR_GA4_CREDENTIALS kosong); dilewati")
+        return None
+    with kunci_advisory(db.engine, KUNCI_GA4) as dapat:
+        if not dapat:
+            print("Pengambilan GA4 lain masih berjalan; dilewati")
+            return None
+        with get_session() as sesi:
+            hasil = kumpulkan_ga4(sesi, jalur, datetime.now(timezone.utc).date())
+    print(f"GA4: {hasil['berhasil']} site berhasil, {hasil['gagal']} gagal")
+    return hasil
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wpmgr")
     sub = parser.add_subparsers(dest="perintah", required=True)
@@ -152,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check-uptime")
     sub.add_parser("check-ssl")
     sub.add_parser("update-geoip")
+    sub.add_parser("collect-ga4")
 
     args = parser.parse_args(argv)
     if args.perintah == "enqueue-scans":
@@ -172,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
         check_ssl()
     elif args.perintah == "update-geoip":
         update_geoip()
+    elif args.perintah == "collect-ga4":
+        collect_ga4()
     return 0
 
 
