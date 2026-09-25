@@ -5,13 +5,27 @@ ini untuk menyusun HANDLER.
 """
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from wpmgr import geoip
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import baca_manifest, baca_zip
 from wpmgr.jobs.queue import antrekan_jika_belum
-from wpmgr.models import ActivityLog, Job, JobType, Site, User
+from wpmgr.models import (
+    ActivityLog,
+    CatatanError,
+    Job,
+    JobStatus,
+    JobType,
+    KejadianLogin,
+    LoginGagal,
+    Site,
+    User,
+)
 from wpmgr.site_client import SiteClient
 
 
@@ -58,3 +72,196 @@ def tangani_update_connector(sesi: Session, job: Job, klien: SiteClient) -> dict
     # bukan menunggu scan per jam.
     antrekan_jika_belum(sesi, site.id, JobType.verify_site)
     return hasil
+
+
+BATAS_HALAMAN_EVENTS = 10
+JENDELA_KAITAN_UPDATE = timedelta(minutes=60)
+TINGKAT_SAH = frozenset({"fatal", "warning", "database"})
+KOMPONEN_SAH = frozenset({"plugin", "mu-plugin", "theme", "core", "lainnya"})
+JENIS_LOGIN_SAH = frozenset({"berhasil", "admin_baru", "jadi_admin"})
+
+
+def _waktu(detik) -> datetime:
+    return datetime.fromtimestamp(int(detik), tz=timezone.utc)
+
+
+def _teks(nilai, panjang: int) -> str | None:
+    if nilai is None:
+        return None
+    return str(nilai)[:panjang]
+
+
+def _daftar(data: dict, kunci: str) -> list:
+    nilai = data.get(kunci)
+    return nilai if isinstance(nilai, list) else []
+
+
+def kaitkan_update(sesi: Session, site_id, komponen_tipe: str, slug: str | None,
+                   pertama: datetime) -> dict | None:
+    """Update sukses atas komponen ini dalam 60 menit sebelum error pertama muncul."""
+    if komponen_tipe not in ("plugin", "theme") or not slug:
+        return None
+    kandidat = sesi.scalars(
+        select(Job)
+        .where(
+            Job.site_id == site_id,
+            Job.tipe == JobType.update_package,
+            Job.status == JobStatus.success,
+            Job.finished_at >= pertama - JENDELA_KAITAN_UPDATE,
+            Job.finished_at <= pertama,
+        )
+        .order_by(Job.finished_at.desc())
+    ).all()
+    for job in kandidat:
+        p = job.payload or {}
+        if p.get("tipe") != komponen_tipe:
+            continue
+        slug_job = str(p.get("slug", ""))
+        # Error menyebut direktori plugin ("elementor"); job menyebut berkas
+        # utamanya ("elementor/elementor.php"). Tema memakai nama direktori
+        # di kedua sisi.
+        if komponen_tipe == "plugin":
+            cocok = slug_job == slug or slug_job.startswith(slug + "/")
+        else:
+            cocok = slug_job == slug
+        if cocok:
+            hasil = job.hasil or {}
+            return {
+                "slug": slug_job,
+                "versi_sebelum": hasil.get("versi_sebelum") or p.get("dari_versi"),
+                "versi_sesudah": hasil.get("versi_sesudah") or p.get("ke_versi"),
+                "job_id": job.id,
+                "waktu": job.finished_at.isoformat(),
+            }
+    return None
+
+
+def simpan_errors(sesi: Session, site: Site, baris: list) -> int:
+    n = 0
+    for b in baris:
+        try:
+            sidik = _teks(b["sidik_jari"], 64)
+            tingkat = b["tingkat"]
+            if not sidik or tingkat not in TINGKAT_SAH:
+                continue
+            komponen = b.get("komponen_tipe") if b.get("komponen_tipe") in KOMPONEN_SAH else "lainnya"
+            slug = _teks(b.get("komponen_slug"), 191) or None
+            nilai = {
+                "tingkat": tingkat,
+                "komponen_tipe": komponen,
+                "komponen_slug": slug,
+                "pesan": _teks(b.get("pesan"), 2000) or "",
+                "file": _teks(b.get("file"), 255),
+                "baris": int(b["baris"]) if b.get("baris") is not None else None,
+                "konteks": b.get("konteks") if isinstance(b.get("konteks"), dict) else None,
+                "jumlah": int(b.get("jumlah") or 1),
+                "pertama_terlihat": _waktu(b["pertama"]),
+                "terakhir_terlihat": _waktu(b["terakhir"]),
+            }
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+
+        sudah_ada = sesi.scalar(
+            select(CatatanError.id).where(
+                CatatanError.site_id == site.id, CatatanError.sidik_jari == sidik
+            )
+        ) is not None
+        # ditandai_selesai_pada dan setelah_update milik dashboard: tidak ada
+        # di `nilai`, sehingga upsert tidak pernah menimpanya.
+        sesi.execute(
+            insert(CatatanError)
+            .values(site_id=site.id, sidik_jari=sidik, **nilai)
+            .on_conflict_do_update(constraint="uq_site_errors_sidik", set_=nilai)
+        )
+        if not sudah_ada:
+            kaitan = kaitkan_update(sesi, site.id, komponen, slug, nilai["pertama_terlihat"])
+            if kaitan is not None:
+                sesi.execute(
+                    update(CatatanError)
+                    .where(CatatanError.site_id == site.id, CatatanError.sidik_jari == sidik)
+                    .values(setelah_update=kaitan)
+                )
+        n += 1
+    return n
+
+
+def simpan_logins(sesi: Session, site: Site, baris: list) -> int:
+    n = 0
+    for b in baris:
+        try:
+            nilai = {
+                "id_di_site": int(b["id"]),
+                "waktu": _waktu(b["waktu"]),
+                "jenis": str(b["jenis"]),
+                "username": _teks(b.get("username"), 60) or "",
+                "role": _teks(b.get("role"), 60),
+                "ip": _teks(b.get("ip"), 45),
+                "lewat_cloudflare": bool(b.get("lewat_cloudflare")),
+                "user_agent": _teks(b.get("user_agent"), 255),
+                "jalur": _teks(b.get("jalur"), 20),
+            }
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        if nilai["jenis"] not in JENIS_LOGIN_SAH:
+            continue
+        nilai["negara"] = geoip.negara(nilai["ip"])
+        sesi.execute(
+            insert(KejadianLogin)
+            .values(site_id=site.id, **nilai)
+            .on_conflict_do_nothing(constraint="uq_login_events_id_site")
+        )
+        n += 1
+    return n
+
+
+def simpan_login_gagal(sesi: Session, site: Site, baris: list) -> int:
+    n = 0
+    for b in baris:
+        try:
+            nilai = {
+                "jam": _waktu(b["jam"]),
+                "ip": _teks(b.get("ip"), 45) or "",
+                "username": _teks(b.get("username"), 60) or "",
+                "jalur": _teks(b.get("jalur"), 20) or "form",
+                "jumlah": int(b["jumlah"]),
+                "user_agent": _teks(b.get("user_agent"), 255),
+            }
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        nilai["negara"] = geoip.negara(nilai["ip"]) if nilai["ip"] else None
+        # jumlah dari site sudah kumulatif per (jam, ip, username, jalur):
+        # ditimpa, bukan ditambah, supaya pengambilan ulang tidak menggandakan.
+        sesi.execute(
+            insert(LoginGagal)
+            .values(site_id=site.id, **nilai)
+            .on_conflict_do_update(
+                constraint="uq_login_gagal_kunci",
+                set_={"jumlah": nilai["jumlah"], "user_agent": nilai["user_agent"],
+                      "negara": nilai["negara"]},
+            )
+        )
+        n += 1
+    return n
+
+
+def tangani_collect_events(sesi: Session, job: Job, klien: SiteClient) -> dict:
+    site = sesi.get(Site, job.site_id)
+    total = {"errors": 0, "logins": 0, "login_gagal": 0, "halaman": 0}
+    kursor = site.events_kursor
+    for _ in range(BATAS_HALAMAN_EVENTS):
+        data = klien.events(kursor)
+        total["errors"] += simpan_errors(sesi, site, _daftar(data, "errors"))
+        total["logins"] += simpan_logins(sesi, site, _daftar(data, "logins"))
+        total["login_gagal"] += simpan_login_gagal(sesi, site, _daftar(data, "login_gagal"))
+        total["halaman"] += 1
+        baru = data.get("kursor")
+        if isinstance(baru, str) and baru:
+            kursor = baru[:200]
+        # Kursor disimpan per halaman: bila halaman berikutnya gagal, yang
+        # sudah tersimpan tidak diambil ulang dari awal.
+        site.events_kursor = kursor
+        site.last_seen_at = datetime.now(timezone.utc)
+        sesi.commit()
+        if not data.get("lagi"):
+            break
+    return total
