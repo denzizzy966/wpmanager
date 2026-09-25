@@ -1,8 +1,10 @@
 import argparse
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from argon2 import PasswordHasher
 from sqlalchemy import select
 
@@ -10,9 +12,10 @@ from wpmgr import db
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import bangun_paket, sumber_bawaan
 from wpmgr.db import get_session
+from wpmgr.geoip import unduh_geoip
 from wpmgr.jobs.queue import antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
-from wpmgr.kunci import KUNCI_SSL, KUNCI_UPTIME, kunci_advisory
+from wpmgr.kunci import KUNCI_GEOIP, KUNCI_SSL, KUNCI_UPTIME, kunci_advisory
 from wpmgr.models import Site, SiteStatus, User
 from wpmgr.ssl_cek import cek_semua_ssl
 from wpmgr.uptime import buat_klien_http, cek_satu, jalankan_putaran
@@ -90,6 +93,17 @@ def check_ssl() -> int:
     return n
 
 
+def update_geoip() -> str | None:
+    with kunci_advisory(db.engine, KUNCI_GEOIP) as dapat:
+        if not dapat:
+            print("Pembaruan GeoIP lain masih berjalan; dilewati")
+            return None
+        with httpx.Client(timeout=120, follow_redirects=True) as http:
+            url = unduh_geoip(get_settings().jalur_geoip, datetime.now(timezone.utc).date(), http)
+    print(f"Database GeoIP diperbarui dari {url}")
+    return url
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wpmgr")
     sub = parser.add_subparsers(dest="perintah", required=True)
@@ -103,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--sumber", default=None)
     sub.add_parser("check-uptime")
     sub.add_parser("check-ssl")
+    sub.add_parser("update-geoip")
 
     args = parser.parse_args(argv)
     if args.perintah == "enqueue-scans":
@@ -117,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
         check_uptime()
     elif args.perintah == "check-ssl":
         check_ssl()
+    elif args.perintah == "update-geoip":
+        update_geoip()
     return 0
 
 
