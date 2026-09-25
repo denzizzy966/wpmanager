@@ -8,7 +8,7 @@ import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from wpmgr.models import KejadianLogin, LoginGagal
@@ -27,10 +27,11 @@ _AWAL = datetime(1970, 1, 1, tzinfo=timezone.utc)
 # supaya ember yang sedang berjalan tetap terhitung di menit mana pun,
 # bukan cuma tepat pukul xx:00.
 _MARJIN_EMBER = timedelta(hours=1)
-# Riwayat negara toh tidak pernah menoleh lebih jauh dari JENDELA_NEGARA;
-# tanpa batas ini, site yang belum pernah "diperiksa" (sejak = 1970) akan
-# memindai seluruh login_events dari awal setiap kali dipanggil.
-_BATAS_KANDIDAT_BERHASIL = 50
+# Batas jumlah baris yang BENAR-BENAR cocok (bukan kandidat yang diperiksa)
+# yang dilaporkan sebagai alasan. Diurutkan dari yang paling baru dulu,
+# supaya kejadian yang baru saja terjadi tidak pernah tersembunyi di balik
+# baris cocok yang lebih lama kalau jumlahnya kebetulan sangat banyak.
+_BATAS_ALASAN_BERHASIL = 20
 
 
 class StatusKeamanan(str, enum.Enum):
@@ -103,6 +104,10 @@ def _alasan_kritis(sesi: Session, site, sekarang: datetime) -> list[str]:
         waktu_utc = k.waktu.astimezone(timezone.utc)
         alasan.append(f"{apa}: {k.username} ({waktu_utc:%Y-%m-%d %H:%M} UTC)")
 
+    # Dibatasi ke JENDELA_NEGARA: riwayat negara tidak pernah menoleh lebih
+    # jauh dari itu, dan site yang belum pernah "diperiksa" (sejak = 1970)
+    # kalau tidak akan memindai seluruh login_events sejak awal setiap kali
+    # nilai_keamanan() dipanggil.
     sejak_berhasil = max(sejak, sekarang - JENDELA_NEGARA)
     e2 = aliased(KejadianLogin)
 
@@ -136,15 +141,25 @@ def _alasan_kritis(sesi: Session, site, sekarang: datetime) -> list[str]:
         .scalar_subquery()
     )
 
+    # Predikat aturan (b)/(c) pindah ke WHERE: LIMIT sesudahnya membatasi
+    # baris yang BENAR-BENAR cocok, bukan kandidat yang diperiksa. Sebelum
+    # perbaikan ini, LIMIT ada pada kandidat terurut lama->baru, jadi site
+    # dengan banyak login sukses yang tidak berbahaya sejak diperiksa bisa
+    # membuat login mencurigakan yang paling baru tidak pernah dievaluasi.
+    kondisi_gagal = and_(KejadianLogin.ip.is_not(None), KejadianLogin.ip != "",
+                        gagal_sum >= AMBANG_GAGAL_SEBELUM_TEMBUS)
+    kondisi_negara = and_(KejadianLogin.negara.is_not(None), pernah, not_(sama))
+
     berhasil = sesi.execute(
         select(KejadianLogin.username, KejadianLogin.ip, KejadianLogin.negara,
               gagal_sum.label("gagal"), pernah.label("pernah"), sama.label("sama"))
         .where(KejadianLogin.site_id == site.id,
                KejadianLogin.jenis == "berhasil",
                KejadianLogin.jalur.is_distinct_from("sso"),
-               KejadianLogin.dicatat_pada > sejak_berhasil)
-        .order_by(KejadianLogin.waktu)
-        .limit(_BATAS_KANDIDAT_BERHASIL)
+               KejadianLogin.dicatat_pada > sejak_berhasil,
+               or_(kondisi_gagal, kondisi_negara))
+        .order_by(KejadianLogin.waktu.desc(), KejadianLogin.id.desc())
+        .limit(_BATAS_ALASAN_BERHASIL)
     ).all()
     for username, ip, negara, gagal, pernah_ada, sama_ada in berhasil:
         if ip and gagal >= AMBANG_GAGAL_SEBELUM_TEMBUS:

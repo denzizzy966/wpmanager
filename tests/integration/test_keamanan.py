@@ -216,3 +216,56 @@ def test_login_sukses_tanpa_jalur_tetap_dievaluasi(sesi, site):
     hasil = nilai_keamanan(sesi, site, SEKARANG)
     assert hasil.status == StatusKeamanan.perlu_diperiksa
     assert "203.0.113.9" in hasil.alasan[0]
+
+
+# --- Fix round 2 -----------------------------------------------------------
+
+
+def test_brute_force_tidak_tertutup_login_lama_lain(sesi, site):
+    """LIMIT lama ada pada KANDIDAT terurut lama->baru: 60 login sukses
+    biasa sebelum satu login yang tembus brute force membuat login yang
+    paling baru itu tidak pernah masuk 50 kandidat teratas, jadi tidak
+    pernah dievaluasi sama sekali."""
+    waktu_serangan = SEKARANG - timedelta(minutes=1)
+    for i in range(60):
+        login(sesi, site, waktu_serangan - timedelta(minutes=60 - i), ip=f"203.0.113.{100 + i}")
+    gagal(sesi, site, waktu_serangan - timedelta(minutes=30), 6, ip="203.0.113.9")
+    login(sesi, site, waktu_serangan, ip="203.0.113.9")
+    hasil = nilai_keamanan(sesi, site, SEKARANG)
+    assert hasil.status == StatusKeamanan.perlu_diperiksa
+    assert "203.0.113.9" in hasil.alasan[0]
+
+
+def test_negara_baru_tidak_tertutup_login_lama_lain(sesi, site):
+    """Setup yang sama seperti di atas, dengan login dari negara baru
+    sebagai insiden yang harus tetap terdeteksi."""
+    login(sesi, site, SEKARANG - timedelta(days=10), negara="ID")
+    waktu_serangan = SEKARANG - timedelta(minutes=1)
+    for i in range(60):
+        login(sesi, site, waktu_serangan - timedelta(minutes=60 - i), ip=f"203.0.113.{200 + i}")
+    login(sesi, site, waktu_serangan, negara="RU", ip="192.0.2.9")
+    hasil = nilai_keamanan(sesi, site, SEKARANG)
+    assert hasil.status == StatusKeamanan.perlu_diperiksa
+    assert "RU" in hasil.alasan[0]
+
+
+def test_gagal_dua_ember_tergabung_sebelum_sukses(sesi, site):
+    """Dua ember gagal (3 + 2) di jam yang berbeda di dalam jendela 25 jam
+    harus dijumlahkan untuk mencapai ambang, bukan dibaca sebagai dua
+    kejadian terpisah yang masing-masing di bawah ambang."""
+    waktu_sukses = SEKARANG - timedelta(minutes=10)
+    gagal(sesi, site, waktu_sukses - timedelta(hours=5), 3, ip="203.0.113.9")
+    gagal(sesi, site, waktu_sukses - timedelta(hours=4), 2, ip="203.0.113.9")
+    login(sesi, site, waktu_sukses, ip="203.0.113.9")
+    hasil = nilai_keamanan(sesi, site, SEKARANG)
+    assert hasil.status == StatusKeamanan.perlu_diperiksa
+    assert "203.0.113.9" in hasil.alasan[0]
+
+
+def test_gagal_tepat_25_jam_sebelum_sukses_dikecualikan(sesi, site):
+    """Ember tepat di jam <= waktu - 25 jam ada di luar jendela; harus
+    dikecualikan walau jumlahnya sendirian sudah melewati ambang."""
+    waktu_sukses = SEKARANG - timedelta(minutes=10)
+    gagal(sesi, site, waktu_sukses - timedelta(hours=25), 10, ip="203.0.113.9")
+    login(sesi, site, waktu_sukses, ip="203.0.113.9")
+    assert nilai_keamanan(sesi, site, SEKARANG).status == StatusKeamanan.aman
