@@ -1,6 +1,58 @@
 <?php
 use PHPUnit\Framework\TestCase;
 
+/**
+ * wpdb tiruan minimal untuk menguji jalur tulis(): tanpa DB sungguhan, hanya
+ * mencatat query yang "dikirim" dan mensimulasikan rows_affected berdasarkan
+ * sidik_jari yang sudah "ada" (lewat constructor atau INSERT tiruan
+ * sebelumnya), supaya jalur UPDATE-dulu-baru-INSERT bisa diuji tanpa MySQL.
+ */
+final class WPMGR_FakeWpdbPenangkap {
+    public $prefix        = 'wp_';
+    public $last_error    = '';
+    public $rows_affected = 0;
+    public $queries       = array();
+
+    private $jumlah_baris;
+    private $ada;
+    private $tersambung;
+
+    public function __construct( $jumlah_baris = 0, array $ada = array(), $tersambung = true ) {
+        $this->jumlah_baris = $jumlah_baris;
+        $this->ada          = $ada;
+        $this->tersambung   = $tersambung;
+    }
+
+    public function check_connection( $allow_bail = true ) {
+        return $this->tersambung;
+    }
+
+    public function suppress_errors( $suppress = true ) {
+        return true;
+    }
+
+    public function get_var( $sql ) {
+        return $this->jumlah_baris;
+    }
+
+    public function prepare( $sql ) {
+        return array( 'sql' => $sql, 'args' => array_slice( func_get_args(), 1 ) );
+    }
+
+    public function query( $disiapkan ) {
+        $this->queries[] = $disiapkan;
+        if ( false !== strpos( $disiapkan['sql'], 'UPDATE' ) ) {
+            $sidik               = $disiapkan['args'][3];
+            $this->rows_affected = isset( $this->ada[ $sidik ] ) ? 1 : 0;
+        } elseif ( false !== strpos( $disiapkan['sql'], 'INSERT' ) ) {
+            $sidik               = $disiapkan['args'][0];
+            $this->ada[ $sidik ] = true;
+            $this->rows_affected = 1;
+        }
+        return true;
+    }
+}
+
 final class PenangkapTest extends TestCase {
 
     const AKAR    = '/var/www/html/';
@@ -8,6 +60,7 @@ final class PenangkapTest extends TestCase {
 
     protected function tearDown(): void {
         WPMGR_Penangkap::reset_untuk_test();
+        unset( $GLOBALS['wpdb'] );
     }
 
     public function test_angka_dinormalkan_sehingga_error_memori_satu_sidik(): void {
@@ -120,5 +173,82 @@ final class PenangkapTest extends TestCase {
         WPMGR_Penangkap::catat_fatal( array( 'type' => E_WARNING, 'message' => 'w', 'file' => '', 'line' => 0 ) );
         WPMGR_Penangkap::catat_fatal( null );
         $this->assertCount( 0, WPMGR_Penangkap::buffer_untuk_test() );
+    }
+
+    public function test_batas_baru_per_request_tidak_berlaku_untuk_fatal_dan_database(): void {
+        $buffer = array();
+        for ( $i = 0; $i < 20; $i++ ) {
+            WPMGR_Penangkap::tambah( $buffer, WPMGR_Penangkap::susun( 'warning', "pesan $i", '/tmp/x.php', $i, self::AKAR, self::KONTEN ), 20 );
+        }
+        $this->assertCount( 20, $buffer );
+
+        WPMGR_Penangkap::tambah( $buffer, WPMGR_Penangkap::susun( 'fatal', 'fatal uji', '/tmp/f.php', 1, self::AKAR, self::KONTEN ), 20 );
+        WPMGR_Penangkap::tambah( $buffer, WPMGR_Penangkap::susun( 'database', 'db uji', '', 0, self::AKAR, self::KONTEN ), 20 );
+
+        // 20 warning + fatal + database: keduanya tetap masuk walau warning
+        // sudah memenuhi batasnya.
+        $this->assertCount( 22, $buffer );
+    }
+
+    public function test_filter_template_mencatat_juga_error_database_sebelum_menulis(): void {
+        $wpdb             = new WPMGR_FakeWpdbPenangkap( 0 );
+        $wpdb->last_error = 'duplicate entry uji';
+        $GLOBALS['wpdb']  = $wpdb;
+
+        WPMGR_Penangkap::reset_untuk_test( null );
+        $error = array( 'type' => E_ERROR, 'message' => 'fatal uji', 'file' => '/tmp/x.php', 'line' => 3 );
+        WPMGR_Penangkap::dari_template_error( array( 'response' => 500 ), $error );
+
+        $tingkat = array_column( WPMGR_Penangkap::buffer_untuk_test(), 'tingkat' );
+        sort( $tingkat );
+        // Sebelum perbaikan, catat_database() di dalam saat_shutdown() tidak
+        // pernah tercapai karena tulis() sudah menandai request selesai ditulis
+        // lebih dulu dari dari_template_error().
+        $this->assertSame( array( 'database', 'fatal' ), $tingkat );
+    }
+
+    public function test_tulis_hanya_sekali_per_request(): void {
+        $wpdb            = new WPMGR_FakeWpdbPenangkap( 0 );
+        $GLOBALS['wpdb'] = $wpdb;
+
+        WPMGR_Penangkap::reset_untuk_test( null );
+        $error = array( 'type' => E_ERROR, 'message' => 'fatal uji', 'file' => '/tmp/x.php', 'line' => 1 );
+        WPMGR_Penangkap::dari_template_error( array(), $error );
+        $jumlah_setelah_filter = count( $wpdb->queries );
+        $this->assertGreaterThan( 0, $jumlah_setelah_filter );
+
+        // saat_shutdown() tetap berjalan (jalur normal, lihat koreksi #1), tapi
+        // tidak boleh menulis ulang.
+        WPMGR_Penangkap::saat_shutdown();
+        $this->assertCount( $jumlah_setelah_filter, $wpdb->queries );
+    }
+
+    public function test_tulis_membatasi_sisipan_baru_saat_tabel_penuh(): void {
+        $wpdb            = new WPMGR_FakeWpdbPenangkap( 499 );
+        $GLOBALS['wpdb'] = $wpdb;
+
+        WPMGR_Penangkap::reset_untuk_test( null );
+        WPMGR_Penangkap::catat_fatal( array( 'type' => E_ERROR, 'message' => 'a', 'file' => '/tmp/a.php', 'line' => 1 ) );
+        WPMGR_Penangkap::catat_fatal( array( 'type' => E_ERROR, 'message' => 'b', 'file' => '/tmp/b.php', 'line' => 2 ) );
+        WPMGR_Penangkap::catat_fatal( array( 'type' => E_ERROR, 'message' => 'c', 'file' => '/tmp/c.php', 'line' => 3 ) );
+        $this->assertCount( 3, WPMGR_Penangkap::buffer_untuk_test() );
+
+        WPMGR_Penangkap::saat_shutdown();
+
+        $sisipan = array_filter( $wpdb->queries, function ( $q ) {
+            return false !== strpos( $q['sql'], 'INSERT' );
+        } );
+        $this->assertCount( 1, $sisipan );
+    }
+
+    public function test_tulis_tidak_menulis_saat_koneksi_terputus(): void {
+        $wpdb            = new WPMGR_FakeWpdbPenangkap( 0, array(), false );
+        $GLOBALS['wpdb'] = $wpdb;
+
+        WPMGR_Penangkap::reset_untuk_test( null );
+        WPMGR_Penangkap::catat_fatal( array( 'type' => E_ERROR, 'message' => 'x', 'file' => '/tmp/x.php', 'line' => 1 ) );
+        WPMGR_Penangkap::saat_shutdown();
+
+        $this->assertCount( 0, $wpdb->queries );
     }
 }

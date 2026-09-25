@@ -32,10 +32,13 @@ class WPMGR_Penangkap {
         try {
             self::$sebelumnya = set_error_handler( array( __CLASS__, 'tangani_error' ) );
             register_shutdown_function( array( __CLASS__, 'saat_shutdown' ) );
-            // Handler fatal WordPress dipasang sebelum mu-plugin mana pun
-            // (wp-settings.php) dan berakhir di wp_die() -> die(). Exit di
-            // dalam fungsi shutdown menghentikan fungsi shutdown berikutnya,
-            // termasuk milik kita; filter ini dipanggil tepat sebelum wp_die().
+            // Jalur utama adalah saat_shutdown(): template fatal bawaan WordPress
+            // memanggil wp_die() dengan 'exit' => false (class-wp-fatal-error-
+            // handler.php:211-214), jadi fungsi shutdown kita tetap berjalan
+            // sesudahnya. Filter wp_php_error_args dipertahankan sebagai jalur
+            // tulis paling awal untuk kasus wp_die() versi lain (drop-in
+            // fatal-error-handler.php kustom, atau wp-content/php-error.php)
+            // benar-benar memanggil die() dan menghentikan fungsi shutdown.
             if ( function_exists( 'add_filter' ) ) {
                 add_filter( 'wp_php_error_args', array( __CLASS__, 'dari_template_error' ), 10, 2 );
             }
@@ -63,6 +66,10 @@ class WPMGR_Penangkap {
     public static function dari_template_error( $args, $error ) {
         try {
             self::catat_fatal( $error );
+            // Ditulis di sini juga karena tulis() hanya berjalan sekali per
+            // request: bila filter ini yang menulis lebih dulu, error database
+            // yang baru dicatat saat_shutdown() nanti tidak akan pernah tersimpan.
+            self::catat_database();
             self::tulis();
         } catch ( \Throwable $e ) {
             unset( $e );
@@ -184,8 +191,20 @@ class WPMGR_Penangkap {
             $buffer[ $s ]['jumlah']++;
             return;
         }
-        if ( count( $buffer ) >= $batas_baru ) {
-            return;
+        // Batas hanya berlaku untuk warning: plugin lama gampang memicu
+        // puluhan warning per request. Fatal dan database (paling banyak satu
+        // masing-masing per request) selalu diterima, supaya tujuan utama
+        // penangkap tidak gagal justru di site paling berisik.
+        if ( 'warning' === $kejadian['tingkat'] ) {
+            $jumlah_warning = 0;
+            foreach ( $buffer as $b ) {
+                if ( 'warning' === $b['tingkat'] ) {
+                    $jumlah_warning++;
+                }
+            }
+            if ( $jumlah_warning >= $batas_baru ) {
+                return;
+            }
         }
         $buffer[ $s ] = $kejadian;
     }
@@ -220,30 +239,43 @@ class WPMGR_Penangkap {
         }
         self::$sudah_ditulis = true;
 
-        $wpdb     = $GLOBALS['wpdb'];
+        $wpdb = $GLOBALS['wpdb'];
+        // Koneksi yang sudah putus membuat wpdb::bail() memanggil dead_db(),
+        // yang berakhir di wp_die() -- dipanggil dari dalam fungsi shutdown
+        // kita sendiri. Diam saja; request berikutnya mencoba lagi.
+        if ( ! $wpdb->check_connection( false ) ) {
+            return;
+        }
+
         $tabel    = $wpdb->prefix . 'wpmgr_errors';
         $sekarang = time();
         $konteks  = json_encode( self::konteks() );
         $lama     = $wpdb->suppress_errors( true );
         try {
-            $penuh = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$tabel}" ) >= self::BATAS_BARIS; // phpcs:ignore WordPress.DB.PreparedSQL
+            // Batas keras: sisa tempat dihitung sekali lalu dikurangi per
+            // sisipan baru, supaya COUNT = 499 tidak meloloskan 20 baris baru
+            // sekaligus (hanya UPDATE yang boleh tak terbatas, karena baris
+            // itu sudah ada).
+            $sisa = self::BATAS_BARIS - (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$tabel}" ); // phpcs:ignore WordPress.DB.PreparedSQL
             foreach ( self::$buffer as $sidik => $k ) {
-                if ( $penuh ) {
-                    // Setelah batas: hanya error yang sudah dikenal yang
-                    // diperbarui; sidik baru menunggu pemangkasan harian.
-                    $wpdb->query( $wpdb->prepare(
-                        "UPDATE {$tabel} SET jumlah = jumlah + %d, terakhir = %d, diubah = %d WHERE sidik_jari = %s",
-                        $k['jumlah'], $sekarang, $sekarang, $sidik
-                    ) );
+                $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tabel} SET jumlah = jumlah + %d, terakhir = %d, diubah = %d WHERE sidik_jari = %s",
+                    $k['jumlah'], $sekarang, $sekarang, $sidik
+                ) );
+                if ( $wpdb->rows_affected > 0 ) {
+                    continue;
+                }
+                if ( $sisa <= 0 ) {
+                    // Tabel penuh: sidik baru menunggu pemangkasan harian.
                     continue;
                 }
                 $wpdb->query( $wpdb->prepare(
                     "INSERT INTO {$tabel} (sidik_jari, tingkat, komponen_tipe, komponen_slug, pesan, file, baris, konteks, jumlah, pertama, terakhir, diubah)
-                     VALUES (%s, %s, %s, %s, %s, %s, %d, %s, %d, %d, %d, %d)
-                     ON DUPLICATE KEY UPDATE jumlah = jumlah + VALUES(jumlah), terakhir = VALUES(terakhir), diubah = VALUES(diubah), konteks = VALUES(konteks)",
+                     VALUES (%s, %s, %s, %s, %s, %s, %d, %s, %d, %d, %d, %d)",
                     $sidik, $k['tingkat'], $k['komponen_tipe'], (string) $k['komponen_slug'], $k['pesan'],
                     $k['file'], $k['baris'], $konteks, $k['jumlah'], $sekarang, $sekarang, $sekarang
                 ) );
+                $sisa--;
             }
         } finally {
             $wpdb->suppress_errors( $lama );
