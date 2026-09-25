@@ -4,6 +4,7 @@ Bagian penilaian murni (tanpa jaringan dan database) supaya aturan yang
 menentukan kapan sebuah site dinyatakan mati bisa diuji langsung.
 """
 
+import logging
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,8 @@ from wpmgr.models import (
     UptimePutaran,
     UptimeStatus,
 )
+
+log = logging.getLogger("wpmgr.uptime")
 
 GAGAL_UNTUK_MATI = 2
 MIN_SITE_ATURAN_GANGGUAN = 5
@@ -136,6 +139,13 @@ def cek_satu(client: httpx.Client, url: str) -> HasilCek:
     try:
         r = client.get(url)
     except httpx.HTTPError as exc:
+        return nilai_kesalahan(exc)
+    except Exception as exc:
+        # mis. httpx.InvalidURL dari URL site yang tidak sah tersimpan di DB:
+        # bukan subkelas HTTPError, jadi tanpa ini lolos dari except dan
+        # menghentikan seluruh putaran lewat ThreadPoolExecutor.map (satu
+        # site rusak wajib gagal sendiri, bukan menggagalkan semua site).
+        log.exception("Kesalahan tak terduga saat mengecek uptime %s", url)
         return nilai_kesalahan(exc)
     return nilai_respons(r.status_code, dict(r.headers), r.text,
                          int((time.monotonic() - mulai) * 1000))

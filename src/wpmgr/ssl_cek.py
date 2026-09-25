@@ -32,7 +32,19 @@ def cek_semua_ssl(sesi: Session, baca_fn=baca_kedaluwarsa, sekarang: datetime | 
         if bagian.scheme != "https" or not bagian.hostname:
             continue
         try:
-            site.ssl_kedaluwarsa = baca_fn(bagian.hostname, bagian.port or 443)
+            # bagian.port melempar ValueError untuk port bukan angka (mis.
+            # "https://contoh.test:abcd"). buat_site hanya mengecek prefiks
+            # https, jadi URL semacam ini tetap bisa tersimpan. Satu site
+            # rusak wajib jadi ssl_error per-site, bukan menghentikan batch
+            # (dan karenanya juga tidak boleh melewatkan sesi.commit()).
+            port = bagian.port or 443
+        except ValueError:
+            site.ssl_error = f"URL site tidak sah: {site.url}"[:500]
+            site.ssl_dicek_pada = sekarang
+            dicek += 1
+            continue
+        try:
+            site.ssl_kedaluwarsa = baca_fn(bagian.hostname, port)
             site.ssl_error = None
         except ssl.SSLCertVerificationError as exc:
             alasan = getattr(exc, "verify_message", None) or str(exc)

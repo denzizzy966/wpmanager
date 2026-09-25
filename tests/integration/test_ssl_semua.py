@@ -59,3 +59,23 @@ def test_port_non_standar(sesi, site):
     dilihat = []
     cek_semua_ssl(sesi, lambda h, p: dilihat.append((h, p)) or SEKARANG, SEKARANG)
     assert dilihat == [("contoh.test", 8443)]
+
+
+def test_url_tidak_sah_tidak_menghentikan_batch(sesi, site):
+    # bagian.port (urlsplit) melempar ValueError untuk port yang bukan angka.
+    # Satu site dengan URL rusak seperti ini tidak boleh menggagalkan seluruh
+    # batch dan melewatkan sesi.commit() untuk site lain yang sudah diproses.
+    site.url = "https://contoh.test:abcd"
+    sah = Site(id=uuid.uuid4(), nama="Sah", url="https://sah.test",
+               status=SiteStatus.active, secret_terenkripsi=b"x")
+    sesi.add(sah)
+    sesi.commit()
+
+    assert cek_semua_ssl(sesi, lambda h, p: SEKARANG + timedelta(days=30), SEKARANG) == 2
+
+    sesi.refresh(site)
+    sesi.refresh(sah)
+    assert site.ssl_error.startswith("URL site tidak sah")
+    assert site.ssl_dicek_pada == SEKARANG
+    assert sah.ssl_kedaluwarsa == SEKARANG + timedelta(days=30)
+    assert sah.ssl_error is None

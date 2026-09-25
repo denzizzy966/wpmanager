@@ -3,6 +3,7 @@ import pytest
 
 from wpmgr.models import UptimeHasil, UptimeStatus
 from wpmgr.uptime import (
+    cek_satu,
     gangguan_dashboard,
     nilai_kesalahan,
     nilai_respons,
@@ -79,6 +80,19 @@ def test_kesalahan_dns():
 def test_kesalahan_koneksi_lain():
     h = nilai_kesalahan(httpx.ConnectError("[Errno 111] Connection refused"))
     assert h.pesan.startswith("Koneksi gagal")
+
+
+def test_cek_satu_kesalahan_bukan_httperror_dianggap_gagal():
+    # httpx.InvalidURL bukan subkelas httpx.HTTPError (mis. dari URL site yang
+    # tidak sah tersimpan di DB). Sebelumnya ini lolos dari except dan
+    # menghentikan seluruh putaran lewat ThreadPoolExecutor.map.
+    def handler(request):
+        raise httpx.InvalidURL("URL tidak sah")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    h = cek_satu(client, "https://contoh.test")
+    assert h.hasil == UptimeHasil.gagal
+    assert h.pesan
 
 
 @pytest.mark.parametrize(
