@@ -7,9 +7,9 @@ ini untuk menyusun HANDLER.
 import hashlib
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
@@ -28,6 +28,8 @@ from wpmgr.models import (
     KejadianLogin,
     LoginGagal,
     Site,
+    TrafficHarian,
+    TrafficRincian,
     User,
 )
 from wpmgr.site_client import SiteClient
@@ -385,3 +387,97 @@ def tangani_collect_events(sesi: Session, job: Job, klien: SiteClient) -> dict:
         if not data.get("lagi"):
             break
     return total
+
+
+DIMENSI_RINCIAN = ("halaman", "asal", "perangkat")
+# Batas defensif atas ukuran satu respons /traffic. Connector asli sudah
+# membatasi payload-nya sendiri (paling banyak 200 kunci `site_lain` +
+# kategori tetap, halaman dibatasi BATAS_PATH_PER_HARI, 3 jenis perangkat),
+# tetapi dashboard tidak boleh mempercayai batas itu -- site yang disusupi
+# bisa mengirim respons /traffic apa saja.
+BATAS_HARI_TRAFFIC = 400
+BATAS_KUNCI_DIMENSI = 2000
+
+
+def _hitungan_traffic(nilai) -> int:
+    """Kunjungan/pengunjung dari site dijepit ke jangkauan kolom `integer`
+    Postgres dan tidak boleh negatif. Beda dari _jumlah() (dipakai untuk
+    site_errors/login_gagal, yang tidak pernah nol): di sini 0 kunjungan
+    adalah nilai yang sah."""
+    return max(0, min(int(nilai), _JUMLAH_MAKS))
+
+
+def simpan_traffic(sesi: Session, site_id, hari: list, sumber: str) -> int:
+    n = 0
+    if len(hari) > BATAS_HARI_TRAFFIC:
+        log.warning(
+            "Respons /traffic membawa %d hari, dipotong ke %d (site %s)",
+            len(hari), BATAS_HARI_TRAFFIC, site_id,
+        )
+    for h in hari[:BATAS_HARI_TRAFFIC]:
+        if not isinstance(h, dict):
+            continue
+        try:
+            tanggal = date.fromisoformat(str(h["tanggal"])[:10])
+            if tanggal > datetime.now(timezone.utc).date() + _TOLERANSI_MASA_DEPAN:
+                raise ValueError("tanggal traffic terlalu jauh di masa depan")
+            total = h["total"]
+            kunjungan = _hitungan_traffic(total["kunjungan"])
+            pengunjung = _hitungan_traffic(total["pengunjung"])
+            rincian: dict[tuple[str, str], int] = {}
+            for dimensi in DIMENSI_RINCIAN:
+                isi = h.get(dimensi)
+                if not isinstance(isi, dict):
+                    continue  # PHP mengodekan array kosong sebagai [], bukan {}
+                item = list(isi.items())
+                if len(item) > BATAS_KUNCI_DIMENSI:
+                    log.warning(
+                        "Dimensi %s hari %s membawa %d kunci, dipotong ke %d (site %s)",
+                        dimensi, tanggal, len(item), BATAS_KUNCI_DIMENSI, site_id,
+                    )
+                for kunci, nilai in item[:BATAS_KUNCI_DIMENSI]:
+                    k = (dimensi, _bersihkan_teks(str(kunci))[:200])
+                    rincian[k] = min(rincian.get(k, 0) + _hitungan_traffic(nilai), _JUMLAH_MAKS)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+
+        try:
+            # Diganti utuh per (tanggal, sumber): angka dari site sudah
+            # akumulatif untuk hari itu, dan hari ini masih terus bertambah
+            # sampai berganti. begin_nested(): satu hari yang ternyata
+            # ditolak database (mis. validasi kita punya bug) tidak boleh
+            # menggagalkan hari lain di respons yang sama.
+            with sesi.begin_nested():
+                sesi.execute(delete(TrafficRincian).where(
+                    TrafficRincian.site_id == site_id, TrafficRincian.tanggal == tanggal,
+                    TrafficRincian.sumber == sumber))
+                sesi.execute(delete(TrafficHarian).where(
+                    TrafficHarian.site_id == site_id, TrafficHarian.tanggal == tanggal,
+                    TrafficHarian.sumber == sumber))
+                sesi.add(TrafficHarian(site_id=site_id, tanggal=tanggal, sumber=sumber,
+                                       kunjungan=kunjungan, pengunjung=pengunjung))
+                sesi.add_all(
+                    TrafficRincian(site_id=site_id, tanggal=tanggal, sumber=sumber,
+                                   dimensi=dimensi, kunci=kunci, kunjungan=nilai)
+                    for (dimensi, kunci), nilai in rincian.items()
+                )
+        except (DBAPIError, UnicodeEncodeError):
+            log.warning("Hari traffic %s dilewati karena ditolak database (site %s)",
+                        tanggal, site_id)
+            continue
+        n += 1
+    sesi.commit()
+    return n
+
+
+def tangani_collect_traffic(sesi: Session, job: Job, klien: SiteClient) -> dict:
+    site = sesi.get(Site, job.site_id)
+    data = klien.traffic()
+    if not isinstance(data, dict):
+        # Sama seperti /events: site hidup dan menjawab 200, tetapi bodinya
+        # bukan objek JSON yang kita harapkan.
+        raise SiteError(BAD_RESPONSE, "Respons /traffic bukan objek JSON")
+    n = simpan_traffic(sesi, site.id, _daftar(data, "hari"), "plugin")
+    site.traffic_diambil_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    return {"hari": n}

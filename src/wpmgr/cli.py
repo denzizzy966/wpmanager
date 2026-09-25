@@ -12,7 +12,7 @@ from wpmgr import db
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import bangun_paket, sumber_bawaan
 from wpmgr.db import get_session
-from wpmgr.fitur import EVENTS
+from wpmgr.fitur import EVENTS, TRAFFIC
 from wpmgr.geoip import unduh_geoip
 from wpmgr.jobs.queue import antrekan_jika_belum, antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
@@ -53,6 +53,22 @@ def enqueue_monitoring() -> int:
             if antrekan_jika_belum(sesi, site.id, JobType.collect_events, max_attempts=1):
                 dibuat += 1
     print(f"{dibuat} job collect_events dibuat")
+    return dibuat
+
+
+def enqueue_traffic() -> int:
+    dibuat = 0
+    with get_session() as sesi:
+        sites = sesi.scalars(
+            select(Site).where(Site.status == SiteStatus.active, Site.fitur.any(TRAFFIC))
+        ).all()
+        for site in sites:
+            # max_attempts=1: pengambilan berikutnya (job berikut) sudah
+            # menjadi retry-nya sendiri; mengulang lebih cepat hanya
+            # menggandakan beban.
+            if antrekan_jika_belum(sesi, site.id, JobType.collect_traffic, max_attempts=1):
+                dibuat += 1
+    print(f"{dibuat} job collect_traffic dibuat")
     return dibuat
 
 
@@ -125,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="perintah", required=True)
     sub.add_parser("enqueue-scans")
     sub.add_parser("enqueue-monitoring")
+    sub.add_parser("enqueue-traffic")
     sub.add_parser("reap-jobs")
     p = sub.add_parser("create-user")
     p.add_argument("--email", required=True)
@@ -141,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         enqueue_scans()
     elif args.perintah == "enqueue-monitoring":
         enqueue_monitoring()
+    elif args.perintah == "enqueue-traffic":
+        enqueue_traffic()
     elif args.perintah == "reap-jobs":
         reap_jobs()
     elif args.perintah == "create-user":
