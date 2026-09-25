@@ -95,6 +95,11 @@ _ID_MAKS = 2**63 - 1
 # Konteks sengaja kecil (path + jenis); apa pun yang jauh lebih besar dari itu
 # adalah site yang disusupi mencoba menyimpan sampah, bukan data nyata.
 _BATAS_KONTEKS_BYTE = 8192
+# json.loads menerima JSON bersarang ratusan level dari payload hanya
+# beberapa KB (site yang disusupi bisa mengirim ini sengaja). Rekursi
+# _bersihkan_json menghabiskan dua frame Python per level, jadi ia mencapai
+# RecursionError jauh sebelum batas ukuran di atas sempat menyaringnya.
+_KEDALAMAN_KONTEKS_MAKS = 32
 # Toleransi jam site yang meleset; lebih dari ini adalah timestamp yang
 # tidak masuk akal (mis. hasil parsing yang salah), bukan sekadar jitter jam.
 _TOLERANSI_MASA_DEPAN = timedelta(days=1)
@@ -120,18 +125,25 @@ def _teks(nilai, panjang: int) -> str | None:
     return _bersihkan_teks(str(nilai))[:panjang]
 
 
-def _bersihkan_json(nilai):
+def _bersihkan_json(nilai, kedalaman: int = 0):
     """Terapkan _bersihkan_teks() ke setiap string di dalam struktur JSONB,
-    termasuk yang bersarang -- `konteks` datang apa adanya dari site."""
+    termasuk yang bersarang -- `konteks` datang apa adanya dari site.
+
+    kedalaman dijaga eksplisit (lihat _KEDALAMAN_KONTEKS_MAKS): tanpa ini,
+    JSON bersarang ratusan level menghabiskan stack Python jauh sebelum
+    _konteks_bersih sempat menyaring lewat ukuran.
+    """
+    if kedalaman > _KEDALAMAN_KONTEKS_MAKS:
+        raise RecursionError("konteks terlalu bersarang")
     if isinstance(nilai, str):
         return _bersihkan_teks(nilai)
     if isinstance(nilai, dict):
         return {
-            (_bersihkan_teks(k) if isinstance(k, str) else k): _bersihkan_json(v)
+            (_bersihkan_teks(k) if isinstance(k, str) else k): _bersihkan_json(v, kedalaman + 1)
             for k, v in nilai.items()
         }
     if isinstance(nilai, list):
-        return [_bersihkan_json(v) for v in nilai]
+        return [_bersihkan_json(v, kedalaman + 1) for v in nilai]
     return nilai
 
 
@@ -156,8 +168,15 @@ def _id_bigint(nilai) -> int:
 def _konteks_bersih(nilai) -> dict | None:
     if not isinstance(nilai, dict):
         return None
-    bersih = _bersihkan_json(nilai)
-    if len(json.dumps(bersih)) > _BATAS_KONTEKS_BYTE:
+    try:
+        bersih = _bersihkan_json(nilai)
+        # allow_nan=False: json.loads menerima literal NaN/Infinity yang
+        # bukan JSON standar, tetapi JSONB Postgres menolaknya -- lebih baik
+        # konteks dibuang di sini daripada baris errornya gugur di savepoint.
+        teks = json.dumps(bersih, allow_nan=False)
+    except (RecursionError, ValueError):
+        return None
+    if len(teks) > _BATAS_KONTEKS_BYTE:
         return None
     return bersih
 
@@ -229,7 +248,10 @@ def simpan_errors(sesi: Session, site: Site, baris: list) -> int:
                 "pertama_terlihat": _waktu(b["pertama"]),
                 "terakhir_terlihat": _waktu(b["terakhir"]),
             }
-        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        except (KeyError, TypeError, ValueError, OverflowError, OSError, RecursionError):
+            # RecursionError: _konteks_bersih sudah menjaga kedalamannya
+            # sendiri; ini jaring pengaman kedua kalau batas itu ternyata
+            # masih kurang rendah di suatu lingkungan.
             continue
 
         try:

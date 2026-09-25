@@ -58,6 +58,22 @@ def klien_berurutan(balasan, diminta):
                       client=httpx.Client(transport=httpx.MockTransport(handler)))
 
 
+def klien_body_mentah(payload: dict) -> SiteClient:
+    """Untuk payload yang tidak bisa dibangun lewat kwarg `json=` httpx (ia
+    memakai ensure_ascii=False dan allow_nan=False, sehingga surrogate lepas
+    atau NaN/Infinity meledak lebih dulu di sisi test, bukan di sisi kode
+    yang diuji): body ditulis manual dengan json.dumps(ensure_ascii=True)
+    milik stdlib, yang menerima keduanya apa adanya seperti json.loads di
+    sisi SiteClient sungguhan."""
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+
+    def handler(request):
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+
+    return SiteClient("https://contoh.test", "s", "f" * 64,
+                      client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+
 def jalankan(sesi, site, balasan, diminta=None):
     job = buat_job(sesi, site.id, JobType.collect_events)
     return tangani_collect_events(sesi, job, klien_berurutan(balasan, diminta if diminta is not None else []))
@@ -225,23 +241,10 @@ def test_konteks_dengan_nul_dibersihkan(sesi, site):
 
 
 def test_lone_surrogate_dibersihkan(sesi, site):
-    """httpx menolak meng-encode surrogate lepas lewat kwarg `json=` (ia
-    memakai ensure_ascii=False), padahal justru itulah yang senyatanya
-    diterima dari site: JSON teks aman-ASCII (escape `\\udc00`) yang oleh
-    json.loads dibaca ulang menjadi satu code point surrogate lepas. Body
-    respons di sini ditulis manual dengan json.dumps(ensure_ascii=True) milik
-    stdlib supaya skenario itu tereproduksi apa adanya."""
     payload = copy.deepcopy(PAYLOAD)
     payload["errors"][0]["pesan"] = "abc\udc00def"
-    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-
-    def handler(request):
-        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
-
-    klien = SiteClient("https://contoh.test", "s", "f" * 64,
-                       client=httpx.Client(transport=httpx.MockTransport(handler)))
     job = buat_job(sesi, site.id, JobType.collect_events)
-    hasil = tangani_collect_events(sesi, job, klien)
+    hasil = tangani_collect_events(sesi, job, klien_body_mentah(payload))
     assert hasil["errors"] == 1
     e = sesi.query(CatatanError).one()
     assert "\udc00" not in e.pesan
@@ -316,6 +319,13 @@ def test_gagal_di_halaman_kedua_mempertahankan_kursor_halaman_pertama(sesi, site
     halaman_pertama = {**PAYLOAD, "lagi": True}
     with pytest.raises(SiteError):
         jalankan(sesi, site, [halaman_pertama, "bukan-dict"])
+    # Tanpa rollback ini, sesi yang sama masih melihat baris halaman pertama
+    # di identity map-nya sendiri terlepas dari apakah commit-nya benar-benar
+    # sampai ke database -- assert di bawah tidak lagi membuktikan apa pun
+    # tentang penyimpanan lintas halaman tanpa rollback eksplisit ini
+    # (mencerminkan sesi.rollback() yang dipanggil worker saat menangkap
+    # kegagalan tak terduga).
+    sesi.rollback()
     sesi.refresh(site)
     assert site.events_kursor == "e=10:1;l=10:5;g=10:1"
     assert sesi.query(CatatanError).count() == 1
@@ -339,5 +349,43 @@ def test_timestamp_masa_depan_dilewati(sesi, site):
     payload["login_gagal"][0]["jam"] = depan
     hasil = jalankan(sesi, site, [payload])
     assert hasil == {"errors": 0, "logins": 0, "login_gagal": 0, "halaman": 1}
+    sesi.refresh(site)
+    assert site.events_kursor == payload["kursor"]
+
+
+# --- Fix round 2: NaN/Infinity dan konteks bersarang terlalu dalam. ---
+
+
+def test_konteks_dengan_nan_disimpan_none(sesi, site):
+    """json.loads menerima literal NaN/Infinity (bukan JSON standar, tetapi
+    Python mengizinkannya), lalu JSONB Postgres menolaknya -- konteks harus
+    dibuang di sini, bukan menggugurkan baris errornya lewat savepoint."""
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["konteks"] = {"path": "/", "jenis": "depan", "angka": float("nan")}
+    job = buat_job(sesi, site.id, JobType.collect_events)
+    hasil = tangani_collect_events(sesi, job, klien_body_mentah(payload))
+    assert hasil["errors"] == 1
+    assert sesi.query(CatatanError).one().konteks is None
+
+
+def _konteks_bersarang(kedalaman: int) -> dict:
+    d = {"nilai": "dasar"}
+    for _ in range(kedalaman):
+        d = {"anak": d}
+    return d
+
+
+def test_konteks_bersarang_terlalu_dalam_disimpan_none(sesi, site):
+    """json.loads menerima ~950 level bersarang dari payload hanya beberapa
+    KB; rekursi _bersihkan_json sendiri jauh lebih boros stack (dua frame
+    Python per level) dan tanpa batas eksplisit mencapai RecursionError lebih
+    dulu -- baris error itu sendiri harus tetap tersimpan, hanya konteksnya
+    yang dibuang, dan halaman (termasuk baris lain) tidak boleh ikut gugur."""
+    payload = copy.deepcopy(PAYLOAD)
+    payload["errors"][0]["konteks"] = _konteks_bersarang(600)
+    hasil = jalankan(sesi, site, [payload])
+    assert hasil == {"errors": 1, "logins": 1, "login_gagal": 1, "halaman": 1}
+    e = sesi.query(CatatanError).one()
+    assert e.konteks is None
     sesi.refresh(site)
     assert site.events_kursor == payload["kursor"]
