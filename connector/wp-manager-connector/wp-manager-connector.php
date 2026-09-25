@@ -23,6 +23,7 @@ define( 'WPMGR_DIR', plugin_dir_path( __FILE__ ) );
 
 require_once WPMGR_DIR . 'includes/class-wpmgr-signing.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-settings.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-ip.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-skema.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-penangkap.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-inventory.php';
