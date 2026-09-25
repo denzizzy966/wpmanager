@@ -50,6 +50,11 @@ if ( ! function_exists( 'is_wp_error' ) ) {
     }
 }
 
+// Konstanta format hasil query wpdb, dipakai WPMGR_Events::kumpulkan().
+if ( ! defined( 'ARRAY_A' ) ) {
+    define( 'ARRAY_A', 'ARRAY_A' );
+}
+
 // get_option()/wp_unslash() minimal: cukup untuk kelas yang menyentuhnya
 // tanpa memuat WordPress penuh (mis. WPMGR_IP::saat_ini() lewat
 // WPMGR_Settings::percayai_xff()). Nilai baliknya sengaja "tidak ada

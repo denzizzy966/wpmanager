@@ -11,15 +11,46 @@ if ( ! defined( 'ABSPATH' ) && ! defined( 'WPMGR_TESTING' ) ) {
  */
 class WPMGR_Events {
 
-    const BATAS_MAKS     = 500;
-    const TUMPANG_TINDIH = 2;
-    const TABEL          = array( 'e' => 'wpmgr_errors', 'l' => 'wpmgr_logins', 'g' => 'wpmgr_login_gagal' );
+    const BATAS_MAKS = 500;
+    const TABEL      = array( 'e' => 'wpmgr_errors', 'l' => 'wpmgr_logins', 'g' => 'wpmgr_login_gagal' );
 
-    public static function urai_kursor( $kursor ) {
-        $posisi = array( 'e' => array( 0, 0 ), 'l' => array( 0, 0 ), 'g' => array( 0, 0 ) );
+    /**
+     * Detik penundaan sebelum sebuah "diubah" dianggap tuntas.
+     *
+     * Semua penulis (WPMGR_Penangkap::tulis(), WPMGR_Login::tulis()) memakai
+     * $sekarang = time() SEKALI di awal flush lalu memakainya untuk setiap
+     * UPDATE/INSERT baris itu -- flush sendiri selesai dalam hitungan
+     * milidetik. Karena itu, begitu jam dinding sungguhan sudah lewat
+     * (detik s + CAKRAWALA), TIDAK ADA request lain yang bisa lagi memanggil
+     * time() dan mendapat s (time() hanya mundur bila jam sistem sendiri
+     * mundur -- ditangani terpisah di urai_kursor()) -- setiap baris yang
+     * "diubah" ke detik s pasti sudah tertulis. Kursor hanya boleh maju
+     * melewati sebuah detik setelah itu terjamin, supaya baris berid rendah
+     * yang diperbarui belakangan ke detik yang sama tidak pernah terlewat
+     * permanen (Ruling review Task 14 putaran 1).
+     */
+    const CAKRAWALA = 5;
+
+    public static function urai_kursor( $kursor, $sekarang = null ) {
+        $sekarang = null === $sekarang ? time() : (int) $sekarang;
+        $posisi   = array( 'e' => array( 0, 0 ), 'l' => array( 0, 0 ), 'g' => array( 0, 0 ) );
+        // ?kursor[]=x mengirim array, bukan string -- (string) atas array
+        // memicu peringatan "Array to string conversion" yang tak perlu.
+        if ( ! is_scalar( $kursor ) ) {
+            return $posisi;
+        }
         foreach ( explode( ';', (string) $kursor ) as $bagian ) {
             if ( preg_match( '/^([elg])=(\d{1,10}):(\d{1,19})$/', $bagian, $m ) ) {
-                $posisi[ $m[1] ] = array( (int) $m[2], (int) $m[3] );
+                $t = (int) $m[2];
+                // Posisi "di masa depan" hanya masuk akal bila jam site
+                // mundur atau basis data dipulihkan dari cadangan lama.
+                // Memakainya apa adanya membuat tabel itu terjebak: ia tidak
+                // akan pernah mengambil apa pun sampai jam sungguhan
+                // mengejar posisi itu. Anggap saja belum pernah mengambil.
+                if ( $t > $sekarang + 60 ) {
+                    continue;
+                }
+                $posisi[ $m[1] ] = array( $t, (int) $m[3] );
             }
         }
         return $posisi;
@@ -33,16 +64,19 @@ class WPMGR_Events {
         return implode( ';', $bagian );
     }
 
-    public static function posisi_berikut( array $lama, array $baris, $batas ) {
-        if ( count( $baris ) >= $batas && ! empty( $baris ) ) {
-            $akhir = end( $baris );
-            return array( (int) $akhir['diubah'], (int) $akhir['id'] );
+    /**
+     * Posisi berikutnya adalah persis (diubah, id) baris terakhir yang
+     * dikembalikan -- tidak pernah mundur. Tabel yang tidak menghasilkan
+     * baris (sudah tuntas, atau semuanya masih di dalam cakrawala) tetap di
+     * posisi lamanya; ia dicoba lagi di pengambilan berikutnya, bukan
+     * dianggap "sudah sampai di situ".
+     */
+    public static function posisi_berikut( array $lama, array $baris ) {
+        if ( empty( $baris ) ) {
+            return $lama;
         }
-        $maks = (int) $lama[0];
-        foreach ( $baris as $b ) {
-            $maks = max( $maks, (int) $b['diubah'] );
-        }
-        return array( max( 0, $maks - self::TUMPANG_TINDIH ), 0 );
+        $akhir = end( $baris );
+        return array( (int) $akhir['diubah'], (int) $akhir['id'] );
     }
 
     public static function batas( $nilai ) {
@@ -98,23 +132,34 @@ class WPMGR_Events {
 
     public static function kumpulkan( $kursor, $batas ) {
         global $wpdb;
-        $posisi = self::urai_kursor( $kursor );
-        $batas  = self::batas( $batas );
-        $hasil  = array();
-        $lagi   = false;
+        // Satu cakrawala untuk ketiga tabel dalam satu request: dihitung
+        // sekali dari time() (bukan NOW() SQL) karena penulis juga memakai
+        // time() PHP untuk kolom diubah -- menyamakan sumber jam mencegah
+        // selisih jam antara PHP dan MySQL menggeser batas tuntas ini.
+        $sekarang = time();
+        $horizon  = $sekarang - self::CAKRAWALA;
+        $posisi   = self::urai_kursor( $kursor, $sekarang );
+        $batas    = self::batas( $batas );
+        $hasil    = array();
+        $lagi     = false;
         foreach ( self::TABEL as $k => $tabel ) {
             list( $t, $id ) = $posisi[ $k ];
+            // diubah >= %d dulu (jangkauan tunggal yang bisa dipakai indeks
+            // (diubah,id)), baru (diubah > %d OR id > %d) menyaring persis
+            // baris sesudah posisi kursor -- setara dengan
+            // "diubah > t OR (diubah = t AND id > id)" tapi tidak memaksa
+            // MySQL memindai dari awal tabel untuk sisi OR yang kedua.
             $baris = $wpdb->get_results( $wpdb->prepare(
                 "SELECT * FROM {$wpdb->prefix}{$tabel}
-                  WHERE diubah > %d OR (diubah = %d AND id > %d)
+                  WHERE diubah >= %d AND (diubah > %d OR id > %d) AND diubah <= %d
                   ORDER BY diubah ASC, id ASC LIMIT %d",
-                $t, $t, $id, $batas
+                $t, $t, $id, $horizon, $batas
             ), ARRAY_A );
             $baris = is_array( $baris ) ? $baris : array();
             if ( count( $baris ) >= $batas ) {
                 $lagi = true;
             }
-            $posisi[ $k ] = self::posisi_berikut( $posisi[ $k ], $baris, $batas );
+            $posisi[ $k ] = self::posisi_berikut( $posisi[ $k ], $baris );
             $hasil[ $k ]  = $baris;
         }
         return array(
