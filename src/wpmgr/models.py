@@ -310,6 +310,14 @@ class KejadianLogin(Base):
     negara: Mapped[str | None] = mapped_column(Text)
     user_agent: Mapped[str | None] = mapped_column(Text)
     jalur: Mapped[str | None] = mapped_column(Text)
+    # Waktu kejadian ini TERSIMPAN di dashboard, bukan waktu di site (`waktu`).
+    # "Sudah diperiksa" dibandingkan dengan ini: `waktu` datang dari site dan
+    # selalu terlambat (cakrawala /events + interval collect_events + jitter
+    # jam), jadi kejadian yang terjadi sebelum klik tetapi baru terkumpul
+    # sesudahnya tidak boleh hilang begitu saja (koreksi #11).
+    dicatat_pada: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class LoginGagal(Base):

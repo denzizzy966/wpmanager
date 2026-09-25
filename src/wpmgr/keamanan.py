@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from wpmgr.models import KejadianLogin, LoginGagal
 
@@ -21,6 +21,16 @@ JENDELA_SERANGAN = timedelta(minutes=60)
 JENDELA_NEGARA = timedelta(days=90)
 JENDELA_ERROR_BARU = timedelta(hours=24)
 _AWAL = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# LoginGagal.jam adalah AWAL jam, bukan tengahnya (connector membulatkan ke
+# bawah -- koreksi #11): ember 11:00 mewakili gagal sepanjang 11:00-11:59.
+# Semua jendela waktu yang dibandingkan ke `jam` mundur satu jam ekstra
+# supaya ember yang sedang berjalan tetap terhitung di menit mana pun,
+# bukan cuma tepat pukul xx:00.
+_MARJIN_EMBER = timedelta(hours=1)
+# Riwayat negara toh tidak pernah menoleh lebih jauh dari JENDELA_NEGARA;
+# tanpa batas ini, site yang belum pernah "diperiksa" (sejak = 1970) akan
+# memindai seluruh login_events dari awal setiap kali dipanggil.
+_BATAS_KANDIDAT_BERHASIL = 50
 
 
 class StatusKeamanan(str, enum.Enum):
@@ -61,71 +71,105 @@ def error_menyalakan_chip(e, sekarang: datetime) -> bool:
     )
 
 
-def _alasan_kritis(sesi: Session, site, sejak: datetime) -> list[str]:
+def _alasan_kritis(sesi: Session, site, sekarang: datetime) -> list[str]:
+    """Alasan yang membuat site "perlu_diperiksa": admin baru/dinaikkan,
+    login sukses yang sebelumnya digempur brute force, atau login dari
+    negara baru.
+
+    "Sejak diperiksa" dibandingkan ke `dicatat_pada` (waktu baris ini
+    TERSIMPAN di dashboard), bukan ke `waktu` (waktu kejadian di site):
+    `waktu` selalu datang belakangan lewat /events (cakrawala + interval
+    collect_events + jitter jam site), jadi kejadian yang terjadi sebelum
+    klik "Sudah diperiksa" tetapi baru terkumpul sesudahnya tidak boleh
+    dianggap sudah terlihat begitu saja (koreksi #11). `waktu` tetap dipakai
+    untuk jendela waktu yang berkaitan dengan ember gagal dan riwayat negara.
+
+    Rule (b) dan (c) diekspresikan sebagai satu query dengan sub-select
+    berkorelasi (bukan satu query Python per login) supaya jumlah query
+    tetap konstan walau jumlah login sukses bertambah.
+    """
     alasan: list[str] = []
+    sejak = site.keamanan_diperiksa_pada or _AWAL
 
     admin = sesi.scalars(
         select(KejadianLogin)
         .where(KejadianLogin.site_id == site.id,
                KejadianLogin.jenis.in_(("admin_baru", "jadi_admin")),
-               KejadianLogin.waktu > sejak)
+               KejadianLogin.dicatat_pada > sejak)
         .order_by(KejadianLogin.waktu)
     ).all()
     for k in admin:
         apa = "Administrator baru" if k.jenis == "admin_baru" else "User dinaikkan menjadi administrator"
-        alasan.append(f"{apa}: {k.username} ({k.waktu:%Y-%m-%d %H:%M} UTC)")
+        waktu_utc = k.waktu.astimezone(timezone.utc)
+        alasan.append(f"{apa}: {k.username} ({waktu_utc:%Y-%m-%d %H:%M} UTC)")
 
-    berhasil = sesi.scalars(
-        select(KejadianLogin)
+    sejak_berhasil = max(sejak, sekarang - JENDELA_NEGARA)
+    e2 = aliased(KejadianLogin)
+
+    def _riwayat_negara(tambahan=()):
+        return (
+            select(e2.id)
+            .where(
+                e2.site_id == site.id,
+                e2.username == KejadianLogin.username,
+                e2.jenis == "berhasil",
+                e2.negara.is_not(None),
+                e2.waktu < KejadianLogin.waktu,
+                e2.waktu >= KejadianLogin.waktu - JENDELA_NEGARA,
+                *tambahan,
+            )
+            .correlate(KejadianLogin)
+            .exists()
+        )
+
+    pernah = _riwayat_negara()
+    sama = _riwayat_negara((e2.negara == KejadianLogin.negara,))
+    gagal_sum = (
+        select(func.coalesce(func.sum(LoginGagal.jumlah), 0))
+        .where(
+            LoginGagal.site_id == site.id,
+            LoginGagal.ip == KejadianLogin.ip,
+            LoginGagal.jam > KejadianLogin.waktu - JENDELA_TEMBUS - _MARJIN_EMBER,
+            LoginGagal.jam <= KejadianLogin.waktu,
+        )
+        .correlate(KejadianLogin)
+        .scalar_subquery()
+    )
+
+    berhasil = sesi.execute(
+        select(KejadianLogin.username, KejadianLogin.ip, KejadianLogin.negara,
+              gagal_sum.label("gagal"), pernah.label("pernah"), sama.label("sama"))
         .where(KejadianLogin.site_id == site.id,
                KejadianLogin.jenis == "berhasil",
                KejadianLogin.jalur.is_distinct_from("sso"),
-               KejadianLogin.waktu > sejak)
+               KejadianLogin.dicatat_pada > sejak_berhasil)
         .order_by(KejadianLogin.waktu)
+        .limit(_BATAS_KANDIDAT_BERHASIL)
     ).all()
-    for k in berhasil:
-        if k.ip:
-            gagal = sesi.scalar(
-                select(func.coalesce(func.sum(LoginGagal.jumlah), 0)).where(
-                    LoginGagal.site_id == site.id,
-                    LoginGagal.ip == k.ip,
-                    LoginGagal.jam >= k.waktu - JENDELA_TEMBUS,
-                    LoginGagal.jam <= k.waktu,
-                )
+    for username, ip, negara, gagal, pernah_ada, sama_ada in berhasil:
+        if ip and gagal >= AMBANG_GAGAL_SEBELUM_TEMBUS:
+            alasan.append(
+                f"Login berhasil sebagai {username} dari {ip}, yang sebelumnya "
+                f"gagal {gagal} kali dalam 24 jam"
             )
-            if gagal >= AMBANG_GAGAL_SEBELUM_TEMBUS:
-                alasan.append(
-                    f"Login berhasil sebagai {k.username} dari {k.ip}, yang sebelumnya "
-                    f"gagal {gagal} kali dalam 24 jam"
-                )
-        if k.negara:
-            riwayat = select(func.count()).select_from(KejadianLogin).where(
-                KejadianLogin.site_id == site.id,
-                KejadianLogin.username == k.username,
-                KejadianLogin.jenis == "berhasil",
-                KejadianLogin.negara.is_not(None),
-                KejadianLogin.waktu < k.waktu,
-                KejadianLogin.waktu >= k.waktu - JENDELA_NEGARA,
-            )
-            pernah = sesi.scalar(riwayat)
-            sama = sesi.scalar(riwayat.where(KejadianLogin.negara == k.negara))
-            if pernah and not sama:
-                alasan.append(f"Login {k.username} dari negara yang belum pernah dipakai: {k.negara}")
+        if negara and pernah_ada and not sama_ada:
+            alasan.append(f"Login {username} dari negara yang belum pernah dipakai: {negara}")
     return alasan
 
 
 def nilai_keamanan(sesi: Session, site, sekarang: datetime) -> HasilKeamanan:
     per_ip = sesi.execute(
         select(LoginGagal.ip, func.sum(LoginGagal.jumlah).label("n"))
-        .where(LoginGagal.site_id == site.id, LoginGagal.jam >= sekarang - JENDELA_SERANGAN)
+        .where(LoginGagal.site_id == site.id,
+               LoginGagal.jam > sekarang - JENDELA_SERANGAN - _MARJIN_EMBER)
         .group_by(LoginGagal.ip)
-        .order_by(func.sum(LoginGagal.jumlah).desc())
+        .order_by(func.sum(LoginGagal.jumlah).desc(), LoginGagal.ip)
     ).all()
     total = int(sum(n for _, n in per_ip))
     teratas = [(ip or "(IP lain)", int(n)) for ip, n in per_ip[:5]]
 
     # Status merah tidak padam sendiri; hanya tombol "Sudah diperiksa".
-    alasan = _alasan_kritis(sesi, site, site.keamanan_diperiksa_pada or _AWAL)
+    alasan = _alasan_kritis(sesi, site, sekarang)
     if alasan:
         return HasilKeamanan(StatusKeamanan.perlu_diperiksa, alasan, total, teratas)
 
