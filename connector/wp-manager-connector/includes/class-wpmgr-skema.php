@@ -33,7 +33,11 @@ class WPMGR_Skema {
      * 404 rest_no_route dan salah menyimpulkan connector sudah dicabut.
      */
     public static function fitur( $monitoring_mati ) {
-        return array( 'self_update' );
+        $fitur = array( 'self_update' );
+        if ( ! $monitoring_mati ) {
+            $fitur[] = 'events';
+        }
+        return $fitur;
     }
 
     public static function mode_penangkap() {

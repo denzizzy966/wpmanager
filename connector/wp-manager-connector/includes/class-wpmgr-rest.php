@@ -33,6 +33,12 @@ class WPMGR_REST {
             'callback'            => array( __CLASS__, 'self_update' ),
             'permission_callback' => $guard,
         ) );
+
+        register_rest_route( self::NS, '/events', array(
+            'methods'             => 'GET',
+            'callback'            => array( __CLASS__, 'events' ),
+            'permission_callback' => $guard,
+        ) );
     }
 
     private static function tolak( $pesan ) {
@@ -152,6 +158,12 @@ class WPMGR_REST {
     public static function self_update( $request ) {
         return rest_ensure_response(
             WPMGR_SelfUpdate::jalankan( json_decode( $request->get_body(), true ) )
+        );
+    }
+
+    public static function events( $request ) {
+        return rest_ensure_response(
+            WPMGR_Events::kumpulkan( $request->get_param( 'kursor' ), $request->get_param( 'batas' ) )
         );
     }
 }
