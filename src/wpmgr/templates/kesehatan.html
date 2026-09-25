@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block judul %}Kesehatan — WP Manager{% endblock %}
+{% block isi %}
+<div x-data="layarKesehatan()" x-init="mulai()">
+  <h1>Kesehatan</h1>
+  <p class="redup" x-show="diperbarui"
+     x-text="`Diperbarui ${diperbarui} · menyegarkan sendiri setiap 60 detik`"></p>
+  <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+
+  <div class="chips">
+    <template x-for="k in urutanChip" :key="k">
+      <button type="button" class="chip" x-show="chip[k] > 0"
+              :class="[kelasChip(k), filter === k ? 'chip-aktif' : '']"
+              @click="pilihChip(k)" x-text="`${chip[k]} ${label(k)}`"></button>
+    </template>
+    <span class="chip chip-hijau" x-show="semuaSehat()">Semua site sehat</span>
+    <button type="button" class="chip" x-show="filter" @click="pilihChip(filter)">Tampilkan semua</button>
+  </div>
+
+  <div id="grid" style="height: 70vh"></div>
+</div>
+<script src="/static/app/kesehatan.js"></script>
+{% endblock %}

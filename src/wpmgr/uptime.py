@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from wpmgr.models import (
@@ -219,3 +219,19 @@ def jalankan_putaran(
             _terapkan_ke_site(sesi, site, h, sekarang)
     sesi.commit()
     return putaran
+
+
+def persen_uptime_per_site(sesi: Session, sejak: datetime) -> dict:
+    """Persen cek `naik` per site, tanpa putaran gangguan dashboard dan tanpa hasil terblokir."""
+    naik = func.count().filter(UptimeCheck.hasil == UptimeHasil.naik)
+    gagal = func.count().filter(UptimeCheck.hasil == UptimeHasil.gagal)
+    baris = sesi.execute(
+        select(UptimeCheck.site_id, naik, gagal)
+        .join(UptimePutaran, UptimePutaran.id == UptimeCheck.putaran_id)
+        .where(UptimeCheck.dicek_pada >= sejak, UptimePutaran.gangguan_dashboard.is_(False))
+        .group_by(UptimeCheck.site_id)
+    ).all()
+    return {
+        site_id: (round(n / (n + g) * 100, 2) if n + g else None)
+        for site_id, n, g in baris
+    }

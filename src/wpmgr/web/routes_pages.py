@@ -34,6 +34,11 @@ def _versi_connector() -> str | None:
 
 
 @router.get("/")
+def halaman_kesehatan(request: Request, pengguna: PenggunaHalaman):
+    return _tpl().TemplateResponse(request, "kesehatan.html", {"pengguna": pengguna})
+
+
+@router.get("/updates")
 def halaman_updates(request: Request, pengguna: PenggunaHalaman):
     return _tpl().TemplateResponse(request, "updates.html", {"pengguna": pengguna})
 

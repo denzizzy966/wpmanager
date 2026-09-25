@@ -29,19 +29,19 @@ def klien(engine, monkeypatch, sesi):
     return c
 
 
-@pytest.mark.parametrize("jalur", ["/", "/sites", "/sites/new", "/activity"])
+@pytest.mark.parametrize("jalur", ["/", "/updates", "/sites", "/sites/new", "/activity"])
 def test_halaman_terbuka_dan_memuat_datagrid(klien, jalur):
     r = klien.get(jalur)
     assert r.status_code == 200
     assert "/static/vendor/datagrid/datagrid.js" in r.text
 
 
-def test_beranda_menyajikan_halaman_update_bukan_placeholder(klien):
+def test_halaman_update_menyajikan_layar_update(klien):
     # Regresi terhadap placeholder GET "/" yang harus dihapus Task 21: jika
     # placeholder itu masih terdaftar, Starlette akan mencocokkannya lebih
     # dulu (ia terdaftar sebelum router halaman) dan "/" tak pernah benar-benar
     # menyajikan updates.html walau status code-nya tetap 200.
-    r = klien.get("/")
+    r = klien.get("/updates")
     assert r.status_code == 200
     assert "layarUpdate()" in r.text
     assert "Masuk sebagai" not in r.text
