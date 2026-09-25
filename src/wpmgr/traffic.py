@@ -21,7 +21,9 @@ log = logging.getLogger("wpmgr.traffic")
 
 URL_RUN_REPORT = "https://analyticsdata.googleapis.com/v1beta/properties/{pid}:runReport"
 CAKUPAN = "https://www.googleapis.com/auth/analytics.readonly"
-POLA_PROPERTY = re.compile(r"^\d{6,12}$")
+# [0-9] dan \Z, bukan \d dan $: \d juga cocok dengan digit non-ASCII, dan $
+# cocok sebelum baris baru di akhir -- keduanya lolos ke URL runReport.
+POLA_PROPERTY = re.compile(r"^[0-9]{6,12}\Z")
 HALAMAN_TERATAS_GA4 = 50
 MIN_MEDIAN_ANOMALI = 20
 HARI_RIWAYAT_ANOMALI = 14

@@ -86,11 +86,13 @@ def test_token_ga4_json_tidak_valid_tidak_membocorkan_jalur(sesi, site, tmp_path
     assert "kredensial-rahasia-rusak" not in site.ga4_error
 
 
-def test_property_id_tidak_valid_dilewati_tanpa_memicu_invalid_url(sesi, site):
+@pytest.mark.parametrize("property_id", ["123\n456", "123456\n", "١٢٣٤٥٦"])
+def test_property_id_tidak_valid_dilewati_tanpa_memicu_invalid_url(sesi, site, property_id):
     """property_id di kolom bisa berupa apa saja; salah satu (mis. karakter
     kontrol) membuat httpx.InvalidURL -- bukan httpx.HTTPError -- yang sebelum
-    perbaikan ini menggagalkan seluruh putaran sebelum sempat commit."""
-    site.ga4_property_id = "123\n456"
+    perbaikan ini menggagalkan seluruh putaran sebelum sempat commit.
+    "123456\n" lolos dari `$`, dan digit non-ASCII lolos dari `\\d`."""
+    site.ga4_property_id = property_id
     sesi.commit()
     with httpx.Client(transport=httpx.MockTransport(balasan_ga)) as http:
         hasil = kumpulkan_ga4(sesi, "k.json", HARI_INI, http=http, token_fn=lambda p: "tkn")
