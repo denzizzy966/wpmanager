@@ -4,6 +4,7 @@ GA4 disimpan di tabel yang sama dengan traffic plugin, dengan sumber 'ga4'.
 Keduanya tidak pernah dijumlah: angkanya memang tidak akan sama.
 """
 
+import logging
 import re
 import statistics
 from collections import defaultdict
@@ -15,6 +16,8 @@ from sqlalchemy.orm import Session
 
 from wpmgr.jobs.monitoring import simpan_traffic
 from wpmgr.models import Site, SiteStatus, TrafficHarian
+
+log = logging.getLogger("wpmgr.traffic")
 
 URL_RUN_REPORT = "https://analyticsdata.googleapis.com/v1beta/properties/{pid}:runReport"
 CAKUPAN = "https://www.googleapis.com/auth/analytics.readonly"
@@ -57,15 +60,23 @@ def _laporan(http: httpx.Client, token: str, property_id: str, dari: date, sampa
         "dateRanges": [{"startDate": dari.isoformat(), "endDate": sampai.isoformat()}],
         "dimensions": [{"name": d} for d in dimensi],
         "metrics": [{"name": m} for m in metrik],
+        # Metrik utama duluan sebelum limit 10000 memotong: tanpa ini, baris
+        # yang GA4 kembalikan pertama (urutan tidak terjamin) yang terpotong,
+        # bukan baris yang benar-benar paling ramai.
+        "orderBys": [{"metric": {"metricName": metrik[0]}, "desc": True}],
         "limit": 10000,
     }
     r = http.post(URL_RUN_REPORT.format(pid=property_id), json=body,
                   headers={"Authorization": f"Bearer {token}"})
     if r.status_code == 403:
         raise GalatGA4("akses", "Service account belum ditambahkan sebagai Viewer di property ini")
-    if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
-        raise GalatGA4("kuota", "Kuota GA4 habis; dicoba lagi besok")
     if r.status_code >= 400:
+        # "RESOURCE_EXHAUSTED" hanya diperiksa di sini, bukan di setiap respons:
+        # `pagePath` datang dari pengunjung site, jadi kunjungan ke URL apa pun
+        # yang kebetulan memuat substring itu tidak boleh membuat respons 200
+        # yang sah dibaca sebagai kuota habis.
+        if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
+            raise GalatGA4("kuota", "Kuota GA4 habis; dicoba lagi besok")
         raise GalatGA4("lain", f"GA4 membalas HTTP {r.status_code}: {r.text[:300]}")
     return [
         ([v.get("value", "") for v in row.get("dimensionValues", [])],
@@ -107,6 +118,13 @@ def ambil_ga4(http: httpx.Client, token: str, property_id: str, dari: date, samp
     return [hari[t] for t in sorted(hari)]
 
 
+def _tandai_kredensial_gagal(sesi: Session, sites: list[Site], pesan: str) -> dict:
+    for site in sites:
+        site.ga4_error = pesan
+    sesi.commit()
+    return {"berhasil": 0, "gagal": len(sites)}
+
+
 def kumpulkan_ga4(sesi: Session, jalur_kredensial: str, hari_ini: date,
                   http: httpx.Client | None = None, token_fn=token_ga4) -> dict:
     sites = sesi.scalars(
@@ -117,12 +135,23 @@ def kumpulkan_ga4(sesi: Session, jalur_kredensial: str, hari_ini: date,
         return hasil
     try:
         token = token_fn(jalur_kredensial)
-    except Exception as exc:  # noqa: BLE001 -- apa pun penyebabnya, tampilkan ke operator
-        for site in sites:
-            site.ga4_error = f"Kredensial GA4 tidak dapat dipakai: {exc}"[:500]
-        sesi.commit()
-        hasil["gagal"] = len(sites)
-        return hasil
+    except OSError as exc:
+        # Berkas tidak ada/tidak terbaca (mis. FileNotFoundError): str(exc)
+        # menyertakan jalur berkas, dan ga4_error tampil di dashboard --
+        # jenis exception dicatat di log, bukan pesannya, jalurnya tidak
+        # pernah masuk ke keduanya.
+        log.warning("Token GA4 gagal dimuat: berkas (%s)", type(exc).__name__)
+        return _tandai_kredensial_gagal(
+            sesi, sites,
+            "Kredensial GA4 tidak dapat dipakai: berkas tidak ditemukan atau tidak dapat dibaca",
+        )
+    except Exception as exc:  # noqa: BLE001 -- JSON tidak valid, google.auth.exceptions.*,
+        # atau kegagalan token_fn kustom apa pun; sama seperti di atas, str(exc)
+        # tidak disisipkan supaya jalur berkas tidak pernah bocor ke DB.
+        log.warning("Token GA4 gagal dimuat: kredensial (%s)", type(exc).__name__)
+        return _tandai_kredensial_gagal(
+            sesi, sites, "Kredensial GA4 tidak dapat dipakai: kredensial tidak sah"
+        )
 
     # GA4 memfinalkan data dalam 24-48 jam; tiga hari terakhir diambil ulang.
     dari, sampai = hari_ini - timedelta(days=3), hari_ini - timedelta(days=1)
@@ -130,6 +159,14 @@ def kumpulkan_ga4(sesi: Session, jalur_kredensial: str, hari_ini: date,
     http = http or httpx.Client(timeout=60)
     try:
         for site in sites:
+            if not POLA_PROPERTY.match(site.ga4_property_id):
+                # property_id di kolom bisa berupa apa saja (diketik manual atau
+                # disalin salah); tanpa penjagaan ini ia masuk mentah ke URL dan
+                # httpx.InvalidURL (bukan httpx.HTTPError) menggagalkan seluruh
+                # putaran sebelum sesi.commit() sempat jalan.
+                site.ga4_error = "GA4 property ID tidak valid (harus 6-12 digit)"
+                hasil["gagal"] += 1
+                continue
             try:
                 hari = ambil_ga4(http, token, site.ga4_property_id, dari, sampai)
             except GalatGA4 as exc:

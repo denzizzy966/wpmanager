@@ -67,6 +67,26 @@ def test_galat_lain_membawa_status():
     assert "400" in exc.value.pesan
 
 
+def test_200_dengan_substring_kuota_di_pagepath_bukan_galat():
+    """pagePath datang dari pengunjung site (bukan dari GA4 sendiri): kunjungan
+    ke URL yang kebetulan memuat substring "RESOURCE_EXHAUSTED" pada respons
+    200 yang sah tidak boleh dibaca sebagai kuota GA4 habis."""
+
+    def balasan(request):
+        body = json.loads(request.content)
+        dimensi = [d["name"] for d in body["dimensions"]]
+        if dimensi == ["date", "pagePath"]:
+            rows = [{"dimensionValues": [{"value": "20260921"},
+                                          {"value": "/RESOURCE_EXHAUSTED-x"}],
+                     "metricValues": [{"value": "7"}]}]
+        else:
+            rows = []
+        return httpx.Response(200, json={"rows": rows})
+
+    hari = ambil(balasan)
+    assert hari[0]["halaman"] == {"/RESOURCE_EXHAUSTED-x": 7}
+
+
 @pytest.mark.parametrize(
     ("kemarin", "riwayat", "harapan"),
     [

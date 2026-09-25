@@ -54,6 +54,51 @@ def test_site_tanpa_property_dilewati(sesi, site):
     assert dipanggil == []
 
 
+def test_token_ga4_berkas_tidak_ada_tidak_membocorkan_jalur(sesi, site, tmp_path):
+    """token_ga4 (bukan token_fn palsu) dipakai lewat kumpulkan_ga4: FileNotFoundError
+    asli menyertakan jalur berkas di str(exc), dan itu tidak boleh sampai ke ga4_error
+    yang tampil di dashboard."""
+    site.ga4_property_id = "123456789"
+    sesi.commit()
+    jalur = tmp_path / "kredensial-rahasia-tidak-ada.json"
+
+    hasil = kumpulkan_ga4(sesi, str(jalur), HARI_INI)
+
+    assert hasil == {"berhasil": 0, "gagal": 1}
+    sesi.refresh(site)
+    assert site.ga4_error is not None
+    assert str(jalur) not in site.ga4_error
+    assert "kredensial-rahasia-tidak-ada" not in site.ga4_error
+
+
+def test_token_ga4_json_tidak_valid_tidak_membocorkan_jalur(sesi, site, tmp_path):
+    site.ga4_property_id = "123456789"
+    sesi.commit()
+    jalur = tmp_path / "kredensial-rahasia-rusak.json"
+    jalur.write_text("bukan json {")
+
+    hasil = kumpulkan_ga4(sesi, str(jalur), HARI_INI)
+
+    assert hasil == {"berhasil": 0, "gagal": 1}
+    sesi.refresh(site)
+    assert site.ga4_error is not None
+    assert str(jalur) not in site.ga4_error
+    assert "kredensial-rahasia-rusak" not in site.ga4_error
+
+
+def test_property_id_tidak_valid_dilewati_tanpa_memicu_invalid_url(sesi, site):
+    """property_id di kolom bisa berupa apa saja; salah satu (mis. karakter
+    kontrol) membuat httpx.InvalidURL -- bukan httpx.HTTPError -- yang sebelum
+    perbaikan ini menggagalkan seluruh putaran sebelum sempat commit."""
+    site.ga4_property_id = "123\n456"
+    sesi.commit()
+    with httpx.Client(transport=httpx.MockTransport(balasan_ga)) as http:
+        hasil = kumpulkan_ga4(sesi, "k.json", HARI_INI, http=http, token_fn=lambda p: "tkn")
+    assert hasil == {"berhasil": 0, "gagal": 1}
+    sesi.refresh(site)
+    assert site.ga4_error == "GA4 property ID tidak valid (harus 6-12 digit)"
+
+
 def _isi(sesi, site, sumber, nilai_per_hari):
     for mundur, n in nilai_per_hari.items():
         sesi.add(TrafficHarian(site_id=site.id, tanggal=HARI_INI - timedelta(days=mundur),
