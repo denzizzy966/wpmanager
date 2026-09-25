@@ -51,10 +51,18 @@ final class WPMGR_FakeWpdbLogin {
     public function query( $disiapkan ) {
         $this->queries[] = $disiapkan;
         if ( false !== strpos( $disiapkan['sql'], 'UPDATE' ) ) {
-            $kunci = $disiapkan['args'][3] . '|' . $disiapkan['args'][4] . '|' . $disiapkan['args'][5] . '|' . $disiapkan['args'][6];
+            // Kunci (jam,ip,username,jalur) SELALU 4 argumen TERAKHIR di
+            // klausa WHERE, apa pun jumlah argumen SET di depannya (kolom
+            // user_agent NULL memakai fragmen literal, bukan placeholder,
+            // sehingga argumennya sendiri hilang dari daftar).
+            $empat = array_slice( $disiapkan['args'], -4 );
+            $kunci = implode( '|', $empat );
             $this->rows_affected = isset( $this->ada[ $kunci ] ) ? 1 : 0;
         } elseif ( false !== strpos( $disiapkan['sql'], 'INSERT' ) ) {
-            $kunci                       = $disiapkan['args'][0] . '|' . $disiapkan['args'][1] . '|' . $disiapkan['args'][2] . '|' . $disiapkan['args'][3];
+            // Kunci (jam,ip,username,jalur) SELALU 4 argumen PERTAMA di
+            // VALUES, sebelum jumlah/user_agent/diubah -- posisinya stabil
+            // terlepas dari NULL-nya user_agent.
+            $kunci                        = implode( '|', array_slice( $disiapkan['args'], 0, 4 ) );
             $this->ada[ $kunci ]         = true;
             $jam                         = $disiapkan['args'][0];
             $this->jumlah_per_jam[ $jam ] = ( isset( $this->jumlah_per_jam[ $jam ] ) ? $this->jumlah_per_jam[ $jam ] : 0 ) + 1;
@@ -69,6 +77,8 @@ final class LoginTest extends TestCase {
     protected function tearDown(): void {
         WPMGR_Login::reset_untuk_test();
         unset( $GLOBALS['wpdb'] );
+        unset( $_SERVER['PHP_AUTH_USER'] );
+        $GLOBALS['wpmgr_test_doing_filter'] = array();
     }
 
     public function test_prioritas_jalur(): void {
@@ -97,6 +107,28 @@ final class LoginTest extends TestCase {
 
     public function test_potong_aman_multibyte(): void {
         $this->assertSame( 'ééé', WPMGR_Login::potong( 'éééé', 3 ) );
+    }
+
+    // --- Fix round 1, temuan #1: byte UTF-8 tak valid tak boleh lolos -----
+    //
+    // mb_substr() meloloskan byte tak valid APA ADANYA pada PHP <=8.2 (baru
+    // di 8.3 mb_substr sendiri mengganti byte rusak dengan '?', jadi RED
+    // untuk temuan ini hanya nyata di bawah PHP 8.3 -- lihat verifikasi
+    // docker php:7.4-cli di laporan). String yang masih memuat byte tak
+    // valid membuat wpdb::query()/insert() MENOLAK seluruh query
+    // (class-wpdb.php:2243-2259 dan 2828-2855) -- baris riwayat login hilang
+    // tanpa jejak sama sekali.
+
+    public function test_potong_membuang_byte_tunggal_tak_valid(): void {
+        $hasil = WPMGR_Login::potong( "\xff", 255 );
+        $this->assertTrue( mb_check_encoding( $hasil, 'UTF-8' ) );
+    }
+
+    public function test_potong_membuang_byte_tak_valid_di_tengah_tetap_simpan_yang_valid(): void {
+        $hasil = WPMGR_Login::potong( "ab\xff\xfecd", 255 );
+        $this->assertTrue( mb_check_encoding( $hasil, 'UTF-8' ) );
+        $this->assertStringContainsString( 'ab', $hasil );
+        $this->assertStringContainsString( 'cd', $hasil );
     }
 
     public function test_naik_ke_admin(): void {
@@ -168,6 +200,84 @@ final class LoginTest extends TestCase {
         $this->assertCount( 2, $buffer );
         $this->assertSame( 'jadi_admin', $buffer[1]['jenis'] );
         $this->assertSame( 'admin_baru', $buffer[2]['jenis'] );
+    }
+
+    // --- Fix round 1, temuan #4: role dipotong ke panjang skema (60) -----
+
+    public function test_role_dipotong_ke_panjang_skema(): void {
+        $user = (object) array( 'user_login' => 'siapa', 'roles' => array( str_repeat( 'x', 100 ) ) );
+        WPMGR_Login::reset_untuk_test();
+        WPMGR_Login::catat_berhasil( $user, 'form' );
+        $baris = array_values( WPMGR_Login::berhasil_untuk_test() );
+        $this->assertCount( 1, $baris );
+        $this->assertSame( 60, strlen( $baris[0]['role'] ) );
+    }
+
+    public function test_role_null_dipertahankan_saat_user_tanpa_peran(): void {
+        // Kolom role mengizinkan NULL -- user tanpa peran sama sekali wajib
+        // tetap NULL, bukan '' hasil pemotongan string kosong.
+        $user = (object) array( 'user_login' => 'siapa', 'roles' => array() );
+        WPMGR_Login::reset_untuk_test();
+        WPMGR_Login::catat_berhasil( $user, 'form' );
+        $baris = array_values( WPMGR_Login::berhasil_untuk_test() );
+        $this->assertNull( $baris[0]['role'] );
+    }
+
+    // --- Fix round 1, temuan #2: app_password vs wp_login_failed ----------
+    //
+    // wp_authenticate_application_password() diperiksa dari dua jalur:
+    // - Lewat filter 'authenticate' (wp-includes/user.php:372, dipasang
+    //   default-filters.php:518): dipakai wp_authenticate() untuk form,
+    //   xmlrpc, dan rest. wp_login_failed TETAP terpicu sesudahnya untuk
+    //   kegagalan yang sama (pluggable.php:731) -- mencatat di sini juga
+    //   berarti dobel hitung dengan label salah (PHP_AUTH_USER kosong).
+    // - Lewat determine_current_user -> wp_validate_application_password
+    //   (user.php:521-544, dipasang default-filters.php:522): REST Basic
+    //   Auth murni. wp_authenticate() tidak pernah dipanggil di jalur ini,
+    //   jadi wp_login_failed TIDAK PERNAH terpicu -- satu-satunya jalur yang
+    //   harus dicatat oleh saat_gagal_app().
+
+    public function test_saat_gagal_app_di_dalam_filter_authenticate_tidak_mencatat(): void {
+        $GLOBALS['wpmgr_test_doing_filter'] = array( 'authenticate' => true );
+        $_SERVER['PHP_AUTH_USER'] = 'admin';
+        WPMGR_Login::reset_untuk_test();
+        WPMGR_Login::saat_gagal_app( new WP_Error( 'x', 'gagal' ) );
+        $this->assertSame( array(), WPMGR_Login::gagal_untuk_test() );
+    }
+
+    public function test_saat_gagal_app_di_luar_filter_authenticate_mencatat_satu_baris(): void {
+        $GLOBALS['wpmgr_test_doing_filter'] = array();
+        $_SERVER['PHP_AUTH_USER'] = 'admin';
+        WPMGR_Login::reset_untuk_test();
+        WPMGR_Login::saat_gagal_app( new WP_Error( 'x', 'gagal' ) );
+        $buffer = array_values( WPMGR_Login::gagal_untuk_test() );
+        $this->assertCount( 1, $buffer );
+        $this->assertSame( 'admin', $buffer[0]['username'] );
+        $this->assertSame( 'app_password', $buffer[0]['jalur'] );
+    }
+
+    public function test_wp_login_failed_mencatat_satu_baris_dengan_jalur_benar(): void {
+        $GLOBALS['wpmgr_test_doing_filter'] = array();
+        WPMGR_Login::reset_untuk_test();
+        WPMGR_Login::saat_gagal( 'admin' );
+        $buffer = array_values( WPMGR_Login::gagal_untuk_test() );
+        $this->assertCount( 1, $buffer );
+        $this->assertSame( 'admin', $buffer[0]['username'] );
+        $this->assertSame( 'form', $buffer[0]['jalur'] );
+    }
+
+    public function test_xmlrpc_app_password_gagal_hanya_tercatat_sekali_lewat_wp_login_failed(): void {
+        // Urutan nyata untuk xmlrpc/form/rest: application_password_failed_
+        // authentication dipicu DI DALAM filter 'authenticate' lebih dulu,
+        // lalu wp_authenticate() memicu wp_login_failed sesudahnya untuk
+        // kegagalan yang sama.
+        $GLOBALS['wpmgr_test_doing_filter'] = array( 'authenticate' => true );
+        WPMGR_Login::reset_untuk_test();
+        WPMGR_Login::saat_gagal_app( new WP_Error( 'x', 'gagal' ) );
+        WPMGR_Login::saat_gagal( 'admin' );
+        $buffer = array_values( WPMGR_Login::gagal_untuk_test() );
+        $this->assertCount( 1, $buffer );
+        $this->assertSame( 'admin', $buffer[0]['username'] );
     }
 
     // --- Pola tulis(): check_connection, UPDATE-dulu-baru-INSERT, batas ---
@@ -243,6 +353,33 @@ final class LoginTest extends TestCase {
         // Baris kedua: cache lokal sudah 2000 >= batas, dialihkan ke ember anonim.
         $this->assertSame( '', $sisipan[1]['args'][1] );
         $this->assertSame( WPMGR_Login::USERNAME_LAIN, $sisipan[1]['args'][2] );
+    }
+
+    public function test_tulis_login_gagal_ua_kosong_disimpan_null_bukan_string_kosong(): void {
+        // Fix round 1, temuan #3: kolom user_agent di wpmgr_login_gagal
+        // mengizinkan NULL (class-wpmgr-skema.php) dan wpmgr_logins sudah
+        // menyimpan NULL sungguhan lewat $wpdb->insert() -- login_gagal
+        // wajib konsisten, bukan string kosong ''.
+        $wpdb            = new WPMGR_FakeWpdbLogin( array(), array( 1790064000 => 5 ) );
+        $GLOBALS['wpdb'] = $wpdb;
+
+        WPMGR_Login::reset_untuk_test();
+        WPMGR_Login::isi_untuk_test( array(), array(
+            array( 'jam' => 1790064000, 'ip' => '198.51.100.7', 'username' => 'admin', 'jalur' => 'xmlrpc', 'jumlah' => 1, 'user_agent' => null ),
+        ) );
+        WPMGR_Login::tulis();
+
+        $this->assertStringContainsString( 'user_agent = NULL', $wpdb->queries[0]['sql'] );
+        $sisipan = array_values( array_filter( $wpdb->queries, function ( $q ) {
+            return false !== strpos( $q['sql'], 'INSERT' );
+        } ) );
+        $this->assertCount( 1, $sisipan );
+        $this->assertStringContainsString( 'VALUES (%d, %s, %s, %s, %d, NULL, %d)', $sisipan[0]['sql'] );
+        // Kunci (jam,ip,username,jalur) tetap 4 argumen pertama walau
+        // user_agent tak lagi punya argumen (bukti tak ada pergeseran posisi
+        // yang salah menyisipkan jumlah sebagai bagian dari kunci).
+        $this->assertSame( 1790064000, $sisipan[0]['args'][0] );
+        $this->assertSame( 'admin', $sisipan[0]['args'][2] );
     }
 
     public function test_tulis_menulis_baris_berhasil_dan_admin_tergabung(): void {

@@ -26,10 +26,9 @@ class WPMGR_Login {
     const BATAS_GAGAL_PER_JAM = 2000;
     const USERNAME_LAIN       = '(lainnya)';
 
-    private static $berhasil  = array();
-    private static $gagal     = array();
-    private static $app_gagal = array();
-    private static $admin     = array();
+    private static $berhasil = array();
+    private static $gagal    = array();
+    private static $admin    = array();
 
     public static function pasang() {
         add_action( 'wp_login', array( __CLASS__, 'saat_berhasil' ), 10, 2 );
@@ -78,6 +77,16 @@ class WPMGR_Login {
 
     public static function potong( $teks, $n ) {
         $teks = (string) $teks;
+        // Byte tak valid UTF-8 (mis. header User-Agent yang dipalsukan
+        // penyerang) lolos APA ADANYA lewat mb_substr() -- baru diganti '?'
+        // oleh mb_substr() sendiri sejak PHP 8.3. String hasil mb_substr()
+        // yang masih memuat byte tak valid membuat wpdb::query()/insert()
+        // MENOLAK seluruh query (strip_invalid_text_from_query(),
+        // class-wpdb.php:2243-2259 dan 2828-2855) -- baris riwayat login itu
+        // lalu hilang tanpa jejak, tanpa error apa pun yang tercatat. Byte
+        // tak valid harus disingkirkan di sini, sebelum mb_substr(), apa pun
+        // versi PHP-nya.
+        $teks = function_exists( 'mb_scrub' ) ? mb_scrub( $teks, 'UTF-8' ) : wp_check_invalid_utf8( $teks, true );
         return function_exists( 'mb_substr' ) ? mb_substr( $teks, 0, $n ) : substr( $teks, 0, $n );
     }
 
@@ -122,7 +131,10 @@ class WPMGR_Login {
 
     private static function role_utama( $user ) {
         $roles = isset( $user->roles ) ? (array) $user->roles : array();
-        return empty( $roles ) ? null : (string) reset( $roles );
+        // null (bukan '') dipertahankan saat user tak berperan sama sekali:
+        // kolom role di skema mengizinkan NULL, dan memotong null lewat
+        // potong() akan salah mengubahnya jadi string kosong.
+        return empty( $roles ) ? null : self::potong( (string) reset( $roles ), 60 );
     }
 
     private static function aktif() {
@@ -174,11 +186,6 @@ class WPMGR_Login {
             if ( ! self::aktif() ) {
                 return;
             }
-            // application_password_failed_authentication dipicu lebih dulu untuk
-            // percobaan yang sama; jangan hitung dua kali.
-            if ( ! empty( self::$app_gagal[ strtolower( (string) $username ) ] ) ) {
-                return;
-            }
             self::tambah_gagal_sekarang( (string) $username, self::jalur( self::konteks_sekarang() ) );
         } catch ( \Throwable $e ) {
             unset( $e );
@@ -190,8 +197,25 @@ class WPMGR_Login {
             if ( ! self::aktif() ) {
                 return;
             }
+            // wp_authenticate_application_password() diperiksa dari DUA jalur
+            // berbeda. Lewat filter 'authenticate' (wp-includes/user.php:372,
+            // dipasang wp-includes/default-filters.php:518) -- dipakai form,
+            // xmlrpc, dan rest lewat wp_authenticate() -- wp_login_failed
+            // TETAP terpicu sesudahnya untuk kegagalan yang sama (pluggable.
+            // php:731), dengan username asli dan jalur yang benar; mencatat
+            // di sini juga berarti satu kegagalan terhitung dua kali dengan
+            // label yang salah (PHP_AUTH_USER kosong untuk xmlrpc/form).
+            // Lewat determine_current_user -> wp_validate_application_password
+            // (wp-includes/user.php:521-544, dipasang default-filters.php:522)
+            // -- REST Basic Auth murni -- wp_authenticate() tidak pernah
+            // dipanggil, jadi wp_login_failed TIDAK PERNAH terpicu; itu
+            // satu-satunya jalur yang harus dicatat di sini. doing_filter()
+            // membedakan keduanya: hanya true saat benar-benar berada di
+            // dalam apply_filters('authenticate', ...).
+            if ( doing_filter( 'authenticate' ) ) {
+                return;
+            }
             $username = isset( $_SERVER['PHP_AUTH_USER'] ) ? (string) wp_unslash( $_SERVER['PHP_AUTH_USER'] ) : '(tidak diketahui)';
-            self::$app_gagal[ strtolower( $username ) ] = true;
             self::tambah_gagal_sekarang( $username, 'app_password' );
         } catch ( \Throwable $e ) {
             unset( $e );
@@ -270,11 +294,25 @@ class WPMGR_Login {
                 // kombinasi benar-benar baru bagi jam itu.
                 $jumlah_per_jam = array();
                 foreach ( self::$gagal as $g ) {
+                    // $wpdb->prepare() selalu mengutip %s sebagai string,
+                    // termasuk untuk argumen null -- tak ada cara membuat
+                    // placeholder %s menghasilkan NULL sungguhan (lihat
+                    // class-wpdb.php prepare()). Kolom user_agent di sini
+                    // mengizinkan NULL (class-wpmgr-skema.php), dan
+                    // wpmgr_logins sudah menyimpan NULL sungguhan lewat
+                    // $wpdb->insert() (yang menangani null secara khusus) --
+                    // supaya konsisten, UA kosong di sini juga harus NULL,
+                    // bukan string kosong ''. Makanya fragmen SQL kolomnya
+                    // sendiri yang diganti (literal NULL tanpa kutip), bukan
+                    // nilainya lewat placeholder.
+                    $ua_kolom = null === $g['user_agent'] ? 'NULL' : '%s';
+                    $ua_args  = null === $g['user_agent'] ? array() : array( (string) $g['user_agent'] );
+
+                    $args_update = array_merge( array( $g['jumlah'] ), $ua_args, array( $sekarang, $g['jam'], $g['ip'], $g['username'], $g['jalur'] ) );
                     $wpdb->query( $wpdb->prepare(
-                        "UPDATE {$p}wpmgr_login_gagal SET jumlah = jumlah + %d, user_agent = %s, diubah = %d
+                        "UPDATE {$p}wpmgr_login_gagal SET jumlah = jumlah + %d, user_agent = {$ua_kolom}, diubah = %d
                          WHERE jam = %d AND ip = %s AND username = %s AND jalur = %s",
-                        $g['jumlah'], (string) $g['user_agent'], $sekarang,
-                        $g['jam'], $g['ip'], $g['username'], $g['jalur']
+                        ...$args_update
                     ) );
                     if ( $wpdb->rows_affected > 0 ) {
                         continue;
@@ -300,11 +338,12 @@ class WPMGR_Login {
                     // WPMGR_Penangkap, ini batas usaha terbaik, bukan kunci
                     // database, karena tak ada bagian connector lain yang
                     // memakai transaksi/locking.
+                    $args_insert = array_merge( array( $g['jam'], $g['ip'], $g['username'], $g['jalur'], $g['jumlah'] ), $ua_args, array( $sekarang ) );
                     $wpdb->query( $wpdb->prepare(
                         "INSERT INTO {$p}wpmgr_login_gagal (jam, ip, username, jalur, jumlah, user_agent, diubah)
-                         VALUES (%d, %s, %s, %s, %d, %s, %d)
+                         VALUES (%d, %s, %s, %s, %d, {$ua_kolom}, %d)
                          ON DUPLICATE KEY UPDATE jumlah = jumlah + VALUES(jumlah), user_agent = VALUES(user_agent), diubah = VALUES(diubah)",
-                        $g['jam'], $g['ip'], $g['username'], $g['jalur'], $g['jumlah'], (string) $g['user_agent'], $sekarang
+                        ...$args_insert
                     ) );
                 }
             } finally {
@@ -321,10 +360,17 @@ class WPMGR_Login {
     // ---- kait test ------------------------------------------------------
 
     public static function reset_untuk_test() {
-        self::$berhasil  = array();
-        self::$gagal     = array();
-        self::$app_gagal = array();
-        self::$admin     = array();
+        self::$berhasil = array();
+        self::$gagal    = array();
+        self::$admin    = array();
+    }
+
+    public static function gagal_untuk_test() {
+        return self::$gagal;
+    }
+
+    public static function berhasil_untuk_test() {
+        return self::$berhasil;
     }
 
     /**

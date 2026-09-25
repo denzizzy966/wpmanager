@@ -50,6 +50,38 @@ if ( ! function_exists( 'is_wp_error' ) ) {
     }
 }
 
+// get_option()/wp_unslash() minimal: cukup untuk kelas yang menyentuhnya
+// tanpa memuat WordPress penuh (mis. WPMGR_IP::saat_ini() lewat
+// WPMGR_Settings::percayai_xff()). Nilai baliknya sengaja "tidak ada
+// pengaturan khusus" (default apa adanya, tanpa unslash sungguhan) --
+// cukup untuk diuji, bukan tiruan perilaku WordPress yang lengkap.
+if ( ! function_exists( 'get_option' ) ) {
+    function get_option( $name, $default = false ) {
+        return $default;
+    }
+}
+
+if ( ! function_exists( 'wp_unslash' ) ) {
+    function wp_unslash( $value ) {
+        return is_string( $value ) ? stripslashes( $value ) : $value;
+    }
+}
+
+// doing_filter() tiruan yang bisa dikendalikan test lewat variabel global,
+// dipakai WPMGR_Login::saat_gagal_app() untuk membedakan jalur filter
+// 'authenticate' (wp_authenticate_application_password() dipanggil DI
+// DALAM filter itu) dari jalur determine_current_user (REST Basic Auth,
+// memanggilnya LANGSUNG, bukan lewat filter).
+if ( ! function_exists( 'doing_filter' ) ) {
+    $GLOBALS['wpmgr_test_doing_filter'] = array();
+    function doing_filter( $hook_name = null ) {
+        if ( null === $hook_name ) {
+            return ! empty( $GLOBALS['wpmgr_test_doing_filter'] );
+        }
+        return ! empty( $GLOBALS['wpmgr_test_doing_filter'][ $hook_name ] );
+    }
+}
+
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-skema.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-penangkap.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-settings.php';
