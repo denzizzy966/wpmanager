@@ -216,9 +216,16 @@ PHP;
             $wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}{$tabel}" ); // phpcs:ignore WordPress.DB.PreparedSQL
         }
         foreach ( array( 'wpmgr_site_id', 'wpmgr_secret', 'wpmgr_dashboard_url', self::OPT_VERSI,
-                         'wpmgr_percayai_xff', 'wpmgr_garam' ) as $opsi ) {
+                         'wpmgr_percayai_xff' ) as $opsi ) {
             delete_option( $opsi );
         }
+        // Nama opsi garam disisipi tanggal (wpmgr_garam_YYYY-MM-DD) supaya
+        // add_option() bisa dipakai sebagai insert-if-absent yang atomik per
+        // hari (lihat WPMGR_Traffic::garam()) -- jadi dihapus lewat pola
+        // nama, bukan nama tunggal.
+        $wpdb->query( $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( 'wpmgr_garam_' ) . '%'
+        ) );
         wp_clear_scheduled_hook( self::HOOK_PANGKAS );
         self::hapus_mu_plugin();
     }

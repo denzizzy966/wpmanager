@@ -202,8 +202,19 @@ class WPMGR_Traffic {
                 return;
             }
             $url = wp_json_encode( rest_url( 'wpmgr/v1/hit' ) );
-            echo "<script>(function(){try{var d=JSON.stringify({p:location.pathname,r:document.referrer});"
-                . "navigator.sendBeacon&&navigator.sendBeacon(" . $url . ",new Blob([d],{type:'text/plain'}));}catch(e){}})();</script>\n"; // phpcs:ignore WordPress.Security.EscapeOutput
+            // Hanya origin referrer yang dikirim, bukan document.referrer utuh:
+            // kategori_asal() cuma pernah memakai host-nya, sedangkan query
+            // string internal yang panjang (mis. hasil filter/pencarian di
+            // halaman sebelumnya) bisa mendorong body melewati MAKS_BODY dan
+            // membuat SELURUH hit gugur diam-diam padahal path-nya sendiri
+            // sah. new URL() dibungkus try tersendiri supaya referrer yang
+            // aneh hanya membuat asalnya kosong (dianggap langsung), bukan
+            // membatalkan seluruh pengiriman hit.
+            echo "<script>(function(){try{"
+                . "var r='';try{r=document.referrer?new URL(document.referrer).origin:'';}catch(e){}"
+                . "var d=JSON.stringify({p:location.pathname,r:r});"
+                . "navigator.sendBeacon&&navigator.sendBeacon(" . $url . ",new Blob([d],{type:'text/plain'}));"
+                . "}catch(e){}})();</script>\n"; // phpcs:ignore WordPress.Security.EscapeOutput
         } catch ( \Throwable $e ) {
             unset( $e );
         }
@@ -219,43 +230,103 @@ class WPMGR_Traffic {
         return new WP_REST_Response( null, 204 );
     }
 
+    /**
+     * Nama opsi disisipi tanggal supaya add_option() (bukan update_option())
+     * bisa dipakai sebagai insert-if-absent yang atomik per hari: opsi
+     * tunggal yang ditimpa lewat update_option() (versi sebelumnya) rentan
+     * race dua request pertama-hari-ini yang sama-sama menemukan "belum ada
+     * garam hari ini", lalu sama-sama menulis garam BERBEDA -- pengunjung
+     * yang sama pun terhitung dua kali karena hash-nya ikut berbeda.
+     */
+    private static function nama_opsi_garam( $tanggal ) {
+        return 'wpmgr_garam_' . $tanggal;
+    }
+
     private static function garam( $tanggal ) {
-        $simpan = get_option( 'wpmgr_garam' );
-        if ( is_array( $simpan ) && isset( $simpan['tanggal'], $simpan['garam'] ) && $simpan['tanggal'] === $tanggal ) {
-            return $simpan['garam'];
+        $nama  = self::nama_opsi_garam( $tanggal );
+        $garam = get_option( $nama );
+        if ( is_string( $garam ) && '' !== $garam ) {
+            return $garam;
         }
-        $garam = bin2hex( random_bytes( 32 ) );
-        update_option( 'wpmgr_garam', array( 'tanggal' => $tanggal, 'garam' => $garam ), false );
-        return $garam;
+        $baru = bin2hex( random_bytes( 32 ) );
+        // option_name punya UNIQUE KEY: kalau request lain menang menyisipkan
+        // opsi hari ini di antara get_option() dan add_option() kita,
+        // add_option() KITA yang gagal (false) -- nilai yang benar adalah
+        // milik pemenang, dibaca ULANG, bukan $baru milik kita sendiri.
+        if ( ! add_option( $nama, $baru, '', false ) ) {
+            $garam = get_option( $nama );
+            return is_string( $garam ) && '' !== $garam ? $garam : $baru;
+        }
+        self::hapus_garam_kemarin( $tanggal );
+        return $baru;
+    }
+
+    /** Opsi garam lama tak boleh menumpuk selamanya: satu per hari sudah cukup. */
+    private static function hapus_garam_kemarin( $tanggal_ini ) {
+        $kemarin = new DateTime( $tanggal_ini );
+        $kemarin->modify( '-1 day' );
+        delete_option( self::nama_opsi_garam( $kemarin->format( 'Y-m-d' ) ) );
     }
 
     /**
-     * Baris (dimensi, kunci) dengan batas keras: kombinasi yang sudah ada
-     * hari ini selalu diperbarui apa adanya (tak menambah baris baru, jadi
-     * tak perlu dibatasi); kombinasi yang benar-benar baru dialihkan ke
-     * bucket $lainnya begitu jumlah kombinasi baru hari ini menyentuh
-     * $batas. Dipakai untuk dimensi 'halaman' (path dikuasai penuh oleh
-     * pengirim /hit) dan 'asal' (site_lain:<domain> dari Referer, juga
-     * dikuasai penuh oleh pengirim).
+     * Transient di sini HANYA meng-cache status "batas sudah tercapai hari
+     * ini", bukan hitungan berjalan. Versi sebelumnya meng-cache ANGKA
+     * (jumlah+1 di-set_transient setiap kali kombinasi baru lolos) --
+     * read-modify-write itu basi di bawah beban bersamaan: request A dan B
+     * yang sama-sama membaca transient "jumlah=998" sebelum keduanya sempat
+     * menulis balik, sama-sama melihat "masih di bawah 1000" dan sama-sama
+     * meloloskan barisnya, lalu sama-sama menulis "999" -- kombinasi baru
+     * yang lolos pada window itu tak pernah kalah dari cap-nya, drift-nya
+     * permanen dan sebanding jumlah worker PHP yang bersamaan. Begitu status
+     * "penuh" tersimpan di sini, ia tak pernah dihitung ulang untuk sisa
+     * hari itu (tak ada lagi query COUNT(*) sampai tanggal berganti).
      */
-    private static function kunci_dengan_batas( $tanggal, $dimensi, $kunci, $batas, $lainnya ) {
+    private static function batas_kunci_penuh( $kunci_cache ) {
+        return true === get_transient( $kunci_cache );
+    }
+
+    /**
+     * Baris (dimensi, kunci) dengan batas keras, aman terhadap konkurensi:
+     * kombinasi yang sudah ada hari ini selalu diperbarui apa adanya (tak
+     * menambah baris baru, jadi lolos tanpa dihitung sama sekali).
+     * Kombinasi yang BENAR-BENAR baru dihitung lewat SELECT COUNT(*) segar
+     * setiap kali (bukan angka ter-cache -- lihat batas_kunci_penuh()) dan
+     * dialihkan ke bucket $lainnya begitu batas tercapai; sedikit overshoot
+     * dari request-request yang bersamaan-sama menghitung "belum penuh"
+     * sebelum salah satu sempat menulis diterima, sama seperti $sisa di
+     * WPMGR_Penangkap::tulis() dan $jumlah_per_jam di WPMGR_Login::tulis().
+     *
+     * $hanya_awalan (opsional) membatasi APA yang dihitung dan dibandingkan
+     * ke $batas: dipakai supaya kategori asal TETAP (pencarian:*, sosial:*
+     * -- himpunan terbatas, lihat kategori_asal()) tak pernah ikut kena
+     * batas yang sebetulnya ditujukan untuk site_lain:<domain>, yang
+     * sepenuhnya dikuasai Referer palsu.
+     */
+    private static function kunci_dengan_batas( $tanggal, $dimensi, $kunci, $batas, $lainnya, $hanya_awalan = '' ) {
         global $wpdb;
         $tabel = $wpdb->prefix . 'wpmgr_traffic';
         $ada   = $wpdb->get_var( $wpdb->prepare(
             "SELECT 1 FROM {$tabel} WHERE tanggal = %s AND dimensi = %s AND kunci = %s", $tanggal, $dimensi, $kunci ) );
-
-        $kunci_cache = 'wpmgr_jml_' . $dimensi . '_' . $tanggal;
-        $jumlah      = get_transient( $kunci_cache );
-        if ( false === $jumlah ) {
-            $jumlah = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$tabel} WHERE tanggal = %s AND dimensi = %s", $tanggal, $dimensi ) );
+        if ( null !== $ada ) {
+            return $kunci;
         }
 
-        if ( ! self::dalam_batas( null !== $ada, (int) $jumlah, $batas ) ) {
+        $kunci_cache = 'wpmgr_penuh_' . $dimensi . ( '' === $hanya_awalan ? '' : '_' . md5( $hanya_awalan ) ) . '_' . $tanggal;
+        if ( self::batas_kunci_penuh( $kunci_cache ) ) {
             return $lainnya;
         }
-        if ( null === $ada ) {
-            set_transient( $kunci_cache, (int) $jumlah + 1, DAY_IN_SECONDS );
+
+        $sql = "SELECT COUNT(*) FROM {$tabel} WHERE tanggal = %s AND dimensi = %s";
+        $arg = array( $tanggal, $dimensi );
+        if ( '' !== $hanya_awalan ) {
+            $sql  .= ' AND kunci LIKE %s';
+            $arg[] = $wpdb->esc_like( $hanya_awalan ) . '%';
+        }
+        $jumlah = (int) $wpdb->get_var( $wpdb->prepare( $sql, ...$arg ) );
+
+        if ( ! self::dalam_batas( false, $jumlah, $batas ) ) {
+            set_transient( $kunci_cache, true, DAY_IN_SECONDS );
+            return $lainnya;
         }
         return $kunci;
     }
@@ -263,20 +334,21 @@ class WPMGR_Traffic {
     /**
      * Batas keras jumlah baris pengunjung (hash) baru per hari. Sama seperti
      * kunci_dengan_batas(), tapi wpmgr_pengunjung tak punya dimensi -- hanya
-     * satu hitungan per tanggal.
+     * satu hitungan per tanggal, dan status "penuh"-nya di-cache dengan cara
+     * yang sama (lihat batas_kunci_penuh()).
      */
     private static function pengunjung_baru_diizinkan( $tanggal ) {
         global $wpdb;
-        $kunci_cache = 'wpmgr_jml_pengunjung_' . $tanggal;
-        $jumlah      = get_transient( $kunci_cache );
-        if ( false === $jumlah ) {
-            $jumlah = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$wpdb->prefix}wpmgr_pengunjung WHERE tanggal = %s", $tanggal ) );
-        }
-        if ( ! self::dalam_batas( false, (int) $jumlah, self::BATAS_PENGUNJUNG_PER_HARI ) ) {
+        $kunci_cache = 'wpmgr_penuh_pengunjung_' . $tanggal;
+        if ( self::batas_kunci_penuh( $kunci_cache ) ) {
             return false;
         }
-        set_transient( $kunci_cache, (int) $jumlah + 1, DAY_IN_SECONDS );
+        $jumlah = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}wpmgr_pengunjung WHERE tanggal = %s", $tanggal ) );
+        if ( ! self::dalam_batas( false, $jumlah, self::BATAS_PENGUNJUNG_PER_HARI ) ) {
+            set_transient( $kunci_cache, true, DAY_IN_SECONDS );
+            return false;
+        }
         return true;
     }
 
@@ -302,6 +374,24 @@ class WPMGR_Traffic {
             return;
         }
 
+        $tanggal = wp_date( 'Y-m-d' );
+        $ip      = WPMGR_IP::saat_ini();
+        $hash    = self::hash_pengunjung( self::garam( $tanggal ), (string) $ip['ip'], $ua );
+        $asal    = self::kategori_asal( $isi[1], (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
+        self::simpan_hit( $tanggal, $hash, $path, $ua, $asal );
+    }
+
+    /**
+     * Bagian catat_hit() yang murni menulis ke database, dipisah dari
+     * pengambilan konteks WordPress (tanggal lokal site, IP, garam, host
+     * site) di atas. WPMGR_Settings::terpasang() di catat_hit() bergantung
+     * pada get_option() yang di harness PHPUnit murni ini SELALU
+     * mengembalikan default -- jadi gerbangnya tak bisa diuji tanpa
+     * WordPress penuh (diverifikasi lewat e2e), tapi pola tulis di sini --
+     * check_connection, UPDATE-dulu-baru-INSERT, batas keras -- bisa, lewat
+     * wpdb tiruan (lihat TrafficTest.php).
+     */
+    public static function simpan_hit( $tanggal, $hash, $path, $ua, $asal ) {
         global $wpdb;
         // Koneksi yang sudah putus membuat wpdb::bail() memanggil dead_db(),
         // yang berujung wp_die() -- ini dipanggil dari request pengunjung
@@ -311,11 +401,8 @@ class WPMGR_Traffic {
             return;
         }
 
-        $p       = $wpdb->prefix;
-        $tanggal = wp_date( 'Y-m-d' );
-        $ip      = WPMGR_IP::saat_ini();
-        $hash    = self::hash_pengunjung( self::garam( $tanggal ), (string) $ip['ip'], $ua );
-        $lama    = $wpdb->suppress_errors( true );
+        $p    = $wpdb->prefix;
+        $lama = $wpdb->suppress_errors( true );
         try {
             $wpdb->query( $wpdb->prepare(
                 "UPDATE {$p}wpmgr_pengunjung SET hit = hit + 1 WHERE tanggal = %s AND hash = %s", $tanggal, $hash ) );
@@ -329,14 +416,26 @@ class WPMGR_Traffic {
             } elseif ( self::pengunjung_baru_diizinkan( $tanggal ) ) {
                 // ON DUPLICATE KEY UPDATE, bukan INSERT polos: UPDATE barusan
                 // tidak menemukan baris ini, tapi request lain dengan hash
-                // yang sama (pengunjung memuat ulang halaman nyaris
-                // bersamaan) bisa saja menang menyisipkannya lebih dulu --
-                // upsert melebur ke baris yang menang, bukan gagal diam-diam
-                // kena kunci unik (tanggal,hash).
+                // yang sama (dua tab, reload cepat) bisa saja menang
+                // menyisipkannya lebih dulu di jendela waktu antara UPDATE
+                // kita dan INSERT kita sendiri -- upsert melebur ke baris
+                // yang menang, bukan gagal diam-diam kena kunci unik
+                // (tanggal,hash).
                 $wpdb->query( $wpdb->prepare(
                     "INSERT INTO {$p}wpmgr_pengunjung (tanggal, hash, hit) VALUES (%s, %s, 1)
                      ON DUPLICATE KEY UPDATE hit = hit + 1", $tanggal, $hash ) );
-                $baru = true;
+                // MySQL melaporkan affected-rows = 1 kalau baris BENAR-BENAR
+                // baru disisipkan, 2 kalau baris itu SUDAH ADA dan ikut
+                // diperbarui (kasus race di atas), 0 kalau nilainya sama
+                // persis. "Baru" harus diputuskan DARI SINI, bukan
+                // diasumsikan begitu saja begitu UPDATE di atas tak
+                // menemukan baris: dua hit nyaris bersamaan dengan hash yang
+                // sama (dua tab, reload cepat) dua-duanya melihat UPDATE
+                // rows_affected 0 lebih dulu dan dua-duanya sampai ke cabang
+                // ini -- tanpa pengecekan affected-rows dari INSERT-nya
+                // sendiri, keduanya akan menganggap diri pengunjung baru dan
+                // pengunjung bertambah 2, bukan 1.
+                $baru = ( 1 === (int) $wpdb->rows_affected );
             }
             // Selain itu (tidak baru, tidak diizinkan): batas harian
             // wpmgr_pengunjung sudah tercapai. Kunjungan tetap dihitung di
@@ -348,9 +447,20 @@ class WPMGR_Traffic {
                 array( 'halaman', self::kunci_dengan_batas( $tanggal, 'halaman', $path, self::BATAS_PATH_PER_HARI, self::PATH_LAIN ) ),
                 array( 'perangkat', self::jenis_perangkat( $ua ) ),
             );
-            $asal = self::kategori_asal( $isi[1], (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
             if ( null !== $asal ) {
-                $kunci[] = array( 'asal', self::kunci_dengan_batas( $tanggal, 'asal', $asal, self::BATAS_ASAL_PER_HARI, self::ASAL_LAIN ) );
+                // Kategori TETAP (pencarian:*, sosial:*) adalah himpunan
+                // terbatas (17 nilai, lihat kategori_asal()) -- tak pernah
+                // dibatasi. Hanya site_lain:<domain>, yang sepenuhnya
+                // dikuasai Referer palsu, dibatasi, dan hanya baris
+                // site_lain:* yang ikut dihitung untuk batas itu: banjir
+                // site_lain palsu tak boleh menggeser pencarian:Google hari
+                // itu ke bucket "(lainnya)".
+                if ( 0 === strpos( $asal, 'site_lain:' ) ) {
+                    $asal = self::kunci_dengan_batas(
+                        $tanggal, 'asal', $asal, self::BATAS_ASAL_PER_HARI, self::ASAL_LAIN, 'site_lain:'
+                    );
+                }
+                $kunci[] = array( 'asal', $asal );
             }
             $tempat = array();
             $arg    = array();
@@ -375,6 +485,16 @@ class WPMGR_Traffic {
         if ( null === $dari ) {
             $kemarin = new DateTime( 'yesterday', wp_timezone() );
             $dari    = $kemarin->format( 'Y-m-d' );
+        }
+        // 'dari' lolos tanda tangan HMAC, tapi tetap tak tepercaya sebagai
+        // batas query: dashboard yang keliru kirim tanggal sangat lampau
+        // (atau nilai uji seperti 0000-01-01) tak boleh membuat query
+        // membaca seluruh riwayat yang tersisa -- data lebih tua dari
+        // HARI_SIMPAN toh sudah dipangkas harian, jadi tak pernah ada
+        // gunanya melewati batas itu.
+        $paling_awal = ( new DateTime( '-' . WPMGR_Skema::HARI_SIMPAN . ' days', wp_timezone() ) )->format( 'Y-m-d' );
+        if ( $dari < $paling_awal ) {
+            $dari = $paling_awal;
         }
         $baris = $wpdb->get_results( $wpdb->prepare(
             "SELECT tanggal, dimensi, kunci, kunjungan, pengunjung FROM {$wpdb->prefix}wpmgr_traffic

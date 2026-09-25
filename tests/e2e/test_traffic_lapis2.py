@@ -84,26 +84,49 @@ def test_hit_tercatat_dan_muncul_di_traffic(site_terpasang):
 
 def test_hit_dari_bot_tidak_dihitung(site_terpasang):
     _kosongkan_traffic()
-    path = f"/uji-bot-{uuid.uuid4().hex[:8]}"
-    body = f'{{"p":"{path}","r":""}}'.encode()
+    path_bot = f"/uji-bot-{uuid.uuid4().hex[:8]}"
     r = httpx.post(
         f"{site_terpasang.url}/wp-json/wpmgr/v1/hit",
-        content=body,
+        content=f'{{"p":"{path_bot}","r":""}}'.encode(),
         headers={"Content-Type": "text/plain", "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1)"},
         timeout=30,
     )
     assert r.status_code == 204
 
-    # Tak ada event async untuk ditunggu di jalur bot (tak pernah menulis) --
-    # jeda tetap di sini hanya menutup kemungkinan tulisan asinkron yang
-    # sebetulnya tak ada, sebelum memastikan path itu memang tak pernah muncul.
-    time.sleep(2)
+    # Bukan fixed sleep: hit kontrol (bukan bot) dikirim SESUDAH hit bot di
+    # atas dan ditunggu lewat polling sampai muncul di /traffic (pola yang
+    # sama seperti test_hit_tercatat_dan_muncul_di_traffic, lihat koreksi
+    # #10 konteks-global -- poll, bukan sleep tetap). /hit memproses secara
+    # sinkron (bukan job async), jadi begitu hit kontrol ini kelihatan,
+    # hit bot yang dikirim lebih dulu SUDAH PASTI juga selesai diproses --
+    # kalaupun ia (keliru) ditulis, ia pasti sudah kelihatan juga saat ini.
+    path_kontrol = f"/uji-kontrol-{uuid.uuid4().hex[:8]}"
+    r = httpx.post(
+        f"{site_terpasang.url}/wp-json/wpmgr/v1/hit",
+        content=f'{{"p":"{path_kontrol}","r":""}}'.encode(),
+        headers={
+            "Content-Type": "text/plain",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0",
+        },
+        timeout=30,
+    )
+    assert r.status_code == 204
+
     secret = dekripsi_secret(site_terpasang.secret_terenkripsi)
-    resp = permintaan_bertanda(site_terpasang, secret, "GET", "/wpmgr/v1/traffic")
-    assert resp.status_code == 200
-    data = resp.json()
+    batas = time.time() + 20
+    data = None
+    while time.time() < batas:
+        resp = permintaan_bertanda(site_terpasang, secret, "GET", "/wpmgr/v1/traffic")
+        assert resp.status_code == 200
+        data = resp.json()
+        if any(path_kontrol in hari.get("halaman", {}) for hari in data["hari"]):
+            break
+        time.sleep(1)
+    else:
+        pytest.fail("hit kontrol tidak muncul di /traffic dalam 20 detik")
+
     for hari in data["hari"]:
-        assert path not in hari.get("halaman", {})
+        assert path_bot not in hari.get("halaman", {})
 
 
 def test_footer_menyisipkan_script_beacon(site_terpasang):
