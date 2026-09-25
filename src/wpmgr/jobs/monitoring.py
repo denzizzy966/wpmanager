@@ -470,6 +470,33 @@ def simpan_traffic(sesi: Session, site_id, hari: list, sumber: str) -> int:
     return n
 
 
+# Dashboard tidak pernah meminta backfill (traffic() dipanggil tanpa `dari`),
+# jadi connector yang jujur hanya pernah membalas kemarin dan hari ini. 3 hari
+# memberi ruang untuk kemarin plus selisih zona waktu terjauh (UTC-12 sampai
+# UTC+14). Entri yang lebih tua dari ini pasti site yang disusupi mencoba
+# menimpa riwayat traffic pra-kompromi lewat semantik ganti-utuh
+# simpan_traffic() -- difilter di sini, bukan di simpan_traffic() sendiri,
+# karena GA4 (Task 20) memakai ulang fungsi itu dengan jangkauan tanggalnya
+# sendiri yang sah jauh ke belakang.
+BATAS_MASA_LALU_TRAFFIC = timedelta(days=3)
+
+
+def _tanggal_traffic(h) -> date | None:
+    """None kalau tidak bisa diurai -- filter usia ini tidak berusaha
+    mendeteksi baris rusak, itu tetap tugas simpan_traffic()."""
+    if not isinstance(h, dict):
+        return None
+    try:
+        return date.fromisoformat(str(h["tanggal"])[:10])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _bukan_riwayat_lama(h, batas: date) -> bool:
+    tanggal = _tanggal_traffic(h)
+    return tanggal is None or tanggal >= batas
+
+
 def tangani_collect_traffic(sesi: Session, job: Job, klien: SiteClient) -> dict:
     site = sesi.get(Site, job.site_id)
     data = klien.traffic()
@@ -477,7 +504,13 @@ def tangani_collect_traffic(sesi: Session, job: Job, klien: SiteClient) -> dict:
         # Sama seperti /events: site hidup dan menjawab 200, tetapi bodinya
         # bukan objek JSON yang kita harapkan.
         raise SiteError(BAD_RESPONSE, "Respons /traffic bukan objek JSON")
-    n = simpan_traffic(sesi, site.id, _daftar(data, "hari"), "plugin")
+    batas = datetime.now(timezone.utc).date() - BATAS_MASA_LALU_TRAFFIC
+    hari = [h for h in _daftar(data, "hari") if _bukan_riwayat_lama(h, batas)]
+    n = simpan_traffic(sesi, site.id, hari, "plugin")
+    if hari and n == 0:
+        # Hanya id site, bukan isi respons: `hari` datang dari site yang
+        # bisa disusupi, dan log tidak boleh jadi tempat singgah datanya.
+        log.warning("Respons /traffic tidak menghasilkan hari tersimpan (site %s)", site.id)
     site.traffic_diambil_pada = datetime.now(timezone.utc)
     sesi.commit()
     return {"hari": n}

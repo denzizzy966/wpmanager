@@ -33,10 +33,16 @@ def klien(muatan, diminta=None):
 
 
 def test_menyimpan_hari_dan_rincian(sesi, site):
+    # tangani_collect_traffic menolak hari yang lebih tua dari
+    # BATAS_MASA_LALU_TRAFFIC (lihat bagian pengerasan di bawah); tanggal di
+    # sini dihitung relatif ke "sekarang" (bukan literal tanggal HARI) supaya
+    # test ini tidak bergantung pada kapan ia dijalankan.
+    kemarin = datetime.now(timezone.utc).date() - timedelta(days=1)
+    hari = {**HARI, "tanggal": kemarin.isoformat()}
     job = buat_job(sesi, site.id, JobType.collect_traffic)
-    hasil = tangani_collect_traffic(sesi, job, klien({"zona_waktu": "Asia/Jakarta", "hari": [HARI]}))
+    hasil = tangani_collect_traffic(sesi, job, klien({"zona_waktu": "Asia/Jakarta", "hari": [hari]}))
     assert hasil == {"hari": 1}
-    h = sesi.get(TrafficHarian, (site.id, date(2026, 9, 21), "plugin"))
+    h = sesi.get(TrafficHarian, (site.id, kemarin, "plugin"))
     assert (h.kunjungan, h.pengunjung) == (12, 7)
     assert sesi.query(TrafficRincian).filter_by(site_id=site.id, dimensi="halaman").count() == 2
     sesi.refresh(site)
@@ -181,3 +187,91 @@ def test_batas_kunci_per_dimensi(sesi, site, monkeypatch):
     assert sesi.query(TrafficRincian).filter_by(
         site_id=site.id, dimensi="halaman"
     ).count() == 2
+
+
+# --- Fix round 1: usia hari, savepoint pada replace, dan kasus tepi lain ---
+
+
+def test_hari_lama_di_respons_tidak_menimpa_riwayat(sesi, site):
+    """Dashboard tidak pernah meminta backfill (tanpa `dari`, connector hanya
+    membalas kemarin dan hari ini): entri jauh di masa lalu dalam respons
+    berarti site yang disusupi mencoba menimpa riwayat traffic
+    pra-kompromi lewat semantik ganti-utuh simpan_traffic()."""
+    sekarang = datetime.now(timezone.utc).date()
+    lama = sekarang - timedelta(days=30)
+    kemarin = sekarang - timedelta(days=1)
+    simpan_traffic(sesi, site.id, [{**HARI, "tanggal": lama.isoformat()}], "plugin")
+
+    racun = {**HARI, "tanggal": lama.isoformat(),
+             "total": {"kunjungan": 999, "pengunjung": 999}, "halaman": {"/racun": 999}}
+    baru = {**HARI, "tanggal": kemarin.isoformat()}
+    job = buat_job(sesi, site.id, JobType.collect_traffic)
+    hasil = tangani_collect_traffic(sesi, job, klien({"hari": [racun, baru]}))
+
+    assert hasil == {"hari": 1}
+    h_lama = sesi.get(TrafficHarian, (site.id, lama, "plugin"))
+    assert (h_lama.kunjungan, h_lama.pengunjung) == (12, 7)
+    assert sesi.query(TrafficRincian).filter_by(
+        site_id=site.id, tanggal=lama, dimensi="halaman"
+    ).count() == 2
+    assert sesi.get(TrafficHarian, (site.id, kemarin, "plugin")) is not None
+
+
+def test_replace_gagal_mempertahankan_hari_lama(sesi, site, monkeypatch):
+    """Semantik simpan_traffic() menghapus baris lama lalu menulis yang baru
+    dalam savepoint yang sama: kalau baris baru ditolak database, savepoint
+    yang rollback harus mengembalikan baris lama juga -- bukan cuma
+    melindungi hari lain dalam respons yang sama (itu sudah dibuktikan oleh
+    test_kegagalan_db_dilewati_via_savepoint di atas)."""
+    simpan_traffic(sesi, site.id, [HARI], "plugin")
+    asli = monitoring._hitungan_traffic
+
+    def _bocor(nilai):
+        if nilai == 999999999999:
+            return 2**40  # lolos validasi kita, tetap di luar jangkauan `integer`
+        return asli(nilai)
+
+    monkeypatch.setattr(monitoring, "_hitungan_traffic", _bocor)
+    racun = {**HARI, "total": {"kunjungan": 999999999999, "pengunjung": 0}}
+    n = simpan_traffic(sesi, site.id, [racun], "plugin")
+
+    assert n == 0
+    h = sesi.get(TrafficHarian, (site.id, date(2026, 9, 21), "plugin"))
+    assert (h.kunjungan, h.pengunjung) == (12, 7)
+    assert sesi.query(TrafficRincian).filter_by(site_id=site.id, dimensi="halaman").count() == 2
+
+
+def test_kunjungan_nan_atau_inf_dilewati(sesi, site):
+    for buruk in (float("nan"), float("inf")):
+        hari = {**HARI, "total": {"kunjungan": buruk, "pengunjung": 0}}
+        assert simpan_traffic(sesi, site.id, [hari], "plugin") == 0
+
+
+def test_kunci_bertabrakan_setelah_dibersihkan_dijumlah(sesi, site):
+    hari = {**HARI, "halaman": {"/a\x00b": 3, "/ab": 4}}
+    simpan_traffic(sesi, site.id, [hari], "plugin")
+    baris = sesi.query(TrafficRincian).filter_by(site_id=site.id, dimensi="halaman").one()
+    assert (baris.kunci, baris.kunjungan) == ("/ab", 7)
+
+
+def test_rincian_gabungan_dijepit(sesi, site):
+    hari = {**HARI, "halaman": {"/a": 2**31 - 1, "/a\x00": 100}}
+    simpan_traffic(sesi, site.id, [hari], "plugin")
+    baris = sesi.query(TrafficRincian).filter_by(site_id=site.id, dimensi="halaman").one()
+    assert baris.kunjungan == 2**31 - 1
+
+
+def test_dimensi_kosong_berbentuk_dict_diterima(sesi, site):
+    hari = {**HARI, "halaman": {}, "asal": {}, "perangkat": {}}
+    assert simpan_traffic(sesi, site.id, [hari], "plugin") == 1
+    assert sesi.query(TrafficRincian).filter_by(site_id=site.id).count() == 0
+
+
+def test_semua_hari_ditolak_dicatat_tanpa_payload(sesi, site, caplog):
+    rusak = {"tanggal": "bukan-tanggal-yang-tidak-boleh-masuk-log"}
+    job = buat_job(sesi, site.id, JobType.collect_traffic)
+    with caplog.at_level("WARNING", logger="wpmgr.jobs.monitoring"):
+        hasil = tangani_collect_traffic(sesi, job, klien({"hari": [rusak]}))
+    assert hasil == {"hari": 0}
+    assert str(site.id) in caplog.text
+    assert "bukan-tanggal-yang-tidak-boleh-masuk-log" not in caplog.text
