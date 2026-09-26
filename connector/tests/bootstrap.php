@@ -223,3 +223,4 @@ require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-pa
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-paket.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-manifest.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-file.php';

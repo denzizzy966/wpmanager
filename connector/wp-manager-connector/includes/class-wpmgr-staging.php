@@ -86,6 +86,7 @@ class WPMGR_Staging {
     public static function rute() {
         return array(
             '/staging/manifest' => array( 'GET', 'manifest' ),
+            '/staging/file'     => array( 'POST', 'file' ),
         );
     }
 
@@ -131,6 +132,17 @@ class WPMGR_Staging {
             $hasil['info'] = $info;
         }
         return rest_ensure_response( $hasil );
+    }
+
+    /**
+     * Isi berkas untuk tarik/snapshot (Task 4): daftar berkas kecil atau satu
+     * rentang byte berkas besar, dikirim sebagai paket biner. Validasi body
+     * dan pembacaan berkasnya ada di WPMGR_Staging_File; di sini hanya
+     * penghubung ke respons REST.
+     */
+    public static function file( $request ) {
+        $hasil = WPMGR_Staging_File::ambil( self::root(), json_decode( $request->get_body(), true ) );
+        return is_wp_error( $hasil ) ? $hasil : self::respons_biner( $hasil );
     }
 
     public static function daftarkan_route() {
