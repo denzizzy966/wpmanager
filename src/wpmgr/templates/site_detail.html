@@ -1,54 +1,200 @@
 {% extends "base.html" %}
 {% block judul %}{{ site.nama }} — WP Manager{% endblock %}
 {% block isi %}
-<h1>{{ site.nama }}</h1>
-<p><a href="{{ site.url }}" target="_blank" rel="noopener">{{ site.url }}</a></p>
-<p>Status: <strong>{{ site.status.value }}</strong> ·
-   WP {{ site.wp_version or '—' }} · PHP {{ site.php_version or '—' }} ·
-   Connector {{ site.connector_version or '—' }}</p>
-{% if site.last_error %}<p class="galat">{{ site.last_error }}</p>{% endif %}
-
-<h2>Inventaris ({{ paket|length }})</h2>
-<table>
-  <tr><th>Tipe</th><th>Nama</th><th>Terpasang</th><th>Tersedia</th><th>Aktif</th></tr>
-  {% for p in paket %}
-  <tr>
-    <td>{{ p.tipe.value }}</td><td>{{ p.nama }}</td>
-    <td>{{ p.versi_terpasang }}</td><td>{{ p.versi_tersedia or '—' }}</td>
-    <td>{{ 'ya' if p.aktif else 'tidak' }}</td>
-  </tr>
-  {% endfor %}
-</table>
-
-<h2>Riwayat</h2>
-<ul>
-  {% for r in riwayat %}
-  <li>{{ r.dibuat_pada.strftime('%Y-%m-%d %H:%M') }} — [{{ r.level }}] {{ r.pesan }}</li>
-  {% endfor %}
-</ul>
-
-<h2>Cabut site</h2>
-<div x-data="{ konfirmasi: false, galat: '' }">
-  <p>Mencabut site menghapus datanya dari dashboard berikut secret-nya, sehingga
-     dashboard ini tidak lagi dapat memerintah site tersebut. Plugin
-     <code>wp-manager-connector</code> dan user <code>wpmgr</code> di site itu
-     harus dihapus manual lewat wp-admin.</p>
-  <button x-show="!konfirmasi" @click="konfirmasi = true">Cabut site ini</button>
-  <div x-show="konfirmasi">
-    <p><strong>Yakin mencabut {{ site.nama }}?</strong></p>
-    {# Pindah ke /sites HANYA bila penghapusan berhasil: dulu kegagalan pun
-       mengarahkan ke daftar site, dan operator mengira secret-nya sudah
-       dicabut padahal site itu masih bisa diperintah. #}
-    <button @click="
-      galat = '';
-      fetch('/api/sites/{{ site.id }}', { method: 'DELETE' })
-        .then(async (r) => {
-          if (r.ok) { window.location = '/sites'; return; }
-          galat = 'Site tidak dicabut. ' + await pesanGalat(r);
-        })
-        .catch((e) => { galat = 'Gagal menghubungi server: ' + e.message; })">Ya, cabut</button>
-    <button @click="konfirmasi = false">Batal</button>
-    <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+{# Hanya site.id (UUID buatan server) dan tab (daftar putih di route) yang
+   boleh masuk ke ekspresi Alpine. Nilai lain dibaca lewat data-* atau API. #}
+<div x-data="detailSite('{{ site.id }}', '{{ tab }}')" x-init="mulai()">
+  <h1>{{ site.nama }}</h1>
+  <p><a href="{{ site.url }}" target="_blank" rel="noopener">{{ site.url }}</a></p>
+  <div class="toolbar">
+    <button type="button" @click="sso()">Masuk wp-admin</button>
+    <button type="button" @click="scan()">Scan</button>
+    <a href="/sites/{{ site.id }}/laporan/{{ bulan_lalu }}" target="_blank" rel="noopener">Laporan bulanan</a>
   </div>
+  <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+  <p class="info" x-show="info" x-text="info" role="status"></p>
+
+  <nav class="tab">
+    {% for kunci, label in tab_detail %}
+    <button type="button" :class="{ aktif: tab === '{{ kunci }}' }" @click="pilih('{{ kunci }}')">
+      {{ label }}{% if lencana[kunci] %} <span class="lencana">{{ lencana[kunci] }}</span>{% endif %}
+    </button>
+    {% endfor %}
+  </nav>
+
+  <section x-show="tab === 'ringkasan'">
+    <p>Status koneksi: <strong>{{ site.status.value }}</strong> ·
+       WP {{ site.wp_version or '—' }} · PHP {{ site.php_version or '—' }} ·
+       Connector {{ site.connector_version or '—' }}</p>
+    {% if site.last_error %}<p class="galat">{{ site.last_error }}</p>{% endif %}
+    <p>Penangkap error: <strong>{{ site.mode_penangkap or 'belum aktif' }}</strong>
+      {% if site.mode_penangkap == 'terbatas' %} — folder mu-plugins di site ini tidak dapat ditulisi,
+      jadi fatal error dari plugin yang dimuat sebelum connector tidak tertangkap.{% endif %}</p>
+    <p>Percayai <code>X-Forwarded-For</code>: <strong>{{ 'ya' if site.percayai_xff else 'tidak' }}</strong>
+       (diatur di <em>Pengaturan → WP Manager</em> di wp-admin site ini).</p>
+
+    {% if ga4_aktif %}
+    <h3>Google Analytics 4</h3>
+    <p>
+      <label>Property ID
+        <input x-model="ga4" x-init="ga4 = $el.dataset.awal" data-awal="{{ site.ga4_property_id or '' }}"
+               inputmode="numeric" placeholder="mis. 412345678">
+      </label>
+      <button type="button" @click="simpanGa4()">Simpan</button>
+    </p>
+    {% if site.ga4_error %}<p class="galat">{{ site.ga4_error }}</p>{% endif %}
+    {% endif %}
+
+    <h3>Cabut site</h3>
+    <div x-data="{ konfirmasi: false, galatCabut: '' }">
+      <p>Mencabut site menghapus datanya dari dashboard berikut secret-nya. Plugin
+         <code>wp-manager-connector</code> dan user <code>wpmgr</code> di site itu harus dihapus
+         manual lewat wp-admin.</p>
+      <button type="button" x-show="!konfirmasi" @click="konfirmasi = true">Cabut site ini</button>
+      <div x-show="konfirmasi">
+        <p><strong>Yakin mencabut {{ site.nama }}?</strong></p>
+        <button type="button" @click="
+          galatCabut = '';
+          fetch('/api/sites/{{ site.id }}', { method: 'DELETE' })
+            .then(async (r) => {
+              if (r.ok) { window.location = '/sites'; return; }
+              galatCabut = 'Site tidak dicabut. ' + await pesanGalat(r);
+            })
+            .catch((e) => { galatCabut = 'Gagal menghubungi server: ' + e.message; })">Ya, cabut</button>
+        <button type="button" @click="konfirmasi = false">Batal</button>
+        <p class="galat" x-show="galatCabut" x-text="galatCabut" role="alert"></p>
+      </div>
+    </div>
+  </section>
+
+  <section x-show="tab === 'paket'">
+    <table>
+      <tr><th>Tipe</th><th>Nama</th><th>Terpasang</th><th>Tersedia</th><th>Aktif</th></tr>
+      {% for p in paket %}
+      <tr>
+        <td>{{ p.tipe.value }}</td><td>{{ p.nama }}</td>
+        <td>{{ p.versi_terpasang }}</td><td>{{ p.versi_tersedia or '—' }}</td>
+        <td>{{ 'ya' if p.aktif else 'tidak' }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </section>
+
+  <section x-show="tab === 'uptime'">
+    <template x-if="uptime">
+      <div>
+        <p>Status: <strong x-text="uptime.status_teks"></strong>
+           <span x-show="uptime.sejak" x-text="'sejak ' + waktu(uptime.sejak)"></span></p>
+        <p>Uptime 24 jam <strong x-text="persen(uptime.persen['24j'])"></strong> ·
+           7 hari <strong x-text="persen(uptime.persen['7h'])"></strong> ·
+           30 hari <strong x-text="persen(uptime.persen['30h'])"></strong> ·
+           waktu respons <span x-text="uptime.rata_ms == null ? '—' : uptime.rata_ms + ' ms'"></span></p>
+        <p>SSL: <span x-text="uptime.ssl.teks"></span></p>
+        <div class="batang" aria-label="Uptime harian 30 hari">
+          <template x-for="h in uptime.harian" :key="h.tanggal">
+            <div class="batang-kolom" :title="`${h.tanggal}: ${persen(h.persen)}`">
+              <div class="batang-isi" :class="{ 'batang-buruk': h.persen != null && h.persen < 99 }"
+                   :style="`height:${h.persen == null ? 0 : Math.max(2, h.persen)}%`"></div>
+            </div>
+          </template>
+        </div>
+        <h3>Insiden</h3>
+        <p class="redup" x-show="uptime.insiden.length === 0">Belum ada insiden.</p>
+        <table x-show="uptime.insiden.length">
+          <tr><th>Mulai</th><th>Selesai</th><th>Durasi</th><th>Penyebab</th></tr>
+          <template x-for="i in uptime.insiden" :key="i.id">
+            <tr>
+              <td x-text="waktu(i.mulai)"></td>
+              <td x-text="i.selesai ? waktu(i.selesai) : 'masih mati'"></td>
+              <td x-text="i.durasi"></td>
+              <td x-text="i.penyebab"></td>
+            </tr>
+          </template>
+        </table>
+      </div>
+    </template>
+  </section>
+
+  <section x-show="tab === 'error'">
+    <template x-if="errors">
+      <div>
+        <p class="redup" x-show="errors.length === 0">Belum ada error yang tercatat.</p>
+        <table x-show="errors.length">
+          <tr><th>Status</th><th>Tingkat</th><th>Komponen</th><th>Pesan</th><th>Lokasi</th>
+              <th>Jumlah</th><th>Terakhir</th><th></th></tr>
+          <template x-for="e in errors" :key="e.id">
+            <tr>
+              <td x-text="e.status_teks"></td>
+              <td x-text="e.tingkat"></td>
+              <td x-text="e.komponen_teks"></td>
+              <td>
+                <div class="pesan-detail" x-text="e.pesan"></div>
+                <div class="galat" x-show="e.setelah_update_teks" x-text="e.setelah_update_teks"></div>
+              </td>
+              <td x-text="e.lokasi"></td>
+              <td x-text="e.jumlah"></td>
+              <td x-text="waktu(e.terakhir_terlihat)"></td>
+              <td><button type="button" x-show="e.status !== 'selesai'" @click="tandaiSelesai(e.id)">Tandai selesai</button></td>
+            </tr>
+          </template>
+        </table>
+      </div>
+    </template>
+  </section>
+
+  <section x-show="tab === 'login'">
+    <template x-if="logins">
+      <div>
+        <p>Status keamanan: <strong x-text="teksKeamanan(logins.status)"></strong>
+           <span x-show="logins.percobaan_sejam" x-text="`· ${logins.percobaan_sejam} percobaan gagal dalam 60 menit`"></span></p>
+        <ul x-show="logins.alasan.length">
+          <template x-for="a in logins.alasan" :key="a"><li x-text="a"></li></template>
+        </ul>
+        <button type="button" x-show="logins.status === 'perlu_diperiksa'" @click="sudahDiperiksa()">Sudah diperiksa</button>
+
+        <h3>Administrator baru</h3>
+        <p class="redup" x-show="logins.admin.length === 0">Tidak ada.</p>
+        <table x-show="logins.admin.length">
+          <tr><th>Waktu</th><th>Kejadian</th><th>Username</th><th>IP</th></tr>
+          <template x-for="(k, i) in logins.admin" :key="i">
+            <tr><td x-text="waktu(k.waktu)"></td><td x-text="k.jenis"></td><td x-text="k.username"></td><td x-text="k.ip || '—'"></td></tr>
+          </template>
+        </table>
+
+        <h3>Login berhasil</h3>
+        <table>
+          <tr><th>Waktu</th><th>Username</th><th>Role</th><th>IP</th><th>Negara</th><th>Browser</th><th>Jalur</th></tr>
+          <template x-for="(k, i) in logins.berhasil" :key="i">
+            <tr>
+              <td x-text="waktu(k.waktu)"></td><td x-text="k.username"></td><td x-text="k.role || '—'"></td>
+              <td x-text="k.ip || '—'"></td><td x-text="k.negara || '—'"></td>
+              <td x-text="k.skrip ? 'skrip' : `${k.peramban} · ${k.os}`"></td><td x-text="k.jalur"></td>
+            </tr>
+          </template>
+        </table>
+
+        <h3>Login gagal (30 hari)</h3>
+        <table>
+          <tr><th>IP</th><th>Negara</th><th>Percobaan</th><th>Username yang dicoba</th><th>Jalur</th><th></th></tr>
+          <template x-for="g in logins.gagal" :key="g.ip">
+            <tr>
+              <td x-text="g.ip"></td><td x-text="g.negara || '—'"></td><td x-text="g.jumlah"></td>
+              <td x-text="g.username.join(', ')"></td><td x-text="g.jalur.join(', ')"></td>
+              <td x-text="g.skrip ? 'skrip' : ''"></td>
+            </tr>
+          </template>
+        </table>
+      </div>
+    </template>
+  </section>
+
+  <section x-show="tab === 'aktivitas'">
+    <ul>
+      {% for r in riwayat %}
+      <li>{{ r.dibuat_pada.strftime('%Y-%m-%d %H:%M') }} — [{{ r.level }}] {{ r.pesan }}</li>
+      {% endfor %}
+    </ul>
+  </section>
 </div>
+<script src="/static/app/detail.js"></script>
 {% endblock %}

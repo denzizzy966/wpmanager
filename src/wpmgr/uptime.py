@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy import func, select
@@ -251,3 +251,58 @@ def persen_uptime_per_site(
         site_id: (round(n / (n + g) * 100, 2) if n + g else None)
         for site_id, n, g in baris
     }
+
+
+def persen_uptime(sesi: Session, site_id, sejak: datetime) -> float | None:
+    # site_ids=[site_id], bukan tanpa filter: lihat catatan performa di
+    # persen_uptime_per_site -- tanpa itu setiap tab Uptime yang dibuka
+    # seq-scan seluruh riwayat uptime_checks, bukan cuma milik site ini.
+    return persen_uptime_per_site(sesi, sejak, [site_id]).get(site_id)
+
+
+def uptime_harian(sesi: Session, site_id, sekarang: datetime, hari: int) -> list[dict]:
+    awal = (sekarang - timedelta(days=hari - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    kolom_hari = func.date_trunc("day", UptimeCheck.dicek_pada).label("hari")
+    naik = func.count().filter(UptimeCheck.hasil == UptimeHasil.naik)
+    gagal = func.count().filter(UptimeCheck.hasil == UptimeHasil.gagal)
+    peta = {
+        baris.hari.date(): (baris[1], baris[2])
+        for baris in sesi.execute(
+            select(kolom_hari, naik, gagal)
+            .join(UptimePutaran, UptimePutaran.id == UptimeCheck.putaran_id)
+            .where(UptimeCheck.site_id == site_id, UptimeCheck.dicek_pada >= awal,
+                   UptimePutaran.gangguan_dashboard.is_(False))
+            .group_by(kolom_hari)
+        ).all()
+    }
+    hasil = []
+    for i in range(hari):
+        tanggal = awal.date() + timedelta(days=i)
+        n, g = peta.get(tanggal, (0, 0))
+        hasil.append({"tanggal": tanggal.isoformat(),
+                      "persen": round(n / (n + g) * 100, 2) if n + g else None})
+    return hasil
+
+
+def rata_waktu_ms(sesi: Session, site_id, sejak: datetime) -> int | None:
+    nilai = sesi.scalar(
+        select(func.avg(UptimeCheck.waktu_ms)).where(
+            UptimeCheck.site_id == site_id, UptimeCheck.hasil == UptimeHasil.naik,
+            UptimeCheck.dicek_pada >= sejak,
+        )
+    )
+    return int(nilai) if nilai is not None else None
+
+
+def teks_durasi(detik: float) -> str:
+    menit = int(detik // 60)
+    jam, menit = divmod(menit, 60)
+    hari, jam = divmod(jam, 24)
+    bagian = []
+    if hari:
+        bagian.append(f"{hari} hari")
+    if jam:
+        bagian.append(f"{jam} jam")
+    if menit or not bagian:
+        bagian.append(f"{menit} menit")
+    return " ".join(bagian)

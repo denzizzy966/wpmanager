@@ -13,3 +13,11 @@ main{padding:1rem}
 .chip-biru{background:#e8f0fb;border-color:#5b8def;color:#2a5bb8}
 .chip-hijau{background:#e6f5ee;border-color:#22a06b;color:#16704a;cursor:default}
 .chip-aktif{outline:2px solid currentColor;outline-offset:1px}
+nav.tab{display:flex;gap:.25rem;border-bottom:2px solid #ccd;margin:1rem 0}
+nav.tab button{border:1px solid transparent;border-bottom:none;background:none;padding:.4rem .8rem;border-radius:.4rem .4rem 0 0;cursor:pointer}
+nav.tab button.aktif{background:#e8f0fb;border-color:#ccd;font-weight:600}
+.lencana{display:inline-block;min-width:1.1em;padding:0 .3em;border-radius:.6em;background:#d64545;color:#fff;font-size:.75em;text-align:center}
+.batang{display:flex;align-items:flex-end;gap:2px;height:80px;margin:.75rem 0}
+.batang-kolom{flex:1;height:100%;display:flex;align-items:flex-end;background:#f3f4f6}
+.batang-isi{width:100%;background:#5b8def}
+.batang-buruk{background:#d64545}

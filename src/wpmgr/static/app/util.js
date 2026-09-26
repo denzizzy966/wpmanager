@@ -18,8 +18,8 @@ function esc(nilai) {
  *
  * FastAPI membalas {"detail": "..."} untuk HTTPException dan
  * {"detail": [{msg: ...}, ...]} untuk galat validasi. Hasilnya teks polos:
- * pemanggil WAJIB menyisipkannya lewat textContent/x-text, bukan innerHTML --
- * detail bisa memuat nilai yang berasal dari site client.
+ * pemanggil WAJIB menyisipkannya lewat textContent/x-text, bukan sebagai markup
+ * mentah -- detail bisa memuat nilai yang berasal dari site client.
  */
 async function pesanGalat(respons) {
   let rincian = "";

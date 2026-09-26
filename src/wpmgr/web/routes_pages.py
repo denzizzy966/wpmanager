@@ -1,4 +1,5 @@
 import uuid
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -9,7 +10,15 @@ from sqlalchemy.exc import IntegrityError
 from wpmgr import db
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import NAMA_ZIP, baca_manifest
-from wpmgr.models import ActivityLog, Site, SitePackage, User
+from wpmgr.keamanan import error_menyalakan_chip, nilai_keamanan
+from wpmgr.models import (
+    ActivityLog,
+    CatatanError,
+    Site,
+    SitePackage,
+    UptimeStatus,
+    User,
+)
 from wpmgr.pairing import buat_site
 from wpmgr.web.auth import pengguna_saat_ini
 
@@ -123,8 +132,23 @@ def simpan_site(
     return _tpl().TemplateResponse(request, "site_new.html", konteks)
 
 
+TAB_DETAIL = [
+    ("ringkasan", "Ringkasan"), ("paket", "Paket"), ("uptime", "Uptime"),
+    ("error", "Error"), ("login", "Login"), ("aktivitas", "Aktivitas"),
+]
+
+
+def _bulan_lalu(hari_ini: date) -> str:
+    awal_bulan = hari_ini.replace(day=1)
+    return (awal_bulan - timedelta(days=1)).strftime("%Y-%m")
+
+
 @router.get("/sites/{site_id}")
-def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalaman):
+def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalaman, tab: str = "ringkasan"):
+    sah = {k for k, _ in TAB_DETAIL}
+    # Hanya nilai dari daftar putih yang boleh masuk ke ekspresi Alpine di template.
+    tab = tab if tab in sah else "ringkasan"
+    sekarang = datetime.now(timezone.utc)
     with db.SessionLocal() as sesi:
         site = sesi.get(Site, site_id)
         if site is None:
@@ -138,7 +162,17 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
             .order_by(ActivityLog.dibuat_pada.desc())
             .limit(100)
         ).all()
+        errors = sesi.scalars(select(CatatanError).where(CatatanError.site_id == site_id)).all()
+        keamanan = nilai_keamanan(sesi, site, sekarang)
+    lencana = {
+        "uptime": "!" if site.uptime_status == UptimeStatus.mati else "",
+        "error": sum(1 for e in errors if error_menyalakan_chip(e, sekarang)) or "",
+        "login": {"perlu_diperiksa": "!", "diserang": "serangan"}.get(keamanan.status.value, ""),
+    }
     return _tpl().TemplateResponse(
         request, "site_detail.html",
-        {"pengguna": pengguna, "site": site, "paket": paket, "riwayat": riwayat},
+        {"pengguna": pengguna, "site": site, "paket": paket, "riwayat": riwayat,
+         "tab": tab, "tab_detail": TAB_DETAIL, "lencana": lencana,
+         "bulan_lalu": _bulan_lalu(sekarang.date()),
+         "ga4_aktif": bool(get_settings().ga4_credentials)},
     )

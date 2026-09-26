@@ -4,7 +4,7 @@
 <h1>Aktivitas</h1>
 {# Isi `detail` sebagian berasal dari site client (pesan WordPress, string
    versi) -- site yang mungkin sudah disusupi. Semuanya lewat autoescape
-   Jinja; jangan pernah memakai |safe di sini. #}
+   Jinja; jangan pernah menonaktifkan escaping di sini. #}
 <table>
   <tr><th>Waktu</th><th>Site</th><th>Level</th><th>Pesan</th><th>Rincian</th></tr>
   {% for log, site_nama in baris %}
