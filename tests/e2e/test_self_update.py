@@ -11,6 +11,7 @@ from wpmgr.worker import proses_satu
 from .conftest import (
     AKAR_REPO,
     _wpcli_status,
+    jalankan_sampai_selesai,
     klien_http,
     sinkronkan_connector,
     versi_connector_sumber,
@@ -29,27 +30,6 @@ def connector_dipulihkan():
 
 def _jalankan(sesi):
     return proses_satu(sesi, "uji-e2e", buat_klien_fn=klien_http)
-
-
-def _jalankan_sampai_selesai(sesi, job, batas: int = 10) -> None:
-    """Proses antrean sampai `job` tertentu keluar dari pending/running.
-
-    proses_satu() memproses SATU job per panggilan -- yang tertua menurut
-    scheduled_for, di seluruh antrean, bukan hanya job yang baru dibuat.
-    verify_site dan update_connector sama-sama meng-antre-kan job susulan
-    (scan_site, verify_site) yang scheduled_for-nya lebih tua daripada job
-    yang baru saja dibuat test ini, sehingga satu panggilan proses_satu()
-    tidak menjamin job yang baru itu yang diambil. Deviasi dari brief Task 7
-    (yang memanggil _jalankan() sekali per job): dengan hanya satu panggilan,
-    test ini gagal karena scan_site/verify_site susulan itu diproses lebih
-    dulu dan job yang diperiksa tetap `pending`.
-    """
-    for _ in range(batas):
-        sesi.refresh(job)
-        if job.status not in (JobStatus.pending, JobStatus.running):
-            return
-        assert _jalankan(sesi)
-    sesi.refresh(job)
 
 
 def test_self_update_mengganti_versi_dan_connector_tetap_aktif(
@@ -75,7 +55,7 @@ def test_self_update_mengganti_versi_dan_connector_tetap_aktif(
     assert "self_update" in site_terpasang.fitur
 
     job = buat_job(sesi, site_terpasang.id, JobType.update_connector, {"versi": versi_baru})
-    _jalankan_sampai_selesai(sesi, job)
+    jalankan_sampai_selesai(sesi, job)
     assert job.status == JobStatus.success, job.error
 
     assert klien_http(site_terpasang).ping()["connector_version"] == versi_baru
@@ -85,7 +65,7 @@ def test_self_update_mengganti_versi_dan_connector_tetap_aktif(
 
     # Mengulang dengan paket yang sama idempoten.
     job2 = buat_job(sesi, site_terpasang.id, JobType.update_connector, {"versi": versi_baru})
-    _jalankan_sampai_selesai(sesi, job2)
+    jalankan_sampai_selesai(sesi, job2)
     assert job2.status == JobStatus.success
     assert "sudah di versi" in job2.hasil["pesan"]
     assert sesi.query(Job).filter_by(tipe=JobType.verify_site).count() >= 1

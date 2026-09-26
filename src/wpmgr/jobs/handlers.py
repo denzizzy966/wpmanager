@@ -44,8 +44,16 @@ def simpan_kemampuan(site: Site, data: dict) -> None:
     """
     fitur = data.get("fitur")
     site.fitur = sorted({f for f in fitur if isinstance(f, str)}) if isinstance(fitur, list) else []
-    mode = data.get("mode_penangkap")
-    site.mode_penangkap = mode if isinstance(mode, str) and mode in MODE_PENANGKAP_SAH else None
+    # /inventory (dipakai scan_site) tidak pernah membawa mode_penangkap --
+    # hanya /ping (verify_site) yang melaporkannya. tangani_verify_site selalu
+    # meng-antre-kan scan_site susulan (antrekan_scan()), jadi tanpa guard ini
+    # tiap scan_site menghapus nilai yang baru saja dicatat verify_site,
+    # membuat mode_penangkap nyaris selalu None di produksi (ditemukan lewat
+    # e2e Task 26: verify_site di fixture site_siap diikuti scan_site
+    # otomatis sebelum collect_events sempat diproses).
+    if "mode_penangkap" in data:
+        mode = data.get("mode_penangkap")
+        site.mode_penangkap = mode if isinstance(mode, str) and mode in MODE_PENANGKAP_SAH else None
     if "percayai_xff" in data:
         site.percayai_xff = bool(data.get("percayai_xff"))
     versi = data.get("connector_version")

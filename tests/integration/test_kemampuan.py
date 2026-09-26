@@ -53,6 +53,28 @@ def test_mode_penangkap_tak_dikenal_diabaikan(sesi, site):
     assert site.mode_penangkap is None
 
 
+def test_scan_tidak_menimpa_mode_penangkap_yang_sudah_diketahui(sesi, site):
+    """/inventory (dipakai scan_site) tidak pernah membawa mode_penangkap --
+    hanya /ping (verify_site) yang melaporkannya. verify_site selalu
+    meng-antre-kan scan_site susulan lewat antrekan_scan(), jadi tanpa
+    penjagaan ini setiap scan_site menghapus nilai yang baru saja dicatat
+    verify_site, membuat mode_penangkap nyaris selalu None di produksi
+    (koreksi ditemukan lewat e2e Task 26: test_fatal_error_plugin_tertangkap_
+    dengan_atribusi gagal karena site_siap.mode_penangkap balik jadi None
+    setelah scan_site susulan diproses)."""
+    job_verify = buat_job(sesi, site.id, JobType.verify_site)
+    tangani_verify_site(sesi, job_verify, klien_palsu(PING))
+    sesi.refresh(site)
+    assert site.mode_penangkap == "penuh"
+
+    inventaris_tanpa_mode = {"core": None, "plugins": [], "themes": [],
+                             "fitur": ["events", "self_update"], "connector_version": "2.0.0"}
+    job_scan = buat_job(sesi, site.id, JobType.scan_site)
+    tangani_scan_site(sesi, job_scan, klien_palsu(inventaris_tanpa_mode))
+    sesi.refresh(site)
+    assert site.mode_penangkap == "penuh"
+
+
 def test_scan_juga_mencatat_fitur(sesi, site):
     inventaris = {"core": {"slug": "core", "nama": "WordPress", "versi_terpasang": "6.5",
                            "versi_tersedia": None, "aktif": True, "auto_update": False},

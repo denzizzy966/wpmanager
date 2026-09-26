@@ -10,10 +10,11 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from wpmgr.crypto import dekripsi_secret
-from wpmgr.models import Base
+from wpmgr.models import Base, JobStatus
 from wpmgr.pairing import buat_site
 from wpmgr.signing import new_nonce, sign
 from wpmgr.site_client import SiteClient
+from wpmgr.worker import proses_satu
 
 WP_URL = "http://localhost:8081"
 pytestmark = pytest.mark.e2e
@@ -118,6 +119,47 @@ def _wpcli_status(*args: str) -> int:
          "--allow-root", *args],
         capture_output=True, text=True, check=False,
     ).returncode
+
+
+def jalankan_sampai_selesai(sesi, job, batas: int = 10) -> None:
+    """Proses antrean sampai `job` tertentu keluar dari pending/running.
+
+    proses_satu() memproses SATU job per panggilan -- yang tertua menurut
+    scheduled_for, di seluruh antrean, bukan hanya job yang baru dibuat.
+    verify_site dan update_connector sama-sama meng-antre-kan job susulan
+    (scan_site, verify_site) yang scheduled_for-nya lebih tua daripada job
+    yang baru saja dibuat test ini, sehingga satu panggilan proses_satu()
+    tidak menjamin job yang baru itu yang diambil. Deviasi dari brief Task 7
+    (yang memanggil _jalankan() sekali per job): dengan hanya satu panggilan,
+    test ini gagal karena scan_site/verify_site susulan itu diproses lebih
+    dulu dan job yang diperiksa tetap `pending`.
+    """
+    for _ in range(batas):
+        sesi.refresh(job)
+        if job.status not in (JobStatus.pending, JobStatus.running):
+            return
+        assert proses_satu(sesi, "uji-e2e", buat_klien_fn=klien_http)
+    sesi.refresh(job)
+
+
+def tunggu_hingga(kondisi, batas_detik: float = 20, jeda: float = 1.0) -> bool:
+    """Ulangi `kondisi()` sampai True atau `batas_detik` terlampaui.
+
+    /events hanya mengirim baris yang sudah melewati CAKRAWALA
+    (WPMGR_Events::CAKRAWALA, 5 detik) -- lihat koreksi #10 di
+    konteks-global.md. Karena itu, memicu sebuah kejadian di site lalu
+    langsung memanggil collect_events SEKALI tidak cukup: baris itu belum
+    tentu "tenang". Dipakai lewat pola "coba job lalu cek kondisi" (lihat
+    _job_sampai di test_monitoring.py), bukan sleep tetap, supaya test
+    berhenti secepat kondisinya terpenuhi.
+    """
+    batas = time.time() + batas_detik
+    while True:
+        if kondisi():
+            return True
+        if time.time() >= batas:
+            return False
+        time.sleep(jeda)
 
 
 @pytest.fixture(scope="session")

@@ -95,7 +95,7 @@ proses harus berjalan bersamaan; tanpa worker, job hanya menumpuk sebagai
 Proyek ini punya tiga lapis test Python plus satu suite PHP, masing-masing
 butuh prasyarat berbeda. **Jangan jalankan `pytest -m "not integration"` saja**
 — marker itu hanya menyingkirkan test integrasi, bukan test e2e, sehingga ia
-tetap mengumpulkan 233 dari 590 test, termasuk 27 test e2e yang butuh
+tetap mengumpulkan 240 dari 598 test, termasuk 34 test e2e yang butuh
 kontainer WordPress menyala. Di clone segar tanpa Docker jalan, ini gagal
 dengan cara yang tidak ada hubungannya dengan perubahan yang sedang diuji.
 Gunakan tiga perintah berikut, sesuai apa yang tersedia:
@@ -104,11 +104,11 @@ Gunakan tiga perintah berikut, sesuai apa yang tersedia:
 # Unit — tidak butuh service apa pun (206 test)
 .venv/Scripts/python -m pytest -m "not integration and not e2e"
 
-# Integrasi — butuh PostgreSQL (357 test)
+# Integrasi — butuh PostgreSQL (358 test)
 docker compose up -d db
 .venv/Scripts/python -m pytest tests/integration -m integration
 
-# End-to-end — butuh kontainer WordPress + MariaDB (27 test)
+# End-to-end — butuh kontainer WordPress + MariaDB (34 test)
 docker compose up -d db wp wpdb wpcli
 .venv/Scripts/python -m pytest tests/e2e -m e2e
 ```
