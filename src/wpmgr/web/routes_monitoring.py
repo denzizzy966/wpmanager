@@ -19,6 +19,7 @@ from wpmgr.models import (
     PackageType,
     Site,
     SitePackage,
+    SiteStatus,
     UptimeInsiden,
     User,
 )
@@ -332,6 +333,71 @@ def keamanan_diperiksa(site_id: uuid.UUID, pengguna: PenggunaApi):
                              pesan=f"Keamanan ditandai sudah diperiksa oleh {pengguna.email}"))
         sesi.commit()
     return {"ok": True}
+
+
+# Batas jumlah IP yang dikembalikan /api/keamanan/penyerang, sama seperti
+# batas jumlah baris hasil akhir lain di berkas ini -- lihat komentar
+# BATAS_IP_LOGIN_GAGAL di atas untuk alasan agregasi selalu dilakukan penuh
+# dulu (SUM atas SEMUA baris login_gagal yang cocok), baru dipotong ke sekian
+# IP paling deras.
+BATAS_IP_PENYERANG = 500
+BATAS_SITE_PER_IP = 5
+BATAS_USERNAME_PER_IP_PENYERANG = 5
+# LoginGagal.jam adalah AWAL jam (dibulatkan ke bawah oleh connector), bukan
+# tengahnya -- koreksi #11 rencana Lapis 2. Jendela "N jam terakhir" mundur
+# satu jam ekstra supaya ember yang sedang berjalan ikut terhitung di menit
+# berapa pun permintaan ini dibuat, bukan cuma tepat pukul xx:00.
+_MARJIN_EMBER_PENYERANG = timedelta(hours=1)
+
+
+@router.get("/api/keamanan/penyerang")
+def penyerang(pengguna: PenggunaApi, jam: int = 24):
+    jam = max(1, min(jam, 24 * 30))
+    sejak = _sekarang() - timedelta(hours=jam) - _MARJIN_EMBER_PENYERANG
+    per_ip: dict = defaultdict(lambda: {"jumlah": 0, "negara": None, "site": set(),
+                                        "username": defaultdict(int), "jalur": set(),
+                                        "skrip": False, "terakhir": None})
+    with db.SessionLocal() as sesi:
+        # ip != "": baris "(IP lain)" adalah ember overflow yang mencampur
+        # banyak IP berbeda dari banyak site -- lihat catatan koreksi #3.
+        # Memasukkannya di sini akan membuat satu baris palsu yang seolah-olah
+        # satu IP menyerang hampir semua site sekaligus.
+        for g, nama_site in sesi.execute(
+            select(LoginGagal, Site.nama).join(Site, Site.id == LoginGagal.site_id)
+            .where(LoginGagal.jam > sejak, LoginGagal.ip != "",
+                   Site.status != SiteStatus.disabled)
+        ).all():
+            r = per_ip[g.ip]
+            r["jumlah"] += g.jumlah
+            r["negara"] = r["negara"] or g.negara
+            r["site"].add(nama_site)
+            r["username"][g.username] += g.jumlah
+            r["jalur"].add(g.jalur)
+            r["skrip"] = r["skrip"] or urai_ua(g.user_agent)["skrip"]
+            r["terakhir"] = max(filter(None, (r["terakhir"], g.jam)))
+    hasil = [
+        {
+            "ip": ip,
+            "negara": r["negara"],
+            "jumlah": r["jumlah"],
+            "jumlah_site": len(r["site"]),
+            "site": ", ".join(sorted(r["site"])[:BATAS_SITE_PER_IP]),
+            "username": ", ".join(
+                u for u, _ in sorted(r["username"].items(), key=lambda x: (-x[1], x[0]))
+                [:BATAS_USERNAME_PER_IP_PENYERANG]
+            ),
+            "jalur": ", ".join(sorted(r["jalur"])),
+            "skrip": r["skrip"],
+            "terakhir": _iso(r["terakhir"]),
+        }
+        for ip, r in per_ip.items()
+    ]
+    # Tie-break dengan ip: dict Python mempertahankan urutan kemunculan
+    # pertama tiap IP di hasil query, yang tidak dijamin stabil antar
+    # eksekusi -- tanpa tie-break kedua, IP dengan jumlah sama bisa bertukar
+    # urutan begitu saja walau datanya tidak berubah.
+    hasil.sort(key=lambda b: (-b["jumlah"], b["ip"]))
+    return hasil[:BATAS_IP_PENYERANG]
 
 
 class PermintaanGA4(BaseModel):

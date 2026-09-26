@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block judul %}Keamanan — WP Manager{% endblock %}
+{% block isi %}
+<div x-data="layarKeamanan()" x-init="muat()">
+  <h1>IP penyerang</h1>
+  <p>Percobaan login gagal lintas semua site. IP yang menyerang banyak site sekaligus hampir selalu
+     botnet; ekspor daftar ini untuk dimasukkan ke daftar blokir Wordfence atau Cloudflare.</p>
+  <div class="toolbar">
+    <label>Rentang
+      <select x-model.number="jam" @change="muat()">
+        <option value="24">24 jam</option>
+        <option value="168">7 hari</option>
+        <option value="720">30 hari</option>
+      </select>
+    </label>
+  </div>
+  <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+  <div id="grid" style="height: 65vh"></div>
+  <p class="redup">IP geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener">DB-IP</a>.</p>
+</div>
+<script src="/static/app/keamanan.js"></script>
+{% endblock %}

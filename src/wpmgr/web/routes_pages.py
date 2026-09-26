@@ -60,6 +60,11 @@ def halaman_sites(request: Request, pengguna: PenggunaHalaman):
     return _tpl().TemplateResponse(request, "sites.html", {"pengguna": pengguna})
 
 
+@router.get("/keamanan")
+def halaman_keamanan(request: Request, pengguna: PenggunaHalaman):
+    return _tpl().TemplateResponse(request, "keamanan.html", {"pengguna": pengguna})
+
+
 @router.get("/activity")
 def halaman_activity(request: Request, pengguna: PenggunaHalaman):
     with db.SessionLocal() as sesi:
