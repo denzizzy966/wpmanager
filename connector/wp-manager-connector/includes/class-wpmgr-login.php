@@ -225,8 +225,10 @@ class WPMGR_Login {
     private static function catat_admin( $user_id, $jenis ) {
         $user = get_userdata( $user_id );
         // User wpmgr dibuat connector sendiri saat pairing; mencatatnya membuat
-        // setiap site baru langsung berstatus merah di dashboard.
-        if ( ! $user || WPMGR_USER_LOGIN === $user->user_login ) {
+        // setiap site baru langsung berstatus merah di dashboard. Dikenali
+        // lewat penanda selama pastikan_user() berjalan, BUKAN lewat nama:
+        // siapa pun yang bisa membuat administrator bisa menamainya "wpmgr".
+        if ( ! $user || ( class_exists( 'WPMGR_Settings' ) && WPMGR_Settings::sedang_membuat_user() ) ) {
             return;
         }
         $baris = self::susun_baris( $jenis, $user, self::jalur( self::konteks_sekarang() ) );
@@ -363,6 +365,10 @@ class WPMGR_Login {
         self::$berhasil = array();
         self::$gagal    = array();
         self::$admin    = array();
+    }
+
+    public static function admin_untuk_test() {
+        return self::$admin;
     }
 
     public static function gagal_untuk_test() {

@@ -10,6 +10,15 @@ class WPMGR_Settings {
     const OPT_DASHBOARD = 'wpmgr_dashboard_url';
     const OPT_XFF       = 'wpmgr_percayai_xff';
 
+    // True hanya selama pastikan_user() sendiri memanggil wp_insert_user(),
+    // supaya pencatat admin bisa melewati user SSO yang dibuat connector
+    // tanpa mengecualikan user lain yang kebetulan bernama sama.
+    private static $membuat_user = false;
+
+    public static function sedang_membuat_user() {
+        return self::$membuat_user;
+    }
+
     public static function site_id() {
         return (string) get_option( self::OPT_SITE_ID, '' );
     }
@@ -39,15 +48,20 @@ class WPMGR_Settings {
         if ( $user ) {
             return (int) $user->ID;
         }
-        $id = wp_insert_user(
-            array(
-                'user_login'   => WPMGR_USER_LOGIN,
-                'user_pass'    => wp_generate_password( 64, true, true ),
-                'user_email'   => 'wpmgr+' . wp_generate_password( 8, false ) . '@invalid.local',
-                'display_name' => 'WP Manager',
-                'role'         => 'administrator',
-            )
-        );
+        self::$membuat_user = true;
+        try {
+            $id = wp_insert_user(
+                array(
+                    'user_login'   => WPMGR_USER_LOGIN,
+                    'user_pass'    => wp_generate_password( 64, true, true ),
+                    'user_email'   => 'wpmgr+' . wp_generate_password( 8, false ) . '@invalid.local',
+                    'display_name' => 'WP Manager',
+                    'role'         => 'administrator',
+                )
+            );
+        } finally {
+            self::$membuat_user = false;
+        }
         return is_wp_error( $id ) ? 0 : (int) $id;
     }
 

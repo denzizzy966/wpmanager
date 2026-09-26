@@ -1,6 +1,40 @@
 <?php
 use PHPUnit\Framework\TestCase;
 
+// Stub minimal untuk jalur saat_user_baru() dan WPMGR_Settings::pastikan_user().
+// wp_insert_user() tiruan memanggil saat_user_baru() secara sinkron, persis
+// seperti hook user_register di WordPress sungguhan (wp-includes/user.php).
+if ( ! defined( 'WPMGR_USER_LOGIN' ) ) {
+    define( 'WPMGR_USER_LOGIN', 'wpmgr' );
+}
+if ( ! function_exists( 'get_userdata' ) ) {
+    function get_userdata( $user_id ) {
+        return isset( $GLOBALS['wpmgr_test_user'][ $user_id ] ) ? $GLOBALS['wpmgr_test_user'][ $user_id ] : false;
+    }
+}
+if ( ! function_exists( 'get_user_by' ) ) {
+    function get_user_by( $field, $value ) {
+        return false;
+    }
+}
+if ( ! function_exists( 'wp_generate_password' ) ) {
+    function wp_generate_password( $length = 12, $special = true, $extra = false ) {
+        return str_repeat( 'a', $length );
+    }
+}
+if ( ! function_exists( 'wp_insert_user' ) ) {
+    function wp_insert_user( $data ) {
+        $id                                  = 42;
+        $GLOBALS['wpmgr_test_user'][ $id ]   = (object) array(
+            'ID'         => $id,
+            'user_login' => $data['user_login'],
+            'roles'      => array( $data['role'] ),
+        );
+        WPMGR_Login::saat_user_baru( $id );
+        return $id;
+    }
+}
+
 /**
  * wpdb tiruan minimal untuk menguji jalur tulis(): tanpa DB sungguhan, hanya
  * mencatat query yang "dikirim" dan mensimulasikan rows_affected/COUNT(*)
@@ -78,6 +112,7 @@ final class LoginTest extends TestCase {
         WPMGR_Login::reset_untuk_test();
         unset( $GLOBALS['wpdb'] );
         unset( $_SERVER['PHP_AUTH_USER'] );
+        $GLOBALS['wpmgr_test_user'] = array();
         $GLOBALS['wpmgr_test_doing_filter'] = array();
     }
 
@@ -415,5 +450,25 @@ final class LoginTest extends TestCase {
         // Panggilan kedua tanpa mengisi ulang buffer: tidak ada tambahan tulis.
         WPMGR_Login::tulis();
         $this->assertCount( 1, $wpdb->inserted );
+    }
+
+    public function test_admin_bernama_wpmgr_tetap_tercatat_di_luar_pastikan_user(): void {
+        // Siapa pun yang bisa membuat administrator bisa menamainya "wpmgr";
+        // pengecualian berdasarkan nama membuat admin itu tak terlihat.
+        $GLOBALS['wpmgr_test_user'][7] = (object) array(
+            'ID' => 7, 'user_login' => 'wpmgr', 'roles' => array( 'administrator' ),
+        );
+        WPMGR_Login::saat_user_baru( 7 );
+
+        $admin = WPMGR_Login::admin_untuk_test();
+        $this->assertCount( 1, $admin );
+        $this->assertSame( 'admin_baru', $admin[7]['jenis'] );
+        $this->assertSame( 'wpmgr', $admin[7]['username'] );
+    }
+
+    public function test_user_yang_dibuat_pastikan_user_tidak_tercatat(): void {
+        $this->assertSame( 42, WPMGR_Settings::pastikan_user() );
+        $this->assertSame( array(), WPMGR_Login::admin_untuk_test() );
+        $this->assertFalse( WPMGR_Settings::sedang_membuat_user() );
     }
 }
