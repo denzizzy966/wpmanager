@@ -15,10 +15,18 @@
 #     akses lebih dari yang sudah dimiliki user itu di host (putusan R13);
 #   - container yang labelnya bukan milik staging tidak pernah disentuh,
 #     termasuk layanan bersama db/router/mail (RF5, putusan F14);
-#   - setiap panggilan docker/certbot/setpriv dibatasi `timeout` supaya
-#     proses root ini tidak hidup lebih lama dari pemanggilnya (putusan F10b);
+#   - setiap panggilan docker/certbot/setpriv dibatasi `timeout` terhadap
+#     tenggat milik skrip ini sendiri per subperintah (putusan F10b). Skrip
+#     tidak mendeteksi kematian pemanggilnya; bila pemanggil mati tanpa
+#     menghentikannya, proses root ini tetap berakhir paling lambat pada
+#     tenggat itu (ditambah jeda -k 10 detik);
 #   - pesan galat tetap dan pendek, tidak pernah menggemakan masukan mentah.
-set -euo pipefail
+#
+# Kode keluar (stderr: satu baris `GALAT <kode>: <pesan>`):
+#   2 argumen, 3 ditolak, 4 docker, 5 sertifikat, 6 impor, 7 konfigurasi,
+#   8 wpcli, 9 internal (kegagalan tak terduga yang tertangkap `set -e`;
+#   kode keluar mentah perintah seperti awk/install tidak pernah diteruskan).
+set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 PATH="${WPMGR_STG_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
@@ -32,8 +40,8 @@ OPSI_KLIEN=""
 SEMENTARA=()
 
 # Tenggat per subperintah = tenggat pembungkus Python (pembantu.py
-# TIMEOUT_*) ditambah margin. Python membunuh grup proses sudo lebih dulu;
-# batas di sini hanya jaring pengaman bila pemanggil mati tanpa membunuhnya.
+# TIMEOUT_*) ditambah margin, supaya dalam keadaan normal pembungkus yang
+# lebih dulu menyerah. Batas ini berlaku apa pun yang terjadi pada pemanggil.
 WAKTU_BAWAAN=180       # TIMEOUT_BAWAAN 120 + 60
 WAKTU_SIAPKAN=960      # TIMEOUT_SIAPKAN 900 + 60
 WAKTU_BUAT=660         # TIMEOUT_BUAT 600 + 60
@@ -42,10 +50,17 @@ WAKTU_WPCLI=960        # TIMEOUT_WPCLI 900 + 60
 WAKTU_SERTIFIKAT=360   # TIMEOUT_SERTIFIKAT 300 + 60
 TENGGAT=$(( SECONDS + WAKTU_BAWAAN ))
 
+ROUTER_CADANGAN=""
+# Penanda "baris GALAT sudah dicetak". Berupa berkas, bukan variabel, karena
+# galat bisa terjadi di subshell substitusi perintah; tanpa penanda ini
+# jebakan ERR di induknya akan mencetak GALAT kedua dan menimpa kodenya.
+PENANDA_GALAT="$(mktemp)"
+
 galat() {
   local kode="$1"
   shift
   printf 'GALAT %s: %s\n' "$kode" "$*" >&2
+  printf '1' > "$PENANDA_GALAT" 2>/dev/null || true
   case "$kode" in
     argumen) exit 2 ;;
     ditolak) exit 3 ;;
@@ -54,11 +69,39 @@ galat() {
     impor) exit 6 ;;
     konfigurasi) exit 7 ;;
     wpcli) exit 8 ;;
-    *) exit 1 ;;
+    *) exit 9 ;;
   esac
 }
 
+# Jebakan ERR (diwarisi fungsi dan subshell lewat `set -E`): kegagalan yang
+# tidak ditangani eksplisit menjadi `GALAT internal` dengan kode 9. Bila baris
+# GALAT sudah dicetak (galat() di subshell), kodenya dipertahankan.
+galat_tak_terduga() {
+  local rc=$?
+  trap - ERR
+  if [[ -s "$PENANDA_GALAT" ]]; then
+    exit "$rc"
+  fi
+  galat internal "kegagalan tak terduga"
+}
+trap galat_tak_terduga ERR
+
+# Mengembalikan konfigurasi router lama; dipanggil dari jebakan EXIT selama
+# ROUTER_CADANGAN terisi, sebelum direktori sementara (cadangannya) dihapus.
+pulihkan_router() {
+  local tujuan="$KONF_DIR/router"
+  rm -f "$tujuan/conf.d/"stg-*.conf "$tujuan/htpasswd/"* 2>/dev/null || true
+  cp -a "$ROUTER_CADANGAN/conf.d/." "$tujuan/conf.d/" 2>/dev/null || true
+  cp -a "$ROUTER_CADANGAN/htpasswd/." "$tujuan/htpasswd/" 2>/dev/null || true
+  ROUTER_CADANGAN=""
+}
+
 bersihkan() {
+  local rc=$?
+  trap - ERR
+  if [[ -n "$ROUTER_CADANGAN" ]]; then
+    pulihkan_router
+  fi
   # Berkas opsi klien MariaDB memuat kata sandi: selalu dihapus, juga saat
   # skrip berhenti karena galat. Batas waktunya sendiri, bukan sisa tenggat,
   # supaya tenggat yang habis tidak mencegah pembersihan.
@@ -66,8 +109,10 @@ bersihkan() {
     timeout -k 5 20 docker exec wpmgr-stg-db rm -f "$OPSI_KLIEN" >/dev/null 2>&1 || true
   fi
   if [[ ${#SEMENTARA[@]} -gt 0 ]]; then
-    rm -rf -- "${SEMENTARA[@]}"
+    rm -rf -- "${SEMENTARA[@]}" || true
   fi
+  rm -f -- "$PENANDA_GALAT" || true
+  exit "$rc"
 }
 trap bersihkan EXIT
 
@@ -124,8 +169,9 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
 
   [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] \
     || galat konfigurasi "DOMAIN tidak sah"
-  # Path dipakai di `-v sumber:tujuan`; titik dua, spasi, atau `..` akan
-  # mengubah arti argumen itu, jadi hanya karakter aman yang diterima.
+  # Path dipakai di `-v sumber:tujuan` dan `--mount type=bind,src=…`; titik
+  # dua, koma, spasi, atau `..` akan mengubah arti argumen itu, jadi hanya
+  # karakter aman yang diterima.
   local p
   for p in "$STAGING_DIR" "$KONF_DIR" "$CERT_DIR" "$ACME_DIR" "$LE_DIR" "$LOG_DIR" "$MEMINFO"; do
     [[ "$p" =~ $POLA_JALUR && "$p" != *..* ]] || galat konfigurasi "path konfigurasi tidak sah"
@@ -147,8 +193,12 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
     UID_W="$(stat -c %u "$STAGING_DIR" 2>/dev/null)" || galat konfigurasi "STAGING_DIR tidak ada"
     GID_W="$(stat -c %g "$STAGING_DIR" 2>/dev/null)" || galat konfigurasi "STAGING_DIR tidak ada"
   fi
-  [[ "$UID_W" =~ ^[0-9]{1,10}$ && "$GID_W" =~ ^[0-9]{1,10}$ && "$UID_W" != 0 ]] \
-    || galat konfigurasi "pemilik STAGING_DIR tidak boleh root"
+  [[ "$UID_W" =~ ^[0-9]{1,10}$ && "$GID_W" =~ ^[0-9]{1,10}$ ]] || galat konfigurasi "UID/GID pengguna tidak sah"
+  # Dibandingkan secara numerik (10#: "00" dan "0000" juga root) lalu
+  # dinormalkan, karena nilainya dibandingkan dengan keluaran `stat -c %u`.
+  (( 10#$UID_W != 0 && 10#$GID_W != 0 )) || galat konfigurasi "pemilik STAGING_DIR tidak boleh root"
+  UID_W=$(( 10#$UID_W ))
+  GID_W=$(( 10#$GID_W ))
 }
 
 # ---- validasi ------------------------------------------------------------
@@ -191,18 +241,36 @@ cek_mount_pengguna() {
   done
 }
 
-# Sumber bind mount milik root (konfigurasi router, log, wp-cli): bukan
-# symlink, jenisnya sesuai (d/f), dan milik root.
+# Sumber bind mount milik root (konfigurasi router, log, wp-cli) di bawah
+# basis milik root (KONF_DIR/LOG_DIR): basis dan setiap komponen sesudahnya
+# bukan symlink dan milik root; komponen terakhir berjenis d/f sesuai jenis.
 cek_mount_root() {
-  local jalur="$1" jenis="$2" pemilik
-  [[ ! -L "$jalur" ]] || galat ditolak "sumber mount tidak sah"
+  local jalur="$1" jenis="$2" basis="$3" p sisa komponen bagian pemilik
+  [[ "$jalur" == "$basis" || "$jalur" == "$basis"/* ]] || galat ditolak "sumber mount tidak sah"
+  p="$basis"
+  komponen=()
+  if [[ "$jalur" != "$basis" ]]; then
+    sisa="${jalur#"$basis"/}"
+    IFS=/ read -r -a komponen <<< "$sisa"
+  fi
+  while :; do
+    [[ ! -L "$p" ]] || galat ditolak "sumber mount tidak sah"
+    pemilik="$(stat -c %u -- "$p" 2>/dev/null)" || galat ditolak "sumber mount tidak terbaca"
+    [[ "$pemilik" == 0 ]] || galat ditolak "sumber mount bukan milik root"
+    if [[ "$p" == "$jalur" ]]; then
+      break
+    fi
+    [[ -d "$p" ]] || galat ditolak "sumber mount tidak sah"
+    bagian="${komponen[0]-}"
+    komponen=("${komponen[@]:1}")
+    [[ -n "$bagian" && "$bagian" != . && "$bagian" != .. ]] || galat ditolak "sumber mount tidak sah"
+    p="$p/$bagian"
+  done
   if [[ "$jenis" == d ]]; then
     [[ -d "$jalur" ]] || galat ditolak "sumber mount tidak sah"
   else
     [[ -f "$jalur" ]] || galat ditolak "sumber mount tidak sah"
   fi
-  pemilik="$(stat -c %u -- "$jalur")" || galat ditolak "sumber mount tidak terbaca"
-  [[ "$pemilik" == 0 ]] || galat ditolak "sumber mount bukan milik root"
 }
 
 # ---- bantuan -------------------------------------------------------------
@@ -233,14 +301,19 @@ jalur_daemon() {
 }
 
 # 0 = ada dan milik label ini; 1 = tidak ada; galat bila ada tetapi milik
-# lain, atau bila docker gagal dengan cara lain (mis. tenggat habis) supaya
-# kegagalan itu tidak disalahartikan sebagai "container belum ada".
+# lain, atau bila docker gagal dengan cara lain (daemon mati, tenggat habis)
+# supaya kegagalan itu tidak disalahartikan sebagai "container belum ada"
+# (mis. `hapus` lalu menghapus konfigurasi staging yang masih berjalan).
+# "Tidak ada" hanya bila docker keluar 1 DAN stderr-nya "No such ...".
 pastikan_milik() {
-  local label rc=0
-  label="$(dk inspect --format '{{ index .Config.Labels "wpmgr.staging" }}' "$1" 2>/dev/null)" || rc=$?
-  if (( rc == 1 )); then
-    return 1
-  elif (( rc != 0 )); then
+  local label rc=0 err
+  err="$(mktemp)"
+  SEMENTARA+=("$err")
+  label="$(dk inspect --type container --format '{{ index .Config.Labels "wpmgr.staging" }}' "$1" 2>"$err")" || rc=$?
+  if (( rc != 0 )); then
+    if (( rc == 1 )) && grep -q 'No such' "$err"; then
+      return 1
+    fi
     galat docker "status container tidak terbaca"
   fi
   [[ "$label" == "$2" ]] || galat ditolak "container sudah ada dan bukan milik staging"
@@ -380,9 +453,9 @@ cmd_siapkan() {
   img_db="$(image mariadb mariadb:11.4)"
   img_mail="$(image mailpit axllent/mailpit:latest)"
   img_router="$(image nginx nginx:1.27-alpine)"
-  cek_mount_root "$KONF_DIR/router/conf.d" d
-  cek_mount_root "$KONF_DIR/router/htpasswd" d
-  cek_mount_root "$LOG_DIR" d
+  cek_mount_root "$KONF_DIR/router/conf.d" d "$KONF_DIR"
+  cek_mount_root "$KONF_DIR/router/htpasswd" d "$KONF_DIR"
+  cek_mount_root "$LOG_DIR" d "$LOG_DIR"
   m_konf="$(jalur_daemon "$KONF_DIR/router/conf.d")"
   m_htpasswd="$(jalur_daemon "$KONF_DIR/router/htpasswd")"
   m_log="$(jalur_daemon "$LOG_DIR")"
@@ -414,7 +487,7 @@ cmd_buat() {
   cek_nama "${1-}"
   cek_versi "${2-}"
   cek_id "${3-}"
-  local nama="$1" versi="$2" situs="$STAGING_DIR/$3" wadah="wp-$1" img sekarang d
+  local nama="$1" versi="$2" situs="$STAGING_DIR/$3" wadah="wp-$1" img sekarang pemakai d
   local m_files m_ekspor m_log m_wp
   pastikan_siap
   img="$(image "php${versi/./}" "wordpress:php${versi}-apache")"
@@ -425,14 +498,23 @@ cmd_buat() {
   for d in files ekspor log; do
     cek_mount_pengguna "$situs/$d"
   done
-  cek_mount_root "$KONF_DIR/wp-cli.phar" f
+  cek_mount_root "$KONF_DIR/wp-cli.phar" f "$KONF_DIR"
   m_files="$(jalur_daemon "$situs/files")"
   m_ekspor="$(jalur_daemon "$situs/ekspor")"
   m_log="$(jalur_daemon "$situs/log")"
   m_wp="$(jalur_daemon "$KONF_DIR/wp-cli.phar")"
   if pastikan_milik "$wadah" "situs:$nama"; then
-    sekarang="$(dk inspect --format '{{ .Config.Image }}' "$wadah")" || galat docker "container tidak terbaca"
-    if [[ "$sekarang" == "$img" ]]; then
+    # Container lama hanya dijalankan ulang bila image, user, DAN site_id
+    # mount-nya sama; selain itu dibuat ulang (seperti saat image berubah).
+    # Mount yang asing atau tidak aman ditolak, bukan dibuat ulang, karena
+    # container berlabel staging dengan mount seperti itu berarti dirusak.
+    cek_mount_wadah "$wadah" struktur
+    sekarang="$(dk inspect --type container --format '{{ .Config.Image }}' "$wadah")" \
+      || galat docker "container tidak terbaca"
+    pemakai="$(dk inspect --type container --format '{{ .Config.User }}' "$wadah")" \
+      || galat docker "container tidak terbaca"
+    if [[ "$sekarang" == "$img" && "$pemakai" == "$UID_W:$GID_W" && "$MOUNT_ID" == "$3" ]]; then
+      cek_mount_wadah "$wadah" penuh
       dk start "$wadah" >/dev/null || galat docker "container staging tidak dapat dijalankan"
       return 0
     fi
@@ -447,25 +529,31 @@ cmd_buat() {
   # WordPress (bila files/ kosong) ditulis sebagai UID ini; direktori
   # run/lock/log Apache di image bermode 1777. Sysctl membuat Apache non-root
   # boleh listen di port 80 (hanya di network namespace container ini).
+  # --mount, bukan -v: sumber yang hilang menjadi galat, tidak dibuat dockerd
+  # sebagai direktori milik root. Path sudah lolos POLA_JALUR (tanpa koma).
   dk run -d --name "$wadah" --label "wpmgr.staging=situs:$nama" --network "$JARINGAN" \
     --restart unless-stopped --memory 384m --memory-swap 384m --cpus 1 --pids-limit 256 \
     --user "$UID_W:$GID_W" --cap-drop ALL --sysctl net.ipv4.ip_unprivileged_port_start=0 \
     --security-opt no-new-privileges \
-    -v "$m_files:/var/www/html" \
-    -v "$m_ekspor:/wpmgr-ekspor" \
-    -v "$m_log:/wpmgr-log" \
-    -v "$m_wp:/usr/local/bin/wp:ro" \
+    --mount "type=bind,src=$m_files,dst=/var/www/html" \
+    --mount "type=bind,src=$m_ekspor,dst=/wpmgr-ekspor" \
+    --mount "type=bind,src=$m_log,dst=/wpmgr-log" \
+    --mount "type=bind,src=$m_wp,dst=/usr/local/bin/wp,readonly" \
     "$img" >/dev/null || galat docker "container staging tidak dapat dibuat"
 }
 
-# Putusan R13 (F2 untuk `jalan`): `jalan` tidak tahu site_id, jadi sumber
-# bind mount yang sebenarnya dibaca dari Docker. Harus persis files/, ekspor/,
-# log/ milik SATU site (plus wp-cli.phar read-only), masing-masing lolos
-# cek_mount_pengguna. Mount lain apa pun berarti container bukan buatan
-# `buat` dan ditolak.
+# Putusan R13 (F2 untuk `jalan` dan start ulang di `buat`): sumber bind
+# mount yang sebenarnya dibaca dari Docker. Harus persis files/, ekspor/,
+# log/ milik SATU site (plus wp-cli.phar read-only); mount lain apa pun
+# berarti container bukan buatan `buat` dan ditolak. Mode `struktur` hanya
+# memeriksa bentuk itu dan mengisi MOUNT_ID (site_id sumbernya); mode
+# `penuh` juga menjalankan cek_mount_pengguna/cek_mount_root pada setiap
+# sumber.
+MOUNT_ID=""
 cek_mount_wadah() {
-  local wadah="$1" daftar sumber tujuan lokal sub s id="" terlihat=" "
-  daftar="$(dk inspect --format '{{range .Mounts}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' "$wadah")" \
+  local wadah="$1" mode="$2" daftar sumber tujuan lokal sub s id="" terlihat=" " p
+  local pengguna=() phar=()
+  daftar="$(dk inspect --type container --format '{{range .Mounts}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' "$wadah")" \
     || galat docker "container tidak terbaca"
   while IFS='|' read -r sumber tujuan; do
     [[ -z "$sumber" && -z "$tujuan" ]] && continue
@@ -477,7 +565,7 @@ cek_mount_wadah() {
       /wpmgr-log) sub=log ;;
       /usr/local/bin/wp)
         [[ "$lokal" == "$KONF_DIR/wp-cli.phar" ]] || galat ditolak "sumber mount container tidak sah"
-        cek_mount_root "$lokal" f
+        phar+=("$lokal")
         continue ;;
       *) galat ditolak "container memuat mount yang tidak dikenal" ;;
     esac
@@ -490,16 +578,25 @@ cek_mount_wadah() {
       || galat ditolak "sumber mount container tidak sah"
     [[ -z "$id" || "$id" == "$s" ]] || galat ditolak "sumber mount container tidak sah"
     id="$s"
-    cek_mount_pengguna "$lokal"
+    pengguna+=("$lokal")
   done <<< "$daftar"
   [[ "$terlihat" == *" files "* && "$terlihat" == *" ekspor "* && "$terlihat" == *" log "* ]] \
     || galat ditolak "sumber mount container tidak lengkap"
+  MOUNT_ID="$id"
+  if [[ "$mode" == penuh ]]; then
+    for p in "${pengguna[@]}"; do
+      cek_mount_pengguna "$p"
+    done
+    for p in "${phar[@]}"; do
+      cek_mount_root "$p" f "$KONF_DIR"
+    done
+  fi
 }
 
 cmd_jalan() {
   cek_nama "${1-}"
   pastikan_milik "wp-$1" "situs:$1" || galat ditolak "staging belum dibuat"
-  cek_mount_wadah "wp-$1"
+  cek_mount_wadah "wp-$1" penuh
   dk start "wp-$1" >/dev/null || galat docker "staging tidak dapat dijalankan"
 }
 
@@ -733,23 +830,27 @@ cmd_router_muat() {
     printf '%s\n' "$baris" > "$baru/$nama.htpasswd"
   done
   mkdir -p "$cadangan/conf.d" "$cadangan/htpasswd"
-  cp -a "$tujuan/conf.d/." "$cadangan/conf.d/" 2>/dev/null || true
-  cp -a "$tujuan/htpasswd/." "$cadangan/htpasswd/" 2>/dev/null || true
+  cp -a "$tujuan/conf.d/." "$cadangan/conf.d/" 2>/dev/null || galat docker "cadangan konfigurasi router gagal"
+  cp -a "$tujuan/htpasswd/." "$cadangan/htpasswd/" 2>/dev/null || galat docker "cadangan konfigurasi router gagal"
+  # Sejak baris ini konfigurasi aktif diubah. Kegagalan APA PUN sesudahnya
+  # (galat eksplisit, `set -e`, tenggat habis) memulihkan cadangan lewat
+  # jebakan EXIT, sebelum direktori sementara cadangan itu dihapus.
+  ROUTER_CADANGAN="$cadangan"
   rm -f "$tujuan/conf.d/"stg-*.conf "$tujuan/htpasswd/"*
   for f in "$baru"/stg-*.conf; do
-    install -m 0644 "$f" "$tujuan/conf.d/"
+    install -m 0644 "$f" "$tujuan/conf.d/" 2>/dev/null \
+      || galat docker "konfigurasi router tidak dapat dipasang; konfigurasi lama dipulihkan"
   done
   for f in "$baru"/*.htpasswd; do
     nama="$(basename "$f" .htpasswd)"
-    install -m 0644 "$f" "$tujuan/htpasswd/$nama"
+    install -m 0644 "$f" "$tujuan/htpasswd/$nama" 2>/dev/null \
+      || galat docker "konfigurasi router tidak dapat dipasang; konfigurasi lama dipulihkan"
   done
-  if ! dk exec wpmgr-stg-router nginx -t >/dev/null 2>&1; then
-    rm -f "$tujuan/conf.d/"stg-*.conf "$tujuan/htpasswd/"*
-    cp -a "$cadangan/conf.d/." "$tujuan/conf.d/" 2>/dev/null || true
-    cp -a "$cadangan/htpasswd/." "$tujuan/htpasswd/" 2>/dev/null || true
-    galat docker "konfigurasi router ditolak nginx -t; konfigurasi lama dipulihkan"
-  fi
-  dk exec wpmgr-stg-router nginx -s reload >/dev/null || galat docker "router tidak dapat dimuat ulang"
+  dk exec wpmgr-stg-router nginx -t >/dev/null 2>&1 \
+    || galat docker "konfigurasi router ditolak nginx -t; konfigurasi lama dipulihkan"
+  dk exec wpmgr-stg-router nginx -s reload >/dev/null \
+    || galat docker "router tidak dapat dimuat ulang; konfigurasi lama dipulihkan"
+  ROUTER_CADANGAN=""
 }
 
 # ---- sertifikat ----------------------------------------------------------

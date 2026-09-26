@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# install tiruan: gagal untuk konfigurasi router (stg-*.conf) bila
+# $PALSU/install-gagal ada; selain itu meneruskan ke install asli.
+if [[ -f "${PALSU-}/install-gagal" && "$*" == *stg-* ]]; then
+  echo "install: gagal (tiruan)" >&2
+  exit 1
+fi
+for asli in /usr/bin/install /bin/install; do
+  [[ -x "$asli" ]] && exec "$asli" "$@"
+done
+exit 127

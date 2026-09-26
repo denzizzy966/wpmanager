@@ -5,15 +5,27 @@ printf '[%s]' "$@" >> "$PALSU/docker.log"
 printf '\n' >> "$PALSU/docker.log"
 case "${1-}" in
   inspect)
+    # wadah/<nama> = label, .image, .user, .mounts (baris "sumber|tujuan").
     nama="${*: -1}"
-    [[ -f "$PALSU/wadah/$nama" ]] || exit 1
-    if [[ "${3-}" == *Labels* ]]; then
-      cat "$PALSU/wadah/$nama"
-    elif [[ "${3-}" == *Mounts* ]]; then
-      cat "$PALSU/wadah/$nama.mounts" 2>/dev/null || true
-    else
-      cat "$PALSU/wadah/$nama.image" 2>/dev/null || true
+    format="" sebelum=""
+    for a in "$@"; do
+      [[ "$sebelum" == --format ]] && format="$a"
+      sebelum="$a"
+    done
+    if [[ -f "$PALSU/daemon-gagal" ]]; then
+      echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
+      exit 1
     fi
+    if [[ ! -f "$PALSU/wadah/$nama" ]]; then
+      echo "Error: No such container: $nama" >&2
+      exit 1
+    fi
+    case "$format" in
+      *Labels*) cat "$PALSU/wadah/$nama" ;;
+      *Mounts*) cat "$PALSU/wadah/$nama.mounts" 2>/dev/null || true ;;
+      *User*) cat "$PALSU/wadah/$nama.user" 2>/dev/null || true ;;
+      *) cat "$PALSU/wadah/$nama.image" 2>/dev/null || true ;;
+    esac
     ;;
   network)
     if [[ "${2-}" == inspect ]]; then

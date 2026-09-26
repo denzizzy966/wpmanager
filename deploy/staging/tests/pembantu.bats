@@ -49,6 +49,13 @@ buat_situs() {
   chown 1000:1000 "$S/staging/$ID" "$S/staging/$ID/files" "$S/staging/$ID/ekspor" "$S/staging/$ID/log"
 }
 
+# Jawaban `docker inspect .Mounts` untuk wp-toko: mount buatan `buat` bagi site $1.
+tulis_mounts() {
+  printf '%s|/var/www/html\n%s|/wpmgr-ekspor\n%s|/wpmgr-log\n%s|/usr/local/bin/wp\n' \
+    "$S/staging/$1/files" "$S/staging/$1/ekspor" "$S/staging/$1/log" "$S/etc/wp-cli.phar" \
+    > "$PALSU/wadah/wp-toko.mounts"
+}
+
 @test "nama staging tidak sah ditolak sebelum docker dipanggil" {
   for nama in "Toko" "../x" "a b" "a;id" "$(printf 'a\nb')" "" "$(printf 'a%.0s' $(seq 1 41))" 'a$(id)'; do
     run "$SKRIP" jalan "$nama"
@@ -104,7 +111,7 @@ buat_situs() {
   [ "$status" -eq 0 ]
   # Putusan R13: seluruh container berjalan sebagai UID dashboard tanpa
   # capability; sysctl membuat Apache non-root boleh listen di port 80.
-  diharapkan="[run][-d][--name][wp-toko][--label][wpmgr.staging=situs:toko][--network][wpmgr-staging][--restart][unless-stopped][--memory][384m][--memory-swap][384m][--cpus][1][--pids-limit][256][--user][1000:1000][--cap-drop][ALL][--sysctl][net.ipv4.ip_unprivileged_port_start=0][--security-opt][no-new-privileges][-v][$S/staging/$ID/files:/var/www/html][-v][$S/staging/$ID/ekspor:/wpmgr-ekspor][-v][$S/staging/$ID/log:/wpmgr-log][-v][$S/etc/wp-cli.phar:/usr/local/bin/wp:ro][wordpress@sha256:$D64]"
+  diharapkan="[run][-d][--name][wp-toko][--label][wpmgr.staging=situs:toko][--network][wpmgr-staging][--restart][unless-stopped][--memory][384m][--memory-swap][384m][--cpus][1][--pids-limit][256][--user][1000:1000][--cap-drop][ALL][--sysctl][net.ipv4.ip_unprivileged_port_start=0][--security-opt][no-new-privileges][--mount][type=bind,src=$S/staging/$ID/files,dst=/var/www/html][--mount][type=bind,src=$S/staging/$ID/ekspor,dst=/wpmgr-ekspor][--mount][type=bind,src=$S/staging/$ID/log,dst=/wpmgr-log][--mount][type=bind,src=$S/etc/wp-cli.phar,dst=/usr/local/bin/wp,readonly][wordpress@sha256:$D64]"
   grep -qxF "$diharapkan" "$PALSU/docker.log"
   ! grep -q 'APACHE_RUN_' "$PALSU/docker.log" || false
   [ -d "$S/staging/$ID/files" ]
@@ -122,10 +129,45 @@ buat_situs() {
 @test "buat hanya menjalankan ulang container milik sendiri dengan image yang sama" {
   printf 'situs:toko' > "$PALSU/wadah/wp-toko"
   printf 'wordpress@sha256:%s' "$D64" > "$PALSU/wadah/wp-toko.image"
+  printf '1000:1000' > "$PALSU/wadah/wp-toko.user"
+  tulis_mounts "$ID"
   run "$SKRIP" buat toko 8.1 "$ID"
   [ "$status" -eq 0 ]
   grep -qxF "[start][wp-toko]" "$PALSU/docker.log"
   ! grep -q '^\[run\]' "$PALSU/docker.log" || false
+  grep -q '^\[inspect\]\[--type\]\[container\]\[--format\]\[{{range .Mounts}}' "$PALSU/docker.log"
+}
+
+@test "buat membuat ulang container milik sendiri bila user atau site_id mount-nya berbeda" {
+  ID2=11111111-2222-3333-4444-555555555555
+  printf 'situs:toko' > "$PALSU/wadah/wp-toko"
+  printf 'wordpress@sha256:%s' "$D64" > "$PALSU/wadah/wp-toko.image"
+  printf '1000:1000' > "$PALSU/wadah/wp-toko.user"
+  # Mount milik site lain (nama staging dipakai ulang untuk site lain).
+  tulis_mounts "$ID2"
+  run "$SKRIP" buat toko 8.1 "$ID"
+  [ "$status" -eq 0 ]
+  grep -qxF "[rm][-f][wp-toko]" "$PALSU/docker.log"
+  grep -qF "[--mount][type=bind,src=$S/staging/$ID/files,dst=/var/www/html]" "$PALSU/docker.log"
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+
+  # Container lama tanpa --user (atau user lain) juga dibuat ulang.
+  rm -f "$PALSU/docker.log"
+  tulis_mounts "$ID"
+  printf '' > "$PALSU/wadah/wp-toko.user"
+  run "$SKRIP" buat toko 8.1 "$ID"
+  [ "$status" -eq 0 ]
+  grep -qxF "[rm][-f][wp-toko]" "$PALSU/docker.log"
+  grep -q '^\[run\]' "$PALSU/docker.log"
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+
+  # Mount asing ditolak, tidak dibuat ulang dan tidak dijalankan.
+  rm -f "$PALSU/docker.log"
+  printf '1000:1000' > "$PALSU/wadah/wp-toko.user"
+  printf '/etc|/host-etc\n' >> "$PALSU/wadah/wp-toko.mounts"
+  run "$SKRIP" buat toko 8.1 "$ID"
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[start\]\|^\[rm\]\|^\[run\]' "$PALSU/docker.log" || false
 }
 
 @test "buat menolak direktori bind mount yang berupa symlink atau bukan milik user dashboard" {
@@ -472,7 +514,7 @@ buat_situs() {
   printf 'AKAR_LOKAL=%s\nAKAR_DAEMON=/run/desktop/mnt/host/d/repo/var\n' "$S" >> "$WPMGR_STG_KONF"
   run "$SKRIP" buat toko 8.1 "$ID"
   [ "$status" -eq 0 ]
-  grep -qF "[-v][/run/desktop/mnt/host/d/repo/var/staging/$ID/files:/var/www/html]" "$PALSU/docker.log"
+  grep -qF "[--mount][type=bind,src=/run/desktop/mnt/host/d/repo/var/staging/$ID/files,dst=/var/www/html]" "$PALSU/docker.log"
   # jalan menerjemahkan balik sumber mount versi daemon sebelum memeriksanya.
   printf 'situs:toko' > "$PALSU/wadah/wp-toko"
   a=/run/desktop/mnt/host/d/repo/var
@@ -481,4 +523,87 @@ buat_situs() {
   run "$SKRIP" jalan toko
   [ "$status" -eq 0 ]
   grep -qxF "[start][wp-toko]" "$PALSU/docker.log"
+}
+
+@test "daemon Docker gagal tidak dianggap container tidak ada" {
+  printf 'situs:toko' > "$PALSU/wadah/wp-toko"
+  printf 'lama' > "$S/etc/router/conf.d/stg-toko.conf"
+  touch "$PALSU/daemon-gagal"
+  # `hapus` akan menghapus konfigurasi staging yang masih berjalan bila
+  # kegagalan ini dibaca sebagai "tidak ada".
+  run "$SKRIP" hapus toko
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"GALAT docker"* ]]
+  [ "$(cat "$S/etc/router/conf.d/stg-toko.conf")" = "lama" ]
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 4 ]
+  run "$SKRIP" buat toko 8.1 "$ID"
+  [ "$status" -eq 4 ]
+  ! grep -q '^\[rm\]\|^\[run\]\|^\[start\]' "$PALSU/docker.log" || false
+  grep -q '^\[inspect\]\[--type\]\[container\]' "$PALSU/docker.log"
+}
+
+@test "router-muat memulihkan konfigurasi lama bila pemasangan gagal di tengah" {
+  printf 'layanan:router' > "$PALSU/wadah/wpmgr-stg-router"
+  printf 'lama' > "$S/etc/router/conf.d/stg-lama.conf"
+  printf 'staging:lama\n' > "$S/etc/router/htpasswd/lama"
+  printf '%s' "$(printf 'e%.0s' $(seq 1 64))" > "$S/staging/router/toko.rahasia"
+  printf 'staging:%s\n' '$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ01234' > "$S/staging/router/toko.htpasswd"
+  touch "$PALSU/install-gagal"
+  run "$SKRIP" router-muat
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"GALAT docker"* ]]
+  [ "$(cat "$S/etc/router/conf.d/stg-lama.conf")" = "lama" ]
+  [ "$(cat "$S/etc/router/htpasswd/lama")" = "staging:lama" ]
+  [ ! -e "$S/etc/router/conf.d/stg-toko.conf" ]
+  [ ! -e "$S/etc/router/htpasswd/toko" ]
+  ! grep -q 'reload\|nginx' "$PALSU/docker.log" || false
+}
+
+@test "kegagalan tak terduga menjadi GALAT internal kode 9, galat di subshell mempertahankan kodenya" {
+  sed -i "s|^MEMINFO=.*|MEMINFO=$S/tidak-ada|" "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 9 ]
+  [[ "$output" == *"GALAT internal"* ]]
+  [ "$(grep -c '^GALAT' <<< "$output")" -eq 1 ]
+
+  # galat() di dalam $(image ...) tetap keluar dengan kodenya sendiri (7).
+  printf 'php81=RUSAK\n' > "$S/etc/digest.lock"
+  run "$SKRIP" buat toko 8.1 "$ID"
+  [ "$status" -eq 7 ]
+  [ "$(grep -c '^GALAT' <<< "$output")" -eq 1 ]
+  [[ "$output" == *"GALAT konfigurasi"* ]]
+}
+
+@test "UID/GID root ditolak secara numerik dan dinormalkan" {
+  sed -i 's/^PENGGUNA_UID=.*/PENGGUNA_UID=00/' "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  sed -i 's/^PENGGUNA_UID=.*/PENGGUNA_UID=1000/; s/^PENGGUNA_GID=.*/PENGGUNA_GID=0000/' "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  sed -i 's/^PENGGUNA_UID=.*/PENGGUNA_UID=01000/; s/^PENGGUNA_GID=.*/PENGGUNA_GID=001000/' "$WPMGR_STG_KONF"
+  run "$SKRIP" buat toko 8.1 "$ID"
+  [ "$status" -eq 0 ]
+  grep -qF '[--user][1000:1000]' "$PALSU/docker.log"
+}
+
+@test "sumber mount milik root ditolak bila berupa symlink, juga di komponen induknya" {
+  # wp-cli.phar berupa symlink.
+  mv "$S/etc/wp-cli.phar" "$S/etc/wp-cli.asli"
+  ln -s "$S/etc/wp-cli.asli" "$S/etc/wp-cli.phar"
+  run "$SKRIP" buat toko 8.1 "$ID"
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[run\]' "$PALSU/docker.log" || false
+
+  # Komponen induk KONF_DIR/router berupa symlink (ke direktori milik root).
+  rm -f "$S/etc/wp-cli.phar"
+  mv "$S/etc/wp-cli.asli" "$S/etc/wp-cli.phar"
+  mv "$S/etc/router" "$S/router-asli"
+  ln -s "$S/router-asli" "$S/etc/router"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\nmailpit=p@sha256:%s\n' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"GALAT ditolak"* ]]
+  ! grep -q '^\[run\]' "$PALSU/docker.log" || false
 }
