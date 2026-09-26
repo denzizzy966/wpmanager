@@ -84,7 +84,23 @@ class WPMGR_Staging {
 
     /** Jalur => array( metode, nama callback di kelas ini ). Diisi Task 3–8. */
     public static function rute() {
-        return array();
+        return array(
+            '/staging/manifest' => array( 'GET', 'manifest' ),
+        );
+    }
+
+    public static function manifest( $request ) {
+        $kursor = (string) $request->get_param( 'kursor' );
+        if ( '' !== $kursor && is_wp_error( WPMGR_Staging_Path::normalisasi( $kursor ) ) ) {
+            return self::galat( 'wpmgr_staging_path', 'Kursor manifest tidak sah.', 400 );
+        }
+        $hasil = WPMGR_Staging_Manifest::jalan( self::root(), $kursor, $request->get_param( 'batas' ),
+            microtime( true ) + self::anggaran_detik() );
+        if ( '' === $kursor ) {
+            global $wpdb;
+            $hasil['info'] = WPMGR_Staging_Manifest::info( $wpdb, self::root(), WP_CONTENT_DIR );
+        }
+        return rest_ensure_response( $hasil );
     }
 
     public static function daftarkan_route() {
