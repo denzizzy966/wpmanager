@@ -29,6 +29,7 @@ final class FileTest extends TestCase {
         StagingDasarTest::hapus( rtrim( $this->akar, '/' ) );
         $GLOBALS['wpmgr_test_opsi'] = array();
         $GLOBALS['wpmgr_test_rute'] = array();
+        WPMGR_Staging_File::atur_pembaca_untuk_uji( null ); // jangan bocor ke test lain
     }
 
     public function test_paket_beberapa_berkas(): void {
@@ -120,21 +121,37 @@ final class FileTest extends TestCase {
     // tanpa exception, 'lengkap' => false, jumlah entri < jumlah diminta. ----
 
     public function test_berhenti_dini_karena_anggaran_meta(): void {
-        // Tiga segmen 250 karakter (<= MAKS_SEGMEN) supaya total path (~780
-        // karakter, <= MAKS_PANJANG 1024) tetap sah lolos normalisasi(),
-        // tapi cukup panjang supaya ~1165 entri saja sudah menabrak 90% dari
-        // WPMGR_Staging_Paket::MAKS_META (1 MiB) -- jauh sebelum MAKS_JUMLAH
-        // (2000) atau anggaran isi (semuanya berkas HILANG, isi kosong).
+        // Tiga segmen 250 karakter (<= MAKS_SEGMEN) supaya total path (780
+        // karakter PERSIS untuk semua entri -- indeks diberi padding tetap
+        // 4 digit supaya panjangnya seragam) tetap sah lolos normalisasi()
+        // (<= MAKS_PANJANG 1024). Jumlah entri yang berhenti dihitung PERSIS
+        // lewat ukuran_meta_entri()/batas_meta_aman() sungguhan (Reflection)
+        // supaya test ini benar-benar membuktikan anggaran META yang
+        // menghentikannya -- bukan sekadar "berhenti di suatu tempat" yang
+        // bisa saja lulus karena kebetulan lain (anggaran isi mustahil --
+        // semua entri 'hilang', isi selalu kosong; tenggat 20 detik bawaan
+        // mustahil tercapai oleh ribuan stat call yang selesai dalam
+        // hitungan puluhan milidetik).
         $segmen = str_repeat( 'a', 250 ) . '/' . str_repeat( 'b', 250 ) . '/' . str_repeat( 'c', 250 );
+        $n      = 1500;
         $daftar = array();
-        for ( $i = 0; $i < 1500; $i++ ) {
-            $daftar[] = 'wp-content/uploads/' . $segmen . '/' . $i . '.dat';
+        for ( $i = 0; $i < $n; $i++ ) {
+            $daftar[] = 'wp-content/uploads/' . $segmen . '/' . sprintf( '%04d', $i ) . '.dat';
         }
+
+        $ukur       = new ReflectionMethod( 'WPMGR_Staging_File', 'ukuran_meta_entri' );
+        $ukur->setAccessible( true );
+        $u          = $ukur->invoke( null, array( 'path' => $daftar[0], 'hilang' => true ), 0 );
+        $batas      = new ReflectionMethod( 'WPMGR_Staging_File', 'batas_meta_aman' );
+        $batas->setAccessible( true );
+        $harapan_k  = intdiv( $batas->invoke( null ), $u );
+        $this->assertLessThan( $n, $harapan_k, 'Setup test tidak menabrak anggaran meta -- perbesar $n atau $segmen.' );
+
         $hasil = WPMGR_Staging_File::ambil( $this->akar, array( 'berkas' => $daftar ) );
         $this->assertNotInstanceOf( WP_Error::class, $hasil );
         list( $meta, ) = WPMGR_Staging_Paket::urai( $hasil );
         $this->assertFalse( $meta['lengkap'] );
-        $this->assertLessThan( 1500, count( $meta['berkas'] ) );
+        $this->assertSame( $harapan_k, count( $meta['berkas'] ) );
         foreach ( $meta['berkas'] as $b ) {
             $this->assertTrue( $b['hilang'] );
         }
@@ -172,12 +189,30 @@ final class FileTest extends TestCase {
     }
 
     // ---- R4: berkas yang ADA tapi tidak terbaca (izin dicabut) mendapat
-    // penanda galat:'baca', bukan galat 500. chmod tidak menegakkan apa pun
-    // di Windows, dan tidak menegakkan apa pun bila proses berjalan sebagai
-    // root (umum di kontainer Docker) -- keduanya dilewati (skip), bukan
-    // dianggap gagal. ----
+    // penanda galat:'baca', bukan galat 500. ----
 
-    public function test_berkas_tidak_terbaca_mendapat_penanda(): void {
+    // R5 (fix temuan 3, review putaran 2): jalur galat:'baca' lewat celah uji
+    // baca_isi()/$pembaca_isi -- deterministik di KEDUA platform (Windows
+    // maupun root di Docker), tidak bergantung pada chmod ditegakkan OS.
+    public function test_berkas_tidak_terbaca_mendapat_penanda_lewat_seam(): void {
+        WPMGR_Staging_File::atur_pembaca_untuk_uji( function ( $abs, $sisa ) {
+            return false;
+        } );
+        list( $meta, $bagian ) = WPMGR_Staging_Paket::urai(
+            WPMGR_Staging_File::ambil( $this->akar, array( 'berkas' => array( 'wp-content/uploads/biner.bin' ) ) )
+        );
+        $this->assertSame( 'baca', $meta['berkas'][0]['galat'] );
+        $this->assertSame( '', $bagian[0] );
+    }
+
+    // Regresi dunia-nyata di platform yang MENEGAKKAN izin berkas (Linux,
+    // bukan root) -- dipertahankan sesuai instruksi ("Keep the chmod test
+    // too"), sengaja tidak dihapus walau celah uji di atas sudah menguji
+    // jalur kodenya secara deterministik. chmod tidak menegakkan apa pun di
+    // Windows, dan tidak menegakkan apa pun bila proses berjalan sebagai
+    // root (umum di kontainer Docker) -- keduanya dilewati (skip), bukan
+    // dianggap gagal.
+    public function test_berkas_tidak_terbaca_mendapat_penanda_chmod(): void {
         if ( 'WIN' === strtoupper( substr( PHP_OS, 0, 3 ) ) ) {
             $this->markTestSkipped( 'chmod tidak menegakkan izin baca di Windows.' );
         }
@@ -231,6 +266,28 @@ final class FileTest extends TestCase {
         $this->assertTrue( $meta['berkas'][0]['hilang'] );
         $this->assertSame( 0, $meta['berkas'][0]['total'] );
         $this->assertSame( '', $bagian[0] );
+    }
+
+    // ---- R5 RED: temuan 1 (review putaran 2) -- ukuran_meta_entri() tidak
+    // menghitung 'ukuran'/'sha256' yang ditambahkan susun() SETELAH diukur,
+    // sekitar 87-95 byte per entri tidak terhitung. 2000 path tidak-ada
+    // sepanjang ~450 karakter lolos batas_meta_aman() yang salah, lalu
+    // MELEDAK di susun() sebagai 500 wpmgr_staging_susun PADA SETIAP
+    // percobaan -- jaminan kemajuan rusak total (dashboard mengulang
+    // permintaan yang sama, mendapat 500 yang sama lagi selamanya). ----
+
+    public function test_dua_ribu_berkas_hilang_path_panjang_tidak_meledak(): void {
+        $daftar = array();
+        for ( $i = 0; $i < 2000; $i++ ) {
+            $daftar[] = 'wp-content/uploads/' . str_repeat( 'a', 220 ) . '/' . str_repeat( 'b', 220 ) . '-' . $i . '.dat';
+        }
+        $hasil = WPMGR_Staging_File::ambil( $this->akar, array( 'berkas' => $daftar ) );
+        $this->assertNotInstanceOf( WP_Error::class, $hasil );
+        list( $meta, ) = WPMGR_Staging_Paket::urai( $hasil );
+        $this->assertLessThanOrEqual( 2000, count( $meta['berkas'] ) );
+        if ( count( $meta['berkas'] ) < 2000 ) {
+            $this->assertFalse( $meta['lengkap'] );
+        }
     }
 
     // ---- Setiap route baru punya test akses anonim (401). ----

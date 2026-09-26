@@ -80,12 +80,79 @@ if ( ! defined( 'ABSPATH' ) && ! defined( 'WPMGR_TESTING' ) ) {
  * BENTUK permintaan yang tidak sah: `panjang` melebihi $maks_paket. Berkas
  * yang hilang di mode ini mengembalikan paket satu-bagian bertanda
  * `hilang: true` (bukan galat 404), sama seperti mode 'berkas'.
+ *
+ * === Perbaikan (R5, ruling controller review putaran 2) ===
+ *
+ * Temuan 1 (Penting): ukuran_meta_entri() versi R4 mengukur SATU entri
+ * SEBELUM 'ukuran' dan 'sha256' ditambahkan -- padahal
+ * WPMGR_Staging_Paket::susun() SELALU menambahkan keduanya ke SETIAP
+ * entri (`$berkas[$i]['ukuran'] = strlen($data); $berkas[$i]['sha256'] =
+ * hash('sha256',$data);`), termasuk entri 'hilang'/'galat'/'terlalu_besar'
+ * yang isinya kosong. Itu meninggalkan ~87-95 byte PER ENTRI tidak
+ * terhitung (`,"ukuran":0` + `,"sha256":"<64 hex>"`), sehingga margin 10%
+ * batas_meta_aman() (bukan "beberapa KB" seperti diklaim docblock R4 --
+ * klaim itu SALAH, dikoreksi di sini) habis sekitar 1200 entri; 2000 path
+ * tidak-ada sepanjang ~400-470 karakter lolos pengukuran yang salah lalu
+ * MELEDAK di susun() sebagai 500 wpmgr_staging_susun PADA SETIAP
+ * percobaan (dashboard tidak bisa pulih -- jaminan kemajuan rusak total).
+ * Diperbaiki: ukuran_meta_entri() sekarang menerima ukuran isi SUNGGUHAN
+ * ($ukuran_isi, sudah diketahui dari strlen($data) SEBELUM entri
+ * ditambahkan) dan menambahkan 'ukuran' + placeholder sha256 64 karakter
+ * (panjang hash sha256 heksadesimal SELALU 64 karakter, apa pun isinya --
+ * placeholder ini memberi ukuran BYTE-PERSIS sama dengan hash sungguhan)
+ * SEBELUM mengukur, plus satu byte koma pemisah antar entri di larik
+ * 'berkas' -- persis kunci dan urutan yang dipakai susun().
+ *
+ * Temuan 2 (Minor): entri ke-i>0 yang SUDAH JELAS akan melampaui anggaran
+ * isi atau meta (dari filesize()/filemtime(), stat MURAH) tidak perlu
+ * dibaca isinya (sampai beberapa MB) hanya untuk dibuang -- perkiraan
+ * dicek DULU, pembacaan isi sungguhan (file_get_contents) menyusul HANYA
+ * bila perkiraan itu lolos kedua anggaran.
+ *
+ * Temuan 3 (Minor): cabang galat:'baca' (berkas ada tapi tiba-tiba tidak
+ * terbaca) tidak punya test yang benar-benar berjalan -- chmod(0000) tidak
+ * ditegakkan di Windows, dan tidak ditegakkan bagi proses yang berjalan
+ * sebagai root (default kontainer Docker yang dipakai suite PHP 7.4).
+ * Ditambahkan celah uji baca_isi()/$pembaca_isi (lihat di bawah) supaya
+ * cabang ini bisa diuji deterministik di kedua platform tanpa bergantung
+ * pada penegakan izin OS; test chmod tetap dipertahankan sebagai regresi
+ * dunia-nyata di platform yang menegakkannya.
  */
 class WPMGR_Staging_File {
 
     const MAKS_JUMLAH = 2000;
 
     public static $maks_paket = 8388608;
+
+    /**
+     * Pembaca isi berkas yang bisa diganti TEST (temuan 3, review putaran
+     * 2): null berarti "pakai file_get_contents() sungguhan" (lihat
+     * baca_isi()). Tetap protected -- bukan bagian API publik kelas ini,
+     * hanya diubah lewat atur_pembaca_untuk_uji().
+     * @var callable|null
+     */
+    protected static $pembaca_isi = null;
+
+    /**
+     * Hanya dipakai test: mengganti pembaca isi berkas sungguhan dengan
+     * pengganti (mis. yang selalu mengembalikan false) untuk menguji jalur
+     * galat:'baca' tanpa bergantung pada chmod, yang tidak ditegakkan di
+     * Windows maupun oleh proses yang berjalan sebagai root. Panggil
+     * dengan null untuk mengembalikan ke pembaca sungguhan.
+     */
+    public static function atur_pembaca_untuk_uji( $pembaca ) {
+        self::$pembaca_isi = $pembaca;
+    }
+
+    private static function baca_isi( $abs, $sisa ) {
+        if ( null !== self::$pembaca_isi ) {
+            return call_user_func( self::$pembaca_isi, $abs, $sisa );
+        }
+        // Batasi pembacaan ke (sisa+1) byte -- cukup untuk mendeteksi
+        // "melebihi sisa anggaran" tanpa pernah memuat berkas yang sudah
+        // tumbuh raksasa (RF3) seutuhnya ke memori.
+        return @file_get_contents( $abs, false, null, 0, $sisa + 1 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+    }
 
     private static function salah( $pesan ) {
         return WPMGR_Staging::galat( 'wpmgr_staging_permintaan', $pesan, 400 );
@@ -108,26 +175,43 @@ class WPMGR_Staging_File {
     }
 
     /**
-     * Perkiraan ukuran json_encode() SATU entri meta, dipakai untuk menjaga
-     * anggaran meta SEBELUM entri ditambahkan (bukan mengecek ukuran paket
-     * UTUH setelah selesai, yang membuat entri terakhir bisa "menabrak"
-     * batas tanpa cara mundur). wp_json_encode()/json_encode() TANPA opsi
-     * unescaped meng-escape unicode ('\uXXXX', 6 byte) dan slash ('\/', 2
-     * byte) -- selalu >= ukuran sungguhan yang dipakai susun() (yang
-     * memakai JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) untuk path
-     * yang sama, jadi perkiraan ini aman dipakai sebagai batas atas.
+     * Ukuran json_encode() SATU entri meta PERSIS seperti yang akan muncul
+     * di paket akhir -- termasuk 'ukuran' dan 'sha256' yang ditambahkan
+     * WPMGR_Staging_Paket::susun() SETELAH entri diukur (fix temuan 1,
+     * review putaran 2 -- lihat docblock kelas), dan satu byte koma
+     * pemisah antar entri di larik 'berkas'. $ukuran_isi adalah panjang
+     * SUNGGUHAN bagian isi entri ini (sudah diketahui sebelum dipanggil,
+     * strlen($data)) dipakai sebagai placeholder 'ukuran' (jumlah digit
+     * cocok persis dengan nilai yang akan ditulis susun()); placeholder
+     * sha256 64 karakter cocok persis ukurannya (panjang hash sha256
+     * heksadesimal SELALU 64 karakter, apa pun isinya).
+     *
+     * wp_json_encode()/json_encode() TANPA opsi unescaped meng-escape
+     * unicode ('\uXXXX', 6 byte) dan slash ('\/', 2 byte) -- selalu >=
+     * ukuran sungguhan yang dipakai susun() (yang memakai
+     * JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) untuk path yang sama,
+     * jadi bagian 'path' dari perkiraan ini tetap aman sebagai batas atas;
+     * bagian 'ukuran'/'sha256'/koma sekarang PERSIS sama (bukan hanya batas
+     * atas) dengan yang ditulis susun().
      */
-    private static function ukuran_meta_entri( array $entri ) {
-        $enc = function_exists( 'wp_json_encode' ) ? wp_json_encode( $entri ) : json_encode( $entri );
-        return false === $enc ? 512 : strlen( $enc );
+    private static function ukuran_meta_entri( array $entri, $ukuran_isi ) {
+        $entri['ukuran'] = (int) $ukuran_isi;
+        $entri['sha256'] = str_repeat( '0', 64 );
+        $enc             = function_exists( 'wp_json_encode' ) ? wp_json_encode( $entri ) : json_encode( $entri );
+        // +1: koma pemisah antar entri di larik 'berkas' -- susun() meng-
+        // gabung seluruh entri dengan satu json_encode() atas larik utuh,
+        // bukan menyusun potongan string satu-satu.
+        return ( false === $enc ? 512 : strlen( $enc ) ) + 1;
     }
 
     /**
      * 90% dari batas keras WPMGR_Staging_Paket::MAKS_META -- margin aman
-     * untuk overhead pembungkus (kurung `[...]`, koma antar entri, kunci
-     * `"lengkap"`) yang tidak ikut terhitung per entri di ukuran_meta_entri().
-     * Overhead itu sendiri paling banyak beberapa KB (2000 entri x satu
-     * koma), jauh di bawah margin 10% (~100 KB pada MAKS_META 1 MiB).
+     * untuk overhead PEMBUNGKUS LEVEL-ATAS (`{"berkas":[...],"lengkap":
+     * ...}`, sekitar 30 byte TETAP, tidak bergantung jumlah entri) yang
+     * tidak ikut terhitung di ukuran_meta_entri() (fungsi itu sendiri
+     * sudah menghitung 'ukuran'/'sha256'/koma persis seperti susun() --
+     * lihat catatan "fix temuan 1" di sana). Margin 10% (~100 KB pada
+     * MAKS_META 1 MiB) jauh melebihi overhead tetap itu.
      */
     private static function batas_meta_aman() {
         return (int) floor( WPMGR_Staging_Paket::MAKS_META * 0.9 );
@@ -146,6 +230,33 @@ class WPMGR_Staging_File {
         } catch ( InvalidArgumentException $e ) {
             return WPMGR_Staging::galat( 'wpmgr_staging_susun', 'Paket staging tidak dapat disusun.', 500 );
         }
+    }
+
+    /**
+     * Penanda satu-entri "berkas ini melampaui anggaran isi" (lihat
+     * docblock kelas, "Pengecualian khusus"). $total_diketahui, bila
+     * sudah ada (dari perkiraan filesize() di ambil()), menghindari
+     * filesize() kedua kalinya; bila null, diukur ulang di sini (mis.
+     * dipanggil setelah pembacaan sungguhan MELEBIHI sisa anggaran --
+     * perkiraan awal sudah basi, perlu ukuran segar).
+     */
+    private static function paket_terlalu_besar( $rel, $abs, $total_diketahui = null ) {
+        if ( null === $total_diketahui ) {
+            clearstatcache( true, $abs );
+            $total_diketahui = (int) @filesize( $abs ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+        }
+        return self::bungkus_atau_500(
+            array(
+                'berkas'  => array( array(
+                    'path'          => $rel,
+                    'terlalu_besar' => true,
+                    'total'         => (int) $total_diketahui,
+                    'mtime'         => (int) @filemtime( $abs ), // phpcs:ignore WordPress.PHP.NoSilencedErrors
+                ) ),
+                'lengkap' => false,
+            ),
+            array( '' )
+        );
     }
 
     public static function ambil( $akar, $p, $tenggat = null ) {
@@ -199,10 +310,33 @@ class WPMGR_Staging_File {
                 $data  = '';
             } else {
                 $sisa = self::$maks_paket - $konten_pakai;
-                // Batasi pembacaan ke (sisa+1) byte -- cukup untuk mendeteksi
-                // "melebihi sisa anggaran" tanpa pernah memuat berkas yang
-                // sudah tumbuh raksasa (RF3) seutuhnya ke memori.
-                $baca = @file_get_contents( $abs, false, null, 0, $sisa + 1 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+
+                // Perkiraan MURAH (filesize/filemtime) dulu -- entri yang
+                // sudah jelas akan menabrak anggaran isi ATAU meta dari
+                // perkiraan ini tidak perlu membaca isinya (sampai
+                // beberapa MB) hanya untuk dibuang (fix temuan 2, review
+                // putaran 2). Bila filesize() gagal (race TOCTOU: berkas
+                // hilang persis di celah ini), perkiraan dilewati dan alur
+                // baca sungguhan di bawah yang memutuskan.
+                clearstatcache( true, $abs );
+                $ukuran_dini = @filesize( $abs ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+
+                if ( false !== $ukuran_dini && $ukuran_dini > $sisa ) {
+                    if ( 0 === $i ) {
+                        return self::paket_terlalu_besar( $rel, $abs, $ukuran_dini );
+                    }
+                    $lengkap = false;
+                    break;
+                }
+                if ( $i > 0 && false !== $ukuran_dini ) {
+                    $entri_dini = array( 'path' => $rel, 'mtime' => (int) @filemtime( $abs ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+                    if ( $meta_pakai + self::ukuran_meta_entri( $entri_dini, $ukuran_dini ) > $batas_meta ) {
+                        $lengkap = false;
+                        break;
+                    }
+                }
+
+                $baca = self::baca_isi( $abs, $sisa );
                 if ( false === $baca ) {
                     // Berkas ADA (lolos untuk_dibaca()) tapi tiba-tiba tidak
                     // terbaca (izin berubah, race TOCTOU): ditandai per-berkas,
@@ -211,30 +345,12 @@ class WPMGR_Staging_File {
                     $entri = array( 'path' => $rel, 'galat' => 'baca' );
                     $data  = '';
                 } elseif ( strlen( $baca ) > $sisa ) {
+                    // Berkas tumbuh di antara perkiraan filesize() dan
+                    // pembacaan sungguhan (RF3): perkiraan sudah basi,
+                    // ukur ulang untuk penanda/berhenti di bawah.
                     if ( 0 === $i ) {
-                        // Entri PERTAMA sendiri sudah melampaui anggaran isi:
-                        // kembalikan penanda supaya dashboard beralih ke mode
-                        // 'rentang' (tanpa batas isi) untuk berkas ini --
-                        // menjamin permintaan tetap membuat kemajuan walau
-                        // tidak ada satu pun berkas yang muat sepenuhnya.
-                        clearstatcache( true, $abs );
-                        return self::bungkus_atau_500(
-                            array(
-                                'berkas'  => array( array(
-                                    'path'          => $rel,
-                                    'terlalu_besar' => true,
-                                    'total'         => (int) @filesize( $abs ), // phpcs:ignore WordPress.PHP.NoSilencedErrors
-                                    'mtime'         => (int) @filemtime( $abs ), // phpcs:ignore WordPress.PHP.NoSilencedErrors
-                                ) ),
-                                'lengkap' => false,
-                            ),
-                            array( '' )
-                        );
+                        return self::paket_terlalu_besar( $rel, $abs );
                     }
-                    // Entri KE-i (i > 0) melampaui SISA anggaran isi paket
-                    // ini: berhenti SEBELUM entri ini -- setidaknya satu
-                    // entri sebelumnya sudah terkirim, jadi permintaan tetap
-                    // membuat kemajuan tanpa perlu penanda khusus di sini.
                     $lengkap = false;
                     break;
                 } else {
@@ -244,7 +360,7 @@ class WPMGR_Staging_File {
                 }
             }
 
-            $ukuran_meta = self::ukuran_meta_entri( $entri );
+            $ukuran_meta = self::ukuran_meta_entri( $entri, strlen( $data ) );
             if ( $i > 0 && $meta_pakai + $ukuran_meta > $batas_meta ) {
                 $lengkap = false;
                 break;
