@@ -2,7 +2,7 @@ import json
 import subprocess
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -153,19 +153,22 @@ def _masuk(client: httpx.Client):
 
 
 def test_login_berhasil_tercatat(sesi, site_siap):
-    sebelum = sesi.query(KejadianLogin).filter_by(site_id=site_siap.id, username="admin").count()
+    # Dibatasi waktu, bukan dibandingkan jumlah: login dari test lain di sesi
+    # yang sama bisa baru terkumpul di tengah test ini dan menaikkan jumlah
+    # tanpa login kita sendiri tercatat. Mundur 2 detik untuk selisih jam
+    # container.
+    mulai = datetime.now(timezone.utc) - timedelta(seconds=2)
     with httpx.Client(timeout=30, follow_redirects=False) as c:
         _masuk(c)
 
-    def _jumlah():
-        return sesi.query(KejadianLogin).filter_by(
-            site_id=site_siap.id, username="admin", jenis="berhasil"
-        ).count()
+    def _login_kita():
+        return sesi.query(KejadianLogin).filter(
+            KejadianLogin.site_id == site_siap.id, KejadianLogin.username == "admin",
+            KejadianLogin.jenis == "berhasil", KejadianLogin.waktu >= mulai,
+        )
 
-    _job_sampai(sesi, site_siap, JobType.collect_events, lambda: _jumlah() > sebelum)
-    baris = sesi.query(KejadianLogin).filter_by(site_id=site_siap.id, username="admin", jenis="berhasil").all()
-    assert len(baris) > sebelum
-    assert baris[-1].jalur == "form"
+    _job_sampai(sesi, site_siap, JobType.collect_events, lambda: _login_kita().count() >= 1)
+    assert _login_kita().order_by(KejadianLogin.waktu.desc()).first().jalur == "form"
 
 
 def test_admin_baru_memerahkan_status_tetapi_user_wpmgr_tidak(sesi, site_siap):
@@ -176,14 +179,19 @@ def test_admin_baru_memerahkan_status_tetapi_user_wpmgr_tidak(sesi, site_siap):
         def _tercatat() -> bool:
             return sesi.query(KejadianLogin).filter_by(
                 site_id=site_siap.id, username=nama, jenis="admin_baru"
-            ).first() is not None
+            ).order_by(KejadianLogin.id).first() is not None
 
         _job_sampai(sesi, site_siap, JobType.collect_events, _tercatat)
-        kejadian = {(k.username, k.jenis) for k in sesi.query(KejadianLogin).filter_by(site_id=site_siap.id)}
+        kejadian = [
+            (k.username, k.jenis)
+            for k in sesi.query(KejadianLogin).filter_by(site_id=site_siap.id)
+            .order_by(KejadianLogin.waktu, KejadianLogin.id)
+        ]
         assert (nama, "admin_baru") in kejadian
         assert not any(u == "wpmgr" and j != "berhasil" for u, j in kejadian)
         hasil = nilai_keamanan(sesi, site_siap, datetime.now(timezone.utc))
         assert hasil.status == StatusKeamanan.perlu_diperiksa
+        assert any(nama in a for a in hasil.alasan), hasil.alasan
     finally:
         _wpcli_status("user", "delete", nama, "--yes")
 
