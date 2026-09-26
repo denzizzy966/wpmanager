@@ -532,6 +532,112 @@ final class TerapkanTest extends TestCase {
         $this->assertFileDoesNotExist( $this->akar . '.maintenance' );
     }
 
+    // ---- Fix round 3 ----
+
+    /** Diadaptasi dari ReviewR2Test reviewer: B (direbut) mencatat nama tmp yang kini ditahan A. */
+    public function test_bersihkan_area_lain_tidak_menghapus_tabel_yang_ditahan_di_nama_tmp(): void {
+        $this->dorongan_kedua_siap(); // ID2 = B
+        $this->assertSame( 'terimpor', $this->dorong()->terapkan( array( 'dorong_id' => self::ID2, 'langkah' => 'impor' ) )['status'] );
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->dorong()->keadaan( self::ID2 )['tabel_tmp'] );
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID2 . '|' . ( time() - 10800 );
+        for ( $n = 1; $n <= 99; $n++ ) {
+            $this->db->tabel[] = 'wpmgr_b' . $n . '_wp_posts';
+        }
+        $this->siap_dengan_sql(); // ID = A merebut kunci B
+        $this->assertSame( 'direbut', $this->dorong()->keadaan( self::ID2 )['status'] );
+        $this->assertSame( 'terimpor', $this->sampai_selesai( 'impor' )['status'] );
+        $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->assertSame( 'dipulihkan', $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->dorong()->keadaan( self::ID )['tabel_batal'] );
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
+
+        $this->assertSame( array( 'lagi' => true ), $this->dorong()->bersihkan( self::ID2 ) );
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->db->tabel, 'tabel yang ditahan A di-DROP oleh jurnal B' );
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->dorong()->keadaan( self::ID2 )['tabel_tmp'] );
+        // Cron juga tidak.
+        $d           = $this->dorong();
+        $k           = $d->keadaan( self::ID2 );
+        $k['diubah'] = time() - 90000;
+        $d->simpan_keadaan( self::ID2, $k );
+        $this->dorong()->cron();
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
+        $this->assertDirectoryExists( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID2 );
+    }
+
+    public function test_entri_batal_kedaluwarsa_tidak_menghapus_tabel_yang_ditahan_dorongan_lebih_baru(): void {
+        $d = $this->dorong();
+        $this->db->tabel[] = 'wpmgr_tmp_wp_posts';
+        $this->db->tabel[] = 'wpmgr_b1_wp_options';
+        // Area lama: entri batal sudah kedaluwarsa; satu entri tanpa cap waktu.
+        $d->simpan_keadaan( self::ID, array( 'status' => 'dipulihkan', 'diubah' => time(),
+            'tabel_batal' => array( 'wpmgr_tmp_wp_posts', 'wpmgr_b1_wp_options' ),
+            'batal_dibuat' => array( 'wpmgr_tmp_wp_posts' => time() - 90000 ) ) );
+        // Area lebih baru menahan nama yang sama.
+        $d->simpan_keadaan( self::ID2, array( 'status' => 'dipulihkan', 'diubah' => time(),
+            'tabel_batal' => array( 'wpmgr_tmp_wp_posts' ), 'batal_dibuat' => array( 'wpmgr_tmp_wp_posts' => time() - 60 ) ) );
+        $this->assertSame( array( 'lagi' => true ), $this->dorong()->bersihkan( self::ID ) );
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
+        // Entri tanpa cap waktu tidak terbukti milik area ini: tidak di-DROP.
+        $this->assertContains( 'wpmgr_b1_wp_options', $this->db->tabel );
+        $this->assertDirectoryExists( $this->dir() );
+
+        // Setelah penahanan area baru juga kedaluwarsa, area lama boleh menghapusnya.
+        $k2                 = $d->keadaan( self::ID2 );
+        $k2['batal_dibuat'] = array( 'wpmgr_tmp_wp_posts' => time() - 90000 );
+        $d->simpan_keadaan( self::ID2, $k2 );
+        $this->assertSame( array( 'lagi' => false ), $this->dorong()->bersihkan( self::ID ) );
+        $this->assertNotContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
+        $this->assertContains( 'wpmgr_b1_wp_options', $this->db->tabel );
+    }
+
+    private function area_rusak( $umur ) {
+        $dir = $this->akar . 'wp-content/wpmgr-dorong/' . self::ID2 . '/';
+        mkdir( $dir, 0777, true );
+        file_put_contents( $dir . 'keadaan.php', 'rusak' );
+        touch( $dir . 'keadaan.php', time() - $umur );
+        touch( $dir, time() - $umur );
+        return $dir;
+    }
+
+    public function test_keadaan_rusak_lebih_dari_24_jam_tidak_memblokir_dan_dibersihkan_cron(): void {
+        $dir = $this->area_rusak( 200000 );
+        $this->siap_dengan_sql();
+        $this->assertSame( 'terimpor', $this->sampai_selesai( 'impor' )['status'] );
+        $this->dorong()->cron();
+        $this->assertDirectoryDoesNotExist( $dir );
+    }
+
+    public function test_keadaan_rusak_kurang_dari_24_jam_tetap_memblokir(): void {
+        $dir = $this->area_rusak( 3600 );
+        $this->siap_dengan_sql();
+        $this->assertSame( 'wpmgr_staging_ditahan', $this->langkah( 'impor' )->get_error_code() );
+        $this->assertSame( array( 'lagi' => true ), $this->dorong()->bersihkan( self::ID2 ) );
+        $this->assertDirectoryExists( $dir );
+    }
+
+    public function test_simpan_keadaan_gagal_encode_tidak_merusak_berkas_lama(): void {
+        $d = $this->dorong();
+        $this->assertTrue( $d->simpan_keadaan( self::ID, array( 'status' => 'siap' ) ) );
+        $this->assertFalse( $d->simpan_keadaan( self::ID, array( 'status' => "\xB1\x31" ) ) );
+        $this->assertSame( array( 'status' => 'siap' ), $d->keadaan( self::ID ) );
+        $this->assertSame( array( 'keadaan.php' ), array_values( array_diff( scandir( $this->dir() ), array( '.', '..' ) ) ) );
+    }
+
+    public function test_kunci_gagal_dilepas_pulihkan_dicatat_lalu_bersihkan_melepasnya(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->db->gagal_pada = "DELETE FROM wp_options WHERE option_name = 'wpmgr_dorong_kunci'";
+        $this->assertSame( 'dipulihkan', $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) )['status'] );
+        $k = $this->dorong()->keadaan( self::ID );
+        $this->assertSame( 'dipulihkan', $k['status'] );
+        $this->assertTrue( $k['kunci_tertahan'] );
+        $this->assertStringStartsWith( self::ID . '|', $this->db->opsi['wpmgr_dorong_kunci'] );
+        $this->db->gagal_pada = null;
+        $this->assertTrue( $this->dorong()->bersihkan( self::ID )['tahan_batal'] );
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+    }
+
     public function test_dorongan_baru_merebut_kunci_walau_area_lama_hanya_berisi_tabel_batal(): void {
         $this->pulihkan_setelah_pertukaran_db();
         // Dashboard tidak pernah memanggil bersihkan: kunci basi 3 jam.

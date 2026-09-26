@@ -219,7 +219,14 @@ class WPMGR_Staging_Dorong {
     }
 
     public function simpan_keadaan( $id, array $k ) {
-        return $this->tulis_terlindung( $this->dir( $id ) . 'keadaan.php', json_encode( $k ) );
+        // Fix round 3: json_encode() yang gagal (mis. UTF-8 tidak sah) dulu
+        // menulis badan kosong dan tetap melapor sukses -- jurnal hilang.
+        // Sekarang gagal, dan berkas lama tidak disentuh.
+        $json = json_encode( $k );
+        if ( ! is_string( $json ) ) {
+            return false;
+        }
+        return $this->tulis_terlindung( $this->dir( $id ) . 'keadaan.php', $json );
     }
 
     /** MINOR: kunci 'status' yang hilang tidak boleh memicu notice PHP di pemanggil. */
@@ -707,6 +714,7 @@ class WPMGR_Staging_Dorong {
 
     protected function kosongkan_jurnal_tabel_inti( $id, array &$k, array $jenis_list ) {
         $dijalankan = 0;
+        $tertahan   = false;
         foreach ( $jenis_list as $kunci_jurnal ) {
             $daftar = ( isset( $k[ $kunci_jurnal ] ) && is_array( $k[ $kunci_jurnal ] ) ) ? $k[ $kunci_jurnal ] : array();
             if ( empty( $daftar ) ) {
@@ -731,6 +739,21 @@ class WPMGR_Staging_Dorong {
                 if ( 'tabel_batal' === $kunci_jurnal && $this->batal_ditahan_sampai( $k, $t ) > 0 ) {
                     continue; // Fix round 1b: belum 24 jam -- tabel dan entrinya dipertahankan.
                 }
+                // Fix round 3: nama yang SAMA bisa sedang ditahan area lain
+                // (tabel batal di nama wpmgr_tmp_*, atau entri lebih baru
+                // bernama sama). Entri tetap di jurnal ini, area tidak dihapus.
+                if ( $this->ditahan_area_lain( $id, $t ) ) {
+                    $tertahan = true;
+                    continue;
+                }
+                if ( 'tabel_batal' === $kunci_jurnal && ! isset( $k['batal_dibuat'][ $t ] ) ) {
+                    // Tanpa cap waktu: tidak terbukti dibuat area ini --
+                    // entri dilupakan, tabelnya tidak pernah di-DROP.
+                    $sisa               = array_values( array_diff( $sisa, array( $t ) ) );
+                    $k[ $kunci_jurnal ] = $sisa;
+                    $this->simpan_keadaan( $id, $k );
+                    continue;
+                }
                 // Jaminan kemajuan: entri PERTAMA pada panggilan ini selalu
                 // diproses, walau tenggat sudah lewat sebelum mulai.
                 if ( $dijalankan > 0 && $this->waktu_habis() ) {
@@ -747,7 +770,7 @@ class WPMGR_Staging_Dorong {
                 $this->simpan_keadaan( $id, $k );
             }
         }
-        return true;
+        return $tertahan ? 'tertahan' : true;
     }
 
     /**
@@ -817,7 +840,7 @@ class WPMGR_Staging_Dorong {
     protected function bersihkan_inti( $id ) {
         $k      = $this->keadaan( $id );
         $status = $this->status( $k );
-        if ( null === $k && is_file( $this->dir( $id ) . 'keadaan.php' ) ) {
+        if ( null === $k && $this->keadaan_rusak_masih_ditahan( $id ) ) {
             // Fix round 2 (N2): keadaan.php ada tetapi (sesaat) tidak
             // terbaca -- jurnal di dalamnya mungkin masih menahan tabel.
             // Area tidak pernah dihapus atas dasar keadaan yang tidak diketahui.
@@ -848,6 +871,9 @@ class WPMGR_Staging_Dorong {
             }
             if ( false === $r ) {
                 return array( 'lagi' => true ); // Waktu habis di tengah -- jurnal sisa sudah tersimpan.
+            }
+            if ( 'tertahan' === $r ) {
+                return array( 'lagi' => true ); // Fix round 3: sebagian nama ditahan area lain; dicoba lagi nanti.
             }
             // Fix round 1b: tabel batal yang belum 24 jam tetap ada. Area
             // (satu-satunya salinan jurnalnya) dipertahankan, tetapi kunci
@@ -1429,6 +1455,9 @@ class WPMGR_Staging_Dorong {
             return $aman;
         }
         foreach ( $daftar as $t ) {
+            if ( $this->ditahan_area_lain( $id, $t ) ) {
+                continue; // Fix round 3: ditahan area lain -- tidak di-DROP, entri tetap di jurnal.
+            }
             if ( in_array( $t, $aman, true ) && true !== $this->db->kueri( "DROP TABLE IF EXISTS `{$t}`" ) ) {
                 return $this->galat_db( 'Tabel sementara dorong tidak dapat dihapus.' );
             }
@@ -1440,6 +1469,23 @@ class WPMGR_Staging_Dorong {
             $k = $simpan;
         }
         return true;
+    }
+
+    /**
+     * Fix round 3: keadaan.php yang ada tetapi tidak terbaca diperlakukan
+     * menahan (gagal tertutup) -- paling lama UMUR_BATAL sejak simpan
+     * terakhir (mtime berkas). Tidak ada penahanan yang melampaui 24 jam
+     * sejak keadaan terakhir berhasil ditulis; sesudahnya area itu tidak
+     * menahan apa pun dan cron boleh menghapusnya.
+     */
+    protected function keadaan_rusak_masih_ditahan( $id ) {
+        $f = $this->dir( $id ) . 'keadaan.php';
+        clearstatcache( true, $f );
+        if ( ! is_file( $f ) ) {
+            return false;
+        }
+        $mtime = (int) @filemtime( $f ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+        return $mtime + self::UMUR_BATAL > time();
     }
 
     /**
@@ -1455,7 +1501,7 @@ class WPMGR_Staging_Dorong {
             }
             $k = $this->keadaan( $lain );
             if ( null === $k ) {
-                if ( is_file( $this->dir( $lain ) . 'keadaan.php' ) ) {
+                if ( $this->keadaan_rusak_masih_ditahan( $lain ) ) {
                     return true;
                 }
                 continue;
@@ -2405,7 +2451,7 @@ class WPMGR_Staging_Dorong {
             $k['status'] = 'dipulihkan';
             $hasil       = $this->selesaikan_langkah( $id, $k, 'pulihkan', $hasil );
             if ( ! is_wp_error( $hasil ) ) {
-                $this->lepas_kunci( $id );
+                $this->lepas_kunci_setelah_pulih( $id );
             }
             return $hasil;
         }
@@ -2483,9 +2529,24 @@ class WPMGR_Staging_Dorong {
             // bukan menunggu bersihkan(), supaya dorongan lain tidak tertahan.
             // Kunci yang gagal dilepas tetap boleh direbut (status terminal).
             $this->lepas_pengaman();
-            $this->lepas_kunci( $id );
+            $this->lepas_kunci_setelah_pulih( $id );
         }
         return $hasil;
+    }
+
+    /**
+     * Fix round 3: kunci dorong yang gagal dilepas setelah 'dipulihkan'
+     * tidak mengubah hasil (produksi sudah kembali), tetapi dicatat di
+     * keadaan ('kunci_tertahan') supaya terlihat; bersihkan() atau
+     * perebutan kunci basi (status terminal) melepasnya kemudian.
+     */
+    protected function lepas_kunci_setelah_pulih( $id ) {
+        $r = $this->lepas_kunci( $id );
+        $k = $this->keadaan( $id );
+        if ( null !== $k ) {
+            $k['kunci_tertahan'] = is_wp_error( $r );
+            $this->simpan_keadaan( $id, $k );
+        }
     }
 
     // ---- selesai ------------------------------------------------------
