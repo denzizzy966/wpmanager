@@ -132,9 +132,11 @@ MAKS_PARALEL = 10
 # raksasa atau menetes pelan menahan satu thread putaran jauh melewati TIMEOUT
 # (timeout httpx berlaku per operasi baca, bukan untuk seluruh body).
 MAKS_BODY = 5000
-# Batas keras satu putaran: satu cek bisa menghabiskan TIMEOUT untuk koneksi
-# ditambah hampir TIMEOUT untuk satu potongan baca terakhir sebelum tenggat
-# di cek_satu() diperiksa. Cek yang belum selesai sesudahnya dianggap gagal.
+# Anggaran waktu per GELOMBANG (MAKS_PARALEL cek berjalan bersamaan); tenggat
+# satu putaran = BATAS_PUTARAN x jumlah gelombang (lihat cek_semua). Cek yang
+# belum selesai sesudahnya dianggap gagal. Site yang sah tetapi sangat lambat
+# (koneksi + header + potongan body masing-masing mendekati TIMEOUT) bisa ikut
+# tercatat gagal; itu disengaja, sama seperti batas waktu httpx sendiri.
 BATAS_PUTARAN = TIMEOUT * 2 + 5
 
 
