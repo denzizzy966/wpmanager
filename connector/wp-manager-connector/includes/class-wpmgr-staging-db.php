@@ -50,6 +50,12 @@ class WPMGR_Staging_Db {
         return $this->wpdb->get_var( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL
     }
 
+    /** Satu baris sebagai array asosiatif, atau null; pemanggil memeriksa galat_terakhir(). */
+    public function baris( $sql ) {
+        $r = $this->wpdb->get_row( $sql, ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL
+        return is_array( $r ) ? $r : null;
+    }
+
     public function siapkan( $sql ) {
         return call_user_func_array( array( $this->wpdb, 'prepare' ), func_get_args() );
     }

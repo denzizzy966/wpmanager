@@ -92,6 +92,7 @@ class WPMGR_Staging {
             '/staging/snapshot'  => array( 'POST', 'snapshot' ),
             '/staging/unggah'    => array( 'POST', 'unggah' ),
             '/staging/bersihkan' => array( 'POST', 'bersihkan' ),
+            '/staging/terapkan'  => array( 'POST', 'terapkan' ),
         );
     }
 
@@ -227,7 +228,8 @@ class WPMGR_Staging {
             self::root(),
             rtrim( str_replace( '\\', '/', WP_CONTENT_DIR ), '/' ) . '/wpmgr-dorong/',
             new WPMGR_Staging_Db( $GLOBALS['wpdb'] ),
-            self::anggaran_detik()
+            self::anggaran_detik(),
+            defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins'
         );
     }
 
@@ -299,6 +301,15 @@ class WPMGR_Staging {
     public static function bersihkan( $request ) {
         $p = self::body_json( $request );
         return rest_ensure_response( self::dorong()->bersihkan( isset( $p['dorong_id'] ) ? $p['dorong_id'] : '' ) );
+    }
+
+    /**
+     * Langkah terapkan dorong (Task 8): siapkan/impor/tukar/pulihkan/selesai.
+     * Kunci, jurnal, dan pemulihan ada di WPMGR_Staging_Dorong::terapkan();
+     * di sini hanya penghubung ke respons REST.
+     */
+    public static function terapkan( $request ) {
+        return rest_ensure_response( self::dorong()->terapkan( self::body_json( $request ) ) );
     }
 
     /**

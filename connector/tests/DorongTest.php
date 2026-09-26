@@ -18,6 +18,12 @@ final class WPMGR_FakeDbDorong {
     // ANTARA UPDATE dan baca-ulang milik panggilan yang sedang diuji.
     public $nilai_urutan   = 0;
     public $nilai_override = array();
+    // Task 8 (R10): baris information_schema.TABLES per nama tabel;
+    // tabel yang ada tetapi tidak disebut di sini dianggap InnoDB biasa.
+    public $mesin = array();
+    // Task 8: kueri yang memuat teks ini MELEMPAR (bukan galat biasa) --
+    // meniru pengecualian tak terduga dari lapisan database.
+    public $lempar_pada = null;
 
     public function prefix() {
         return 'wp_';
@@ -50,7 +56,10 @@ final class WPMGR_FakeDbDorong {
     }
 
     private function tandai_gagal_bila_cocok( $sql ) {
-        $this->galat = ( null !== $this->gagal_pada && false !== strpos( $sql, $this->gagal_pada ) ) ? 'galat tiruan' : '';
+        if ( null !== $this->lempar_pada && false !== strpos( $sql, $this->lempar_pada ) ) {
+            throw new RuntimeException( 'pengecualian tiruan' );
+        }
+        $this->galat =( null !== $this->gagal_pada && false !== strpos( $sql, $this->gagal_pada ) ) ? 'galat tiruan' : '';
         return '' !== $this->galat;
     }
 
@@ -79,6 +88,20 @@ final class WPMGR_FakeDbDorong {
                 return $this->nilai_override[ $urutan ];
             }
             return isset( $this->opsi['wpmgr_dorong_kunci'] ) ? $this->opsi['wpmgr_dorong_kunci'] : null;
+        }
+        return null;
+    }
+
+    public function baris( $sql ) {
+        $this->kueri[] = $sql;
+        if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
+            return null;
+        }
+        if ( preg_match( "/information_schema\\.TABLES .*TABLE_NAME = '([^']*)'/", $sql, $m ) ) {
+            if ( ! in_array( $m[1], $this->tabel, true ) ) {
+                return null;
+            }
+            return isset( $this->mesin[ $m[1] ] ) ? $this->mesin[ $m[1] ] : array( 'ENGINE' => 'InnoDB', 'CREATE_OPTIONS' => '' );
         }
         return null;
     }
@@ -497,13 +520,13 @@ final class DorongTest extends TestCase {
         $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
         $d->catat_tabel( self::ID, 'old', 'wpmgr_old_wp_posts' );
         $k           = $d->keadaan( self::ID );
-        // Fix Minor 5 (review putaran 3): STATUS_AMAN_TERMINAL sekarang
-        // mencakup 'gagal'/'direbut' juga (push yang riwayatnya sendiri
-        // sudah berakhir, apa pun hasilnya) -- 'ditukar' SENGAJA TIDAK ada
-        // di situ (Task 8 belum mendefinisikan artinya secara pasti),
-        // jadi itulah satu-satunya status di STATUS_BOLEH_BERSIHKAN yang
-        // masih memicu gerbang ini.
-        $k['status'] = 'ditukar';
+        // Status pra-tukar yang boleh dibersihkan (bukan terminal) dengan
+        // tabel_old yang (secara tidak wajar) tercatat: gerbang ini tetap
+        // menolak. Task 8 mengeluarkan 'ditukar' dari STATUS_BOLEH_BERSIHKAN
+        // (lama/ dan wpmgr_old_* adalah satu-satunya salinan untuk
+        // pemulihan eksplisit), jadi 'ditukar' kini ditolak lebih awal
+        // dengan wpmgr_staging_sibuk -- diuji juga di bawah.
+        $k['status'] = 'terimpor';
         $d->simpan_keadaan( self::ID, $k );
         $this->db->tabel = array( 'wp_posts', 'wpmgr_old_wp_posts' );
         $galat = $d->bersihkan( self::ID );
@@ -511,6 +534,14 @@ final class DorongTest extends TestCase {
         $this->assertSame( 'wpmgr_staging_perlu_pemulihan', $galat->get_error_code() );
         $this->assertSame( 409, $galat->get_error_data()['status'] );
         // Tidak disentuh sama sekali -- direktori, tabel, dan kunci utuh.
+        $this->assertDirectoryExists( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        $this->assertSame( array( 'wp_posts', 'wpmgr_old_wp_posts' ), $this->db->tabel );
+
+        $k['status'] = 'ditukar';
+        $d->simpan_keadaan( self::ID, $k );
+        $galat = $d->bersihkan( self::ID );
+        $this->assertSame( 'wpmgr_staging_sibuk', $galat->get_error_code() );
+        $this->assertSame( 409, $galat->get_error_data()['status'] );
         $this->assertDirectoryExists( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
         $this->assertSame( array( 'wp_posts', 'wpmgr_old_wp_posts' ), $this->db->tabel );
     }
