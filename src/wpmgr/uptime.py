@@ -5,6 +5,7 @@ menentukan kapan sebuah site dinyatakan mati bisa diuji langsung.
 """
 
 import logging
+import math
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -183,9 +184,14 @@ def cek_semua(urls: Sequence[str], cek_fn: Callable[[str], HasilCek]) -> list[Ha
     di latar belakang; hasilnya tidak dipakai.
     """
     ex = ThreadPoolExecutor(max_workers=MAKS_PARALEL)
+    # BATAS_PUTARAN per gelombang: dengan MAKS_PARALEL thread, URL ke-11 dst.
+    # baru mulai setelah thread sebelumnya bebas. Tenggat tetap untuk seluruh
+    # putaran akan membatalkan site yang masih antre (lalu tercatat gagal dan
+    # bisa memicu aturan gangguan_dashboard) begitu lebih dari ~20 site lambat.
+    gelombang = max(1, math.ceil(len(urls) / MAKS_PARALEL))
     try:
         futs = [ex.submit(cek_fn, u) for u in urls]
-        wait(futs, timeout=BATAS_PUTARAN)
+        wait(futs, timeout=BATAS_PUTARAN * gelombang)
         return [
             f.result() if f.done() and not f.cancelled()
             else HasilCek(UptimeHasil.gagal, pesan="Tidak selesai dalam batas waktu")

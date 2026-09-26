@@ -157,6 +157,21 @@ def test_cek_semua_memutus_cek_yang_melewati_batas(monkeypatch):
     assert hasil[1].pesan == "Tidak selesai dalam batas waktu"
 
 
+def test_cek_semua_tenggat_per_gelombang_tidak_membatalkan_site_antre(monkeypatch):
+    """Dengan 2 thread dan 3 URL yang masing-masing butuh ~0.2 detik, URL ketiga
+    baru mulai di gelombang kedua. Tenggat tetap 0.3 detik untuk seluruh
+    putaran akan membatalkannya; tenggat per gelombang tidak."""
+    monkeypatch.setattr("wpmgr.uptime.BATAS_PUTARAN", 0.3)
+    monkeypatch.setattr("wpmgr.uptime.MAKS_PARALEL", 2)
+
+    def cek(url):
+        time.sleep(0.2)
+        return HasilCek(UptimeHasil.naik, 200, 5)
+
+    hasil = cek_semua(["a", "b", "c"], cek)
+    assert [h.hasil for h in hasil] == [UptimeHasil.naik] * 3
+
+
 @pytest.mark.parametrize(
     ("site", "gagal", "harapan"),
     [(10, 9, True), (10, 8, False), (5, 5, True), (4, 4, False), (0, 0, False)],
