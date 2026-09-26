@@ -273,4 +273,53 @@ final class PenangkapTest extends TestCase {
 
         $this->assertCount( 0, $wpdb->queries );
     }
+
+    public function test_potong_membuang_byte_utf8_rusak(): void {
+        $hasil = WPMGR_Penangkap::potong( "abc\xff\xfe def", 100 );
+        $this->assertTrue( mb_check_encoding( $hasil, 'UTF-8' ) );
+        $this->assertStringStartsWith( 'abc', $hasil );
+    }
+
+    public function test_susun_menghasilkan_utf8_valid_dan_slug_dibatasi(): void {
+        $slug_panjang = str_repeat( 'x', 300 ) . "\xff";
+        $k = WPMGR_Penangkap::susun(
+            'warning',
+            "Gagal \xff\xfe membuka berkas",
+            self::KONTEN . "/plugins/pl\xc3ugin\xff/a\xfe.php",
+            3,
+            self::AKAR,
+            self::KONTEN
+        );
+        $this->assertTrue( mb_check_encoding( $k['pesan'], 'UTF-8' ) );
+        $this->assertTrue( mb_check_encoding( $k['file'], 'UTF-8' ) );
+        $this->assertTrue( mb_check_encoding( $k['komponen_slug'], 'UTF-8' ) );
+        $this->assertNotFalse( json_encode( $k ) );
+
+        $k2 = WPMGR_Penangkap::susun( 'warning', 'x', self::KONTEN . '/plugins/' . $slug_panjang . '/a.php', 1, self::AKAR, self::KONTEN );
+        $this->assertTrue( mb_check_encoding( $k2['komponen_slug'], 'UTF-8' ) );
+        $this->assertLessThanOrEqual( 191, mb_strlen( $k2['komponen_slug'], 'UTF-8' ) );
+    }
+
+    public function test_susun_slug_null_tetap_null(): void {
+        $k = WPMGR_Penangkap::susun( 'database', 'x', '', 0, self::AKAR, self::KONTEN );
+        $this->assertNull( $k['komponen_slug'] );
+    }
+
+    public function test_konteks_dengan_path_rusak_tetap_bisa_dijadikan_json(): void {
+        $lama                   = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : null;
+        $_SERVER['REQUEST_URI'] = "/halaman\xff\xfe/?token=rahasia";
+        try {
+            $m = new ReflectionMethod( 'WPMGR_Penangkap', 'konteks' );
+            $m->setAccessible( true );
+            $konteks = $m->invoke( null );
+        } finally {
+            if ( null === $lama ) {
+                unset( $_SERVER['REQUEST_URI'] );
+            } else {
+                $_SERVER['REQUEST_URI'] = $lama;
+            }
+        }
+        $this->assertTrue( mb_check_encoding( $konteks['path'], 'UTF-8' ) );
+        $this->assertNotFalse( json_encode( $konteks ) );
+    }
 }

@@ -111,7 +111,17 @@ class WPMGR_Penangkap {
 
     // ---- fungsi murni ---------------------------------------------------
 
+    // Byte UTF-8 rusak dibuang lebih dulu: pesan error, path, dan URI bisa
+    // memuat byte apa saja, dan satu byte rusak membuat json_encode()
+    // mengembalikan false (konteks hilang) serta ditolak kolom utf8mb4.
+    // Tidak memakai WPMGR_Login karena mu-plugin memuat kelas ini sendirian.
     public static function potong( $teks, $panjang ) {
+        $teks = (string) $teks;
+        if ( function_exists( 'mb_scrub' ) ) {
+            $teks = mb_scrub( $teks, 'UTF-8' );
+        } elseif ( function_exists( 'iconv' ) ) {
+            $teks = (string) @iconv( 'UTF-8', 'UTF-8//IGNORE', $teks );
+        }
         return function_exists( 'mb_substr' ) ? mb_substr( $teks, 0, $panjang ) : substr( $teks, 0, $panjang );
     }
 
@@ -177,7 +187,7 @@ class WPMGR_Penangkap {
             'sidik_jari'    => self::sidik_jari( $tingkat, $relatif, $baris, self::normalisasi_pesan( $pesan, $abspath ) ),
             'tingkat'       => $tingkat,
             'komponen_tipe' => $tipe,
-            'komponen_slug' => $slug,
+            'komponen_slug' => null === $slug ? null : self::potong( $slug, 191 ),
             'pesan'         => $pesan,
             'file'          => self::potong( $relatif, 255 ),
             'baris'         => (int) $baris,
