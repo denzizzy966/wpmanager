@@ -11,6 +11,13 @@ final class WPMGR_FakeDbDorong {
     // dikosongkan di awal SETIAP kolom()/nilai()/kueri() baru, diisi hanya
     // saat panggilan itu gagal (lihat WPMGR_Staging_Db::galat_terakhir()).
     private $galat = '';
+    // Fix N5 (review putaran 2, Minor): menyuntikkan nilai PENGGANTI untuk
+    // SELECT option_value ke-n (0-based, dihitung per panggilan nilai()
+    // yang menyentuh wpmgr_dorong_kunci) -- dipakai mensimulasikan
+    // permintaan LAIN dari PEMEGANG YANG SAMA yang menyegarkan kunci di
+    // ANTARA UPDATE dan baca-ulang milik panggilan yang sedang diuji.
+    public $nilai_urutan   = 0;
+    public $nilai_override = array();
 
     public function prefix() {
         return 'wp_';
@@ -67,6 +74,10 @@ final class WPMGR_FakeDbDorong {
             return null;
         }
         if ( false !== strpos( $sql, "option_name = 'wpmgr_dorong_kunci'" ) ) {
+            $urutan = $this->nilai_urutan++;
+            if ( array_key_exists( $urutan, $this->nilai_override ) ) {
+                return $this->nilai_override[ $urutan ];
+            }
             return isset( $this->opsi['wpmgr_dorong_kunci'] ) ? $this->opsi['wpmgr_dorong_kunci'] : null;
         }
         return null;
@@ -138,6 +149,7 @@ final class DorongTest extends TestCase {
 
     const ID  = '0123456789abcdef0123456789abcdef';
     const ID2 = 'fedcba9876543210fedcba9876543210';
+    const ID3 = '1111111111111111aaaaaaaaaaaaaaaa';
 
     private $akar;
     private $db;
@@ -242,6 +254,29 @@ final class DorongTest extends TestCase {
         $this->assertSame( 'wpmgr_staging_sibuk', $galat->get_error_code() );
     }
 
+    // ---- Fix N5 (review putaran 2, Minor): fencing penyegaran
+    // membandingkan hanya AWALAN '<id>|', bukan nilai PERSIS -- dua
+    // permintaan tumpang tindih dari PEMEGANG YANG SAMA yang melintasi
+    // batas detik bisa saja sama-sama menyegarkan dengan stempel waktu
+    // berbeda; membandingkan nilai persis salah mengira ini sebagai kunci
+    // yang hilang, padahal tetap dipegang id yang sama sepanjang waktu. ----
+
+    public function test_kunci_fencing_hanya_membandingkan_awalan_id(): void {
+        $d = $this->dorong();
+        $this->assertTrue( $d->kunci( self::ID ) );
+        // Simulasikan permintaan LAIN dari PEMEGANG YANG SAMA yang tumpang
+        // tindih dan menyegarkan kunci ini DI ANTARA UPDATE dan baca-ulang
+        // milik panggilan kunci() yang sedang diuji -- indeks 0 adalah
+        // SELECT setelah INSERT IGNORE (nilai asli), indeks 1 adalah
+        // SELECT baca-ulang setelah UPDATE penyegaran, tempat permintaan
+        // tumpang tindih itu "menang" dengan stempel waktu BERBEDA (tapi
+        // id yang SAMA).
+        $this->db->nilai_urutan   = 0; // Dihitung ulang dari 0 untuk panggilan kunci() berikut ini saja.
+        $this->db->nilai_override = array( 1 => self::ID . '|' . ( time() + 5 ) );
+        $this->assertTrue( $d->kunci( self::ID ),
+            'Penyegaran dari pemegang yang sama tidak boleh dianggap kunci hilang hanya karena stempel waktu berbeda.' );
+    }
+
     // ---- Fix C1 (review putaran 1, Kritis): push yang DIREBUT tidak boleh
     // bisa melanjutkan lagi walau kuncinya kelak bebas kembali (mis.
     // perebutnya sendiri melepaskannya setelah selesai). ----
@@ -256,6 +291,76 @@ final class DorongTest extends TestCase {
         $galat = $d->unggah( $this->paket( self::ID, 1, 'sql', array( array( 'path' => 'sql' ) ), array( 'c' ) ) );
         $this->assertInstanceOf( WP_Error::class, $galat );
         $this->assertSame( 'wpmgr_staging_direbut', $galat->get_error_code() );
+        $this->assertSame( 409, $galat->get_error_data()['status'] );
+    }
+
+    // ---- Fix N2 (review putaran 2, Penting): unggah() memeriksa status
+    // 'direbut' SEBELUM memanggil kunci() -- draf sebelumnya memanggil
+    // kunci() lebih dulu (yang untuk push ini sendiri berhasil merebut/
+    // menyegarkan miliknya sendiri), baru kemudian menolak. Percobaan yang
+    // PASTI ditolak seperti itu tetap menahan kunci 2 jam lagi, memblokir
+    // push BARU yang sah walau push lama sudah pasti akan ditolak. ----
+
+    public function test_unggah_direbut_tidak_menahan_kunci_untuk_push_baru(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'a' ) ) );
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $this->assertTrue( $d->kunci( self::ID2 ) ); // ID2 merebut, menandai ID sebagai 'direbut'.
+        $d->lepas_kunci( self::ID2 ); // ID2 selesai/gagal dan melepas kuncinya sendiri.
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+        $galat = $d->unggah( $this->paket( self::ID, 1, 'sql', array( array( 'path' => 'sql' ) ), array( 'c' ) ) );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_direbut', $galat->get_error_code() );
+        // Percobaan yang ditolak TIDAK BOLEH merebut/menyegarkan kunci --
+        // kunci masih bebas persis seperti sebelum percobaan itu.
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi,
+            'unggah() untuk push yang direbut tidak boleh mengunci ulang.' );
+        // Push BARU (id lain) tidak boleh dianggap sibuk oleh kunci yang
+        // seharusnya tidak pernah tersentuh itu.
+        $this->assertTrue( $d->kunci( self::ID3 ) );
+    }
+
+    // ---- Fix N3 (review putaran 2, Penting): perebutan kunci basi hanya
+    // aman bila status push lama masih PRA-TUKAR -- push yang sedang
+    // 'menukar' (menggeser berkas/tabel produksi ke lama/) tidak boleh
+    // direbut begitu saja: 'direbut' ada di STATUS_BOLEH_BERSIHKAN, jadi
+    // bersihkan() akan menghapus lama/ (satu-satunya salinan produksi
+    // tergeser) walau proses tukar belum tentu selesai/aman dibatalkan. ----
+
+    public function test_takeover_ditolak_saat_status_lama_menukar_lama_tetap_utuh(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $k           = $d->keadaan( self::ID );
+        $k['status'] = 'menukar';
+        $d->simpan_keadaan( self::ID, $k );
+        // lama/ menyimpan data produksi ASLI yang tergeser -- harus tetap utuh.
+        $dir_lama = $this->akar . 'wp-content/wpmgr-dorong/' . self::ID . '/lama';
+        mkdir( $dir_lama, 0777, true );
+        file_put_contents( $dir_lama . '/asli.txt', 'produksi asli' );
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $galat = $d->kunci( self::ID2 );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_perlu_pemulihan', $galat->get_error_code() );
+        $this->assertSame( 409, $galat->get_error_data()['status'] );
+        // Status TIDAK ditandai 'direbut' -- tidak pernah ditimpa.
+        $this->assertSame( 'menukar', $d->keadaan( self::ID )['status'] );
+        // Kunci masih milik push LAMA -- tidak diambil alih.
+        $this->assertStringStartsWith( self::ID . '|', $this->db->opsi['wpmgr_dorong_kunci'] );
+        // lama/ (data produksi tergeser) tetap utuh.
+        $this->assertFileExists( $dir_lama . '/asli.txt' );
+    }
+
+    public function test_takeover_ditolak_saat_keadaan_hilang_padahal_area_ada(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        // keadaan.php rusak/hilang, tapi direktori (area) masih ada -- tidak
+        // bisa dibuktikan aman, jadi ditolak, bukan diloloskan diam-diam.
+        unlink( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID . '/keadaan.php' );
+        $this->assertNull( $d->keadaan( self::ID ) );
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $galat = $d->kunci( self::ID2 );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_perlu_pemulihan', $galat->get_error_code() );
         $this->assertSame( 409, $galat->get_error_data()['status'] );
     }
 
@@ -316,18 +421,56 @@ final class DorongTest extends TestCase {
         $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 1;' ) ) );
         // Fix C2 (review putaran 1): tabel yang dihapus dibatasi JURNAL
         // push ini sendiri -- catat_tabel() adalah API yang akan dipakai
-        // Task 8 setiap kali CREATE/RENAME sungguhan terjadi.
+        // Task 8 setiap kali CREATE/RENAME sungguhan terjadi. tabel_old
+        // TIDAK dicatat di sini -- dalam pemakaian sungguhan ia hanya
+        // pernah ada setelah langkah 'menukar' dimulai, yang belum pernah
+        // terjadi selama status masih 'mengunggah'.
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
+        $this->db->tabel = array( 'wp_posts', 'wpmgr_tmp_wp_posts' );
+        $this->assertSame( array( 'lagi' => false ), $d->bersihkan( self::ID ) );
+        $this->assertDirectoryDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        $this->assertSame( array( 'wp_posts' ), $this->db->tabel );
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+    }
+
+    // ---- Status TERMINAL (STATUS_AMAN_HAPUS_LAMA): 'tabel_old' (data
+    // produksi tergeser) sekarang juga aman dihapus bersama tabel sementara. ----
+
+    public function test_bersihkan_status_terminal_menghapus_tabel_lama_juga(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 1;' ) ) );
         $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
         $d->catat_tabel( self::ID, 'old', 'wpmgr_old_wp_posts' );
+        $k           = $d->keadaan( self::ID );
+        $k['status'] = 'selesai';
+        $d->simpan_keadaan( self::ID, $k );
         $this->db->tabel = array( 'wp_posts', 'wpmgr_tmp_wp_posts', 'wpmgr_old_wp_posts' );
         $this->assertSame( array( 'lagi' => false ), $d->bersihkan( self::ID ) );
         $this->assertDirectoryDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
-        // Status masih 'mengunggah' (bukan status TERMINAL di
-        // STATUS_AMAN_HAPUS_LAMA): tabel SEMENTARA dihapus, tetapi
-        // 'tabel_old' (data produksi tergeser, untuk pemulihan) tetap
-        // dipertahankan sampai statusnya membuktikan tukar benar tuntas.
-        $this->assertSame( array( 'wp_posts', 'wpmgr_old_wp_posts' ), $this->db->tabel );
+        $this->assertSame( array( 'wp_posts' ), $this->db->tabel );
         $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+    }
+
+    // ---- Fix N4 (review putaran 2, Penting): jangan pernah menghapus
+    // direktori (satu-satunya salinan jurnal) selama 'tabel_old' masih ada
+    // tapi status BELUM membuktikan aman dihapus -- kehilangan jurnal itu
+    // berarti tabel produksi lama tidak akan pernah dibersihkan siapa pun. ----
+
+    public function test_bersihkan_menolak_saat_tabel_lama_belum_aman_dihapus(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $d->catat_tabel( self::ID, 'old', 'wpmgr_old_wp_posts' );
+        $k           = $d->keadaan( self::ID );
+        $k['status'] = 'gagal'; // Gagal DI TENGAH menukar -- tabel_old sudah ada, belum tentu aman dibuang.
+        $d->simpan_keadaan( self::ID, $k );
+        $this->db->tabel = array( 'wp_posts', 'wpmgr_old_wp_posts' );
+        $galat = $d->bersihkan( self::ID );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_perlu_pemulihan', $galat->get_error_code() );
+        $this->assertSame( 409, $galat->get_error_data()['status'] );
+        // Tidak disentuh sama sekali -- direktori, tabel, dan kunci utuh.
+        $this->assertDirectoryExists( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        $this->assertSame( array( 'wp_posts', 'wpmgr_old_wp_posts' ), $this->db->tabel );
     }
 
     // ---- Fix C2 (review putaran 1, Kritis): nama tabel sementara
@@ -389,6 +532,35 @@ final class DorongTest extends TestCase {
         $this->assertSame( 500, $galat->get_error_data()['status'] );
         // Tabel yang gagal di-drop TETAP ada -- bukan hilang diam-diam.
         $this->assertContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
+        // Fix N4 (review putaran 2): direktori (satu-satunya salinan
+        // jurnal) TIDAK BOLEH terhapus saat DROP gagal -- draf round 1
+        // menghapus direktori LEBIH DULU (sebelum mencoba DROP), jadi
+        // jurnal hilang bersamanya walau tabelnya sendiri tidak pernah
+        // terhapus -- mengorphankannya permanen.
+        $this->assertDirectoryExists( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        $this->assertSame( array( 'wpmgr_tmp_wp_posts' ), $d->keadaan( self::ID )['tabel_tmp'] );
+    }
+
+    // ---- Fix N4 (review putaran 2, Penting): retry setelah galat DROP
+    // melanjutkan dari jurnal yang tersisa, lalu benar-benar menghapus
+    // direktori setelah jurnal kosong. ----
+
+    public function test_bersihkan_gagal_drop_lalu_retry_berhasil_menghapus_direktori(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
+        $this->db->tabel      = array( 'wp_posts', 'wpmgr_tmp_wp_posts' );
+        $this->db->gagal_pada = 'DROP TABLE';
+        $galat                = $d->bersihkan( self::ID );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( array( 'wp_posts', 'wpmgr_tmp_wp_posts' ), $this->db->tabel );
+
+        $this->db->gagal_pada = null; // Percobaan kedua (retry) tanpa galat.
+        $hasil                = $d->bersihkan( self::ID );
+        $this->assertSame( array( 'lagi' => false ), $hasil );
+        $this->assertSame( array( 'wp_posts' ), $this->db->tabel );
+        $this->assertDirectoryDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
     }
 
     // ---- Fix I3 (review putaran 1): batas ruang disk, lewat penyedia yang

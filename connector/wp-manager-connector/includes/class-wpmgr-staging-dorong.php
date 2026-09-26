@@ -63,6 +63,15 @@ class WPMGR_Staging_Dorong {
     // TIDAK PERNAH ikut membuang 'tabel_old' -- itu satu-satunya salinan
     // data produksi lama bila proses tukar sendiri belum terbukti tuntas.
     const STATUS_AMAN_HAPUS_LAMA = array( 'selesai', 'ditukar', 'dipulihkan' );
+    // Fix N3 (review putaran 2, Penting): status PRA-TUKAR -- satu-satunya
+    // status push LAMA yang aman direbut lewat kunci basi (kunci()). Belum
+    // pernah menyentuh lama/ (produksi yang tergeser) atau tabel_old sama
+    // sekali, jadi merebutnya dan menandainya 'direbut' tidak pernah
+    // membuang apa pun yang masih dibutuhkan. Task 8 WAJIB memakai salah
+    // satu nama di sini untuk setiap status SEBELUM langkah 'menukar'
+    // dimulai -- status apa pun sesudahnya (termasuk 'menukar' sendiri,
+    // dan status pemulihan) TIDAK PERNAH ditambahkan ke sini.
+    const STATUS_PRA_TUKAR = array( 'baru', 'mengunggah', 'siap' );
 
     protected $akar;
     protected $dasar;
@@ -221,7 +230,14 @@ class WPMGR_Staging_Dorong {
             if ( '' !== $this->db->galat_terakhir() ) {
                 return $this->galat_db( 'Kunci dorong tidak dapat dibaca.' );
             }
-            if ( $nilai !== (string) $ulang ) {
+            // Fix N5 (review putaran 2, Minor): dibandingkan hanya AWALAN
+            // '<id>|', bukan nilai PERSIS -- dua permintaan yang tumpang
+            // tindih dari PEMEGANG YANG SAMA (mis. dua potongan diunggah
+            // hampir bersamaan) bisa saja sama-sama menyegarkan dengan
+            // stempel waktu berbeda satu detik; membandingkan nilai persis
+            // salah mengira itu sebagai kunci yang "hilang", padahal
+            // kuncinya tetap dipegang id yang sama sepanjang waktu.
+            if ( 0 !== strpos( (string) $ulang, $id . '|' ) ) {
                 // Fencing: antara baca dan tulis kita, push lain sudah
                 // merebut kunci ini (mis. kita sendiri baru saja dianggap
                 // basi oleh push yang lebih baru). Melanjutkan permintaan
@@ -234,7 +250,12 @@ class WPMGR_Staging_Dorong {
         if ( 2 === count( $bagian ) && (int) $bagian[1] < time() - self::UMUR_KUNCI ) {
             // Pemegang lama tidak menyentuh/menyegarkan kuncinya 2 jam:
             // direbut secara atomik, hanya bila nilainya masih sama dengan
-            // yang kita baca.
+            // yang kita baca DAN status push lama masih pra-tukar (fix N3).
+            $id_lama = $bagian[0];
+            $cek     = $this->cek_takeover_aman( $id_lama );
+            if ( is_wp_error( $cek ) ) {
+                return $cek;
+            }
             $r = $this->db->kueri( $this->db->siapkan(
                 "UPDATE {$o} SET option_value = %s WHERE option_name = %s AND option_value = %s", $nilai, self::KUNCI, $sekarang ) );
             if ( is_string( $r ) ) {
@@ -245,11 +266,50 @@ class WPMGR_Staging_Dorong {
                 return $this->galat_db( 'Kunci dorong tidak dapat dibaca.' );
             }
             if ( 0 === strpos( (string) $ulang, $id . '|' ) ) {
-                $this->tandai_direbut( $bagian[0] );
+                $this->tandai_direbut( $id_lama );
                 return true;
             }
         }
         return $this->galat( 'wpmgr_staging_sibuk', 'Dorongan lain sedang berlangsung di site ini.', 409 );
+    }
+
+    /**
+     * Fix N3 (review putaran 2, Penting): perebutan kunci basi HANYA
+     * diizinkan bila status push LAMA masih PRA-TUKAR (STATUS_PRA_TUKAR).
+     * Draf sebelumnya (tandai_direbut()) menimpa status APA PUN dengan
+     * 'direbut', termasuk status di TENGAH menukar (mis. 'menukar') --
+     * 'direbut' ada di STATUS_BOLEH_BERSIHKAN, jadi bersihkan() lantas
+     * menghapus lama/ (data produksi ASLI yang tergeser, satu-satunya
+     * salinan untuk pemulihan) bersama jurnalnya begitu saja, padahal
+     * proses menukar push lama itu belum tentu selesai atau aman
+     * dibatalkan.
+     *
+     * Bila status push lama BUKAN pra-tukar (sedang menukar/memulihkan),
+     * ATAU tidak diketahui/hilang padahal AREANYA masih ada di disk
+     * (keadaan.php rusak/hilang tidak bisa membuktikan aman-tidaknya),
+     * perebutan DITOLAK 409 wpmgr_staging_perlu_pemulihan. Status push
+     * lama TIDAK PERNAH ditandai/ditimpa dalam kasus ini -- lihat juga
+     * STATUS_PRA_TUKAR di dekat STATUS_BOLEH_BERSIHKAN untuk kosakata yang
+     * harus dipakai Task 8.
+     */
+    protected function cek_takeover_aman( $id_lama ) {
+        if ( ! self::id_sah( $id_lama ) ) {
+            return true; // Nilai kunci rusak/tak dikenal -- tidak ada apa pun yang bisa diverifikasi maupun dilindungi.
+        }
+        $k_lama      = $this->keadaan( $id_lama );
+        $status_lama = $this->status( $k_lama );
+        if ( null === $k_lama ) {
+            if ( is_dir( $this->dir( $id_lama ) ) ) {
+                return $this->galat( 'wpmgr_staging_perlu_pemulihan',
+                    'Dorongan sebelumnya tidak dapat diverifikasi amannya; pulihkan atau selesaikan dulu.', 409 );
+            }
+            return true; // Tidak ada keadaan maupun area -- tidak ada apa pun untuk dilindungi.
+        }
+        if ( ! in_array( $status_lama, self::STATUS_PRA_TUKAR, true ) ) {
+            return $this->galat( 'wpmgr_staging_perlu_pemulihan',
+                'Dorongan sebelumnya harus dipulihkan atau diselesaikan dulu sebelum direbut.', 409 );
+        }
+        return true;
     }
 
     /**
@@ -258,6 +318,8 @@ class WPMGR_Staging_Dorong {
      * perebutnya sendiri gagal/dibersihkan). Diam-diam tidak melakukan apa
      * pun bila push lama belum pernah mengunggah apa pun (belum ada
      * keadaan.php untuk ditandai) -- tidak ada apa pun untuk dilindungi.
+     * Aman dipanggil di sini (fix N3): cek_takeover_aman() sudah memastikan
+     * status push lama pra-tukar sebelum baris ini pernah tercapai.
      */
     protected function tandai_direbut( $id_lama ) {
         if ( ! self::id_sah( $id_lama ) ) {
@@ -333,22 +395,31 @@ class WPMGR_Staging_Dorong {
                 }
             }
         }
+        // Fix N2 (review putaran 2, Penting): status TERMINAL (direbut,
+        // atau sudah melewati tahap unggah) diperiksa SEBELUM mengunci --
+        // draf sebelumnya memanggil kunci() lebih dulu, yang untuk push
+        // yang SUDAH direbut tetap berhasil (id ini sendiri yang memegang/
+        // menyegarkan kuncinya, sebelum baru kemudian ditolak). Setiap
+        // percobaan unggah() yang PASTI akan ditolak seperti itu tetap
+        // menahan kunci 2 jam lagi -- memblokir push BARU yang sah tanpa
+        // alasan. kunci() sekarang TIDAK PERNAH dipanggil untuk push yang
+        // sudah pasti akan ditolak di sini.
+        $k      = $this->keadaan( $id );
+        $status = $this->status( $k );
+        if ( 'direbut' === $status ) {
+            return $this->galat( 'wpmgr_staging_direbut', 'Dorongan ini sudah direbut dorongan lain dan tidak dapat dilanjutkan.', 409 );
+        }
+        if ( null !== $k && 'mengunggah' !== $status ) {
+            return $this->galat( 'wpmgr_staging_urutan', 'Dorongan ini sudah melewati tahap unggah.', 409 );
+        }
+
         $kunci = $this->kunci( $id );
         if ( is_wp_error( $kunci ) ) {
             return $kunci;
         }
         $this->pastikan_dasar();
-        $k      = $this->keadaan( $id );
-        $status = $this->status( $k );
         if ( null === $k ) {
             $k = array( 'status' => 'mengunggah', 'dibuat' => time(), 'byte_total' => 0 );
-        } elseif ( 'direbut' === $status ) {
-            // Fix C1: push ini pernah direbut push lain -- tidak boleh
-            // melanjutkan walau kuncinya baru saja berhasil kita rebut
-            // balik (state-nya sudah tidak bisa dipercaya).
-            return $this->galat( 'wpmgr_staging_direbut', 'Dorongan ini sudah direbut dorongan lain dan tidak dapat dilanjutkan.', 409 );
-        } elseif ( 'mengunggah' !== $status ) {
-            return $this->galat( 'wpmgr_staging_urutan', 'Dorongan ini sudah melewati tahap unggah.', 409 );
         }
 
         $path_potongan = $this->dir( $id ) . 'potongan/' . sprintf( '%06d', $nomor ) . '.php';
@@ -522,23 +593,63 @@ class WPMGR_Staging_Dorong {
     }
 
     /**
-     * Fix C2 (review putaran 1): HANYA men-DROP tabel yang tercatat di
-     * $daftar (jurnal push ini SENDIRI) dan lolos tabel_journal_aman().
-     * Fix I5: kueri yang gagal mengembalikan galat 500 KERAS, bukan
-     * dilewati diam-diam.
+     * Fix N4 (review putaran 2, Penting): menghapus tabel jurnal SATU per
+     * SATU, menyimpan keadaan.php (membuang entri yang baru saja sukses
+     * dari jurnal) SEGERA setelah setiap DROP berhasil -- bukan menghapus
+     * semuanya lalu baru menyimpan sekali di akhir (fix C2/I5 round 1).
+     * Waktu habis atau galat DROP di tengah proses meninggalkan entri yang
+     * BELUM diproses tetap tersimpan di jurnal, supaya percobaan berikutnya
+     * melanjutkan dari situ, bukan kehilangan jejak tabel yang belum
+     * sempat dihapus (pemanggil, bersihkan(), baru menghapus DIREKTORI --
+     * satu-satunya salinan keadaan.php/jurnal -- setelah fungsi ini
+     * mengembalikan true).
+     *
+     * true = jurnal (tabel_tmp, dan tabel_old bila $status ada di
+     * STATUS_AMAN_HAPUS_LAMA) sudah kosong sepenuhnya. false = waktu habis
+     * di tengah (jurnal sisa sudah tersimpan). WP_Error = galat DROP atau
+     * galat membaca listing tabel (jurnal sejauh yang sudah sukses juga
+     * sudah tersimpan).
      */
-    protected function hapus_tabel_terdaftar( array $daftar ) {
-        if ( empty( $daftar ) ) {
-            return true;
+    protected function kosongkan_jurnal_tabel( $id, array $k, $status ) {
+        $jenis_list = array( 'tabel_tmp' );
+        if ( in_array( $status, self::STATUS_AMAN_HAPUS_LAMA, true ) ) {
+            $jenis_list[] = 'tabel_old';
         }
-        $aman = $this->tabel_journal_aman( $daftar );
-        if ( is_wp_error( $aman ) ) {
-            return $aman;
-        }
-        foreach ( $aman as $t ) {
-            $r = $this->db->kueri( "DROP TABLE IF EXISTS `{$t}`" );
-            if ( is_string( $r ) ) {
-                return $this->galat_db( 'Tabel sementara dorong tidak dapat dihapus.' );
+        $dijalankan = 0;
+        foreach ( $jenis_list as $kunci_jurnal ) {
+            $daftar = ( isset( $k[ $kunci_jurnal ] ) && is_array( $k[ $kunci_jurnal ] ) ) ? $k[ $kunci_jurnal ] : array();
+            if ( empty( $daftar ) ) {
+                continue;
+            }
+            $aman = $this->tabel_journal_aman( $daftar );
+            if ( is_wp_error( $aman ) ) {
+                return $aman;
+            }
+            $sisa = $daftar;
+            foreach ( $daftar as $t ) {
+                if ( ! in_array( $t, $aman, true ) ) {
+                    // Bukan (lagi) tabel milik site ini menurut listing
+                    // sungguhan (sudah dihapus di luar, atau entri jurnal
+                    // keliru) -- tidak ada apa pun untuk di-DROP, buang
+                    // saja dari jurnal.
+                    $sisa               = array_values( array_diff( $sisa, array( $t ) ) );
+                    $k[ $kunci_jurnal ] = $sisa;
+                    $this->simpan_keadaan( $id, $k );
+                    continue;
+                }
+                // Jaminan kemajuan: entri PERTAMA pada panggilan ini selalu
+                // diproses, walau tenggat sudah lewat sebelum mulai.
+                if ( $dijalankan > 0 && $this->waktu_habis() ) {
+                    return false;
+                }
+                $r = $this->db->kueri( "DROP TABLE IF EXISTS `{$t}`" );
+                if ( is_string( $r ) ) {
+                    return $this->galat_db( 'Tabel sementara dorong tidak dapat dihapus.' );
+                }
+                $dijalankan++;
+                $sisa               = array_values( array_diff( $sisa, array( $t ) ) );
+                $k[ $kunci_jurnal ] = $sisa;
+                $this->simpan_keadaan( $id, $k );
             }
         }
         return true;
@@ -553,6 +664,14 @@ class WPMGR_Staging_Dorong {
      * tabel asli, bukan dari id push), jadi menghapusnya di sini akan
      * merusak push yang sedang berjalan. Pembersihan BERKAS milik push ini
      * SENDIRI (direktorinya sendiri) tetap selalu boleh, lepas dari itu.
+     *
+     * Fix N4 (review putaran 2, Penting): TABEL dihapus SEBELUM DIREKTORI
+     * (dibalik dari round 1) -- direktori menyimpan keadaan.php, satu-
+     * satunya salinan jurnal tabel. Draf round 1 menghapus direktori LEBIH
+     * DULU, jadi galat DROP/waktu habis/lock-gated-skip SESUDAHNYA membuang
+     * jurnal bersama direktorinya dan mengorphankan tabelnya PERMANEN
+     * (termasuk wpmgr_old_*, salinan produksi tergeser) -- tidak ada lagi
+     * yang mengingat tabel itu perlu dihapus.
      */
     public function bersihkan( $id ) {
         if ( ! self::id_sah( $id ) ) {
@@ -563,25 +682,31 @@ class WPMGR_Staging_Dorong {
         if ( null !== $k && ! in_array( $status, self::STATUS_BOLEH_BERSIHKAN, true ) ) {
             return $this->galat( 'wpmgr_staging_sibuk', 'Dorongan sedang diterapkan; pulihkan dulu.', 409 );
         }
-        if ( ! $this->hapus_rekursif( rtrim( $this->dir( $id ), '/' ) ) ) {
-            return array( 'lagi' => true );
+        if ( null !== $k ) {
+            $old_tersisa = ( isset( $k['tabel_old'] ) && is_array( $k['tabel_old'] ) ) ? $k['tabel_old'] : array();
+            if ( ! empty( $old_tersisa ) && ! in_array( $status, self::STATUS_AMAN_HAPUS_LAMA, true ) ) {
+                // Fix N4: tabel_old (data produksi tergeser) belum aman
+                // dihapus untuk status ini -- jangan pernah lanjut ke
+                // pembersihan direktori (lihat docblock kosongkan_jurnal_tabel()).
+                return $this->galat( 'wpmgr_staging_perlu_pemulihan',
+                    'Dorongan ini memiliki tabel produksi lama yang belum aman dihapus; pulihkan atau selesaikan dulu.', 409 );
+            }
         }
         $pemegang = $this->kunci_pemegang();
         if ( is_wp_error( $pemegang ) ) {
             return $pemegang;
         }
-        if ( '' === $pemegang || $pemegang === $id ) {
-            $tabel = array();
-            if ( null !== $k ) {
-                $tabel = ( isset( $k['tabel_tmp'] ) && is_array( $k['tabel_tmp'] ) ) ? $k['tabel_tmp'] : array();
-                if ( in_array( $status, self::STATUS_AMAN_HAPUS_LAMA, true ) ) {
-                    $tabel = array_merge( $tabel, ( isset( $k['tabel_old'] ) && is_array( $k['tabel_old'] ) ) ? $k['tabel_old'] : array() );
-                }
-            }
-            $r = $this->hapus_tabel_terdaftar( $tabel );
+        if ( null !== $k && ( '' === $pemegang || $pemegang === $id ) ) {
+            $r = $this->kosongkan_jurnal_tabel( $id, $k, $status );
             if ( is_wp_error( $r ) ) {
                 return $r;
             }
+            if ( false === $r ) {
+                return array( 'lagi' => true ); // Waktu habis di tengah -- jurnal sisa sudah tersimpan.
+            }
+        }
+        if ( ! $this->hapus_rekursif( rtrim( $this->dir( $id ), '/' ) ) ) {
+            return array( 'lagi' => true );
         }
         $r = $this->lepas_kunci( $id );
         if ( is_wp_error( $r ) ) {

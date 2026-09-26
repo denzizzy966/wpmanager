@@ -198,6 +198,111 @@ final class SqlTest extends TestCase {
             WPMGR_Staging_Sql::ubah( 'DROP TABLE IF EXISTS `wp_abc_posts`', 'wp_' ) );
     }
 
+    // ---- Fix N1 (review putaran 2, KRITIS): komentar bertanda versi
+    // MySQL/MariaDB (/*! ... */, /*M! ... */) DIEKSEKUSI sebagai SQL
+    // sungguhan, bukan dibuang -- topeng tanpa_literal() (fix I1)
+    // menyembunyikannya dari validator tapi teks yang DIKEMBALIKAN tetap
+    // memuat isinya utuh. Probe reviewer persis, harus ditolak SELURUHNYA. ----
+
+    public function test_ubah_menolak_komentar_bertanda_yang_menyembunyikan_perintah(): void {
+        foreach ( array(
+            'DROP TABLE IF EXISTS `wp_a` /*!, `wp_users` */',
+            "INSERT INTO `wp_posts` (`a`) VALUES (1) /*!50000 ON DUPLICATE KEY UPDATE `a` = 2 */",
+            "CREATE TABLE `wp_posts` (`a` int) /*!50000 ENGINE=FEDERATED */",
+            'ALTER TABLE `wp_posts` ENABLE KEYS /*!, RENAME TO `wp_x` */',
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code(), $s );
+        }
+    }
+
+    public function test_ubah_menolak_komentar_apa_pun_di_luar_string(): void {
+        foreach ( array(
+            "DROP TABLE IF EXISTS `wp_posts` -- komentar\n",
+            'DROP TABLE IF EXISTS `wp_posts` # komentar',
+            'DROP TABLE /* komentar */ IF EXISTS `wp_posts`',
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code(), $s );
+        }
+    }
+
+    public function test_ubah_menerima_komentar_di_dalam_literal_string(): void {
+        // '/* bukan komentar */' di sini adalah ISI STRING (literal),
+        // bukan komentar sungguhan -- ada_komentar() harus tetap menerima
+        // pernyataan ini.
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "INSERT INTO `wp_posts` (`a`) VALUES ('/* bukan komentar */ -- juga bukan # juga')", 'wp_' );
+        $this->assertSame(
+            "INSERT INTO `wpmgr_tmp_wp_posts` (`a`) VALUES ('/* bukan komentar */ -- juga bukan # juga')", $hasil );
+    }
+
+    // ---- Fix N1: ENGINE diperiksa lewat allowlist, mencakup nilai
+    // berkutip/backtick yang sebelumnya tersembunyi dari denylist oleh
+    // topeng literal. ----
+
+    public function test_ubah_menolak_engine_berkutip_atau_backtick(): void {
+        foreach ( array(
+            "CREATE TABLE `wp_posts` (`a` int) ENGINE='FEDERATED'",
+            'CREATE TABLE `wp_posts` (`a` int) ENGINE="FEDERATED"',
+            'CREATE TABLE `wp_posts` (`a` int) ENGINE=`FEDERATED`',
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code(), $s );
+        }
+    }
+
+    public function test_ubah_menolak_engine_merge_dengan_union(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            'CREATE TABLE `wp_posts` (`a` int) ENGINE=MERGE UNION=(`wp_x`,`wp_y`) INSERT_METHOD=LAST', 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_connection(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB CONNECTION='mysql://x/y'", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menerima_engine_yang_diizinkan(): void {
+        foreach ( array( 'InnoDB', 'MyISAM', 'Aria', 'innodb', 'MYISAM' ) as $mesin ) {
+            $hasil = WPMGR_Staging_Sql::ubah( "CREATE TABLE `wp_posts` (`a` int) ENGINE={$mesin}", 'wp_' );
+            $this->assertSame( "CREATE TABLE `wpmgr_tmp_wp_posts` (`a` int) ENGINE={$mesin}", $hasil, $mesin );
+        }
+    }
+
+    // ---- Fix N1: isi VALUES divalidasi token demi token -- subquery dan
+    // pemanggilan fungsi ditolak, bukan diterima apa pun setelah VALUES. ----
+
+    public function test_ubah_menolak_subquery_di_dalam_values(): void {
+        $hasil = WPMGR_Staging_Sql::ubah( 'INSERT INTO `wp_posts` (`a`) VALUES ((SELECT `a` FROM `wp_x`))', 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_pemanggilan_fungsi_di_dalam_values(): void {
+        foreach ( array(
+            "INSERT INTO `wp_posts` (`a`) VALUES (LOAD_FILE('/etc/passwd'))",
+            "INSERT INTO `wp_posts` (`a`) VALUES (CONCAT('a','b'))",
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code(), $s );
+        }
+    }
+
+    public function test_ubah_menerima_semua_bentuk_literal_values_yang_sah(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "INSERT INTO `wp_posts` (`a`,`b`,`c`,`d`) VALUES (1,'x',NULL,0x3b27),(-2.5,'y',NULL,0x00)", 'wp_' );
+        $this->assertSame(
+            "INSERT INTO `wpmgr_tmp_wp_posts` (`a`,`b`,`c`,`d`) VALUES (1,'x',NULL,0x3b27),(-2.5,'y',NULL,0x00)", $hasil );
+    }
+
     public function test_keluaran_ekspor_tabel_terpecah_benar(): void {
         WPMGR_Staging_Tabel::$baris     = 2000;
         WPMGR_Staging_Tabel::$sub       = 200;
