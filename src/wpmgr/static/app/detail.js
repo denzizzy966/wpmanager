@@ -108,6 +108,25 @@ function detailSite(siteId, tabAwal) {
       }
     },
 
+    panelTraffic() {
+      if (!this.traffic) return [];
+      const panel = [{
+        kunci: 'plugin', label: 'penghitung plugin', data: this.traffic.plugin,
+        kosong: 'Belum ada data dari penghitung plugin. Data mulai terkumpul setelah connector 2.x terpasang.',
+      }];
+      if (this.traffic.ga4_terpasang) {
+        panel.push({
+          kunci: 'ga4', label: 'Google Analytics', data: this.traffic.ga4,
+          kosong: this.traffic.ga4_error || 'Data GA4 belum diambil. Pengambilan berjalan sekali sehari.',
+        });
+      }
+      return panel;
+    },
+
+    tinggi(n, maks) {
+      return !n || !maks ? 0 : Math.max(2, Math.round((n / maks) * 100));
+    },
+
     teksKeamanan(s) { return TEKS_KEAMANAN_DETAIL[s] || s; },
     persen(p) { return p == null ? '—' : `${p}%`; },
     waktu(iso) { return iso ? new Date(iso).toLocaleString('id-ID') : '—'; },

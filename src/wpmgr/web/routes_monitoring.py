@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from wpmgr import db
+from wpmgr.config import get_settings
 from wpmgr.keamanan import nilai_keamanan, status_error
 from wpmgr.kesehatan import susun_kesehatan
 from wpmgr.models import (
@@ -22,7 +23,12 @@ from wpmgr.models import (
     User,
 )
 from wpmgr.ssl_cek import sisa_hari_ssl
-from wpmgr.traffic import POLA_PROPERTY
+from wpmgr.traffic import (
+    CATATAN_DUA_SUMBER,
+    POLA_PROPERTY,
+    anomali_site,
+    ringkasan_traffic,
+)
 from wpmgr.uagent import urai_ua
 from wpmgr.uptime import persen_uptime, rata_waktu_ms, teks_durasi, uptime_harian
 from wpmgr.web.auth import pengguna_api
@@ -109,6 +115,24 @@ def uptime_site(site_id: uuid.UUID, pengguna: PenggunaApi, hari: int = 30):
                 for i in insiden
             ],
             "ssl": {"sisa_hari": sisa, "error": site.ssl_error, "teks": ssl_teks},
+        }
+
+
+@router.get("/api/sites/{site_id}/traffic")
+def traffic_site(site_id: uuid.UUID, pengguna: PenggunaApi, hari: int = 30):
+    hari = max(1, min(hari, 90))
+    sampai = _sekarang().date()
+    dari = sampai - timedelta(days=hari - 1)
+    with db.SessionLocal() as sesi:
+        site = _site(sesi, site_id)
+        return {
+            "plugin": ringkasan_traffic(sesi, site.id, dari, sampai, "plugin"),
+            "ga4": ringkasan_traffic(sesi, site.id, dari, sampai, "ga4") if site.ga4_property_id else None,
+            "ga4_terpasang": bool(site.ga4_property_id),
+            "ga4_aktif": bool(get_settings().ga4_credentials),
+            "ga4_error": site.ga4_error,
+            "anomali": anomali_site(sesi, site.id, sampai),
+            "catatan": CATATAN_DUA_SUMBER,
         }
 
 

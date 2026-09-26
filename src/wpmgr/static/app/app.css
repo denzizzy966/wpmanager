@@ -21,3 +21,6 @@ nav.tab button.aktif{background:#e8f0fb;border-color:#ccd;font-weight:600}
 .batang-kolom{flex:1;height:100%;display:flex;align-items:flex-end;background:#f3f4f6}
 .batang-isi{width:100%;background:#5b8def}
 .batang-buruk{background:#d64545}
+.dua-panel{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem}
+.panel{border:1px solid #d5d9de;border-radius:.5rem;padding:.75rem}
+.sumber{display:inline-block;font-size:.75em;font-weight:400;padding:0 .5em;border-radius:.6em;background:#eef0f3;color:#5a626c}

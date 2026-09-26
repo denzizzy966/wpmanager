@@ -1,0 +1,9 @@
+{% macro batang(harian, maks) -%}
+<div class="batang">
+  {% for h in harian %}
+  <div class="batang-kolom" title="{{ h.tanggal }}: {{ h.kunjungan if h.kunjungan is not none else 'tanpa data' }}">
+    <div class="batang-isi" style="height: {{ (((h.kunjungan or 0) / maks) * 100)|round(0, 'ceil')|int if maks else 0 }}%"></div>
+  </div>
+  {% endfor %}
+</div>
+{%- endmacro %}

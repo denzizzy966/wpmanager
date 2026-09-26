@@ -11,11 +11,11 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from wpmgr.jobs.monitoring import simpan_traffic
-from wpmgr.models import Site, SiteStatus, TrafficHarian
+from wpmgr.models import Site, SiteStatus, TrafficHarian, TrafficRincian
 
 log = logging.getLogger("wpmgr.traffic")
 
@@ -221,3 +221,64 @@ def anomali_site(sesi: Session, site_id, hari_ini: date) -> str | None:
         riwayat = [n for t, n in baris.items() if t < kemarin]
         return nilai_anomali(baris.get(kemarin), riwayat)
     return None
+
+
+CATATAN_DUA_SUMBER = (
+    "Angka GA biasanya lebih kecil karena tidak menghitung pengunjung yang memakai "
+    "ad-blocker atau menolak cookie. Keduanya benar menurut cara hitungnya masing-masing."
+)
+NAMA_KATEGORI = {
+    "pencarian": "Pencarian", "sosial": "Media sosial", "langsung": "Langsung",
+    "site_lain": "Site lain", "lainnya": "Lainnya",
+}
+
+
+def urai_asal(kunci: str) -> tuple[str, str]:
+    kategori, _, nama = kunci.partition(":")
+    return NAMA_KATEGORI.get(kategori, "Lainnya"), nama
+
+
+def ringkasan_traffic(sesi: Session, site_id, dari: date, sampai: date, sumber: str) -> dict | None:
+    harian_db = {
+        b.tanggal: b
+        for b in sesi.scalars(
+            select(TrafficHarian).where(
+                TrafficHarian.site_id == site_id, TrafficHarian.sumber == sumber,
+                TrafficHarian.tanggal >= dari, TrafficHarian.tanggal <= sampai,
+            )
+        ).all()
+    }
+    if not harian_db:
+        return None
+    harian = []
+    for i in range((sampai - dari).days + 1):
+        t = dari + timedelta(days=i)
+        b = harian_db.get(t)
+        harian.append({"tanggal": t.isoformat(),
+                       "kunjungan": b.kunjungan if b else None,
+                       "pengunjung": b.pengunjung if b else None})
+
+    jumlah = func.sum(TrafficRincian.kunjungan).label("n")
+    rincian = sesi.execute(
+        select(TrafficRincian.dimensi, TrafficRincian.kunci, jumlah)
+        .where(TrafficRincian.site_id == site_id, TrafficRincian.sumber == sumber,
+               TrafficRincian.tanggal >= dari, TrafficRincian.tanggal <= sampai)
+        .group_by(TrafficRincian.dimensi, TrafficRincian.kunci)
+        .order_by(jumlah.desc())
+    ).all()
+    halaman = [{"kunci": k, "kunjungan": int(n)} for d, k, n in rincian if d == "halaman"][:10]
+    asal = [
+        {"kategori": urai_asal(k)[0], "nama": urai_asal(k)[1], "kunjungan": int(n)}
+        for d, k, n in rincian if d == "asal"
+    ]
+    perangkat = [{"kunci": k, "kunjungan": int(n)} for d, k, n in rincian if d == "perangkat"]
+
+    return {
+        "harian": harian,
+        "total_kunjungan": sum(b.kunjungan for b in harian_db.values()),
+        "total_pengunjung_harian": sum(b.pengunjung for b in harian_db.values()),
+        "maks_harian": max(b.kunjungan for b in harian_db.values()),
+        "halaman": halaman,
+        "asal": asal,
+        "perangkat": perangkat,
+    }

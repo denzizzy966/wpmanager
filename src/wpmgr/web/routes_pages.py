@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
@@ -11,6 +12,7 @@ from wpmgr import db
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import NAMA_ZIP, baca_manifest
 from wpmgr.keamanan import JENDELA_ERROR_BARU, nilai_keamanan
+from wpmgr.laporan import susun_laporan
 from wpmgr.models import (
     ActivityLog,
     CatatanError,
@@ -20,6 +22,7 @@ from wpmgr.models import (
     User,
 )
 from wpmgr.pairing import buat_site
+from wpmgr.traffic import anomali_site
 from wpmgr.web.auth import pengguna_saat_ini
 
 router = APIRouter()
@@ -134,8 +137,12 @@ def simpan_site(
 
 TAB_DETAIL = [
     ("ringkasan", "Ringkasan"), ("paket", "Paket"), ("uptime", "Uptime"),
-    ("error", "Error"), ("login", "Login"), ("aktivitas", "Aktivitas"),
+    ("error", "Error"), ("login", "Login"), ("traffic", "Traffic"), ("aktivitas", "Aktivitas"),
 ]
+# [0-9] dan \Z, bukan \d dan $ (lihat POLA_PROPERTY di traffic.py): \d juga
+# cocok dengan digit non-ASCII, dan $ cocok sebelum baris baru di akhir --
+# keduanya bisa membuat pola ini lolos untuk input yang bukan "YYYY-MM".
+POLA_BULAN = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])\Z")
 
 
 def _bulan_lalu(hari_ini: date) -> str:
@@ -182,10 +189,12 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
             )
         )
         keamanan = nilai_keamanan(sesi, site, sekarang)
+        anomali = anomali_site(sesi, site.id, sekarang.date())
     lencana = {
         "uptime": "!" if site.uptime_status == UptimeStatus.mati else "",
         "error": jumlah_error or "",
         "login": {"perlu_diperiksa": "!", "diserang": "serangan"}.get(keamanan.status.value, ""),
+        "traffic": "!" if anomali else "",
     }
     return _tpl().TemplateResponse(
         request, "site_detail.html",
@@ -194,3 +203,27 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
          "bulan_lalu": _bulan_lalu(sekarang.date()),
          "ga4_aktif": bool(get_settings().ga4_credentials)},
     )
+
+
+@router.get("/sites/{site_id}/laporan/{bulan}")
+def laporan_bulanan(request: Request, site_id: uuid.UUID, bulan: str, pengguna: PenggunaHalaman):
+    cocok = POLA_BULAN.match(bulan)
+    sekarang = datetime.now(timezone.utc)
+    if cocok is None:
+        raise HTTPException(status_code=404, detail="Bulan tidak dikenal")
+    tahun, nomor = int(cocok.group(1)), int(cocok.group(2))
+    try:
+        # Regex membatasi ke 4 digit, tapi "0000-01" tetap lolos regex --
+        # date() menolaknya sendiri (MINYEAR=1), jadi tetap harus ditangkap
+        # supaya bulan tak masuk akal berujung 404, bukan 500.
+        awal_bulan = date(tahun, nomor, 1)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Bulan tidak dikenal") from None
+    if awal_bulan > sekarang.date():
+        raise HTTPException(status_code=404, detail="Bulan ini belum dimulai")
+    with db.SessionLocal() as sesi:
+        site = sesi.get(Site, site_id)
+        if site is None:
+            raise HTTPException(status_code=404, detail="Site tidak ditemukan")
+        data = susun_laporan(sesi, site, tahun, nomor, sekarang)
+    return _tpl().TemplateResponse(request, "laporan.html", {"pengguna": pengguna, **data})

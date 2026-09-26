@@ -1,0 +1,85 @@
+{% from "_batang.html" import batang %}
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <title>Laporan {{ judul_bulan }} — {{ site.nama }}</title>
+  <style>
+    body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#1f2328;max-width:900px;margin:2rem auto;padding:0 1rem;line-height:1.45}
+    h1{margin-bottom:.25rem} h2{border-bottom:1px solid #d5d9de;padding-bottom:.25rem;margin-top:2rem}
+    table{border-collapse:collapse;width:100%} th,td{text-align:left;padding:.3rem .5rem;border-bottom:1px solid #e3e6ea}
+    .dua{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
+    .batang{display:flex;align-items:flex-end;gap:2px;height:70px;margin:.5rem 0}
+    .batang-kolom{flex:1;height:100%;display:flex;align-items:flex-end;background:#f3f4f6}
+    .batang-isi{width:100%;background:#5b8def}
+    .catatan{color:#5a626c;font-size:.9em}
+    @media print{.cetak-sembunyi{display:none} body{margin:0} h2{break-after:avoid}}
+  </style>
+</head>
+<body>
+<p class="cetak-sembunyi"><button type="button" onclick="window.print()">Cetak / simpan PDF</button>
+  <a href="/sites/{{ site.id }}">Kembali ke dashboard</a></p>
+
+<h1>Laporan pemeliharaan website</h1>
+<p><strong>{{ site.nama }}</strong> · {{ site.url }}<br>
+   Periode {{ judul_bulan }} ({{ awal.strftime('%d-%m-%Y') }} s.d. {{ akhir.strftime('%d-%m-%Y') }})</p>
+
+<h2>Ketersediaan</h2>
+{% if uptime.persen is none %}
+  <p>Site belum dipantau pada periode ini.</p>
+{% else %}
+  <p>Uptime <strong>{{ '%.2f'|format(uptime.persen) }}%</strong> · {{ uptime.jumlah_insiden }} insiden ·
+     total waktu tidak dapat diakses {{ uptime.durasi_mati }}</p>
+  {% if uptime.insiden %}
+  <table>
+    <tr><th>Mulai</th><th>Selesai</th><th>Durasi</th><th>Penyebab</th></tr>
+    {% for i in uptime.insiden %}
+    <tr><td>{{ i.mulai.strftime('%d-%m-%Y %H:%M') }}</td>
+        <td>{{ i.selesai.strftime('%d-%m-%Y %H:%M') if i.selesai else 'belum pulih' }}</td>
+        <td>{{ i.durasi }}</td><td>{{ i.penyebab }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+{% endif %}
+
+<h2>Pengunjung</h2>
+{% if not traffic.plugin and not traffic.ga4 %}
+  <p>Belum ada data pengunjung untuk periode ini.</p>
+{% else %}
+<div class="dua">
+  {% for kunci, judul in [('plugin', 'Penghitung WP Manager'), ('ga4', 'Google Analytics')] %}
+  {% set t = traffic[kunci] %}
+  {% if t %}
+  <div>
+    <h3>{{ judul }}</h3>
+    <p>Kunjungan <strong>{{ t.total_kunjungan }}</strong> · jumlah pengunjung harian <strong>{{ t.total_pengunjung_harian }}</strong></p>
+    {{ batang(t.harian, t.maks_harian) }}
+    <h4>Halaman teratas</h4>
+    <ol>{% for h in t.halaman %}<li>{{ h.kunci }} — {{ h.kunjungan }}</li>{% endfor %}</ol>
+    <h4>Asal pengunjung</h4>
+    <ul>{% for a in t.asal %}<li>{{ a.kategori }}{% if a.nama %} · {{ a.nama }}{% endif %}: {{ a.kunjungan }}</li>{% endfor %}</ul>
+    <h4>Perangkat</h4>
+    <ul>{% for p in t.perangkat %}<li>{{ p.kunci }}: {{ p.kunjungan }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+  {% endfor %}
+</div>
+{% if traffic.plugin and traffic.ga4 %}<p class="catatan">{{ catatan }}</p>{% endif %}
+{% endif %}
+
+<h2>Pembaruan yang dikerjakan</h2>
+{% if update %}
+<table>
+  <tr><th>Tanggal</th><th>Komponen</th><th>Versi</th></tr>
+  {% for u in update %}
+  <tr><td>{{ u.tanggal.strftime('%d-%m-%Y') }}</td><td>{{ u.komponen }}</td>
+      <td>{{ u.versi_sebelum }} → {{ u.versi_sesudah }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>Tidak ada pembaruan pada periode ini.</p>
+{% endif %}
+
+<p class="catatan">Dibuat {{ dibuat_pada.strftime('%d-%m-%Y %H:%M') }} UTC oleh WP Manager.</p>
+</body>
+</html>

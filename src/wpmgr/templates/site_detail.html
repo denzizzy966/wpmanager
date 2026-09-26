@@ -188,6 +188,55 @@
     </template>
   </section>
 
+  <section x-show="tab === 'traffic'">
+    <template x-if="traffic">
+      <div>
+        <p class="galat" x-show="traffic.anomali === 'anjlok'">Traffic kemarin anjlok dibandingkan median 14 hari sebelumnya.</p>
+        <p class="info" x-show="traffic.anomali === 'melonjak'">Traffic kemarin melonjak dibandingkan median 14 hari sebelumnya (kemungkinan bot atau kampanye).</p>
+        <div class="dua-panel">
+          <template x-for="panel in panelTraffic()" :key="panel.kunci">
+            <div class="panel">
+              <h3>Kunjungan 30 hari <span class="sumber" x-text="panel.label"></span></h3>
+              <p class="redup" x-show="!panel.data" x-text="panel.kosong"></p>
+              <template x-if="panel.data">
+                <div>
+                  <div class="batang">
+                    <template x-for="h in panel.data.harian" :key="h.tanggal">
+                      <div class="batang-kolom" :title="`${h.tanggal}: ${h.kunjungan ?? 'tanpa data'}`">
+                        <div class="batang-isi" :style="`height:${tinggi(h.kunjungan, panel.data.maks_harian)}%`"></div>
+                      </div>
+                    </template>
+                  </div>
+                  <p>Kunjungan <strong x-text="panel.data.total_kunjungan"></strong> ·
+                     jumlah pengunjung harian <strong x-text="panel.data.total_pengunjung_harian"></strong></p>
+                  <h4>Halaman teratas</h4>
+                  <ol>
+                    <template x-for="h in panel.data.halaman" :key="h.kunci">
+                      <li><span x-text="h.kunci"></span> — <span x-text="h.kunjungan"></span></li>
+                    </template>
+                  </ol>
+                  <h4>Asal pengunjung</h4>
+                  <ul>
+                    <template x-for="a in panel.data.asal" :key="a.kategori + a.nama">
+                      <li x-text="`${a.kategori}${a.nama ? ' · ' + a.nama : ''}: ${a.kunjungan}`"></li>
+                    </template>
+                  </ul>
+                  <h4>Perangkat</h4>
+                  <ul>
+                    <template x-for="p in panel.data.perangkat" :key="p.kunci">
+                      <li x-text="`${p.kunci}: ${p.kunjungan}`"></li>
+                    </template>
+                  </ul>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+        <p class="redup" x-show="traffic.ga4_terpasang" x-text="traffic.catatan"></p>
+      </div>
+    </template>
+  </section>
+
   <section x-show="tab === 'aktivitas'">
     <ul>
       {% for r in riwayat %}
