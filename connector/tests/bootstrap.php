@@ -136,6 +136,16 @@ if ( ! function_exists( 'rest_ensure_response' ) ) {
     }
 }
 
+// wp_cache_flush() tiruan: hanya MENGHITUNG panggilan, dipakai TerapkanTest
+// untuk memastikan cache objek persisten dikosongkan setelah tabel ditukar.
+if ( ! function_exists( 'wp_cache_flush' ) ) {
+    $GLOBALS['wpmgr_test_cache_flush'] = 0;
+    function wp_cache_flush() {
+        $GLOBALS['wpmgr_test_cache_flush'] = ( isset( $GLOBALS['wpmgr_test_cache_flush'] ) ? $GLOBALS['wpmgr_test_cache_flush'] : 0 ) + 1;
+        return true;
+    }
+}
+
 // register_rest_route() tiruan: hanya MENCATAT argumen yang dikirim (kunci
 // namespace+route => array metode/callback/permission_callback), dipakai
 // FileTest.php untuk memverifikasi bahwa /staging/file didaftarkan dengan

@@ -24,6 +24,13 @@ final class WPMGR_FakeDbDorong {
     // Task 8: kueri yang memuat teks ini MELEMPAR (bukan galat biasa) --
     // meniru pengecualian tak terduga dari lapisan database.
     public $lempar_pada = null;
+    // Task 8 fix round 1: nilai variabel sesi yang ditangkap sebelum
+    // diubah (SELECT @@SESSION...), dan jawaban nilai() per potongan teks.
+    public $sesi = array(
+        'sql_mode' => 'STRICT_TRANS_TABLES', 'fk' => '1', 'uc' => '1', 'cs_client' => 'utf8mb4',
+        'cs_conn' => 'utf8mb4', 'cs_results' => 'utf8mb4', 'coll' => 'utf8mb4_unicode_ci', 'lwt' => '31536000',
+    );
+    public $jawaban_nilai = array();
 
     public function prefix() {
         return 'wp_';
@@ -89,6 +96,11 @@ final class WPMGR_FakeDbDorong {
             }
             return isset( $this->opsi['wpmgr_dorong_kunci'] ) ? $this->opsi['wpmgr_dorong_kunci'] : null;
         }
+        foreach ( $this->jawaban_nilai as $pola => $jawaban ) {
+            if ( false !== strpos( $sql, $pola ) ) {
+                return $jawaban;
+            }
+        }
         return null;
     }
 
@@ -102,6 +114,9 @@ final class WPMGR_FakeDbDorong {
                 return null;
             }
             return isset( $this->mesin[ $m[1] ] ) ? $this->mesin[ $m[1] ] : array( 'ENGINE' => 'InnoDB', 'CREATE_OPTIONS' => '' );
+        }
+        if ( false !== strpos( $sql, '@@SESSION.' ) ) {
+            return $this->sesi;
         }
         return null;
     }

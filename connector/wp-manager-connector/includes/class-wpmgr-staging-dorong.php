@@ -643,13 +643,9 @@ class WPMGR_Staging_Dorong {
             if ( 1 !== preg_match( '/^[A-Za-z0-9_$]{1,64}\z/', $t ) ) {
                 continue;
             }
-            $asli = null;
-            foreach ( array( 'wpmgr_tmp_', 'wpmgr_old_' ) as $awalan ) {
-                if ( 0 === strpos( $t, $awalan ) ) {
-                    $asli = substr( $t, strlen( $awalan ) );
-                    break;
-                }
-            }
+            // Task 8 fix round 1: wpmgr_b<n>_ adalah tabel "batal" (hasil
+            // pembalikan yang memuat tulisan produksi pasca-tukar).
+            $asli = 1 === preg_match( '/^(?:wpmgr_tmp_|wpmgr_old_|wpmgr_b[1-9]_)(.*)\z/s', $t, $m ) ? $m[1] : null;
             if ( null === $asli || 0 !== strpos( $asli, $prefix ) ) {
                 continue; // Bukan tabel sementara/lama sama sekali, atau nama aslinya di luar prefix site ini.
             }
@@ -689,7 +685,23 @@ class WPMGR_Staging_Dorong {
         $jenis_list = array( 'tabel_tmp' );
         if ( in_array( $status, self::STATUS_AMAN_TERMINAL, true ) ) {
             $jenis_list[] = 'tabel_old';
+            // Task 8 fix round 1 (R11): tabel batal hanya ada setelah
+            // pemulihan selesai ('dipulihkan', terminal); dihapus di sini --
+            // lewat bersihkan() eksplisit atau cron setelah 24 jam.
+            $jenis_list[] = 'tabel_batal';
         }
+        $sesi = $this->buka_sesi( null );
+        if ( is_wp_error( $sesi ) ) {
+            return $sesi;
+        }
+        try {
+            return $this->kosongkan_jurnal_tabel_inti( $id, $k, $jenis_list );
+        } finally {
+            $this->tutup_sesi( $sesi );
+        }
+    }
+
+    protected function kosongkan_jurnal_tabel_inti( $id, array $k, array $jenis_list ) {
         $dijalankan = 0;
         foreach ( $jenis_list as $kunci_jurnal ) {
             $daftar = ( isset( $k[ $kunci_jurnal ] ) && is_array( $k[ $kunci_jurnal ] ) ) ? $k[ $kunci_jurnal ] : array();
@@ -752,6 +764,28 @@ class WPMGR_Staging_Dorong {
         if ( ! self::id_sah( $id ) ) {
             return $this->galat( 'wpmgr_staging_permintaan', 'Id dorongan tidak sah.', 400 );
         }
+        // Task 8 fix round 1: flock per push yang SAMA dengan terapkan() --
+        // bersihkan tidak pernah berjalan bersamaan dengan satu langkah
+        // (mis. impor yang sedang membuat tabel sementara yang akan di-DROP).
+        $flock = null;
+        if ( is_dir( $this->dir( $id ) ) ) {
+            $flock = $this->kunci_langkah( $id );
+            if ( is_wp_error( $flock ) ) {
+                return $flock;
+            }
+        }
+        try {
+            $hasil = $this->bersihkan_inti( $id );
+        } finally {
+            $this->lepas_kunci_langkah( $flock );
+        }
+        if ( is_array( $hasil ) && false === $hasil['lagi'] ) {
+            @unlink( $this->berkas_kunci_langkah( $id ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+        }
+        return $hasil;
+    }
+
+    protected function bersihkan_inti( $id ) {
         $k      = $this->keadaan( $id );
         $status = $this->status( $k );
         if ( null !== $k && ! in_array( $status, self::STATUS_BOLEH_BERSIHKAN, true ) ) {
@@ -789,9 +823,10 @@ class WPMGR_Staging_Dorong {
             // begitu saja, mengorphankan tabel yang masih tercatat di sana
             // secara permanen. cron() bisa mencapai jalur ini (push lain
             // baru merebut kunci di antara pemeriksaan status dan di sini).
-            $tmp_tersisa = ( isset( $k['tabel_tmp'] ) && is_array( $k['tabel_tmp'] ) ) ? $k['tabel_tmp'] : array();
-            $old_tersisa = ( isset( $k['tabel_old'] ) && is_array( $k['tabel_old'] ) ) ? $k['tabel_old'] : array();
-            if ( ! empty( $tmp_tersisa ) || ! empty( $old_tersisa ) ) {
+            $tmp_tersisa   = ( isset( $k['tabel_tmp'] ) && is_array( $k['tabel_tmp'] ) ) ? $k['tabel_tmp'] : array();
+            $old_tersisa   = ( isset( $k['tabel_old'] ) && is_array( $k['tabel_old'] ) ) ? $k['tabel_old'] : array();
+            $batal_tersisa = ( isset( $k['tabel_batal'] ) && is_array( $k['tabel_batal'] ) ) ? $k['tabel_batal'] : array();
+            if ( ! empty( $tmp_tersisa ) || ! empty( $old_tersisa ) || ! empty( $batal_tersisa ) ) {
                 return array( 'lagi' => true );
             }
         }
@@ -829,6 +864,7 @@ class WPMGR_Staging_Dorong {
      */
     public function terapkan( $p ) {
         $flock = null;
+        $aktif = null; // [id, langkah] setelah flock + kunci dipegang
         try {
             if ( ! is_array( $p ) || ! isset( $p['dorong_id'], $p['langkah'] ) || ! self::id_sah( $p['dorong_id'] ) ) {
                 return $this->galat( 'wpmgr_staging_permintaan', 'Permintaan terapkan tidak sah.', 400 );
@@ -867,6 +903,7 @@ class WPMGR_Staging_Dorong {
             if ( 'direbut' === $this->status( $k ) ) {
                 return $this->galat_direbut();
             }
+            $aktif = array( $id, $langkah );
             switch ( $langkah ) {
                 case 'siapkan':
                     return $this->siapkan( $id, $k, $p );
@@ -881,6 +918,19 @@ class WPMGR_Staging_Dorong {
             }
         } catch ( \Throwable $e ) {
             unset( $e );
+            // Fix round 1: pengecualian di tengah tukar tidak boleh
+            // meninggalkan produksi setengah tertukar sampai cron datang --
+            // pemulihan otomatis dijalankan sekarang (flock masih dipegang).
+            if ( null !== $aktif && 'tukar' === $aktif[1] ) {
+                try {
+                    if ( 'menukar' === $this->status( $this->keadaan( $aktif[0] ) ) ) {
+                        return $this->gagal_tukar( $aktif[0],
+                            $this->galat( 'wpmgr_staging_tukar', 'Galat tak terduga di tengah penukaran.', 500 ) );
+                    }
+                } catch ( \Throwable $e2 ) {
+                    unset( $e2 );
+                }
+            }
             return $this->galat( 'wpmgr_staging_galat', 'Galat tak terduga saat menerapkan dorongan; lihat log server.', 500 );
         } finally {
             $this->lepas_kunci_langkah( $flock );
@@ -914,9 +964,18 @@ class WPMGR_Staging_Dorong {
         return $k['hasil'][ $langkah ];
     }
 
-    /** flock non-blok atas <area>/terapkan.lock; WP_Error 409 bila langkah lain sedang berjalan. */
+    /**
+     * Berkas flock per push, DI LUAR area push itu sendiri: bersihkan()
+     * memegangnya selagi menghapus area (Windows tidak bisa menghapus
+     * berkas yang sedang terbuka), lalu menghapusnya setelah dilepas.
+     */
+    protected function berkas_kunci_langkah( $id ) {
+        return $this->dasar . $id . '.lock';
+    }
+
+    /** flock non-blok atas <dasar>/<id>.lock; WP_Error 409 bila langkah lain sedang berjalan. */
     protected function kunci_langkah( $id ) {
-        $h = @fopen( $this->dir( $id ) . 'terapkan.lock', 'c' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+        $h = @fopen( $this->berkas_kunci_langkah( $id ), 'c' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
         if ( false === $h ) {
             return $this->galat( 'wpmgr_staging_tulis', 'Kunci langkah dorongan tidak dapat dibuka.', 500 );
         }
@@ -1174,30 +1233,98 @@ class WPMGR_Staging_Dorong {
     // ---- impor --------------------------------------------------------
 
     /**
-     * Sesi koneksi untuk mengeksekusi keluaran WPMGR_Staging_Sql::ubah().
-     * sql_mode SENGAJA tidak memuat NO_BACKSLASH_ESCAPES: pemecah dan
-     * validator Task 7 mengasumsikan escape backslash; dengan mode itu
-     * server akan membaca batas literal berbeda dari validatornya.
+     * Membuka sesi database untuk satu blok kerja di koneksi $wpdb BERSAMA
+     * (sisa request WordPress memakai koneksi yang sama), mengembalikan
+     * nilai variabel sesi sebelumnya untuk tutup_sesi().
+     *
+     * $charset string (impor, tukar_db): SET NAMES, FOREIGN_KEY_CHECKS=0,
+     * UNIQUE_CHECKS=0, dan sql_mode yang SENGAJA tanpa NO_BACKSLASH_ESCAPES
+     * -- pemecah dan validator Task 7 mengasumsikan escape backslash.
+     * $charset null: hanya lock_wait_timeout.
+     *
+     * Fix round 1 (I1): lock_wait_timeout = 5 SELALU diset. Bawaan server
+     * 1 tahun (MySQL 8) / 1 hari (MariaDB): RENAME/DROP yang menunggu
+     * metadata lock transaksi lain membuat semua pembacaan front-end antre
+     * di belakangnya, dan bila klien diputus pernyataan itu tetap antre di
+     * server lalu berjalan belakangan -- membalik jawaban "apakah tukar
+     * terjadi" setelah dorongan dinilai. Dengan batas ini galat 1205
+     * masuk jalur gagal/pemulihan yang biasa.
      */
-    protected function sesi_impor( $charset ) {
-        if ( ! in_array( $charset, self::CHARSET, true ) ) {
-            return 'charset';
+    protected function buka_sesi( $charset ) {
+        if ( null !== $charset && ! in_array( $charset, self::CHARSET, true ) ) {
+            return $this->galat_db( 'Charset sesi database tidak sah.' );
         }
-        foreach ( array( "SET NAMES {$charset}", 'SET FOREIGN_KEY_CHECKS=0', 'SET UNIQUE_CHECKS=0',
-                         "SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO'" ) as $q ) {
-            $r = $this->db->kueri( $q );
-            if ( true !== $r ) {
-                return $r;
+        $lama = $this->db->baris( 'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.foreign_key_checks AS fk,'
+            . ' @@SESSION.unique_checks AS uc, @@SESSION.character_set_client AS cs_client,'
+            . ' @@SESSION.character_set_connection AS cs_conn, @@SESSION.character_set_results AS cs_results,'
+            . ' @@SESSION.collation_connection AS coll, @@SESSION.lock_wait_timeout AS lwt' );
+        if ( '' !== $this->db->galat_terakhir() || ! is_array( $lama ) ) {
+            return $this->galat_db( 'Variabel sesi database tidak dapat dibaca.' );
+        }
+        $sesi = array( 'lama' => array_change_key_case( $lama, CASE_LOWER ), 'penuh' => null !== $charset );
+        $set  = array();
+        if ( null !== $charset ) {
+            $set = array( "SET NAMES {$charset}", 'SET FOREIGN_KEY_CHECKS=0', 'SET UNIQUE_CHECKS=0',
+                          "SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO'" );
+        }
+        $set[] = 'SET SESSION lock_wait_timeout = 5';
+        foreach ( $set as $q ) {
+            if ( true !== $this->db->kueri( $q ) ) {
+                $this->tutup_sesi( $sesi );
+                return $this->galat_db( 'Sesi database tidak dapat disiapkan.' );
             }
         }
-        return true;
+        return $sesi;
+    }
+
+    /** Mengembalikan variabel sesi yang diubah buka_sesi(); nilai yang tidak lolos validasi tidak ditanam ke SQL. */
+    protected function tutup_sesi( $sesi ) {
+        if ( ! is_array( $sesi ) || ! isset( $sesi['lama'] ) ) {
+            return;
+        }
+        $l   = $sesi['lama'];
+        $ada = function ( $kunci, $pola ) use ( $l ) {
+            return isset( $l[ $kunci ] ) && 1 === preg_match( $pola, (string) $l[ $kunci ] );
+        };
+        $q = array();
+        if ( $sesi['penuh'] ) {
+            if ( $ada( 'sql_mode', '/^[A-Za-z0-9_,]*\z/' ) ) {
+                $q[] = "SET SESSION sql_mode = '" . $l['sql_mode'] . "'";
+            }
+            foreach ( array( 'fk' => 'FOREIGN_KEY_CHECKS', 'uc' => 'UNIQUE_CHECKS' ) as $kunci => $nama ) {
+                if ( $ada( $kunci, '/^[01]\z/' ) ) {
+                    $q[] = "SET SESSION {$nama} = " . (int) $l[ $kunci ];
+                }
+            }
+            foreach ( array( 'cs_client' => 'character_set_client', 'cs_conn' => 'character_set_connection',
+                             'cs_results' => 'character_set_results', 'coll' => 'collation_connection' ) as $kunci => $nama ) {
+                if ( $ada( $kunci, '/^[A-Za-z0-9_]{1,64}\z/' ) ) {
+                    $q[] = "SET SESSION {$nama} = " . $l[ $kunci ];
+                } elseif ( 'cs_results' === $kunci && array_key_exists( $kunci, $l ) && null === $l[ $kunci ] ) {
+                    $q[] = 'SET SESSION character_set_results = NULL';
+                }
+            }
+        }
+        if ( $ada( 'lwt', '/^[0-9]{1,9}\z/' ) && (int) $l['lwt'] >= 1 ) {
+            $q[] = 'SET SESSION lock_wait_timeout = ' . (int) $l['lwt'];
+        }
+        foreach ( $q as $satu ) {
+            $this->db->kueri( $satu );
+        }
+    }
+
+    /** Fix round 1 (I3): cache objek persisten (Redis/Memcached) jangan menyajikan opsi/post dari sebelum tabel ditukar. */
+    protected function kosongkan_cache() {
+        if ( function_exists( 'wp_cache_flush' ) ) {
+            wp_cache_flush();
+        }
     }
 
     /** Set nama tabel yang ada di bawah prefix site, wpmgr_tmp_<prefix>, dan wpmgr_old_<prefix>. */
     protected function tabel_ada() {
         $prefix = $this->db->prefix();
         $hasil  = array();
-        foreach ( array( $prefix, 'wpmgr_tmp_' . $prefix, 'wpmgr_old_' . $prefix ) as $awal ) {
+        foreach ( array( $prefix, 'wpmgr_tmp_' . $prefix, 'wpmgr_old_' . $prefix, 'wpmgr_b' ) as $awal ) {
             $daftar = $this->db->kolom( "SHOW TABLES LIKE '" . $this->db->suka( $awal ) . "%'" );
             if ( '' !== $this->db->galat_terakhir() ) {
                 return $this->galat_db( 'Daftar tabel tidak dapat dibaca.' );
@@ -1233,6 +1360,18 @@ class WPMGR_Staging_Dorong {
         if ( empty( $daftar ) ) {
             return true;
         }
+        $sesi = $this->buka_sesi( null );
+        if ( is_wp_error( $sesi ) ) {
+            return $sesi;
+        }
+        try {
+            return $this->hapus_tabel_jurnal_inti( $id, $k, $kunci_jurnal, $daftar );
+        } finally {
+            $this->tutup_sesi( $sesi );
+        }
+    }
+
+    protected function hapus_tabel_jurnal_inti( $id, array &$k, $kunci_jurnal, array $daftar ) {
         $aman = $this->tabel_journal_aman( $daftar );
         if ( is_wp_error( $aman ) ) {
             return $aman;
@@ -1357,7 +1496,36 @@ class WPMGR_Staging_Dorong {
                 return $r;
             }
         }
-        return true;
+        return $this->pastikan_connector_aktif( $tmp );
+    }
+
+    /**
+     * Fix round 1 (I4): active_plugins ikut dari staging. Bila connector
+     * nonaktif di sana, sesudah tukar dashboard tidak bisa lagi mencapai
+     * selesai/pulihkan. Nilainya array terserialisasi, jadi dibaca, diubah
+     * di PHP (tanpa objek: allowed_classes=false), lalu ditulis kembali.
+     */
+    protected function pastikan_connector_aktif( $tmp ) {
+        $basename = self::basename_connector();
+        $nilai    = $this->db->nilai( "SELECT option_value FROM `{$tmp}` WHERE option_name = 'active_plugins'" );
+        if ( '' !== $this->db->galat_terakhir() ) {
+            return 'active_plugins tidak dapat dibaca.';
+        }
+        if ( null === $nilai ) {
+            $q = $this->db->siapkan( "INSERT INTO `{$tmp}` (`option_name`, `option_value`, `autoload`) VALUES ('active_plugins', %s, 'yes')",
+                serialize( array( $basename ) ) );
+        } else {
+            $daftar = @unserialize( (string) $nilai, array( 'allowed_classes' => false ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+            $daftar = is_array( $daftar ) ? array_values( array_filter( $daftar, 'is_string' ) ) : array();
+            if ( in_array( $basename, $daftar, true ) ) {
+                return true;
+            }
+            $daftar[] = $basename;
+            $daftar   = array_values( array_unique( $daftar ) );
+            sort( $daftar ); // WordPress sendiri menyimpan daftar ini terurut (activate_plugin()).
+            $q = $this->db->siapkan( "UPDATE `{$tmp}` SET option_value = %s WHERE option_name = 'active_plugins'", serialize( $daftar ) );
+        }
+        return $this->db->kueri( $q );
     }
 
     protected function impor( $id, array $k ) {
@@ -1374,9 +1542,19 @@ class WPMGR_Staging_Dorong {
                 return $k;
             }
         }
-        if ( true !== $this->sesi_impor( $k['charset'] ) ) {
+        $sesi = $this->buka_sesi( isset( $k['charset'] ) ? $k['charset'] : '' );
+        if ( is_wp_error( $sesi ) ) {
             return $this->galat( 'wpmgr_staging_impor', 'Sesi impor database tidak dapat disiapkan.', 500 );
         }
+        try {
+            return $this->impor_dalam_sesi( $id, $k );
+        } finally {
+            $this->tutup_sesi( $sesi );
+        }
+    }
+
+    /** Badan impor; sesi database sudah dibuka impor() dan ditutup di finally-nya. */
+    protected function impor_dalam_sesi( $id, array $k ) {
         $prefix       = $this->db->prefix();
         $prefix_asing = $this->prefix_asing_site();
         if ( is_wp_error( $prefix_asing ) ) {
@@ -1470,7 +1648,27 @@ class WPMGR_Staging_Dorong {
         return $ops;
     }
 
+    /** Fix round 1: hanya hash sha256 heksadesimal yang pernah ditanam ke kode PHP. */
+    protected static function hash_sah( $hash ) {
+        return is_string( $hash ) && 1 === preg_match( '/^[0-9a-f]{64}\z/', $hash );
+    }
+
+    protected static function basename_sah( $b ) {
+        return is_string( $b ) && 1 === preg_match( '/^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}\.php\z/', $b )
+            && false === strpos( $b, '..' );
+    }
+
+    /** Basename plugin connector (plugin_basename(WPMGR_FILE)), atau bawaan bila tidak tersedia/tidak sah. */
+    public static function basename_connector() {
+        $b = ( defined( 'WPMGR_FILE' ) && function_exists( 'plugin_basename' ) ) ? plugin_basename( WPMGR_FILE ) : '';
+        return self::basename_sah( $b ) ? $b : 'wp-manager-connector/wp-manager-connector.php';
+    }
+
+    /** '' bila $hash tidak sah -- pemanggil memperlakukannya sebagai gagal pasang. */
     public static function isi_maintenance( $hash, $sampai ) {
+        if ( ! self::hash_sah( $hash ) ) {
+            return '';
+        }
         return "<?php\n// " . self::TANDA_MAINTENANCE . ".\n"
             . "// WordPress mengabaikan berkas ini 10 menit setelah \$upgrading, jadi batasnya 15 menit sejak dibuat.\n"
             . '$upgrading = ' . (int) $sampai . ";\n"
@@ -1479,12 +1677,17 @@ class WPMGR_Staging_Dorong {
             . "}\n";
     }
 
-    public static function isi_mu_aman( $hash ) {
+    /** '' bila $hash tidak sah; $basename yang tidak lolos regex ketat diganti basename_connector(). */
+    public static function isi_mu_aman( $hash, $basename = null ) {
+        if ( ! self::hash_sah( $hash ) ) {
+            return '';
+        }
+        $basename = self::basename_sah( $basename ) ? $basename : self::basename_connector();
         return "<?php\n/**\n * Plugin Name: WP Manager — pengaman dorong (sementara)\n"
             . " * Description: Dipasang selama dorongan staging diterapkan dan dihapus sesudahnya.\n */\n"
             . "if ( isset( \$_SERVER['HTTP_X_WPMGR_LEWATI'] ) && hash_equals( '" . $hash . "', hash( 'sha256', (string) \$_SERVER['HTTP_X_WPMGR_LEWATI'] ) ) ) {\n"
             . "    add_filter( 'option_active_plugins', function () {\n"
-            . "        return array( 'wp-manager-connector/wp-manager-connector.php' );\n"
+            . "        return array( '" . $basename . "' );\n"
             . "    }, PHP_INT_MAX );\n"
             . "    add_filter( 'site_option_active_sitewide_plugins', function () {\n"
             . "        return array();\n"
@@ -1531,8 +1734,9 @@ class WPMGR_Staging_Dorong {
         if ( $this->maintenance_asing() ) {
             return false;
         }
-        $hash = (string) $k['token_hash'];
-        if ( ! $this->tulis_atomik( $this->akar . '.maintenance', self::isi_maintenance( $hash, (int) $k['maintenance_dibuat'] + 300 ) ) ) {
+        $hash = isset( $k['token_hash'] ) ? (string) $k['token_hash'] : '';
+        $isi  = self::isi_maintenance( $hash, (int) $k['maintenance_dibuat'] + 300 );
+        if ( '' === $isi || ! $this->tulis_atomik( $this->akar . '.maintenance', $isi ) ) {
             return false;
         }
         $mu = $this->dir_mu . self::MU_AMAN;
@@ -1701,9 +1905,19 @@ class WPMGR_Staging_Dorong {
             $simpan          = $this->sentuh_wajib( $id, $k );
             return is_wp_error( $simpan ) ? $simpan : true;
         }
-        if ( true !== $this->sesi_impor( isset( $k['charset'] ) ? $k['charset'] : '' ) ) {
+        $sesi = $this->buka_sesi( isset( $k['charset'] ) ? $k['charset'] : '' );
+        if ( is_wp_error( $sesi ) ) {
             return $this->galat( 'wpmgr_staging_tukar', 'Sesi database tidak dapat disiapkan.', 500 );
         }
+        try {
+            return $this->tukar_db_dalam_sesi( $id, $k, $ada );
+        } finally {
+            $this->tutup_sesi( $sesi );
+        }
+    }
+
+    /** Badan tukar_db(); sesi (lock_wait_timeout = 5) sudah dibuka pemanggil. */
+    protected function tukar_db_dalam_sesi( $id, array &$k, array $ada ) {
         if ( true !== $this->pertahankan_opsi( $k ) ) {
             return $this->galat( 'wpmgr_staging_tukar', 'Opsi produksi tidak dapat dipertahankan.', 500 );
         }
@@ -1755,6 +1969,7 @@ class WPMGR_Staging_Dorong {
         }
         $k['db_ditukar'] = true;
         $k               = $this->sentuh( $id, $k );
+        $this->kosongkan_cache();
         return true;
     }
 
@@ -1776,6 +1991,14 @@ class WPMGR_Staging_Dorong {
             if ( ! $this->token_cocok( $k, $token ) ) {
                 return $this->galat( 'wpmgr_staging_token', 'Token tukar tidak cocok.', 403 );
             }
+            // Fix round 1: pengaman dipasang ulang pada SETIAP request tukar
+            // dengan cap waktu segar -- .maintenance yang hilang atau
+            // kedaluwarsa di tengah tukar panjang kembali; bila dashboard
+            // berhenti, site tetap pulih sendiri 15 menit setelah aktivitas
+            // terakhir. Gagal memasang di sini tidak menghentikan tukar.
+            $k['maintenance_dibuat'] = time();
+            $k                       = $this->sentuh( $id, $k );
+            $this->pasang_pengaman( $k );
         } else {
             if ( ( empty( $k['sql'] ) ? 'siap' : 'terimpor' ) !== $k['status'] ) {
                 return $this->galat( 'wpmgr_staging_urutan', 'Dorongan belum siap ditukar.', 409 );
@@ -1831,9 +2054,16 @@ class WPMGR_Staging_Dorong {
                 return $this->gagal_tukar( $id, $hasil );
             }
         }
-        $this->lepas_pengaman();
+        // Fix round 1 (I2a): 'ditukar' disimpan DULU, baru pengaman dilepas.
+        // Bila keadaan tidak tersimpan, pengaman tetap terpasang dan langkah
+        // gagal -- ulangan tukar menyelesaikannya (semua operasi idempoten).
         $k['status'] = 'ditukar';
-        return $this->selesaikan_langkah( $id, $k, 'tukar', array( 'selesai' => true, 'status' => 'ditukar' ) );
+        $hasil       = $this->selesaikan_langkah( $id, $k, 'tukar', array( 'selesai' => true, 'status' => 'ditukar' ) );
+        if ( is_wp_error( $hasil ) ) {
+            return $hasil;
+        }
+        $this->lepas_pengaman();
+        return $hasil;
     }
 
     // ---- pulihkan -----------------------------------------------------
@@ -1843,9 +2073,9 @@ class WPMGR_Staging_Dorong {
      * perlu dibalik"); string = masalah (pesan tetap). Setiap cabang
      * idempoten, jadi entri yang sama boleh dibalik berkali-kali.
      */
-    protected function balikkan( $id, array $e ) {
+    protected function balikkan( $id, array $e, array &$k ) {
         if ( 'db' === $e['aksi'] ) {
-            return $this->balikkan_db( isset( $e['tabel'] ) ? (array) $e['tabel'] : array() );
+            return $this->balikkan_db( $id, $k, isset( $e['tabel'] ) ? (array) $e['tabel'] : array() );
         }
         $rel = isset( $e['path'] ) ? $e['path'] : null;
         if ( ! is_string( $rel ) || ! WPMGR_Staging_Path::boleh_ditulis( $rel ) ) {
@@ -1878,7 +2108,7 @@ class WPMGR_Staging_Dorong {
      * untuk tabel baru, wpmgr_tmp_* sudah tidak ada (tabel itu kita buat
      * dan hanya bisa hilang lewat RENAME). Satu pernyataan, atomik.
      */
-    protected function balikkan_db( array $tabel ) {
+    protected function balikkan_db( $id, array &$k, array $tabel ) {
         $ada = $this->tabel_ada();
         if ( is_wp_error( $ada ) ) {
             return 'Daftar tabel tidak dapat dibaca.';
@@ -1909,7 +2139,107 @@ class WPMGR_Staging_Dorong {
         if ( empty( $pasang ) ) {
             return true;
         }
-        return true === $this->db->kueri( 'RENAME TABLE ' . implode( ', ', $pasang ) ) ? true : 'Tabel database tidak dapat dikembalikan.';
+        // Tulis-lebih-dulu (fix round 1, I2b): tanda bahwa tabel produksi
+        // sesudah tukar (yang bisa memuat pesanan/komentar baru) dikembalikan
+        // ke nama wpmgr_tmp_* -- pulihkan lalu menyimpannya sebagai tabel
+        // batal, bukan men-DROP-nya.
+        $k['db_dibalik'] = true;
+        $simpan          = $this->sentuh_wajib( $id, $k );
+        if ( is_wp_error( $simpan ) ) {
+            return 'Keadaan dorongan tidak dapat disimpan.';
+        }
+        $k    = $simpan;
+        $sesi = $this->buka_sesi( null );
+        if ( is_wp_error( $sesi ) ) {
+            return 'Sesi database tidak dapat disiapkan.';
+        }
+        try {
+            $r = $this->db->kueri( 'RENAME TABLE ' . implode( ', ', $pasang ) );
+        } finally {
+            $this->tutup_sesi( $sesi );
+        }
+        if ( true !== $r ) {
+            return 'Tabel database tidak dapat dikembalikan.';
+        }
+        $this->kosongkan_cache();
+        return true;
+    }
+
+    /**
+     * Fix round 1 (I2b, Ruling R11): setelah pertukaran DB yang terbukti,
+     * tabel yang dibalik ke wpmgr_tmp_* memuat tulisan produksi SESUDAH
+     * tukar (pesanan, komentar). Tabel itu TIDAK di-DROP, tetapi diganti
+     * nama ke wpmgr_b<n>_<asli> (n = slot bebas terkecil 1..9) dan dicatat
+     * di jurnal 'tabel_batal'. Hanya bersihkan() (eksplisit, atau cron
+     * setelah 24 jam) yang menghapusnya.
+     *
+     * Bentuk nama: 'wpmgr_batal_' (12 karakter) tidak muat untuk nama asli
+     * sampai 54 karakter (batas ubah(): 'wpmgr_tmp_' + asli <= 64), jadi
+     * dipakai awalan 9 karakter 'wpmgr_b<n>_'; slot memberi nama yang
+     * deterministik walau pemulihan sebelumnya masih menyisakan tabelnya.
+     */
+    protected function simpan_tabel_batal( $id, array &$k ) {
+        $calon = array();
+        foreach ( ( isset( $k['db_rencana'] ) && is_array( $k['db_rencana'] ) ) ? $k['db_rencana'] : array() as $t ) {
+            if ( is_array( $t ) && isset( $t[0] ) && 1 === preg_match( '/^[A-Za-z0-9_$]{1,54}\z/', (string) $t[0] ) ) {
+                $calon[ 'wpmgr_tmp_' . $t[0] ] = (string) $t[0];
+            }
+        }
+        if ( empty( $calon ) ) {
+            return true;
+        }
+        $ada = $this->tabel_ada();
+        if ( is_wp_error( $ada ) ) {
+            return $ada;
+        }
+        $aman = $this->tabel_journal_aman( $this->jurnal_tmp( $k ) );
+        if ( is_wp_error( $aman ) ) {
+            return $aman;
+        }
+        $sesi = $this->buka_sesi( null );
+        if ( is_wp_error( $sesi ) ) {
+            return $sesi;
+        }
+        try {
+            foreach ( $aman as $t ) {
+                if ( ! isset( $calon[ $t ], $ada[ $t ] ) ) {
+                    continue;
+                }
+                $nama = null;
+                for ( $n = 1; $n <= 9 && null === $nama; $n++ ) {
+                    $c = 'wpmgr_b' . $n . '_' . $calon[ $t ];
+                    if ( ! isset( $ada[ $c ] ) ) {
+                        $nama = $c;
+                    }
+                }
+                if ( null === $nama ) {
+                    return $this->galat( 'wpmgr_staging_pulihkan',
+                        'Tidak ada nama cadangan bebas untuk tabel yang dibatalkan; bersihkan dorongan sebelumnya dulu.', 500 );
+                }
+                $batal            = ( isset( $k['tabel_batal'] ) && is_array( $k['tabel_batal'] ) ) ? $k['tabel_batal'] : array();
+                $batal[]          = $nama;
+                $k['tabel_batal'] = array_values( array_unique( $batal ) );
+                $simpan           = $this->sentuh_wajib( $id, $k );
+                if ( is_wp_error( $simpan ) ) {
+                    return $simpan;
+                }
+                $k = $simpan;
+                if ( true !== $this->db->kueri( "RENAME TABLE `{$t}` TO `{$nama}`" ) ) {
+                    // Nama itu tidak jadi milik kita: jangan sampai bersihkan()
+                    // kelak men-DROP tabel lain yang memakainya.
+                    $k['tabel_batal'] = array_values( array_diff( $k['tabel_batal'], array( $nama ) ) );
+                    $k                = $this->sentuh( $id, $k );
+                    return $this->galat( 'wpmgr_staging_pulihkan', 'Tabel yang dibatalkan tidak dapat disimpan.', 500 );
+                }
+                $ada[ $nama ] = true;
+                unset( $ada[ $t ] );
+                $k['tabel_tmp'] = array_values( array_diff( $this->jurnal_tmp( $k ), array( $t ) ) );
+                $k              = $this->sentuh( $id, $k );
+            }
+        } finally {
+            $this->tutup_sesi( $sesi );
+        }
+        return true;
     }
 
     /** Dipanggil cron() dan pemanggil luar: flock dulu, lalu pulihkan_inti(). */
@@ -1975,17 +2305,19 @@ class WPMGR_Staging_Dorong {
         if ( ! $paksa && ! $this->token_cocok( $k, $token ) ) {
             return $this->galat( 'wpmgr_staging_token', 'Token pemulihan tidak cocok.', 403 );
         }
+        $awal = array( 'status' => 'memulihkan', 'maintenance_dibuat' => time() );
         if ( 'memulihkan' !== $status ) {
-            $k = $this->sentuh_wajib( $id, array_merge( $k, array(
-                'status' => 'memulihkan', 'pulih' => 0, 'pulih_gagal' => 0, 'maintenance_dibuat' => time(),
-            ) ) );
-            if ( is_wp_error( $k ) ) {
-                return $k;
-            }
-            // Gagal memasang pengaman tidak menghentikan pemulihan: produksi
-            // yang setengah tertukar lebih buruk daripada tanpa maintenance.
-            $this->pasang_pengaman( $k );
+            $awal['pulih']       = 0;
+            $awal['pulih_gagal'] = 0;
         }
+        $k = $this->sentuh_wajib( $id, array_merge( $k, $awal ) );
+        if ( is_wp_error( $k ) ) {
+            return $k;
+        }
+        // Dipasang ulang pada SETIAP request pulihkan (fix round 1) dengan
+        // cap waktu segar. Gagal memasang tidak menghentikan pemulihan:
+        // produksi setengah tertukar lebih buruk daripada tanpa maintenance.
+        $this->pasang_pengaman( $k );
         $jurnal = $this->baca_jurnal( $id );
         $sudah  = isset( $k['pulih'] ) ? (int) $k['pulih'] : 0;
         $gagal  = isset( $k['pulih_gagal'] ) ? (int) $k['pulih_gagal'] : 0;
@@ -1994,7 +2326,7 @@ class WPMGR_Staging_Dorong {
             if ( $maju && $this->waktu_habis() ) {
                 return $this->lagi( $id, $k );
             }
-            if ( true !== $this->balikkan( $id, $jurnal[ $i ] ) ) {
+            if ( true !== $this->balikkan( $id, $jurnal[ $i ], $k ) ) {
                 $gagal++;
             }
             $sudah++;
@@ -2021,13 +2353,24 @@ class WPMGR_Staging_Dorong {
             return $this->galat( 'wpmgr_staging_pulihkan',
                 'Sebagian berkas atau tabel belum dapat dikembalikan; ulangi langkah pulihkan.', 500 );
         }
+        if ( ! empty( $k['db_ditukar'] ) || ! empty( $k['db_dibalik'] ) ) {
+            $r = $this->simpan_tabel_batal( $id, $k );
+            if ( is_wp_error( $r ) ) {
+                return $r;
+            }
+        }
         $r = $this->hapus_tabel_jurnal( $id, $k, 'tabel_tmp' );
         if ( is_wp_error( $r ) ) {
             return $r;
         }
-        $this->lepas_pengaman();
-        $k['status'] = 'dipulihkan';
-        return $this->selesaikan_langkah( $id, $k, 'pulihkan', $hasil );
+        // Semua wpmgr_old_* sudah terbukti kembali ke nama aslinya di atas.
+        $k['tabel_old'] = array();
+        $k['status']    = 'dipulihkan';
+        $hasil          = $this->selesaikan_langkah( $id, $k, 'pulihkan', $hasil );
+        if ( ! is_wp_error( $hasil ) ) {
+            $this->lepas_pengaman();
+        }
+        return $hasil;
     }
 
     // ---- selesai ------------------------------------------------------

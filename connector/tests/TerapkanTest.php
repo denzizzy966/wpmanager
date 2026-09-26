@@ -1,6 +1,18 @@
 <?php
 use PHPUnit\Framework\TestCase;
 
+/** Menyuntikkan kegagalan tulis keadaan untuk satu status tertentu. */
+final class WPMGR_DorongGagalSimpan extends WPMGR_Staging_Dorong {
+    public $gagal_status = null;
+
+    public function simpan_keadaan( $id, array $k ) {
+        if ( isset( $k['status'] ) && $k['status'] === $this->gagal_status ) {
+            return false;
+        }
+        return parent::simpan_keadaan( $id, $k );
+    }
+}
+
 final class TerapkanTest extends TestCase {
 
     const ID    = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -249,8 +261,283 @@ final class TerapkanTest extends TestCase {
         $this->assertNotContains( 'wpmgr_old_wp_posts', $this->db->tabel );
         $this->assertNotContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
         $this->assertNotContains( 'wpmgr_tmp_wp_options', $this->db->tabel );
+        // Fix round 1 (I2b): tabel yang dibalik setelah pertukaran terbukti
+        // memuat tulisan produksi pasca-tukar -- disimpan, bukan di-DROP.
+        $this->assertContains( 'wpmgr_b1_wp_posts', $this->db->tabel );
+        $this->assertContains( 'wpmgr_b1_wp_options', $this->db->tabel );
         $this->assertFileDoesNotExist( $this->akar . '.maintenance' );
         $this->assertFileDoesNotExist( $this->akar . 'wp-content/mu-plugins/wpmgr-dorong-aman.php' );
+    }
+
+    // ------------------------------------------------------------------
+    // Fix round 1.
+    // ------------------------------------------------------------------
+
+    /** Setiap RENAME/DROP didahului lock_wait_timeout = 5 dan diikuti pemulihan nilai sesi sebelumnya. */
+    private function cek_batas_kunci( $pola ) {
+        $q     = $this->db->kueri;
+        $ketemu = 0;
+        foreach ( $q as $i => $sql ) {
+            if ( 1 !== preg_match( $pola, $sql ) ) {
+                continue;
+            }
+            $ketemu++;
+            $sebelum = null;
+            for ( $j = $i - 1; $j >= 0; $j-- ) {
+                if ( 0 === strpos( $q[ $j ], 'SET SESSION lock_wait_timeout' ) ) {
+                    $sebelum = $q[ $j ];
+                    break;
+                }
+            }
+            $sesudah = null;
+            for ( $j = $i + 1; $j < count( $q ); $j++ ) {
+                if ( 0 === strpos( $q[ $j ], 'SET SESSION lock_wait_timeout' ) ) {
+                    $sesudah = $q[ $j ];
+                    break;
+                }
+            }
+            $this->assertSame( 'SET SESSION lock_wait_timeout = 5', $sebelum, $sql );
+            $this->assertSame( 'SET SESSION lock_wait_timeout = 31536000', $sesudah, $sql );
+        }
+        return $ketemu;
+    }
+
+    public function test_rename_dan_drop_memakai_lock_wait_timeout_lalu_dikembalikan(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) );
+        // Tukar, balik, dan dua rename ke tabel batal.
+        $this->assertSame( 4, $this->cek_batas_kunci( '/^RENAME TABLE /' ) );
+        $this->assertGreaterThan( 0, $this->cek_batas_kunci( '/^DROP TABLE /' ) );
+    }
+
+    public function test_lock_wait_timeout_saat_rename_memicu_pemulihan_otomatis(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        // Galat 1205 (Lock wait timeout exceeded) dari server.
+        $this->db->gagal_pada = 'RENAME TABLE `wp_posts` TO `wpmgr_old_wp_posts`';
+        $h = $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->assertSame( 'wpmgr_staging_tukar', $h->get_error_code() );
+        $this->assertSame( 'dipulihkan', $h->get_error_data()['pemulihan'] );
+        $this->assertSame( 'lama', file_get_contents( $this->akar . 'wp-content/themes/t/style.css' ) );
+        $this->assertSame( 1, $this->cek_batas_kunci( '/^RENAME TABLE `wp_posts` TO `wpmgr_old_wp_posts`/' ) );
+    }
+
+    public function test_status_ditukar_disimpan_sebelum_pengaman_dilepas(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $d               = new WPMGR_DorongGagalSimpan( $this->akar, $this->akar . 'wp-content/wpmgr-dorong/', $this->db,
+            20, $this->akar . 'wp-content/mu-plugins/' );
+        $d->gagal_status = 'ditukar';
+        $h               = $d->terapkan( array( 'dorong_id' => self::ID, 'langkah' => 'tukar', 'token' => self::TOKEN ) );
+        $this->assertInstanceOf( WP_Error::class, $h );
+        $this->assertFileExists( $this->akar . '.maintenance' );
+        $this->assertFileExists( $this->akar . 'wp-content/mu-plugins/wpmgr-dorong-aman.php' );
+        $this->assertSame( 'menukar', $this->dorong()->keadaan( self::ID )['status'] );
+        // Ulangan normal menyelesaikan tukar (tidak memulihkan) lalu melepas pengaman.
+        $this->assertSame( 'ditukar', $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertSame( 'baru', file_get_contents( $this->akar . 'wp-content/themes/t/style.css' ) );
+        $this->assertFileDoesNotExist( $this->akar . '.maintenance' );
+    }
+
+    public function test_pulihkan_setelah_pertukaran_menyimpan_tabel_batal_sampai_bersihkan(): void {
+        $this->db->tabel[] = 'wpmgr_b1_wp_posts'; // Sisa pemulihan sebelumnya: slot 1 terpakai.
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->assertSame( 'dipulihkan', $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertContains( 'wp_posts', $this->db->tabel );
+        $this->assertContains( 'wpmgr_b2_wp_posts', $this->db->tabel );
+        $this->assertContains( 'wpmgr_b1_wp_options', $this->db->tabel );
+        $k = $this->dorong()->keadaan( self::ID );
+        $this->assertSame( array( 'wpmgr_b2_wp_posts', 'wpmgr_b1_wp_options' ), $k['tabel_batal'] );
+        $this->assertSame( array(), $k['tabel_old'] );
+        $this->assertSame( array(), $k['tabel_tmp'] );
+        $this->assertSame( array( 'lagi' => false ), $this->dorong()->bersihkan( self::ID ) );
+        $this->assertNotContains( 'wpmgr_b2_wp_posts', $this->db->tabel );
+        $this->assertNotContains( 'wpmgr_b1_wp_options', $this->db->tabel );
+        // Milik pemulihan lain (tidak di jurnal ini) tidak disentuh.
+        $this->assertContains( 'wpmgr_b1_wp_posts', $this->db->tabel );
+    }
+
+    public function test_pulihkan_tanpa_pertukaran_db_tidak_menyimpan_tabel_batal(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $this->db->gagal_pada = 'RENAME TABLE `wp_posts` TO `wpmgr_old_wp_posts`';
+        $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->assertEmpty( preg_grep( '/^wpmgr_b[0-9]_/', $this->db->tabel ) );
+        $this->assertNotContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
+    }
+
+    public function test_cache_objek_dikosongkan_setelah_tukar_dan_pembalikan(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $awal = $GLOBALS['wpmgr_test_cache_flush'];
+        $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->assertSame( $awal + 1, $GLOBALS['wpmgr_test_cache_flush'] );
+        $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) );
+        $this->assertSame( $awal + 2, $GLOBALS['wpmgr_test_cache_flush'] );
+    }
+
+    private function update_active_plugins() {
+        return array_values( preg_grep( "/^(UPDATE|INSERT INTO) `wpmgr_tmp_wp_options`.*active_plugins/s", $this->db->kueri ) );
+    }
+
+    public function test_connector_tetap_aktif_walau_staging_menonaktifkannya(): void {
+        $this->db->jawaban_nilai["FROM `wpmgr_tmp_wp_options` WHERE option_name = 'active_plugins'"] = serialize( array( 'akismet/akismet.php' ) );
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $q = $this->update_active_plugins();
+        $this->assertNotEmpty( $q );
+        $this->assertStringStartsWith( 'UPDATE `wpmgr_tmp_wp_options` SET option_value = ', $q[0] );
+        $diharapkan = serialize( array( 'akismet/akismet.php', 'wp-manager-connector/wp-manager-connector.php' ) );
+        $this->assertStringContainsString( addslashes( $diharapkan ), $q[0] );
+    }
+
+    public function test_active_plugins_tidak_diubah_bila_connector_sudah_aktif_dan_dibuat_bila_hilang(): void {
+        $this->db->jawaban_nilai["FROM `wpmgr_tmp_wp_options` WHERE option_name = 'active_plugins'"]
+            = serialize( array( 'wp-manager-connector/wp-manager-connector.php' ) );
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $this->assertEmpty( $this->update_active_plugins() );
+
+        $this->tearDown();
+        $this->setUp();
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $q = $this->update_active_plugins();
+        $this->assertStringStartsWith( 'INSERT INTO `wpmgr_tmp_wp_options`', $q[0] );
+        $this->assertStringContainsString( addslashes( serialize( array( 'wp-manager-connector/wp-manager-connector.php' ) ) ), $q[0] );
+    }
+
+    public function test_pengaman_dipasang_ulang_pada_setiap_request_tukar_dan_pulihkan(): void {
+        list( $n, $sha ) = $this->unggah( array(
+            'wp-content/themes/t/style.css' => 'baru', 'wp-content/themes/t/b.css' => 'b', 'wp-content/themes/t/c.css' => 'c',
+        ), array( 'wp-content/themes/t/hapus.php' ), null );
+        $this->sampai_selesai( 'siapkan', array( 'jumlah_potongan' => $n, 'sha256_rencana' => $sha ) );
+        $this->langkah( 'tukar', array( 'token' => self::TOKEN ), 0 );
+        $d                       = $this->dorong();
+        $k                       = $d->keadaan( self::ID );
+        $k['maintenance_dibuat'] = time() - 3000;
+        $d->simpan_keadaan( self::ID, $k );
+        unlink( $this->akar . '.maintenance' );
+        unlink( $this->akar . 'wp-content/mu-plugins/wpmgr-dorong-aman.php' );
+
+        $this->assertFalse( $this->langkah( 'tukar', array( 'token' => self::TOKEN ), 0 )['selesai'] );
+        $dibuat = $this->dorong()->keadaan( self::ID )['maintenance_dibuat'];
+        $this->assertGreaterThanOrEqual( time() - 5, $dibuat );
+        $this->assertStringContainsString( '$upgrading = ' . ( $dibuat + 300 ) . ';', file_get_contents( $this->akar . '.maintenance' ) );
+        $this->assertFileExists( $this->akar . 'wp-content/mu-plugins/wpmgr-dorong-aman.php' );
+        // Tiga entri jurnal: pulihkan beranggaran 0 butuh tiga request.
+        $this->assertFalse( $this->langkah( 'tukar', array( 'token' => self::TOKEN ), 0 )['selesai'] );
+
+        $this->assertFalse( $this->langkah( 'pulihkan', array( 'token' => self::TOKEN ), 0 )['selesai'] );
+        unlink( $this->akar . '.maintenance' );
+        $this->assertFalse( $this->langkah( 'pulihkan', array( 'token' => self::TOKEN ), 0 )['selesai'] );
+        $this->assertFileExists( $this->akar . '.maintenance' );
+        $this->assertSame( 'dipulihkan', $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertFileDoesNotExist( $this->akar . '.maintenance' );
+    }
+
+    public function test_pengecualian_di_tengah_tukar_memicu_pemulihan_otomatis(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $this->db->lempar_pada = 'RENAME TABLE `wp_posts` TO `wpmgr_old_wp_posts`';
+        $h = $this->langkah( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->assertSame( 'wpmgr_staging_tukar', $h->get_error_code() );
+        $this->assertStringNotContainsString( 'tiruan', $h->get_error_message() );
+        $this->assertSame( 'dipulihkan', $this->dorong()->keadaan( self::ID )['status'] );
+        $this->assertSame( 'lama', file_get_contents( $this->akar . 'wp-content/themes/t/style.css' ) );
+        $this->assertFileDoesNotExist( $this->akar . '.maintenance' );
+    }
+
+    public function test_variabel_sesi_dikembalikan_setelah_impor_dan_tukar(): void {
+        $this->siap_dengan_sql();
+        foreach ( array( 'impor', 'tukar' ) as $langkah ) {
+            $this->db->kueri = array();
+            $this->sampai_selesai( $langkah, array( 'token' => self::TOKEN ) );
+            // Nilai TERAKHIR yang diset untuk setiap variabel sesi = nilai
+            // yang ditangkap sebelum langkah dimulai.
+            $akhir = array();
+            foreach ( $this->db->kueri as $q ) {
+                if ( preg_match( '/^SET (?:SESSION )?(sql_mode|FOREIGN_KEY_CHECKS|UNIQUE_CHECKS|character_set_client|character_set_connection|character_set_results|collation_connection|lock_wait_timeout|NAMES)\b/', $q, $m ) ) {
+                    $nama           = 'NAMES' === $m[1] ? 'character_set_client' : $m[1];
+                    $akhir[ $nama ] = $q;
+                }
+            }
+            ksort( $akhir );
+            $this->assertSame( array(
+                'FOREIGN_KEY_CHECKS'       => 'SET SESSION FOREIGN_KEY_CHECKS = 1',
+                'UNIQUE_CHECKS'            => 'SET SESSION UNIQUE_CHECKS = 1',
+                'character_set_client'     => 'SET SESSION character_set_client = utf8mb4',
+                'character_set_connection' => 'SET SESSION character_set_connection = utf8mb4',
+                'character_set_results'    => 'SET SESSION character_set_results = utf8mb4',
+                'collation_connection'     => 'SET SESSION collation_connection = utf8mb4_unicode_ci',
+                'lock_wait_timeout'        => 'SET SESSION lock_wait_timeout = 31536000',
+                'sql_mode'                 => "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'",
+            ), $akhir, $langkah );
+        }
+    }
+
+    public function test_bersihkan_mengambil_flock_yang_sama(): void {
+        $this->siap_dengan_sql();
+        $h = fopen( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID . '.lock', 'c' );
+        $this->assertTrue( flock( $h, LOCK_EX | LOCK_NB ) );
+        $galat = $this->dorong()->bersihkan( self::ID );
+        flock( $h, LOCK_UN );
+        fclose( $h );
+        $this->assertSame( 'wpmgr_staging_sibuk', $galat->get_error_code() );
+        $this->assertDirectoryExists( $this->dir() );
+        $this->assertSame( array( 'lagi' => false ), $this->dorong()->bersihkan( self::ID ) );
+        $this->assertDirectoryDoesNotExist( $this->dir() );
+        $this->assertFileDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID . '.lock' );
+    }
+
+    public function test_hash_dan_basename_divalidasi_sebelum_ditanam(): void {
+        $this->assertSame( '', WPMGR_Staging_Dorong::isi_maintenance( "a'; system('x'); //", 1 ) );
+        $this->assertSame( '', WPMGR_Staging_Dorong::isi_maintenance( str_repeat( 'A', 64 ), 1 ) );
+        $this->assertSame( '', WPMGR_Staging_Dorong::isi_mu_aman( str_repeat( 'a', 63 ) ) );
+        $mu = WPMGR_Staging_Dorong::isi_mu_aman( str_repeat( 'a', 64 ), 'wpmgr-lain/utama.php' );
+        $this->assertStringContainsString( "'wpmgr-lain/utama.php'", $mu );
+        $jahat = WPMGR_Staging_Dorong::isi_mu_aman( str_repeat( 'a', 64 ), "x/y.php' ); evil(); //" );
+        $this->assertStringNotContainsString( 'evil', $jahat );
+        $this->assertStringContainsString( "'wp-manager-connector/wp-manager-connector.php'", $jahat );
+    }
+
+    /** Proses mati di antara "tujuan -> lama/" dan "baru/ -> tujuan" pada operasi kedua. */
+    private function crash_di_tengah_operasi_kedua() {
+        list( $n, $sha ) = $this->unggah( array(
+            'wp-content/themes/t/style.css' => 'baru', 'wp-content/plugins/p/p.php' => 'p baru',
+        ), array(), null );
+        $this->sampai_selesai( 'siapkan', array( 'jumlah_potongan' => $n, 'sha256_rencana' => $sha ) );
+        $this->assertFalse( $this->langkah( 'tukar', array( 'token' => self::TOKEN ), 0 )['selesai'] );
+        // Tiru jalankan_op() yang mati: entri jurnal sudah ditulis, berkas
+        // produksi sudah di lama/, berkas baru belum dipasang, kursor belum maju.
+        $rel = 'wp-content/plugins/p/p.php';
+        file_put_contents( $this->dir() . 'jurnal.php', json_encode( array( 'aksi' => 'ganti', 'path' => $rel ) ) . "\n", FILE_APPEND );
+        mkdir( dirname( $this->dir() . 'lama/' . $rel ), 0777, true );
+        rename( $this->akar . $rel, $this->dir() . 'lama/' . $rel );
+        $this->assertFileDoesNotExist( $this->akar . $rel );
+        $this->assertSame( 1, $this->dorong()->keadaan( self::ID )['tukar'] );
+        return $rel;
+    }
+
+    public function test_crash_di_antara_dua_pemindahan_lalu_dilanjutkan_lalu_dipulihkan(): void {
+        $rel = $this->crash_di_tengah_operasi_kedua();
+        $this->assertSame( 'ditukar', $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertSame( 'p baru', file_get_contents( $this->akar . $rel ) );
+        $this->assertSame( 'baru', file_get_contents( $this->akar . 'wp-content/themes/t/style.css' ) );
+        $this->assertSame( 'dipulihkan', $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertSame( 'p lama', file_get_contents( $this->akar . $rel ) );
+        $this->assertSame( 'lama', file_get_contents( $this->akar . 'wp-content/themes/t/style.css' ) );
+    }
+
+    public function test_crash_di_antara_dua_pemindahan_lalu_langsung_dipulihkan(): void {
+        $rel = $this->crash_di_tengah_operasi_kedua();
+        $this->assertSame( 'dipulihkan', $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertSame( 'p lama', file_get_contents( $this->akar . $rel ) );
+        $this->assertSame( 'lama', file_get_contents( $this->akar . 'wp-content/themes/t/style.css' ) );
     }
 
     public function test_cron_memulihkan_tukar_yang_macet(): void {
@@ -463,7 +750,8 @@ final class TerapkanTest extends TestCase {
         $this->assertSame( 'wpmgr_staging_impor', $h->get_error_code() );
         $this->assertSame( 'Tabel hasil impor memakai mesin atau opsi yang tidak diizinkan.', $h->get_error_message() );
         $this->assertNotContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
-        $this->assertContains( 'DROP TABLE IF EXISTS `wpmgr_tmp_wp_posts`', array_slice( $this->db->kueri, -3 ) );
+        $cek = array_keys( preg_grep( "/information_schema\\.TABLES .*'wpmgr_tmp_wp_posts'/", $this->db->kueri ) );
+        $this->assertContains( 'DROP TABLE IF EXISTS `wpmgr_tmp_wp_posts`', array_slice( $this->db->kueri, end( $cek ) + 1 ) );
         $this->assertNotContains( 'wpmgr_tmp_wp_posts', $this->dorong()->keadaan( self::ID )['tabel_tmp'] );
         // Tidak ada data yang dimuat ke tabel itu, dan tukar tidak bisa dimulai.
         $this->assertEmpty( preg_grep( '/^INSERT INTO `wpmgr_tmp_wp_posts`/', $this->db->kueri ) );
@@ -622,7 +910,7 @@ final class TerapkanTest extends TestCase {
 
     public function test_langkah_bersamaan_ditolak(): void {
         $this->siap_dengan_sql();
-        $h = fopen( $this->dir() . 'terapkan.lock', 'c' );
+        $h = fopen( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID . '.lock', 'c' );
         $this->assertTrue( flock( $h, LOCK_EX | LOCK_NB ) );
         $galat = $this->langkah( 'impor' );
         flock( $h, LOCK_UN );
