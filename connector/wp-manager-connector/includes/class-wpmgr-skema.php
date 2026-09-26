@@ -193,6 +193,9 @@ PHP;
         if ( ! wp_next_scheduled( self::HOOK_PANGKAS ) ) {
             wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::HOOK_PANGKAS );
         }
+        if ( ! wp_next_scheduled( WPMGR_Staging::HOOK_BERSIHKAN ) ) {
+            wp_schedule_event( time() + HOUR_IN_SECONDS, 'hourly', WPMGR_Staging::HOOK_BERSIHKAN );
+        }
     }
 
     /** Dipanggil WP-Cron harian: data site dibatasi 30 hari (spec §5.2). */
@@ -246,6 +249,7 @@ PHP;
             ) );
         }
         wp_clear_scheduled_hook( self::HOOK_PANGKAS );
+        wp_clear_scheduled_hook( 'wpmgr_staging_bersihkan' );
         self::hapus_mu_plugin();
     }
 }

@@ -89,6 +89,9 @@ class WPMGR_Staging {
             '/staging/file'      => array( 'POST', 'file' ),
             '/staging/tabel'     => array( 'POST', 'tabel' ),
             '/staging/tanda-air' => array( 'GET', 'tanda_air' ),
+            '/staging/snapshot'  => array( 'POST', 'snapshot' ),
+            '/staging/unggah'    => array( 'POST', 'unggah' ),
+            '/staging/bersihkan' => array( 'POST', 'bersihkan' ),
         );
     }
 
@@ -217,6 +220,78 @@ class WPMGR_Staging {
         $sejak  = is_string( $sejak ) ? $sejak : '';
         $hasil  = WPMGR_Staging_TandaAir::kumpulkan( $wpdb, $sejak, (int) $request->get_param( 'posts_maks' ) );
         return is_wp_error( $hasil ) ? $hasil : rest_ensure_response( $hasil );
+    }
+
+    public static function dorong() {
+        return new WPMGR_Staging_Dorong(
+            self::root(),
+            rtrim( str_replace( '\\', '/', WP_CONTENT_DIR ), '/' ) . '/wpmgr-dorong/',
+            new WPMGR_Staging_Db( $GLOBALS['wpdb'] ),
+            self::anggaran_detik()
+        );
+    }
+
+    private static function body_json( $request ) {
+        $p = json_decode( $request->get_body(), true );
+        return is_array( $p ) ? $p : null;
+    }
+
+    /**
+     * Unggah potongan dorong (Task 7): validasi meta, kunci, dan penulisan
+     * terlindung ada di WPMGR_Staging_Dorong; di sini hanya penghubung ke
+     * respons REST.
+     */
+    public static function unggah( $request ) {
+        return rest_ensure_response( self::dorong()->unggah( $request->get_body() ) );
+    }
+
+    /**
+     * Metadata snapshot sebelum dorong (Task 7, Koreksi #12): hanya
+     * ada/ukuran/mtime untuk path yang akan tertimpa, daftar tabel, dan
+     * tanda air -- isi berkas/tabel diambil lewat /staging/file dan
+     * /staging/tabel yang sudah ada (Task 4, 5).
+     */
+    public static function snapshot( $request ) {
+        global $wpdb;
+        $p = self::body_json( $request );
+        if ( null === $p ) {
+            return self::galat( 'wpmgr_staging_permintaan', 'Body permintaan bukan objek.', 400 );
+        }
+        $berkas = self::dorong()->snapshot_berkas( isset( $p['paths'] ) ? $p['paths'] : null );
+        if ( is_wp_error( $berkas ) ) {
+            return $berkas;
+        }
+        $hasil = array( 'berkas' => $berkas );
+        if ( ! empty( $p['awal'] ) ) {
+            list( $hasil['tabel'] ) = WPMGR_Staging_Manifest::tabel( $wpdb );
+            $hasil['tanda_air']     = WPMGR_Staging_TandaAir::kumpulkan( $wpdb, '', 0 );
+        }
+        return rest_ensure_response( $hasil );
+    }
+
+    /**
+     * Pembersihan area sementara dan tabel dorong (Task 7): logikanya ada di
+     * WPMGR_Staging_Dorong::bersihkan(); di sini hanya penghubung ke
+     * respons REST.
+     */
+    public static function bersihkan( $request ) {
+        $p = self::body_json( $request );
+        return rest_ensure_response( self::dorong()->bersihkan( isset( $p['dorong_id'] ) ? $p['dorong_id'] : '' ) );
+    }
+
+    /**
+     * WP-Cron tiap jam (HOOK_BERSIHKAN): area dorong yang tidak disentuh
+     * 24 jam dibuang. Tidak boleh pernah fatal -- itu akan menghentikan
+     * semua hook WP-Cron lain yang dijadwalkan di request cron yang sama.
+     */
+    public static function cron_bersihkan() {
+        try {
+            if ( isset( $GLOBALS['wpdb'] ) ) {
+                self::dorong()->cron();
+            }
+        } catch ( \Throwable $e ) {
+            unset( $e );
+        }
     }
 
     public static function daftarkan_route() {

@@ -238,3 +238,6 @@ require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-ma
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-file.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-tabel.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-tanda-air.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-sql.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-db.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-dorong.php';

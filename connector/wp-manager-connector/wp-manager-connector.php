@@ -40,10 +40,14 @@ require_once WPMGR_DIR . 'includes/class-wpmgr-staging-manifest.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging-file.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging-tabel.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging-tanda-air.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-staging-sql.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-staging-db.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-staging-dorong.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging.php';
 
 add_action( 'plugins_loaded', array( 'WPMGR_Skema', 'pastikan' ) );
 add_action( WPMGR_Skema::HOOK_PANGKAS, array( 'WPMGR_Skema', 'pangkas' ) );
+add_action( WPMGR_Staging::HOOK_BERSIHKAN, array( 'WPMGR_Staging', 'cron_bersihkan' ) );
 add_action( 'rest_api_init', array( 'WPMGR_REST', 'daftarkan_route' ) );
 add_filter( 'rest_post_dispatch', array( 'WPMGR_REST', 'tambah_header_anti_cache' ), 10, 3 );
 add_filter( 'rest_pre_serve_request', array( 'WPMGR_Staging', 'sajikan_biner' ), 10, 4 );
