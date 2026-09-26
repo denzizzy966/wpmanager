@@ -48,20 +48,38 @@ class WPMGR_Staging {
         return new WP_Error( $kode, $pesan, array( 'status' => $status ) );
     }
 
-    /** Murni: HMAC diperiksa lebih dulu supaya pihak tak dikenal tidak bisa menebak setelan. */
-    public static function putuskan( $hasil_hmac, $fitur_aktif ) {
+    /**
+     * Murni: HMAC diperiksa lebih dulu supaya pihak tak dikenal tidak bisa
+     * menebak setelan.
+     *
+     * $mode_staging (fix R1 minor e) opsional supaya tetap murni/mudah diuji
+     * tanpa konstanta global: null berarti "tanyakan mode_staging() sendiri"
+     * (dipakai guard() sungguhan). Site yang MEMANG salinan staging perlu
+     * pesan yang berbeda dari site produksi yang setelannya sekadar belum
+     * dinyalakan -- menyuruh admin staging "mengaktifkan Izinkan staging"
+     * membingungkan, karena endpoint staging memang selalu mati di sana.
+     */
+    public static function putuskan( $hasil_hmac, $fitur_aktif, $mode_staging = null ) {
         if ( true !== $hasil_hmac ) {
             return $hasil_hmac;
         }
-        if ( ! $fitur_aktif ) {
-            return self::galat( 'wpmgr_staging_mati',
-                'Staging tidak diizinkan di site ini. Aktifkan "Izinkan staging" di Pengaturan -> WP Manager.', 403 );
+        if ( $fitur_aktif ) {
+            return true;
         }
-        return true;
+        if ( null === $mode_staging ) {
+            $mode_staging = self::mode_staging();
+        }
+        if ( $mode_staging ) {
+            return self::galat( 'wpmgr_staging_mati',
+                'Site ini adalah salinan staging yang dikelola dashboard WP Manager; endpoint staging dimatikan di sini.',
+                403 );
+        }
+        return self::galat( 'wpmgr_staging_mati',
+            'Staging tidak diizinkan di site ini. Aktifkan "Izinkan staging" di Pengaturan -> WP Manager.', 403 );
     }
 
     public static function guard( $request ) {
-        return self::putuskan( WPMGR_REST::guard( $request ), self::fitur_aktif() );
+        return self::putuskan( WPMGR_REST::guard( $request ), self::fitur_aktif(), self::mode_staging() );
     }
 
     /** Jalur => array( metode, nama callback di kelas ini ). Diisi Task 3–8. */

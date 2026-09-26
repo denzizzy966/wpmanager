@@ -6,7 +6,12 @@ final class StagingDasarTest extends TestCase {
     private $akar;
 
     protected function setUp(): void {
-        $this->akar = sys_get_temp_dir() . '/wpmgr-stg-' . bin2hex( random_bytes( 6 ) ) . '/';
+        // Dinormalisasi ke '/' (fix R1): sys_get_temp_dir() di Windows memakai
+        // '\\', persis seperti ABSPATH mentah -- dan WPMGR_Staging::root()
+        // sendiri selalu menormalisasinya sebelum dipakai. Tanpa ini,
+        // perbandingan realpath() (yang juga dinormalisasi ke '/') di
+        // path_kanonik() tidak pernah cocok dengan $this->akar apa adanya.
+        $this->akar = str_replace( '\\', '/', sys_get_temp_dir() ) . '/wpmgr-stg-' . bin2hex( random_bytes( 6 ) ) . '/';
         mkdir( $this->akar . 'wp-content/uploads', 0777, true );
     }
 
@@ -166,6 +171,80 @@ final class StagingDasarTest extends TestCase {
         $this->assertInstanceOf( WP_Error::class, WPMGR_Staging_Path::untuk_ditulis( $this->akar, 'wp-config.php' ) );
     }
 
+    // ---- fix R1: direktori symlink DI DALAM akar (bukan ke luar akar) -----
+
+    public function test_untuk_dibaca_menolak_direktori_symlink_di_dalam_akar(): void {
+        file_put_contents( $this->akar . 'wp-config.php', "define('DB_PASSWORD','rahasia');" );
+        // 'akar' menunjuk ke root itu sendiri -- path relatif yang lewat
+        // situ tampak berada "di dalam" root menurut perbandingan berawalan
+        // lama, padahal sebenarnya jalan memutar untuk membaca wp-config.php.
+        $this->symlink_atau_lewati( rtrim( $this->akar, '/' ), $this->akar . 'wp-content/uploads/akar' );
+        $hasil = WPMGR_Staging_Path::untuk_dibaca( $this->akar, 'wp-content/uploads/akar/wp-config.php' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+    }
+
+    public function test_untuk_ditulis_menolak_direktori_symlink_di_dalam_akar(): void {
+        file_put_contents( $this->akar . 'wp-config.php', "define('DB_PASSWORD','rahasia');" );
+        $this->symlink_atau_lewati( rtrim( $this->akar, '/' ), $this->akar . 'wp-content/uploads/akar' );
+        $hasil = WPMGR_Staging_Path::untuk_ditulis( $this->akar, 'wp-content/uploads/akar/wp-config.php' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+    }
+
+    public function test_menolak_symlink_berkas_ke_berkas_lain_di_dalam_akar(): void {
+        file_put_contents( $this->akar . 'wp-content/uploads/asli.txt', 'isi asli' );
+        $this->symlink_atau_lewati(
+            $this->akar . 'wp-content/uploads/asli.txt',
+            $this->akar . 'wp-content/uploads/tautan-lokal.txt'
+        );
+        $this->assertInstanceOf( WP_Error::class,
+            WPMGR_Staging_Path::untuk_dibaca( $this->akar, 'wp-content/uploads/tautan-lokal.txt' ) );
+        $this->assertInstanceOf( WP_Error::class,
+            WPMGR_Staging_Path::untuk_ditulis( $this->akar, 'wp-content/uploads/tautan-lokal.txt' ) );
+    }
+
+    // ---- fix R1: alias huruf besar/kecil dan nama pendek 8.3 (Windows/macOS) ----
+
+    public function test_untuk_dibaca_menolak_variasi_huruf_besar_kecil(): void {
+        file_put_contents( $this->akar . 'wp-config.php', "define('DB_PASSWORD','rahasia');" );
+        if ( ! file_exists( $this->akar . 'WP-CONFIG.PHP' ) ) {
+            $this->markTestSkipped( 'Sistem berkas ini case-sensitive (bukan Windows/macOS).' );
+        }
+        foreach ( array( 'WP-CONFIG.PHP', 'Wp-Config.php' ) as $variasi ) {
+            $hasil = WPMGR_Staging_Path::untuk_dibaca( $this->akar, $variasi );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $variasi );
+        }
+    }
+
+    public function test_untuk_dibaca_menolak_nama_pendek_8_3(): void {
+        file_put_contents( $this->akar . 'wp-config.php', "define('DB_PASSWORD','rahasia');" );
+        if ( ! file_exists( $this->akar . 'WP-CON~1.PHP' ) ) {
+            $this->markTestSkipped( 'Nama pendek 8.3 tidak didukung/tidak aktif di volume ini.' );
+        }
+        $hasil = WPMGR_Staging_Path::untuk_dibaca( $this->akar, 'WP-CON~1.PHP' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+    }
+
+    public function test_boleh_ditulis_menolak_variasi_huruf_besar_kecil(): void {
+        // Logika murni (tanpa I/O): berlaku di semua OS, bukan hanya yang
+        // sistem berkasnya case-insensitive.
+        foreach ( array(
+            'WP-CONFIG.PHP',
+            'wp-content/plugins/WP-MANAGER-CONNECTOR/x.php',
+            'wp-content/mu-plugins/WPMGR-STAGING.php',
+            'WP-CONTENT/MU-PLUGINS/wpmgr-dorong-aman.php',
+        ) as $p ) {
+            $this->assertFalse( WPMGR_Staging_Path::boleh_ditulis( $p ), $p );
+        }
+    }
+
+    // ---- fix R1 minor (c): direktori terlarang tanpa slash akhir ----------
+
+    public function test_boleh_ditulis_menolak_direktori_plugin_tanpa_slash_akhir(): void {
+        $this->assertFalse(
+            WPMGR_Staging_Path::boleh_ditulis( 'wp-content/plugins/wp-manager-connector' )
+        );
+    }
+
     public function test_paket_bolak_balik(): void {
         $isi   = array( '', "biner\0\xff\x1a\n'\"" );
         $data  = WPMGR_Staging_Paket::susun( array( 'jenis' => 'uji', 'berkas' => array(
@@ -191,6 +270,39 @@ final class StagingDasarTest extends TestCase {
         $galat = WPMGR_Staging_Paket::urai( $rusak );
         $this->assertSame( 'wpmgr_staging_hash', $galat->get_error_code() );
         $this->assertSame( array( 'status' => 422 ), $galat->get_error_data() );
+    }
+
+    // ---- fix R1 minor (a): kunci meta['berkas'] harus berurutan 0..n-1 ----
+
+    public function test_paket_menolak_kunci_berkas_tidak_berurutan(): void {
+        // Dirakit manual (bukan lewat susun(), yang selalu menomori ulang
+        // berurutan): meta dengan lubang di indeks (0, 2) tidak boleh
+        // diterima -- pemanggil mencocokkan bagian isi ke meta['berkas']
+        // berdasarkan posisi, dan lubang/urutan yang tidak berurutan membuat
+        // pencocokan itu tidak lagi bisa dipercaya.
+        $meta = array(
+            'berkas' => array(
+                0 => array( 'path' => 'a', 'ukuran' => 0, 'sha256' => hash( 'sha256', '' ) ),
+                2 => array( 'path' => 'b', 'ukuran' => 0, 'sha256' => hash( 'sha256', '' ) ),
+            ),
+        );
+        $json  = json_encode( $meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+        $data  = "WPMGRPAK1\n" . sprintf( '%08x', strlen( $json ) ) . "\n" . $json;
+        $galat = WPMGR_Staging_Paket::urai( $data );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_paket', $galat->get_error_code() );
+    }
+
+    // ---- fix R1 minor (e): pesan 403 berbeda bila site ini sendiri staging ----
+
+    public function test_putuskan_pesan_berbeda_saat_mode_staging(): void {
+        $biasa   = WPMGR_Staging::putuskan( true, false, false );
+        $staging = WPMGR_Staging::putuskan( true, false, true );
+        $this->assertStringContainsString( 'Izinkan staging', $biasa->get_error_message() );
+        $this->assertStringNotContainsString( 'Izinkan staging', $staging->get_error_message() );
+        $this->assertStringContainsString( 'staging', strtolower( $staging->get_error_message() ) );
+        $this->assertSame( 'wpmgr_staging_mati', $staging->get_error_code() );
+        $this->assertSame( array( 'status' => 403 ), $staging->get_error_data() );
     }
 
     public function test_respons_biner_disajikan_apa_adanya(): void {

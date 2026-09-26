@@ -15,10 +15,26 @@ if ( ! defined( 'ABSPATH' ) && ! defined( 'WPMGR_TESTING' ) ) {
 class WPMGR_Staging_Paket {
 
     const MAGIC     = "WPMGRPAK1\n";
-    const MAKS_META = 4194304;
+    // Fix R1 minor (b): diturunkan dari 4 MiB ke 1 MiB -- metadata paket
+    // hanya berisi daftar path/ukuran/sha256, tidak pernah sebesar itu dalam
+    // pemakaian sah; batas kecil mengurangi permukaan serangan alokasi
+    // memori dari input yang belum diverifikasi.
+    const MAKS_META = 1048576;
 
     private static function rusak( $pesan ) {
         return new WP_Error( 'wpmgr_staging_paket', $pesan, array( 'status' => 400 ) );
+    }
+
+    /**
+     * Fix R1 minor (a): meta['berkas'] wajib berkunci 0..n-1 tanpa lubang
+     * maupun urutan acak. urai() mencocokkan setiap entri meta ke bagian
+     * isi berikutnya berdasarkan URUTAN ITERASI array, bukan nilai kuncinya;
+     * kunci yang berlubang atau tidak berurutan (mis. hasil JSON objek
+     * `{"0":...,"2":...}` yang direkayasa tangan) membuat pencocokan itu
+     * tidak lagi bisa dipercaya mewakili urutan bagian yang sebenarnya.
+     */
+    private static function kunci_berurutan( array $x ) {
+        return array_keys( $x ) === ( empty( $x ) ? array() : range( 0, count( $x ) - 1 ) );
     }
 
     public static function susun( array $meta, array $isi ) {
@@ -54,8 +70,13 @@ class WPMGR_Staging_Paket {
         if ( $panjang > self::MAKS_META || $awal + 9 + $panjang > $total ) {
             return self::rusak( 'Panjang meta paket tidak sah.' );
         }
-        $meta = json_decode( substr( $data, $awal + 9, $panjang ), true );
-        if ( ! is_array( $meta ) || ! isset( $meta['berkas'] ) || ! is_array( $meta['berkas'] ) ) {
+        // Depth 8 (fix R1 minor b): meta paket selalu dangkal (objek -> daftar
+        // berkas -> field skalar); membatasi depth mencegah json_decode()
+        // dipaksa mengurai struktur bersarang dalam-dalam dari input yang
+        // belum dipercaya.
+        $meta = json_decode( substr( $data, $awal + 9, $panjang ), true, 8 );
+        if ( ! is_array( $meta ) || ! isset( $meta['berkas'] ) || ! is_array( $meta['berkas'] )
+            || ! self::kunci_berurutan( $meta['berkas'] ) ) {
             return self::rusak( 'Meta paket tidak sah.' );
         }
         $posisi = $awal + 9 + $panjang;
