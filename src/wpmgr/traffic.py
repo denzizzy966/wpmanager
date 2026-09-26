@@ -231,11 +231,49 @@ NAMA_KATEGORI = {
     "pencarian": "Pencarian", "sosial": "Media sosial", "langsung": "Langsung",
     "site_lain": "Site lain", "lainnya": "Lainnya",
 }
+# "asal" dan "kunci halaman" berasal dari Referer/path pengunjung (masukan
+# penyerang, lihat konteks-global.md #7): 90 hari bisa berarti puluhan ribu
+# baris "site_lain:<host>" unik. Tanpa batas SQL, semuanya diambil, dipetakan
+# ke Python, DAN dikirim lewat API/laporan -- baris yang tak ikut 15/10 besar
+# dilipat jadi satu baris "Lainnya" dengan sisa jumlahnya, bukan dibuang diam-diam.
+BATAS_HALAMAN = 10
+BATAS_ASAL = 15
+BATAS_PERANGKAT = 10
+KUNCI_ASAL_LAINNYA = "(lainnya)"
+KUNCI_ASAL_LIPATAN = "__lainnya__"
 
 
 def urai_asal(kunci: str) -> tuple[str, str]:
     kategori, _, nama = kunci.partition(":")
     return NAMA_KATEGORI.get(kategori, "Lainnya"), nama
+
+
+def _top_dimensi(sesi: Session, site_id, sumber: str, dari: date, sampai: date,
+                 dimensi: str, batas: int) -> list[tuple[str, int]]:
+    jumlah = func.sum(TrafficRincian.kunjungan).label("n")
+    baris = sesi.execute(
+        select(TrafficRincian.kunci, jumlah)
+        .where(TrafficRincian.site_id == site_id, TrafficRincian.sumber == sumber,
+               TrafficRincian.dimensi == dimensi, TrafficRincian.tanggal >= dari,
+               TrafficRincian.tanggal <= sampai)
+        .group_by(TrafficRincian.kunci)
+        # kunci sebagai tie-break: tanpa itu urutan baris dengan jumlah sama
+        # tak tentu, dan LIMIT bisa memotong baris yang berbeda tiap dipanggil.
+        .order_by(jumlah.desc(), TrafficRincian.kunci)
+        .limit(batas)
+    ).all()
+    return [(k, int(n)) for k, n in baris]
+
+
+def _total_dimensi(sesi: Session, site_id, sumber: str, dari: date, sampai: date, dimensi: str) -> int:
+    total = sesi.scalar(
+        select(func.sum(TrafficRincian.kunjungan)).where(
+            TrafficRincian.site_id == site_id, TrafficRincian.sumber == sumber,
+            TrafficRincian.dimensi == dimensi, TrafficRincian.tanggal >= dari,
+            TrafficRincian.tanggal <= sampai,
+        )
+    )
+    return int(total) if total else 0
 
 
 def ringkasan_traffic(sesi: Session, site_id, dari: date, sampai: date, sumber: str) -> dict | None:
@@ -258,20 +296,26 @@ def ringkasan_traffic(sesi: Session, site_id, dari: date, sampai: date, sumber: 
                        "kunjungan": b.kunjungan if b else None,
                        "pengunjung": b.pengunjung if b else None})
 
-    jumlah = func.sum(TrafficRincian.kunjungan).label("n")
-    rincian = sesi.execute(
-        select(TrafficRincian.dimensi, TrafficRincian.kunci, jumlah)
-        .where(TrafficRincian.site_id == site_id, TrafficRincian.sumber == sumber,
-               TrafficRincian.tanggal >= dari, TrafficRincian.tanggal <= sampai)
-        .group_by(TrafficRincian.dimensi, TrafficRincian.kunci)
-        .order_by(jumlah.desc())
-    ).all()
-    halaman = [{"kunci": k, "kunjungan": int(n)} for d, k, n in rincian if d == "halaman"][:10]
-    asal = [
-        {"kategori": urai_asal(k)[0], "nama": urai_asal(k)[1], "kunjungan": int(n)}
-        for d, k, n in rincian if d == "asal"
-    ]
-    perangkat = [{"kunci": k, "kunjungan": int(n)} for d, k, n in rincian if d == "perangkat"]
+    halaman = [{"kunci": k, "kunjungan": n}
+              for k, n in _top_dimensi(sesi, site_id, sumber, dari, sampai, "halaman", BATAS_HALAMAN)]
+    perangkat = [{"kunci": k, "kunjungan": n}
+                for k, n in _top_dimensi(sesi, site_id, sumber, dari, sampai, "perangkat", BATAS_PERANGKAT)]
+
+    asal_teratas = _top_dimensi(sesi, site_id, sumber, dari, sampai, "asal", BATAS_ASAL)
+    sisa = _total_dimensi(sesi, site_id, sumber, dari, sampai, "asal") - sum(n for _, n in asal_teratas)
+    asal = []
+    lainnya_terlipat = False
+    for k, n in asal_teratas:
+        kategori, nama = urai_asal(k)
+        baris = {"kunci": k, "kategori": kategori, "nama": nama, "kunjungan": n}
+        if sisa > 0 and k == KUNCI_ASAL_LAINNYA:
+            # Baris "(lainnya)" asli kebetulan masuk 15 besar: sisa digabung
+            # ke situ, bukan jadi baris "Lainnya" kedua yang membingungkan.
+            baris["kunjungan"] += sisa
+            lainnya_terlipat = True
+        asal.append(baris)
+    if sisa > 0 and not lainnya_terlipat:
+        asal.append({"kunci": KUNCI_ASAL_LIPATAN, "kategori": "Lainnya", "nama": "", "kunjungan": sisa})
 
     return {
         "harian": harian,

@@ -20,6 +20,11 @@ def susun_laporan(sesi: Session, site, tahun: int, bulan: int, sekarang: datetim
     awal_dt = datetime(tahun, bulan, 1, tzinfo=timezone.utc)
     akhir_dt = datetime.combine(akhir + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
     batas = min(akhir_dt, sekarang)
+    # Site belum ada sebelum site.dibuat_pada, jadi periode uptime tidak boleh
+    # mulai lebih awal dari itu -- tanpa ini, bulan-bulan sebelum site
+    # terdaftar dihitung seolah 100% naik (tidak ada insiden karena memang
+    # belum dipantau, bukan karena benar-benar tidak pernah mati).
+    mulai_pantau = max(awal_dt, site.dibuat_pada)
 
     insiden = sesi.scalars(
         select(UptimeInsiden).where(
@@ -28,15 +33,22 @@ def susun_laporan(sesi: Session, site, tahun: int, bulan: int, sekarang: datetim
             or_(UptimeInsiden.selesai.is_(None), UptimeInsiden.selesai > awal_dt),
         ).order_by(UptimeInsiden.mulai)
     ).all()
+
+    def _durasi_terpotong(i: UptimeInsiden) -> float:
+        # Dipotong ke mulai_pantau..batas (koreksi #6), dipakai baik untuk
+        # total maupun untuk durasi per baris di tabel -- keduanya harus
+        # memakai potongan yang sama, supaya baris per insiden benar-benar
+        # berjumlah sama dengan total "waktu tidak dapat diakses".
+        return max(0.0, (min(i.selesai or sekarang, batas) - max(i.mulai, mulai_pantau)).total_seconds())
+
     # Dihitung dari insiden, bukan dari tabel cek: cek dipangkas setelah 90
     # hari, insiden disimpan permanen.
-    detik_mati = sum(
-        max(0.0, (min(i.selesai or sekarang, batas) - max(i.mulai, awal_dt)).total_seconds())
-        for i in insiden
-    )
-    detik_periode = (batas - awal_dt).total_seconds()
+    detik_mati = sum(_durasi_terpotong(i) for i in insiden)
+    detik_periode = (batas - mulai_pantau).total_seconds()
     dipantau = site.uptime_status != UptimeStatus.belum_dicek and detik_periode > 0
-    persen = round(100 * (1 - detik_mati / detik_periode), 2) if dipantau else None
+    # max(0.0, ...): penjaga terakhir kalau pembulatan/insiden yang tumpang
+    # tindih membuat detik_mati sedikit melebihi detik_periode.
+    persen = round(max(0.0, 100 * (1 - detik_mati / detik_periode)), 2) if dipantau else None
 
     update = []
     for log in sesi.scalars(
@@ -71,7 +83,7 @@ def susun_laporan(sesi: Session, site, tahun: int, bulan: int, sekarang: datetim
             "durasi_mati": teks_durasi(detik_mati),
             "insiden": [
                 {"mulai": i.mulai, "selesai": i.selesai, "penyebab": i.penyebab,
-                 "durasi": teks_durasi(((i.selesai or sekarang) - i.mulai).total_seconds())}
+                 "durasi": teks_durasi(_durasi_terpotong(i))}
                 for i in insiden
             ],
         },

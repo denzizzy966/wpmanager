@@ -217,7 +217,7 @@
                   </ol>
                   <h4>Asal pengunjung</h4>
                   <ul>
-                    <template x-for="a in panel.data.asal" :key="a.kategori + a.nama">
+                    <template x-for="a in panel.data.asal" :key="a.kunci">
                       <li x-text="`${a.kategori}${a.nama ? ' · ' + a.nama : ''}: ${a.kunjungan}`"></li>
                     </template>
                   </ul>
