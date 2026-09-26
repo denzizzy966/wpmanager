@@ -72,6 +72,23 @@ class WPMGR_Staging_Path {
             if ( strlen( $segmen ) > self::MAKS_SEGMEN ) {
                 return self::tolak( 'Nama berkas terlalu panjang.' );
             }
+            // Fix R2: ':' tidak pernah sah di nama berkas WordPress, tetapi di
+            // NTFS ia membuka alternate data stream ('nama::$DATA' membaca/
+            // menulis ISI berkas 'nama' itu sendiri, dan 'dir::$INDEX_ALLOCATION'
+            // adalah alias direktori itu sendiri) -- sintaks yang tidak
+            // dikenali strpos/file_exists di sini tetapi dipahami OS saat
+            // fopen() sungguhan terjadi, sehingga path yang tampak "baru"
+            // ternyata menimpa berkas yang dilindungi. Titik atau spasi di
+            // akhir segmen juga ditolak: Win32 API (dipakai fopen()) memangkas
+            // keduanya dari komponen terakhir, jadi 'wp-config.php.' dan
+            // 'wp-config.php ' adalah alias 'wp-config.php' juga.
+            if ( false !== strpos( $segmen, ':' ) ) {
+                return self::tolak( 'Path memuat karakter terlarang.' );
+            }
+            $akhir_segmen = substr( $segmen, -1 );
+            if ( '.' === $akhir_segmen || ' ' === $akhir_segmen ) {
+                return self::tolak( 'Path memuat segmen terlarang.' );
+            }
         }
         return $rel;
     }
@@ -256,7 +273,12 @@ class WPMGR_Staging_Path {
         while ( true ) {
             $rel_induk = implode( '/', $segmen );
             $abs_induk = '' === $rel_induk ? rtrim( $akar, '/' ) : $akar . $rel_induk;
-            if ( file_exists( $abs_induk ) ) {
+            // is_link() di depan (fix R2 minor): file_exists() mengembalikan
+            // false untuk symlink menggantung (target hilang), jadi tanpa ini
+            // leluhur symlink yang kebetulan menggantung dianggap "belum ada"
+            // dan diloncati begitu saja -- padahal komponen itu tetap sebuah
+            // symlink, menggantung atau tidak, dan harus tetap ditolak.
+            if ( is_link( $abs_induk ) || file_exists( $abs_induk ) ) {
                 $induk_nyata = self::realpath_garis( $abs_induk );
                 $diharapkan  = '' === $rel_induk
                     ? rtrim( $akar_nyata, '/' )

@@ -99,8 +99,22 @@ final class StagingDasarTest extends TestCase {
 
     public function test_normalisasi_menerima_path_sah(): void {
         foreach ( array( 'wp-content/uploads/ü-berkas.txt', '.htaccess', 'wp-content/plugins/a b/c.php',
-                         'wp-content/uploads/' . str_repeat( 'é', 120 ) . '.jpg' ) as $p ) {
+                         'wp-content/uploads/' . str_repeat( 'é', 120 ) . '.jpg', 'jquery.min.js' ) as $p ) {
             $this->assertSame( $p, WPMGR_Staging_Path::normalisasi( $p ) );
+        }
+    }
+
+    // ---- fix R2: sintaks NTFS alternate data stream, titik/spasi akhir ----
+
+    public function test_normalisasi_menolak_ads_dan_titik_spasi_akhir(): void {
+        foreach ( array(
+            'wp-content/mu-plugins/wpmgr-staging.php::$DATA',
+            'wp-content/plugins/wp-manager-connector::$INDEX_ALLOCATION/wp-manager-connector.php',
+            'wp-config.php.',
+            'wp-config.php ',
+        ) as $p ) {
+            $hasil = WPMGR_Staging_Path::normalisasi( $p );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $p );
         }
     }
 
@@ -169,6 +183,42 @@ final class StagingDasarTest extends TestCase {
         $this->assertSame( $this->akar . 'wp-content/uploads/2026/x.jpg',
             WPMGR_Staging_Path::untuk_ditulis( $this->akar, 'wp-content/uploads/2026/x.jpg' ) );
         $this->assertInstanceOf( WP_Error::class, WPMGR_Staging_Path::untuk_ditulis( $this->akar, 'wp-config.php' ) );
+    }
+
+    // ---- fix R2: sintaks NTFS alternate data stream pada jalur tulis ------
+
+    public function test_untuk_ditulis_menolak_ads_dan_titik_spasi_akhir(): void {
+        // Berkas ASLI yang sebelum fix R2 bisa ditimpa lewat sintaks ADS
+        // ('nama::$DATA' merujuk isi 'nama' itu sendiri; 'dir::$INDEX_ALLOCATION'
+        // adalah alias 'dir' itu sendiri) tanpa pernah cocok dengan larangan
+        // string apa pun di boleh_ditulis()/dikecualikan().
+        mkdir( $this->akar . 'wp-content/mu-plugins', 0777, true );
+        file_put_contents( $this->akar . 'wp-content/mu-plugins/wpmgr-staging.php', 'ASLI' );
+        mkdir( $this->akar . 'wp-content/plugins/wp-manager-connector', 0777, true );
+        file_put_contents( $this->akar . 'wp-content/plugins/wp-manager-connector/wp-manager-connector.php', 'ASLI' );
+        file_put_contents( $this->akar . 'wp-config.php', 'ASLI' );
+
+        foreach ( array(
+            'wp-content/mu-plugins/wpmgr-staging.php::$DATA',
+            'wp-content/plugins/wp-manager-connector::$INDEX_ALLOCATION/wp-manager-connector.php',
+            'wp-config.php.',
+            'wp-config.php ',
+        ) as $p ) {
+            $this->assertInstanceOf( WP_Error::class, WPMGR_Staging_Path::untuk_ditulis( $this->akar, $p ), $p );
+        }
+    }
+
+    // ---- fix R2 minor: leluhur symlink yang MENGGANTUNG (dangling) --------
+
+    public function test_untuk_ditulis_menolak_leluhur_symlink_gantung(): void {
+        $tidak_ada = sys_get_temp_dir() . '/wpmgr-tidak-ada-' . bin2hex( random_bytes( 4 ) );
+        // Sengaja TIDAK dibuat: symlink menggantung, menunjuk ke target yang
+        // tidak ada, di luar akar. file_exists() mengembalikan false untuk
+        // symlink macam ini, jadi ancestor walk yang hanya memakai
+        // file_exists() melewatinya begitu saja seolah "belum ada".
+        $this->symlink_atau_lewati( $tidak_ada, $this->akar . 'wp-content/uploads/gantung' );
+        $hasil = WPMGR_Staging_Path::untuk_ditulis( $this->akar, 'wp-content/uploads/gantung/new.txt' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
     }
 
     // ---- fix R1: direktori symlink DI DALAM akar (bukan ke luar akar) -----
