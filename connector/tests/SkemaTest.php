@@ -113,6 +113,7 @@ final class SkemaTest extends TestCase {
         $this->assertSame( array( 'self_update', 'events', 'traffic' ), WPMGR_Skema::fitur( false ) );
         // Self-update bukan pemantauan: tetap tersedia walau pemantauan dimatikan.
         $this->assertSame( array( 'self_update' ), WPMGR_Skema::fitur( true ) );
+        $this->assertSame( array( 'self_update', 'staging' ), WPMGR_Skema::fitur( true, true ) );
     }
 
     public function test_perlu_migrasi_hanya_bila_versi_berbeda(): void {

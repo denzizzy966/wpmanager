@@ -32,11 +32,14 @@ class WPMGR_Skema {
      * mengumumkan fitur yang endpoint-nya belum ada membuat dashboard menerima
      * 404 rest_no_route dan salah menyimpulkan connector sudah dicabut.
      */
-    public static function fitur( $monitoring_mati ) {
+    public static function fitur( $monitoring_mati, $staging = false ) {
         $fitur = array( 'self_update' );
         if ( ! $monitoring_mati ) {
             $fitur[] = 'events';
             $fitur[] = 'traffic';
+        }
+        if ( $staging ) {
+            $fitur[] = 'staging';
         }
         return $fitur;
     }
@@ -225,7 +228,7 @@ PHP;
             $wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}{$tabel}" ); // phpcs:ignore WordPress.DB.PreparedSQL
         }
         foreach ( array( 'wpmgr_site_id', 'wpmgr_secret', 'wpmgr_dashboard_url', self::OPT_VERSI,
-                         'wpmgr_percayai_xff' ) as $opsi ) {
+                         'wpmgr_percayai_xff', 'wpmgr_izinkan_staging', 'wpmgr_dorong_kunci' ) as $opsi ) {
             delete_option( $opsi );
         }
         // Nama opsi garam disisipi tanggal (wpmgr_garam_YYYY-MM-DD) supaya

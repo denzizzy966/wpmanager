@@ -89,6 +89,37 @@ if ( ! function_exists( 'doing_filter' ) ) {
     }
 }
 
+// Respons REST minimal untuk WPMGR_Staging::respons_biner()/sajikan_biner().
+if ( ! class_exists( 'WP_HTTP_Response' ) ) {
+    class WP_HTTP_Response {
+        public $data;
+        public $headers = array();
+        public $status  = 200;
+
+        public function __construct( $data = null, $status = 200, $headers = array() ) {
+            $this->data    = $data;
+            $this->status  = $status;
+            $this->headers = $headers;
+        }
+
+        public function get_data() {
+            return $this->data;
+        }
+
+        public function header( $kunci, $nilai, $ganti = true ) {
+            $this->headers[ $kunci ] = $nilai;
+        }
+
+        public function get_headers() {
+            return $this->headers;
+        }
+    }
+}
+if ( ! class_exists( 'WP_REST_Response' ) ) {
+    class WP_REST_Response extends WP_HTTP_Response {
+    }
+}
+
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-skema.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-penangkap.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-settings.php';
@@ -100,3 +131,6 @@ require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-rest.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-updater.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-selfupdate.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-sso.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-path.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging-paket.php';
+require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-staging.php';

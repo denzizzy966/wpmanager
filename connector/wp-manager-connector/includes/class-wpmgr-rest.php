@@ -53,6 +53,8 @@ class WPMGR_REST {
             'callback'            => array( __CLASS__, 'traffic' ),
             'permission_callback' => $guard,
         ) );
+
+        WPMGR_Staging::daftarkan_route();
     }
 
     private static function tolak( $pesan ) {
@@ -138,7 +140,7 @@ class WPMGR_REST {
             'wp_version'        => get_bloginfo( 'version' ),
             'php_version'       => PHP_VERSION,
             'site_url'          => home_url(),
-            'fitur'             => WPMGR_Skema::fitur( WPMGR_Skema::monitoring_mati() ),
+            'fitur'             => WPMGR_Skema::fitur( WPMGR_Skema::monitoring_mati(), WPMGR_Staging::fitur_aktif() ),
             'mode_penangkap'    => WPMGR_Skema::mode_penangkap(),
             'percayai_xff'      => WPMGR_Settings::percayai_xff(),
             'versi_skema'       => (int) get_option( WPMGR_Skema::OPT_VERSI, 0 ),
@@ -154,7 +156,7 @@ class WPMGR_REST {
             return WPMGR_Updater::galat_sibuk();
         }
         $data                      = WPMGR_Inventory::kumpulkan();
-        $data['fitur']             = WPMGR_Skema::fitur( WPMGR_Skema::monitoring_mati() );
+        $data['fitur']             = WPMGR_Skema::fitur( WPMGR_Skema::monitoring_mati(), WPMGR_Staging::fitur_aktif() );
         $data['connector_version'] = WPMGR_VERSION;
         return rest_ensure_response( $data );
     }

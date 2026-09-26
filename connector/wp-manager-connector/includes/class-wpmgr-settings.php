@@ -9,6 +9,7 @@ class WPMGR_Settings {
     const OPT_SECRET    = 'wpmgr_secret';
     const OPT_DASHBOARD = 'wpmgr_dashboard_url';
     const OPT_XFF       = 'wpmgr_percayai_xff';
+    const OPT_STAGING   = 'wpmgr_izinkan_staging';
 
     // True hanya selama pastikan_user() sendiri memanggil wp_insert_user(),
     // supaya pencatat admin bisa melewati user SSO yang dibuat connector
@@ -33,6 +34,11 @@ class WPMGR_Settings {
 
     public static function percayai_xff() {
         return '1' === (string) get_option( self::OPT_XFF, '0' );
+    }
+
+    /** Default mati (spec §6.1): admin site yang memutuskan datanya boleh disalin. */
+    public static function izinkan_staging() {
+        return '1' === (string) get_option( self::OPT_STAGING, '0' );
     }
 
     public static function terpasang() {
@@ -176,6 +182,14 @@ class WPMGR_Settings {
             return;
         }
 
+        if ( isset( $_POST['wpmgr_simpan_staging'] ) ) {
+            check_admin_referer( 'wpmgr_staging' );
+            update_option( self::OPT_STAGING, empty( $_POST['wpmgr_izinkan_staging'] ) ? '0' : '1', false );
+            set_transient( 'wpmgr_pesan', 'Pengaturan staging disimpan.', 30 );
+            wp_safe_redirect( admin_url( 'options-general.php?page=wpmgr' ) );
+            exit;
+        }
+
         if ( isset( $_POST['wpmgr_simpan_setelan'] ) ) {
             check_admin_referer( 'wpmgr_setelan' );
             update_option( self::OPT_XFF, empty( $_POST['wpmgr_percayai_xff'] ) ? '0' : '1', false );
@@ -243,6 +257,29 @@ class WPMGR_Settings {
                 </p>
                 <?php submit_button( 'Simpan pengaturan' ); ?>
             </form>
+
+            <h2>Staging</h2>
+            <?php if ( WPMGR_Staging::mode_staging() ) : ?>
+                <p>Site ini adalah <strong>salinan staging</strong> yang dikelola dashboard WP Manager.
+                   Pemantauan dan endpoint staging dimatikan di sini.</p>
+            <?php else : ?>
+                <form method="post">
+                    <?php wp_nonce_field( 'wpmgr_staging' ); ?>
+                    <input type="hidden" name="wpmgr_simpan_staging" value="1">
+                    <p>
+                        <label>
+                            <input type="checkbox" name="wpmgr_izinkan_staging" value="1" <?php checked( self::izinkan_staging() ); ?>>
+                            Izinkan staging
+                        </label>
+                    </p>
+                    <p class="description">
+                        Bila diaktifkan, dashboard WP Manager dapat menyalin seluruh berkas dan database site ini
+                        ke server staging, lalu mendorong perubahan dari staging kembali ke site ini (dengan
+                        snapshot sebelumnya). Matikan kapan saja untuk menutup akses tersebut.
+                    </p>
+                    <?php submit_button( 'Simpan pengaturan staging' ); ?>
+                </form>
+            <?php endif; ?>
         </div>
         <?php
     }

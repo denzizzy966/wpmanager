@@ -1,0 +1,109 @@
+<?php
+if ( ! defined( 'ABSPATH' ) && ! defined( 'WPMGR_TESTING' ) ) {
+    define( 'WPMGR_TESTING', true );
+}
+
+/**
+ * Pintu masuk endpoint /staging/* (spec §6.1). Semua endpoint mati kecuali
+ * admin site menyalakan "Izinkan staging", dan connector di site staging
+ * sendiri (WPMGR_STAGING) tidak pernah mengumumkan atau melayaninya.
+ */
+class WPMGR_Staging {
+
+    const KUNCI_BINER    = '__wpmgr_biner';
+    const HOOK_BERSIHKAN = 'wpmgr_staging_bersihkan';
+
+    private static $biner = null;
+
+    public static function mode_staging() {
+        return defined( 'WPMGR_STAGING' ) && WPMGR_STAGING;
+    }
+
+    public static function fitur_aktif() {
+        return WPMGR_Settings::izinkan_staging() && ! self::mode_staging();
+    }
+
+    public static function root() {
+        return rtrim( str_replace( '\\', '/', ABSPATH ), '/' ) . '/';
+    }
+
+    /**
+     * Sisa waktu yang aman dipakai satu request. Hosting murah memakai
+     * max_execution_time 30 detik; delapan detik disisakan untuk bootstrap
+     * WordPress dan pengiriman respons.
+     */
+    public static function anggaran_detik() {
+        $batas = (int) ini_get( 'max_execution_time' );
+        if ( $batas <= 0 ) {
+            return 20;
+        }
+        return max( 5, min( 20, $batas - 8 ) );
+    }
+
+    public static function bersih( $teks, $panjang ) {
+        return WPMGR_Penangkap::potong( $teks, $panjang );
+    }
+
+    public static function galat( $kode, $pesan, $status ) {
+        return new WP_Error( $kode, $pesan, array( 'status' => $status ) );
+    }
+
+    /** Murni: HMAC diperiksa lebih dulu supaya pihak tak dikenal tidak bisa menebak setelan. */
+    public static function putuskan( $hasil_hmac, $fitur_aktif ) {
+        if ( true !== $hasil_hmac ) {
+            return $hasil_hmac;
+        }
+        if ( ! $fitur_aktif ) {
+            return self::galat( 'wpmgr_staging_mati',
+                'Staging tidak diizinkan di site ini. Aktifkan "Izinkan staging" di Pengaturan -> WP Manager.', 403 );
+        }
+        return true;
+    }
+
+    public static function guard( $request ) {
+        return self::putuskan( WPMGR_REST::guard( $request ), self::fitur_aktif() );
+    }
+
+    /** Jalur => array( metode, nama callback di kelas ini ). Diisi Task 3–8. */
+    public static function rute() {
+        return array();
+    }
+
+    public static function daftarkan_route() {
+        foreach ( self::rute() as $jalur => $r ) {
+            register_rest_route( WPMGR_REST::NS, $jalur, array(
+                'methods'             => $r[0],
+                'callback'            => array( __CLASS__, $r[1] ),
+                'permission_callback' => array( __CLASS__, 'guard' ),
+            ) );
+        }
+    }
+
+    /**
+     * Balasan biner (isi berkas, SQL) tanpa base64: 8 MB isi tetap 8 MB di
+     * kabel. Isinya ditahan di sini dan dicetak oleh sajikan_biner() pada
+     * rest_pre_serve_request, setelah WordPress mengirim header respons
+     * (termasuk header anti-cache dari rest_post_dispatch).
+     */
+    public static function respons_biner( $isi ) {
+        self::$biner = (string) $isi;
+        $r = new WP_REST_Response( array( self::KUNCI_BINER => true ) );
+        $r->header( 'Content-Type', 'application/octet-stream' );
+        $r->header( 'Content-Length', (string) strlen( self::$biner ) );
+        $r->header( 'X-Wpmgr-Sha256', hash( 'sha256', self::$biner ) );
+        return $r;
+    }
+
+    public static function sajikan_biner( $served, $result, $request, $server ) {
+        if ( $served || null === self::$biner || ! ( $result instanceof WP_HTTP_Response ) ) {
+            return $served;
+        }
+        $data = $result->get_data();
+        if ( ! is_array( $data ) || empty( $data[ self::KUNCI_BINER ] ) ) {
+            return $served;
+        }
+        echo self::$biner; // phpcs:ignore WordPress.Security.EscapeOutput -- isi biner, bukan HTML
+        self::$biner = null;
+        return true;
+    }
+}
