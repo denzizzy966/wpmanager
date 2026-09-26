@@ -16,8 +16,16 @@ from wpmgr.fitur import EVENTS, TRAFFIC
 from wpmgr.geoip import unduh_geoip
 from wpmgr.jobs.queue import antrekan_jika_belum, antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
-from wpmgr.kunci import KUNCI_GA4, KUNCI_GEOIP, KUNCI_SSL, KUNCI_UPTIME, kunci_advisory
+from wpmgr.kunci import (
+    KUNCI_GA4,
+    KUNCI_GEOIP,
+    KUNCI_RETENSI,
+    KUNCI_SSL,
+    KUNCI_UPTIME,
+    kunci_advisory,
+)
 from wpmgr.models import JobType, Site, SiteStatus, User
+from wpmgr.retensi import pangkas
 from wpmgr.ssl_cek import cek_semua_ssl
 from wpmgr.traffic import kumpulkan_ga4
 from wpmgr.uptime import buat_klien_http, cek_satu, jalankan_putaran
@@ -137,6 +145,17 @@ def update_geoip() -> str | None:
     return url
 
 
+def prune_monitoring() -> dict | None:
+    with kunci_advisory(db.engine, KUNCI_RETENSI) as dapat:
+        if not dapat:
+            print("Pemangkasan lain masih berjalan; dilewati")
+            return None
+        with get_session() as sesi:
+            hasil = pangkas(sesi, datetime.now(timezone.utc))
+    print(", ".join(f"{k}: {v}" for k, v in hasil.items()))
+    return hasil
+
+
 def collect_ga4() -> dict | None:
     jalur = get_settings().ga4_credentials
     if not jalur:
@@ -169,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check-ssl")
     sub.add_parser("update-geoip")
     sub.add_parser("collect-ga4")
+    sub.add_parser("prune-monitoring")
 
     args = parser.parse_args(argv)
     if args.perintah == "enqueue-scans":
@@ -191,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
         update_geoip()
     elif args.perintah == "collect-ga4":
         collect_ga4()
+    elif args.perintah == "prune-monitoring":
+        prune_monitoring()
     return 0
 
 

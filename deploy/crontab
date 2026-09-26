@@ -1,3 +1,12 @@
 # deploy/crontab — pasang dengan: crontab -u wpmgr deploy/crontab
-0   *  * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli enqueue-scans >> /var/log/wpmgr/cron.log 2>&1
-*/5 *  * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli reap-jobs     >> /var/log/wpmgr/cron.log 2>&1
+# Lapis 1 -- scan inventaris dan pemulihan job
+0    * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli enqueue-scans      >> /var/log/wpmgr/cron.log 2>&1
+*/5  * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli reap-jobs          >> /var/log/wpmgr/cron.log 2>&1
+# Lapis 2 -- pemantauan: uptime, SSL, event login, traffic, GA4, retensi, GeoIP
+*/5  * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli check-uptime       >> /var/log/wpmgr/cron.log 2>&1
+*/15 * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli enqueue-monitoring >> /var/log/wpmgr/cron.log 2>&1
+5    * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli enqueue-traffic    >> /var/log/wpmgr/cron.log 2>&1
+30   2 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli check-ssl          >> /var/log/wpmgr/cron.log 2>&1
+45   2 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli collect-ga4        >> /var/log/wpmgr/cron.log 2>&1
+15   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli prune-monitoring   >> /var/log/wpmgr/cron.log 2>&1
+0    4 1 * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli update-geoip       >> /var/log/wpmgr/cron.log 2>&1

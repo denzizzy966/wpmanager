@@ -5,9 +5,10 @@ tempat: melihat inventaris plugin/tema/core di seluruh site, menjalankan update
 (termasuk update massal lintas-site) lewat plugin connector yang terpasang di
 tiap site, dan masuk ke wp-admin site mana pun dengan satu klik lewat SSO
 bertanda tangan — tanpa dashboard pernah menyimpan atau mengetik password
-wp-admin site tersebut. Backend Python/FastAPI menjalankan web dan worker
-antrean job terpisah; plugin PHP `wp-manager-connector` di sisi site
-mengekspos endpoint REST yang diverifikasi dengan HMAC.
+wp-admin site tersebut. Dashboard juga memantau uptime, SSL, error PHP,
+riwayat login, dan traffic setiap site. Backend Python/FastAPI menjalankan web
+dan worker antrean job terpisah; plugin PHP `wp-manager-connector` di sisi
+site mengekspos endpoint REST yang diverifikasi dengan HMAC.
 
 ## Prasyarat
 
@@ -94,25 +95,25 @@ proses harus berjalan bersamaan; tanpa worker, job hanya menumpuk sebagai
 Proyek ini punya tiga lapis test Python plus satu suite PHP, masing-masing
 butuh prasyarat berbeda. **Jangan jalankan `pytest -m "not integration"` saja**
 — marker itu hanya menyingkirkan test integrasi, bukan test e2e, sehingga ia
-tetap mengumpulkan 117 dari 275 test, termasuk 16 test e2e yang butuh
+tetap mengumpulkan 233 dari 590 test, termasuk 27 test e2e yang butuh
 kontainer WordPress menyala. Di clone segar tanpa Docker jalan, ini gagal
 dengan cara yang tidak ada hubungannya dengan perubahan yang sedang diuji.
 Gunakan tiga perintah berikut, sesuai apa yang tersedia:
 
 ```bash
-# Unit — tidak butuh service apa pun (101 test)
+# Unit — tidak butuh service apa pun (206 test)
 .venv/Scripts/python -m pytest -m "not integration and not e2e"
 
-# Integrasi — butuh PostgreSQL (158 test)
+# Integrasi — butuh PostgreSQL (357 test)
 docker compose up -d db
 .venv/Scripts/python -m pytest tests/integration -m integration
 
-# End-to-end — butuh kontainer WordPress + MariaDB (16 test)
+# End-to-end — butuh kontainer WordPress + MariaDB (27 test)
 docker compose up -d db wp wpdb wpcli
 .venv/Scripts/python -m pytest tests/e2e -m e2e
 ```
 
-Dan untuk plugin connector PHP (68 test):
+Dan untuk plugin connector PHP (198 test):
 
 ```bash
 cd connector && php vendor/bin/phpunit
@@ -125,16 +126,22 @@ cd connector && php vendor/bin/phpunit
 1. Di dashboard, buka **Sites → Tambah Site**, isi nama dan URL (`https://`
    wajib). Dashboard membuatkan secret dan menampilkan satu **kunci koneksi**
    — kunci ini hanya ditampilkan sekali, salin sebelum berpindah halaman.
-2. Bungkus plugin connector dari sumber (ini yang diunggah ke site klien;
-   jangan unggah folder `connector/` mentah-mentah):
+2. Unduh zip plugin lewat tautan **"Unduh plugin connector"** di halaman
+   **Tambah Site** (`/connector/unduh`) — ini yang diunggah ke site klien;
+   jangan unggah folder `connector/` mentah-mentah. Zip ini disiapkan lebih
+   dulu di server dashboard dengan:
 
    ```bash
-   cd connector && zip -r ../wp-manager-connector.zip wp-manager-connector
+   python -m wpmgr.cli build-connector
    ```
 
-   `connector/vendor/` adalah dependency development (PHPUnit dkk) yang
-   dipasang lewat Composer hanya untuk menjalankan test — folder ini **tidak
-   boleh ikut masuk ke dalam zip** yang diunggah ke site klien.
+   `connector/tests/` dan `connector/vendor/` (dependency development —
+   PHPUnit dkk — yang dipasang lewat Composer hanya untuk menjalankan test)
+   **tidak ikut** di dalam zip; perintah build di atas sudah mengecualikan
+   keduanya. Tanpa perintah ini dijalankan sekali dulu, tautan unduhan
+   membalas pesan yang menyuruh menjalankannya (lihat juga bagian
+   [Pemantauan (Lapis 2)](#pemantauan-lapis-2) soal kapan menjalankannya
+   ulang).
 3. Di wp-admin site klien: **Plugins → Add New → Upload Plugin**, unggah
    `wp-manager-connector.zip`, aktifkan.
 4. Buka halaman setting plugin, tempel kunci koneksi dari langkah 1. Plugin
@@ -316,6 +323,91 @@ password lama mungkin bocor, ganti juga `WPMGR_SESSION_SECRET` di `.env`
 lalu `systemctl restart wpmgr-web` — setiap cookie sesi yang ada menjadi
 tidak sah dan semua orang harus login ulang.
 
+## Pemantauan (Lapis 2)
+
+Selain inventaris dan update, dashboard memantau kesehatan tiap site dari
+beberapa sumber berbeda:
+
+| Data | Datang dari |
+|---|---|
+| Uptime dan SSL | Cron dashboard sendiri (`check-uptime`, `check-ssl`), tidak butuh apa pun di site |
+| Error PHP, riwayat login, dan traffic (sumber "plugin") | Plugin connector 2.x, dikumpulkan lewat job (`collect_events`, `collect_traffic`) |
+| Traffic (sumber "ga4") | Google Analytics Data API, lewat `collect-ga4` |
+
+**Setiap deploy** (setelah `git pull`), dua perintah ini wajib dijalankan
+sebelum service di-restart:
+
+```bash
+.venv/bin/python -m alembic upgrade head
+.venv/bin/python -m wpmgr.cli build-connector
+```
+
+Tanpa `build-connector` dijalankan ulang, tombol **"Perbarui connector"** di
+halaman Site dan tautan unduhan di halaman Tambah Site tetap membalas pesan
+yang menyuruh menjalankan perintah itu — keduanya membaca paket zip dan
+manifest yang dihasilkannya, bukan folder `connector/` mentah.
+
+**Sekali setelah deploy pertama** (database GeoIP belum ada sampai perintah
+ini dijalankan; setelahnya `deploy/crontab` menjalankannya ulang otomatis
+setiap bulan):
+
+```bash
+.venv/bin/python -m wpmgr.cli update-geoip
+```
+
+**Memperbarui connector di site klien.** Site yang masih memakai connector
+1.x (dari Lapis 1) perlu satu kali upload manual versi 2.x lewat wp-admin
+(**Plugins → Add New → Upload Plugin**, ambil zip dari `/connector/unduh`),
+sama seperti pemasangan pertama kali. Setelah connector 2.x aktif di site
+itu, pembaruan berikutnya cukup lewat aksi massal **"Perbarui connector"** di
+halaman **Site**.
+
+**Setup GA4 (opsional).** Tanpa langkah ini, dashboard tetap berjalan penuh,
+hanya tanpa panel traffic sumber "ga4":
+
+1. Di Google Cloud Console, buat project (atau pakai yang sudah ada) dan
+   sebuah service account, lalu aktifkan **Google Analytics Data API**
+   untuknya.
+2. Unduh kunci JSON service account tersebut ke
+   `/opt/wpmgr/ga4-service-account.json`, lalu batasi aksesnya:
+   ```bash
+   chown wpmgr:wpmgr /opt/wpmgr/ga4-service-account.json
+   chmod 600 /opt/wpmgr/ga4-service-account.json
+   ```
+3. Isi `WPMGR_GA4_CREDENTIALS=/opt/wpmgr/ga4-service-account.json` di `.env`.
+4. Untuk tiap site klien yang ingin dipantau: di properti GA4 milik client,
+   tambahkan alamat email service account sebagai **Viewer**
+   (**Admin → Property access management**). Lalu, di tab **Ringkasan** pada
+   halaman detail site di dashboard, isi **Property ID** — angka polos
+   (mis. `123456789`), **bukan** ID pengukuran berformat `G-XXXXXXX`.
+
+**Mematikan pemantauan di satu site.** Tambahkan baris berikut ke
+`wp-config.php` site tersebut:
+
+```php
+define( 'WPMGR_DISABLE_MONITORING', true );
+```
+
+Pembaruan plugin/tema/core dan SSO tetap berjalan seperti biasa; hanya
+penangkap error, pencatat login, dan penghitung traffic connector yang mati.
+
+**Setelan proxy per site.** Untuk site yang berjalan di belakang load
+balancer atau reverse proxy sendiri (di luar nginx dashboard ini), buka
+**Pengaturan → WP Manager** di wp-admin site tersebut untuk mengatur apakah
+header `X-Forwarded-For` dari proxy itu boleh dipercaya saat menentukan IP
+pengunjung/penyerang.
+
+**Variabel env baru** (lihat `.env.example`), semuanya opsional:
+
+| Variabel | Default | Untuk |
+|---|---|---|
+| `WPMGR_VAR_DIR` | `var` | Induk direktori data lokal (paket connector, database GeoIP) |
+| `WPMGR_GEOIP_PATH` | `<WPMGR_VAR_DIR>/geoip/dbip-country-lite.mmdb` | Lokasi database GeoIP, bila ingin di luar `WPMGR_VAR_DIR` |
+| `WPMGR_GA4_CREDENTIALS` | *(kosong = GA4 nonaktif)* | Jalur berkas kunci JSON service account GA4 |
+
+**Atribusi:** data negara berasal dari [DB-IP Lite](https://db-ip.com/db/lite.php)
+([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)).
+
 ## Keterbatasan yang diketahui
 
 Reaper memulihkan job berstatus `running` yang sudah terkunci lebih lama
@@ -334,11 +426,37 @@ handler individual, dan jendela masalahnya sendiri butuh worker yang macet
 di luar timeout HTTP-nya sendiri untuk terjadi — sesuatu yang jarang terjadi
 dalam operasi normal.
 
+Keterbatasan pemantauan (Lapis 2):
+
+- **Tanpa notifikasi.** Uptime turun, SSL kedaluwarsa, error baru, atau
+  serangan login hanya terlihat kalau seseorang membuka halaman Kesehatan;
+  tidak ada email, Slack, atau saluran lain yang mengabari secara aktif.
+- Site dengan drop-in `wp-content/php-error.php` **tidak** tertangkap fatal
+  error-nya: drop-in itu memanggil `die()` sebelum fungsi shutdown milik
+  connector sempat berjalan (lihat koreksi #1 di
+  `docs/superpowers/plans/2026-09-22-wp-manager-lapis2.md`).
+- Penangkap error berjalan dalam **mode "terbatas"** bila folder
+  `wp-content/mu-plugins` di site tersebut tidak dapat ditulisi connector
+  saat aktivasi; halaman detail site menandai kondisi ini di kolom "Penangkap
+  error".
+- Angka traffic sumber "plugin" dan "ga4" **memang berbeda** dan tidak pernah
+  dijumlahkan — GA4 tidak menghitung pengunjung yang memakai ad-blocker atau
+  menolak cookie, sedangkan penghitung plugin menghitung semuanya.
+- "Jumlah pengunjung harian" di kedua sumber menghitung ulang pengunjung yang
+  sama di hari yang berbeda (bukan pengunjung unik sepanjang periode); ini
+  angka harian, bukan agregat yang boleh dijumlahkan lintas hari.
+- Ambang status keamanan (jumlah percobaan login gagal yang dianggap
+  serangan, jendela waktu tembusnya brute force, dst.) adalah konstanta di
+  `src/wpmgr/keamanan.py`, bukan setelan yang bisa diubah lewat UI.
+
 ## Struktur repo (ringkas)
 
 | Path | Isi |
 |---|---|
 | `src/wpmgr/` | Aplikasi Python: web (FastAPI), worker, job handler, klien HTTP ke site |
+| `src/wpmgr/{uptime,ssl_cek,keamanan,traffic,laporan,retensi,kesehatan}.py` | Modul pemantauan Lapis 2: penilaian uptime, cek SSL, status keamanan, GA4/anomali traffic, laporan bulanan, retensi data, halaman Kesehatan |
+| `src/wpmgr/{fitur,versi,kunci,connector_paket,uagent,geoip}.py` | Pendukung Lapis 2: fitur yang diumumkan connector, perbandingan versi, advisory lock cron, paket zip connector, parsing user-agent, GeoIP |
+| `src/wpmgr/jobs/monitoring.py`, `src/wpmgr/web/routes_monitoring.py` | Handler job (`collect_events`, `collect_traffic`, `update_connector`) dan API JSON untuk data pemantauan |
 | `connector/wp-manager-connector/` | Plugin WordPress yang dipasang di tiap site klien |
 | `migrations/` | Migrasi Alembic |
 | `tests/unit/`, `tests/integration/`, `tests/e2e/` | Tiga lapis test Python (lihat bagian test di atas) |
