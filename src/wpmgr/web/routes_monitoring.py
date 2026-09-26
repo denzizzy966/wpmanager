@@ -335,14 +335,20 @@ def keamanan_diperiksa(site_id: uuid.UUID, pengguna: PenggunaApi):
     return {"ok": True}
 
 
-# Batas jumlah IP yang dikembalikan /api/keamanan/penyerang, sama seperti
-# batas jumlah baris hasil akhir lain di berkas ini -- lihat komentar
-# BATAS_IP_LOGIN_GAGAL di atas untuk alasan agregasi selalu dilakukan penuh
-# dulu (SUM atas SEMUA baris login_gagal yang cocok), baru dipotong ke sekian
-# IP paling deras.
+# Batas jumlah IP yang dikembalikan /api/keamanan/penyerang. Sama seperti
+# BATAS_IP_LOGIN_GAGAL di atas: agregasi (SUM/COUNT DISTINCT/MAX) dilakukan
+# penuh di SQL atas SEMUA baris login_gagal yang cocok, GROUP BY ip, baru
+# hasil yang sudah diringkas itu dipotong LIMIT ke sekian IP paling deras --
+# tidak pernah menarik baris mentah ke Python sebelum agregasi (bug yang
+# sama seperti /logins sebelum Task 22 memperbaikinya, tapi lebih parah di
+# sini karena lintas SEMUA site sekaligus).
 BATAS_IP_PENYERANG = 500
+# Per IP yang lolos ke 500 besar itu, jumlah nama site/username yang
+# ditampilkan di string gabungan juga dibatasi PER IP lewat row_number() --
+# satu IP bisa menyerang ratusan site atau mencoba ribuan username.
 BATAS_SITE_PER_IP = 5
 BATAS_USERNAME_PER_IP_PENYERANG = 5
+BATAS_UA_SAMPEL_PER_IP_PENYERANG = 20
 # LoginGagal.jam adalah AWAL jam (dibulatkan ke bawah oleh connector), bukan
 # tengahnya -- koreksi #11 rencana Lapis 2. Jendela "N jam terakhir" mundur
 # satu jam ekstra supaya ember yang sedang berjalan ikut terhitung di menit
@@ -354,50 +360,140 @@ _MARJIN_EMBER_PENYERANG = timedelta(hours=1)
 def penyerang(pengguna: PenggunaApi, jam: int = 24):
     jam = max(1, min(jam, 24 * 30))
     sejak = _sekarang() - timedelta(hours=jam) - _MARJIN_EMBER_PENYERANG
-    per_ip: dict = defaultdict(lambda: {"jumlah": 0, "negara": None, "site": set(),
-                                        "username": defaultdict(int), "jalur": set(),
-                                        "skrip": False, "terakhir": None})
+    # ip != "": baris "(IP lain)" adalah ember overflow yang mencampur banyak
+    # IP berbeda dari banyak site -- lihat catatan koreksi #3. Memasukkannya
+    # di sini akan membuat satu baris palsu yang seolah-olah satu IP
+    # menyerang hampir semua site sekaligus.
+    filter_dasar = (LoginGagal.jam > sejak, LoginGagal.ip != "", Site.status != SiteStatus.disabled)
+
     with db.SessionLocal() as sesi:
-        # ip != "": baris "(IP lain)" adalah ember overflow yang mencampur
-        # banyak IP berbeda dari banyak site -- lihat catatan koreksi #3.
-        # Memasukkannya di sini akan membuat satu baris palsu yang seolah-olah
-        # satu IP menyerang hampir semua site sekaligus.
-        for g, nama_site in sesi.execute(
-            select(LoginGagal, Site.nama).join(Site, Site.id == LoginGagal.site_id)
-            .where(LoginGagal.jam > sejak, LoginGagal.ip != "",
-                   Site.status != SiteStatus.disabled)
-        ).all():
-            r = per_ip[g.ip]
-            r["jumlah"] += g.jumlah
-            r["negara"] = r["negara"] or g.negara
-            r["site"].add(nama_site)
-            r["username"][g.username] += g.jumlah
-            r["jalur"].add(g.jalur)
-            r["skrip"] = r["skrip"] or urai_ua(g.user_agent)["skrip"]
-            r["terakhir"] = max(filter(None, (r["terakhir"], g.jam)))
-    hasil = [
+        # Langkah 1: SUM/COUNT DISTINCT/MAX di SQL atas SEMUA baris yang
+        # cocok, GROUP BY ip -- baru hasil yang sudah diringkas ini yang
+        # dipotong ke BATAS_IP_PENYERANG IP paling deras. jumlah_site dihitung
+        # dari site_id (COUNT DISTINCT), BUKAN dari nama site: nama site tidak
+        # unik, dua site berbeda boleh bernama sama.
+        agregat_ip = sesi.execute(
+            select(
+                LoginGagal.ip,
+                func.sum(LoginGagal.jumlah).label("jumlah"),
+                func.count(func.distinct(LoginGagal.site_id)).label("jumlah_site"),
+                func.max(LoginGagal.jam).label("terakhir"),
+                func.max(LoginGagal.negara).label("negara"),
+            )
+            .join(Site, Site.id == LoginGagal.site_id)
+            .where(*filter_dasar)
+            .group_by(LoginGagal.ip)
+            .order_by(func.sum(LoginGagal.jumlah).desc(), LoginGagal.ip)
+            .limit(BATAS_IP_PENYERANG)
+        ).all()
+        ip_teratas = [baris.ip for baris in agregat_ip]
+
+        site_per_ip: dict = defaultdict(list)
+        username_per_ip: dict = defaultdict(list)
+        jalur_per_ip: dict = defaultdict(set)
+        skrip_per_ip: dict = defaultdict(bool)
+
+        if ip_teratas:
+            filter_ip = (*filter_dasar, LoginGagal.ip.in_(ip_teratas))
+
+            # Langkah 2a: nama site teratas per IP, dibatasi PER IP lewat
+            # row_number() atas SITE_ID (bukan nama) -- dua site berbeda
+            # dengan nama sama harus tetap tampil sebagai dua entri terpisah
+            # di string gabungan, bukan menyusut jadi satu lewat GROUP BY nama.
+            peringkat_site = (
+                select(
+                    LoginGagal.ip,
+                    Site.nama,
+                    func.sum(LoginGagal.jumlah).label("jumlah"),
+                    func.row_number().over(
+                        partition_by=LoginGagal.ip,
+                        order_by=(func.sum(LoginGagal.jumlah).desc(), Site.nama, LoginGagal.site_id),
+                    ).label("rn"),
+                )
+                .join(Site, Site.id == LoginGagal.site_id)
+                .where(*filter_ip)
+                .group_by(LoginGagal.ip, LoginGagal.site_id, Site.nama)
+            ).subquery()
+            baris_site = sesi.execute(
+                select(peringkat_site.c.ip, peringkat_site.c.nama)
+                .where(peringkat_site.c.rn <= BATAS_SITE_PER_IP)
+                .order_by(peringkat_site.c.ip, peringkat_site.c.rn)
+            ).all()
+            for ip, nama in baris_site:
+                site_per_ip[ip].append(nama)
+
+            # Langkah 2b: username teratas per IP -- pola sama seperti /logins
+            # (Task 22): row_number() PER IP, bukan LIMIT baris mentah global.
+            peringkat_username = (
+                select(
+                    LoginGagal.ip,
+                    LoginGagal.username,
+                    func.sum(LoginGagal.jumlah).label("jumlah"),
+                    func.row_number().over(
+                        partition_by=LoginGagal.ip,
+                        order_by=func.sum(LoginGagal.jumlah).desc(),
+                    ).label("rn"),
+                )
+                .join(Site, Site.id == LoginGagal.site_id)
+                .where(*filter_ip)
+                .group_by(LoginGagal.ip, LoginGagal.username)
+            ).subquery()
+            baris_username = sesi.execute(
+                select(peringkat_username.c.ip, peringkat_username.c.username)
+                .where(peringkat_username.c.rn <= BATAS_USERNAME_PER_IP_PENYERANG)
+                .order_by(peringkat_username.c.ip, peringkat_username.c.rn)
+            ).all()
+            for ip, username in baris_username:
+                username_per_ip[ip].append(username)
+
+            # Langkah 2c: jalur hanya berisi tiga nilai tetap ("form",
+            # "xmlrpc", "app_password") -- DISTINCT langsung tanpa
+            # row_number(), tidak akan pernah membengkak seberapa pun banyak
+            # baris login_gagal di baliknya.
+            baris_jalur = sesi.execute(
+                select(LoginGagal.ip, LoginGagal.jalur).distinct()
+                .join(Site, Site.id == LoginGagal.site_id)
+                .where(*filter_ip)
+            ).all()
+            for ip, jalur in baris_jalur:
+                jalur_per_ip[ip].add(jalur)
+
+            # Langkah 2d: "skrip" cukup sampel N baris terbaru per IP lintas
+            # site -- pola sama seperti /logins, diperiksa lewat urai_ua()
+            # yang sama, bukan diduplikasi ke SQL.
+            peringkat_ua = (
+                select(
+                    LoginGagal.ip,
+                    LoginGagal.user_agent,
+                    func.row_number().over(
+                        partition_by=LoginGagal.ip, order_by=LoginGagal.jam.desc(),
+                    ).label("rn"),
+                )
+                .join(Site, Site.id == LoginGagal.site_id)
+                .where(*filter_ip)
+            ).subquery()
+            baris_ua = sesi.execute(
+                select(peringkat_ua.c.ip, peringkat_ua.c.user_agent)
+                .where(peringkat_ua.c.rn <= BATAS_UA_SAMPEL_PER_IP_PENYERANG)
+            ).all()
+            for ip, user_agent in baris_ua:
+                if urai_ua(user_agent)["skrip"]:
+                    skrip_per_ip[ip] = True
+
+    return [
         {
-            "ip": ip,
-            "negara": r["negara"],
-            "jumlah": r["jumlah"],
-            "jumlah_site": len(r["site"]),
-            "site": ", ".join(sorted(r["site"])[:BATAS_SITE_PER_IP]),
-            "username": ", ".join(
-                u for u, _ in sorted(r["username"].items(), key=lambda x: (-x[1], x[0]))
-                [:BATAS_USERNAME_PER_IP_PENYERANG]
-            ),
-            "jalur": ", ".join(sorted(r["jalur"])),
-            "skrip": r["skrip"],
-            "terakhir": _iso(r["terakhir"]),
+            "ip": baris.ip,
+            "negara": baris.negara,
+            "jumlah": int(baris.jumlah),
+            "jumlah_site": baris.jumlah_site,
+            "site": ", ".join(site_per_ip.get(baris.ip, [])),
+            "username": ", ".join(username_per_ip.get(baris.ip, [])),
+            "jalur": ", ".join(sorted(jalur_per_ip.get(baris.ip, ()))),
+            "skrip": skrip_per_ip.get(baris.ip, False),
+            "terakhir": _iso(baris.terakhir),
         }
-        for ip, r in per_ip.items()
+        for baris in agregat_ip
     ]
-    # Tie-break dengan ip: dict Python mempertahankan urutan kemunculan
-    # pertama tiap IP di hasil query, yang tidak dijamin stabil antar
-    # eksekusi -- tanpa tie-break kedua, IP dengan jumlah sama bisa bertukar
-    # urutan begitu saja walau datanya tidak berubah.
-    hasil.sort(key=lambda b: (-b["jumlah"], b["ip"]))
-    return hasil[:BATAS_IP_PENYERANG]
 
 
 class PermintaanGA4(BaseModel):
