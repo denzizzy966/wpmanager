@@ -262,7 +262,14 @@ def persen_uptime(sesi: Session, site_id, sejak: datetime) -> float | None:
 
 def uptime_harian(sesi: Session, site_id, sekarang: datetime, hari: int) -> list[dict]:
     awal = (sekarang - timedelta(days=hari - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    kolom_hari = func.date_trunc("day", UptimeCheck.dicek_pada).label("hari")
+    # func.timezone("UTC", ...) dulu, baru date_trunc: date_trunc('day', timestamptz)
+    # membagi hari menurut TimeZone SESI Postgres, bukan UTC. Mesin koneksi sudah
+    # dipatok ke UTC (wpmgr/db.py), tapi fungsi ini tidak boleh diam-diam salah
+    # kalau suatu saat dipanggil lewat sesi/koneksi lain yang tidak dipatok --
+    # timezone("UTC", kolom) mengubahnya jadi timestamp tanpa zona dalam waktu
+    # UTC dulu, sehingga date_trunc sesudahnya murni operasi kalender, tak
+    # tersentuh TimeZone sesi sama sekali.
+    kolom_hari = func.date_trunc("day", func.timezone("UTC", UptimeCheck.dicek_pada)).label("hari")
     naik = func.count().filter(UptimeCheck.hasil == UptimeHasil.naik)
     gagal = func.count().filter(UptimeCheck.hasil == UptimeHasil.gagal)
     peta = {
@@ -285,10 +292,16 @@ def uptime_harian(sesi: Session, site_id, sekarang: datetime, hari: int) -> list
 
 
 def rata_waktu_ms(sesi: Session, site_id, sejak: datetime) -> int | None:
+    # Sama seperti persen_uptime_per_site: putaran gangguan_dashboard tidak
+    # merepresentasikan site ini sungguhan lambat/cepat, cuma jaringan
+    # dashboard yang bermasalah -- tanpa filter ini waktu respons semua site
+    # ikut tercemar oleh satu putaran yang gagal massal.
     nilai = sesi.scalar(
-        select(func.avg(UptimeCheck.waktu_ms)).where(
+        select(func.avg(UptimeCheck.waktu_ms))
+        .join(UptimePutaran, UptimePutaran.id == UptimeCheck.putaran_id)
+        .where(
             UptimeCheck.site_id == site_id, UptimeCheck.hasil == UptimeHasil.naik,
-            UptimeCheck.dicek_pada >= sejak,
+            UptimeCheck.dicek_pada >= sejak, UptimePutaran.gangguan_dashboard.is_(False),
         )
     )
     return int(nilai) if nilai is not None else None

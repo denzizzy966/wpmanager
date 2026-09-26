@@ -5,7 +5,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from wpmgr import db
 from wpmgr.keamanan import nilai_keamanan, status_error
@@ -36,11 +36,21 @@ TEKS_STATUS_UPTIME = {"naik": "Naik", "mati": "Mati", "terblokir": "Terblokir",
                       "belum_dicek": "Belum dicek"}
 TEKS_KOMPONEN = {"plugin": "Plugin", "mu-plugin": "Must-use plugin", "theme": "Tema",
                  "core": "WordPress core", "lainnya": "Lainnya"}
-# Batas baris LoginGagal mentah yang diambil dari DB sebelum diringkas per IP,
-# diurutkan dari yang paling deras dulu -- site yang sedang digempur brute
-# force dengan banyak username/jam berbeda tidak boleh membuat query ini
-# menarik puluhan ribu baris ke memori proses dashboard.
-BATAS_BARIS_LOGIN_GAGAL = 5000
+# Batas JUMLAH IP (bukan baris mentah) yang dikembalikan /logins: agregasi
+# jumlah per IP dilakukan penuh di SQL atas SEMUA baris yang cocok (supaya
+# totalnya selalu akurat), lalu hasil yang sudah diringkas itu yang dipotong
+# ke sekian IP paling deras. Ini beda dari LIMIT baris mentah sebelum agregasi
+# (bug lama): LIMIT baris mentah bisa menjatuhkan baris "kecil" -- misalnya
+# serangan username-spray yang menyebar jadi ribuan baris ber-jumlah=1 per
+# jam/username -- sehingga total per IP salah dan IP itu bisa hilang total
+# dari daftar walau ia sebenarnya salah satu yang paling deras.
+BATAS_IP_LOGIN_GAGAL = 200
+# Per IP yang lolos ke 200 besar itu, jumlah username teratas dan sampel user
+# agent yang diperiksa juga dibatasi -- serangan username-spray terhadap SATU
+# IP bisa mencoba ribuan username berbeda, dan kita hanya perlu representasi,
+# bukan semuanya.
+BATAS_USERNAME_PER_IP = 5
+BATAS_UA_SAMPEL_PER_IP = 20
 
 
 @router.get("/api/kesehatan")
@@ -173,10 +183,6 @@ def logins_site(site_id: uuid.UUID, pengguna: PenggunaApi, hari: int = 30):
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
         keamanan = nilai_keamanan(sesi, site, sekarang)
-        kejadian = sesi.scalars(
-            select(KejadianLogin).where(KejadianLogin.site_id == site.id, KejadianLogin.waktu >= sejak)
-            .order_by(KejadianLogin.waktu.desc()).limit(500)
-        ).all()
 
         def bentuk(k):
             ua = urai_ua(k.user_agent)
@@ -184,33 +190,111 @@ def logins_site(site_id: uuid.UUID, pengguna: PenggunaApi, hari: int = 30):
                     "ip": k.ip, "negara": k.negara, "jalur": k.jalur, "peramban": ua["peramban"],
                     "os": ua["os"], "skrip": ua["skrip"]}
 
-        per_ip: dict = defaultdict(lambda: {"jumlah": 0, "negara": None, "username": defaultdict(int),
-                                            "jalur": set(), "skrip": False})
-        for g in sesi.scalars(
-            select(LoginGagal).where(LoginGagal.site_id == site.id, LoginGagal.jam >= sejak)
-            .order_by(LoginGagal.jumlah.desc()).limit(BATAS_BARIS_LOGIN_GAGAL)
-        ).all():
-            ringkas = per_ip[g.ip or "(IP lain)"]
-            ringkas["jumlah"] += g.jumlah
-            ringkas["negara"] = ringkas["negara"] or g.negara
-            ringkas["username"][g.username] += g.jumlah
-            ringkas["jalur"].add(g.jalur)
-            ringkas["skrip"] = ringkas["skrip"] or urai_ua(g.user_agent)["skrip"]
-        gagal = sorted(
-            ({"ip": ip, "negara": r["negara"], "jumlah": r["jumlah"],
-              "username": [u for u, _ in sorted(r["username"].items(), key=lambda x: -x[1])[:5]],
-              "jalur": sorted(r["jalur"]), "skrip": r["skrip"]}
-             for ip, r in per_ip.items()),
-            key=lambda b: -b["jumlah"],
-        )[:200]
+        # Dua query terpisah, bukan satu LIMIT 500 atas semua jenis: admin_baru/
+        # jadi_admin jarang tapi login berhasil bisa sangat sering. Satu LIMIT
+        # bersama membuat login berhasil yang deras menenggelamkan kejadian admin
+        # yang lebih lama tapi masih dalam jendela `hari` -- tabel "Administrator
+        # baru" bisa bilang "Tidak ada" padahal `alasan` di atasnya justru
+        # menyebut admin itu.
+        admin_kejadian = sesi.scalars(
+            select(KejadianLogin).where(
+                KejadianLogin.site_id == site.id, KejadianLogin.waktu >= sejak,
+                KejadianLogin.jenis != "berhasil",
+            ).order_by(KejadianLogin.waktu.desc()).limit(500)
+        ).all()
+        berhasil_kejadian = sesi.scalars(
+            select(KejadianLogin).where(
+                KejadianLogin.site_id == site.id, KejadianLogin.waktu >= sejak,
+                KejadianLogin.jenis == "berhasil",
+            ).order_by(KejadianLogin.waktu.desc()).limit(500)
+        ).all()
+
+        # Langkah 1: total per IP dihitung SQL SUM atas SEMUA baris yang cocok
+        # (tanpa LIMIT baris mentah apa pun di sini) -- baru hasil yang sudah
+        # diringkas ini yang dipotong ke BATAS_IP_LOGIN_GAGAL IP paling deras.
+        # Totalnya selalu akurat berapa pun banyak baris mentah di baliknya.
+        agregat_ip = sesi.execute(
+            select(
+                LoginGagal.ip,
+                func.sum(LoginGagal.jumlah).label("jumlah"),
+                func.max(LoginGagal.negara).label("negara"),
+                func.array_agg(LoginGagal.jalur.distinct()).label("jalur"),
+            )
+            .where(LoginGagal.site_id == site.id, LoginGagal.jam >= sejak)
+            .group_by(LoginGagal.ip)
+            .order_by(func.sum(LoginGagal.jumlah).desc(), LoginGagal.ip)
+            .limit(BATAS_IP_LOGIN_GAGAL)
+        ).all()
+        ip_teratas = [baris.ip for baris in agregat_ip]
+
+        # Langkah 2: username teratas per IP, dibatasi PER IP lewat row_number()
+        # (bukan lagi dengan menyortir baris mentah global) -- serangan
+        # username-spray terhadap satu IP tetap menampilkan 5 username
+        # terbanyak IP itu, bukan lima nama pertama yang kebetulan lolos LIMIT
+        # global.
+        username_per_ip: dict = defaultdict(list)
+        if ip_teratas:
+            peringkat_username = (
+                select(
+                    LoginGagal.ip,
+                    LoginGagal.username,
+                    func.sum(LoginGagal.jumlah).label("jumlah"),
+                    func.row_number().over(
+                        partition_by=LoginGagal.ip,
+                        order_by=func.sum(LoginGagal.jumlah).desc(),
+                    ).label("rn"),
+                )
+                .where(LoginGagal.site_id == site.id, LoginGagal.jam >= sejak,
+                       LoginGagal.ip.in_(ip_teratas))
+                .group_by(LoginGagal.ip, LoginGagal.username)
+            ).subquery()
+            baris_username = sesi.execute(
+                select(peringkat_username.c.ip, peringkat_username.c.username)
+                .where(peringkat_username.c.rn <= BATAS_USERNAME_PER_IP)
+                .order_by(peringkat_username.c.ip, peringkat_username.c.rn)
+            ).all()
+            for ip, username in baris_username:
+                username_per_ip[ip].append(username)
+
+        # Langkah 3: "skrip" hanya butuh SATU baris yang User-Agent-nya
+        # menyerupai skrip, jadi cukup sampel N baris terbaru per IP (bukan
+        # agregat presisi seperti total/username) -- diperiksa di Python lewat
+        # urai_ua() yang sama dipakai di tempat lain, bukan diduplikasi ke SQL.
+        skrip_per_ip: dict = defaultdict(bool)
+        if ip_teratas:
+            peringkat_ua = (
+                select(
+                    LoginGagal.ip,
+                    LoginGagal.user_agent,
+                    func.row_number().over(
+                        partition_by=LoginGagal.ip, order_by=LoginGagal.jam.desc(),
+                    ).label("rn"),
+                )
+                .where(LoginGagal.site_id == site.id, LoginGagal.jam >= sejak,
+                       LoginGagal.ip.in_(ip_teratas))
+            ).subquery()
+            baris_ua = sesi.execute(
+                select(peringkat_ua.c.ip, peringkat_ua.c.user_agent)
+                .where(peringkat_ua.c.rn <= BATAS_UA_SAMPEL_PER_IP)
+            ).all()
+            for ip, user_agent in baris_ua:
+                if urai_ua(user_agent)["skrip"]:
+                    skrip_per_ip[ip] = True
+
+        gagal = [
+            {"ip": baris.ip or "(IP lain)", "negara": baris.negara, "jumlah": int(baris.jumlah),
+             "username": username_per_ip.get(baris.ip, []), "jalur": sorted(baris.jalur),
+             "skrip": skrip_per_ip.get(baris.ip, False)}
+            for baris in agregat_ip
+        ]
 
         return {
             "status": keamanan.status.value,
             "alasan": keamanan.alasan,
             "percobaan_sejam": keamanan.percobaan_sejam,
             "diperiksa_pada": _iso(site.keamanan_diperiksa_pada),
-            "berhasil": [bentuk(k) for k in kejadian if k.jenis == "berhasil"],
-            "admin": [bentuk(k) for k in kejadian if k.jenis != "berhasil"],
+            "berhasil": [bentuk(k) for k in berhasil_kejadian],
+            "admin": [bentuk(k) for k in admin_kejadian],
             "gagal": gagal,
         }
 
@@ -238,7 +322,14 @@ def atur_ga4(site_id: uuid.UUID, req: PermintaanGA4, pengguna: PenggunaApi):
                             detail="Property ID GA4 berupa 6 sampai 12 digit angka, bukan Measurement ID (G-...).")
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
-        site.ga4_property_id = nilai or None
-        site.ga4_error = None
+        baru = nilai or None
+        if baru != site.ga4_property_id:
+            # Hanya bersihkan status lama kalau property ID SUNGGUHAN berubah:
+            # menyimpan ulang nilai yang sama (klik "Simpan" tanpa mengubah apa
+            # pun) sebelumnya diam-diam menghapus ga4_error yang justru masih
+            # berlaku untuk property yang sama itu.
+            site.ga4_property_id = baru
+            site.ga4_error = None
+            site.ga4_diambil_pada = None
         sesi.commit()
     return {"ok": True}

@@ -4,13 +4,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from wpmgr import db
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import NAMA_ZIP, baca_manifest
-from wpmgr.keamanan import error_menyalakan_chip, nilai_keamanan
+from wpmgr.keamanan import JENDELA_ERROR_BARU, nilai_keamanan
 from wpmgr.models import (
     ActivityLog,
     CatatanError,
@@ -162,11 +162,29 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
             .order_by(ActivityLog.dibuat_pada.desc())
             .limit(100)
         ).all()
-        errors = sesi.scalars(select(CatatanError).where(CatatanError.site_id == site_id)).all()
+        # Setara SQL dari error_menyalakan_chip()/status_error() di keamanan.py
+        # (status "baru" atau "masih_terjadi", bukan "selesai"/"berhenti"), tapi
+        # dihitung dengan COUNT di database alih-alih menarik SETIAP CatatanError
+        # site ini ke Python hanya untuk memberi badge di nav tab. Kalau logika
+        # kedua fungsi itu berubah, cerminan di sini wajib ikut diperbarui.
+        jumlah_error = sesi.scalar(
+            select(func.count()).select_from(CatatanError).where(
+                CatatanError.site_id == site_id,
+                CatatanError.tingkat.in_(("fatal", "database")),
+                not_(and_(
+                    CatatanError.ditandai_selesai_pada.is_not(None),
+                    CatatanError.terakhir_terlihat <= CatatanError.ditandai_selesai_pada,
+                )),
+                or_(
+                    CatatanError.pertama_terlihat >= sekarang - JENDELA_ERROR_BARU,
+                    CatatanError.terakhir_terlihat >= sekarang - JENDELA_ERROR_BARU,
+                ),
+            )
+        )
         keamanan = nilai_keamanan(sesi, site, sekarang)
     lencana = {
         "uptime": "!" if site.uptime_status == UptimeStatus.mati else "",
-        "error": sum(1 for e in errors if error_menyalakan_chip(e, sekarang)) or "",
+        "error": jumlah_error or "",
         "login": {"perlu_diperiksa": "!", "diserang": "serangan"}.get(keamanan.status.value, ""),
     }
     return _tpl().TemplateResponse(
