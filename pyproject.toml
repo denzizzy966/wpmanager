@@ -18,6 +18,7 @@ dependencies = [
     "maxminddb>=2.6",
     "google-auth>=2.30",
     "requests>=2.32",
+    "bcrypt>=4.1",
 ]
 
 [project.optional-dependencies]

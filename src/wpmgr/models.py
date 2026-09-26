@@ -49,6 +49,20 @@ class JobType(str, enum.Enum):
     collect_events = "collect_events"
     collect_traffic = "collect_traffic"
     update_connector = "update_connector"
+    staging_tarik = "staging_tarik"
+    staging_uji_update = "staging_uji_update"
+    staging_dorong = "staging_dorong"
+    staging_kembalikan = "staging_kembalikan"
+
+
+# Job staging diproses worker khusus (Koreksi #1). Tarik dan uji hanya
+# membaca produksi, jadi boleh berjalan bersamaan dengan job non-staging di
+# site yang sama; dorong dan kembalikan menulis ke produksi dan tidak boleh.
+JOB_STAGING = frozenset({
+    JobType.staging_tarik, JobType.staging_uji_update,
+    JobType.staging_dorong, JobType.staging_kembalikan,
+})
+JOB_STAGING_BACA = frozenset({JobType.staging_tarik, JobType.staging_uji_update})
 
 
 class JobStatus(str, enum.Enum):
@@ -70,6 +84,15 @@ class UptimeHasil(str, enum.Enum):
     naik = "naik"
     gagal = "gagal"
     terblokir = "terblokir"
+
+
+class StatusStaging(str, enum.Enum):
+    menyalin = "menyalin"
+    siap = "siap"
+    berjalan_uji = "berjalan_uji"
+    mendorong = "mendorong"
+    dijeda = "dijeda"
+    gagal = "gagal"
 
 
 def _uuid() -> uuid.UUID:
@@ -163,6 +186,15 @@ class Job(Base):
     __table_args__ = (
         Index("ix_jobs_status_scheduled_for", "status", "scheduled_for"),
         Index("ix_jobs_site_id_status", "site_id", "status"),
+        # Paling banyak satu job staging tertunda/berjalan per site (spec §11).
+        # Dijaga di database supaya dua klik bersamaan tidak lolos keduanya.
+        Index(
+            "uq_jobs_staging_aktif", "site_id", unique=True,
+            postgresql_where=text(
+                "tipe IN ('staging_tarik', 'staging_uji_update', 'staging_dorong', "
+                "'staging_kembalikan') AND status IN ('pending', 'running')"
+            ),
+        ),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     site_id: Mapped[uuid.UUID] = mapped_column(
@@ -366,3 +398,65 @@ class TrafficRincian(Base):
     dimensi: Mapped[str] = mapped_column(Text, nullable=False)
     kunci: Mapped[str] = mapped_column(Text, nullable=False)
     kunjungan: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class Staging(Base):
+    """Satu salinan staging per site (spec §5.1)."""
+
+    __tablename__ = "staging"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    site_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    nama: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    status: Mapped[StatusStaging] = mapped_column(
+        Enum(StatusStaging, name="status_staging"), nullable=False,
+        default=StatusStaging.menyalin, server_default="menyalin",
+    )
+    aktif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    sandi_hash: Mapped[str | None] = mapped_column(Text)
+    # Kunci secure_link router untuk SSO dan probe (Koreksi #5), Fernet.
+    rahasia_router_terenkripsi: Mapped[bytes | None] = mapped_column(LargeBinary)
+    versi_php: Mapped[str | None] = mapped_column(Text)
+    ukuran_file: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    ukuran_db: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    ditarik_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tanda_air: Mapped[dict | None] = mapped_column(JSONB)
+    diubah_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dibuka_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sertifikat_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    galat: Mapped[str | None] = mapped_column(Text)
+    dorong_gagal_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    batal_diminta_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dibuat_pada: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StagingSnapshot(Base):
+    __tablename__ = "staging_snapshot"
+    __table_args__ = (Index("ix_staging_snapshot_site_dibuat", "site_id", "dibuat_pada"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    site_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("jobs.id", ondelete="SET NULL"))
+    jenis: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    ukuran: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[dict | None] = mapped_column(JSONB)
+    dibuat_pada: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StagingUji(Base):
+    __tablename__ = "staging_uji"
+    __table_args__ = (Index("ix_staging_uji_site_dibuat", "site_id", "dibuat_pada"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    site_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False
+    )
+    # Nullable (Koreksi #4): riwayat uji lebih berharga daripada baris job-nya.
+    job_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("jobs.id", ondelete="SET NULL"))
+    paket: Mapped[list] = mapped_column(JSONB, nullable=False)
+    hasil: Mapped[str] = mapped_column(Text, nullable=False)
+    pemeriksaan: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    dibuat_pada: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
