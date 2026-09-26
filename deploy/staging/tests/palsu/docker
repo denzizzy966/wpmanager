@@ -9,6 +9,8 @@ case "${1-}" in
     [[ -f "$PALSU/wadah/$nama" ]] || exit 1
     if [[ "${3-}" == *Labels* ]]; then
       cat "$PALSU/wadah/$nama"
+    elif [[ "${3-}" == *Mounts* ]]; then
+      cat "$PALSU/wadah/$nama.mounts" 2>/dev/null || true
     else
       cat "$PALSU/wadah/$nama.image" 2>/dev/null || true
     fi

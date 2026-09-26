@@ -102,8 +102,11 @@ buat_situs() {
 @test "buat menjalankan container dengan batas sumber daya dan mount yang tepat" {
   run "$SKRIP" buat toko 8.1 "$ID"
   [ "$status" -eq 0 ]
-  diharapkan="[run][-d][--name][wp-toko][--label][wpmgr.staging=situs:toko][--network][wpmgr-staging][--restart][unless-stopped][--memory][384m][--memory-swap][384m][--cpus][1][--pids-limit][256][--security-opt][no-new-privileges][-e][APACHE_RUN_USER=#1000][-e][APACHE_RUN_GROUP=#1000][-v][$S/staging/$ID/files:/var/www/html][-v][$S/staging/$ID/ekspor:/wpmgr-ekspor][-v][$S/staging/$ID/log:/wpmgr-log][-v][$S/etc/wp-cli.phar:/usr/local/bin/wp:ro][wordpress@sha256:$D64]"
+  # Putusan R13: seluruh container berjalan sebagai UID dashboard tanpa
+  # capability; sysctl membuat Apache non-root boleh listen di port 80.
+  diharapkan="[run][-d][--name][wp-toko][--label][wpmgr.staging=situs:toko][--network][wpmgr-staging][--restart][unless-stopped][--memory][384m][--memory-swap][384m][--cpus][1][--pids-limit][256][--user][1000:1000][--cap-drop][ALL][--sysctl][net.ipv4.ip_unprivileged_port_start=0][--security-opt][no-new-privileges][-v][$S/staging/$ID/files:/var/www/html][-v][$S/staging/$ID/ekspor:/wpmgr-ekspor][-v][$S/staging/$ID/log:/wpmgr-log][-v][$S/etc/wp-cli.phar:/usr/local/bin/wp:ro][wordpress@sha256:$D64]"
   grep -qxF "$diharapkan" "$PALSU/docker.log"
+  ! grep -q 'APACHE_RUN_' "$PALSU/docker.log" || false
   [ -d "$S/staging/$ID/files" ]
 }
 
@@ -166,6 +169,56 @@ buat_situs() {
   ! grep -q '^\[run\]' "$PALSU/docker.log" || false
 }
 
+@test "jalan memeriksa sumber bind mount container sebelum start" {
+  buat_situs
+  printf 'situs:toko' > "$PALSU/wadah/wp-toko"
+  mounts() {
+    printf '%s|/var/www/html\n%s|/wpmgr-ekspor\n%s|/wpmgr-log\n%s|/usr/local/bin/wp\n' \
+      "$1/files" "$1/ekspor" "$1/log" "$S/etc/wp-cli.phar" > "$PALSU/wadah/wp-toko.mounts"
+  }
+  mounts "$S/staging/$ID"
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 0 ]
+  grep -qxF "[start][wp-toko]" "$PALSU/docker.log"
+  rm -f "$PALSU/docker.log"
+
+  # Sumber mount berupa symlink.
+  mkdir -p "$S/lain"
+  chown 1000:1000 "$S/lain"
+  rmdir "$S/staging/$ID/files"
+  ln -s "$S/lain" "$S/staging/$ID/files"
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"GALAT ditolak"* ]]
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+
+  # Sumber mount milik UID lain.
+  rm -f "$S/staging/$ID/files"
+  mkdir "$S/staging/$ID/files"
+  chown 1001:1001 "$S/staging/$ID/files"
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+
+  # Mount tambahan di luar pola yang diharapkan.
+  chown 1000:1000 "$S/staging/$ID/files"
+  mounts "$S/staging/$ID"
+  printf '/etc|/host-etc\n' >> "$PALSU/wadah/wp-toko.mounts"
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+
+  # Mount site yang hilang, atau menunjuk tujuan yang tertukar.
+  printf '%s|/var/www/html\n%s|/wpmgr-log\n%s|/wpmgr-ekspor\n' \
+    "$S/staging/$ID/files" "$S/staging/$ID/ekspor" "$S/staging/$ID/log" > "$PALSU/wadah/wp-toko.mounts"
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 3 ]
+  printf '%s|/var/www/html\n' "$S/staging/$ID/files" > "$PALSU/wadah/wp-toko.mounts"
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+}
+
 @test "jalan dan jeda menolak container asing" {
   printf 'layanan:db' > "$PALSU/wadah/wp-toko"
   run "$SKRIP" jeda toko
@@ -206,6 +259,9 @@ buat_situs() {
   grep -qxF "[exec][-u][1000:1000][wp-toko][php][-d][memory_limit=512M][/usr/local/bin/wp][--path=/var/www/html][plugin][update][akismet][--version=5.3.1]" "$PALSU/docker.log"
   run "$SKRIP" wpcli toko option update blog_public 0
   [ "$status" -eq 0 ]
+  # Putusan R13: tidak ada exec ke container site tanpa -u UID dashboard.
+  grep -q '^\[exec\]' "$PALSU/docker.log"
+  ! grep '^\[exec\]' "$PALSU/docker.log" | grep -v '^\[exec\]\(\[-i\]\)\?\[-u\]\[1000:1000\]\[wp-' || false
 }
 
 @test "wpcli gagal dilaporkan dengan kode 8" {
@@ -398,6 +454,11 @@ buat_situs() {
   grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-router\]' "$PALSU/docker.log"
   grep -q '\[-p\]\[127.0.0.1:8090:80\]' "$PALSU/docker.log"
   ! grep -q 'MARIADB_ROOT_PASSWORD=' "$PALSU/docker.log" || false
+  # Router (root di container) hanya memasang berkas yang dirender skrip ini,
+  # read-only; tidak ada path yang bisa ditulis user dashboard.
+  grep -qF "[-v][$S/etc/router/conf.d:/etc/nginx/conf.d:ro]" "$PALSU/docker.log"
+  grep -qF "[-v][$S/etc/router/htpasswd:/etc/nginx/wpmgr-htpasswd:ro]" "$PALSU/docker.log"
+  ! grep -qF "[-v][$S/staging" "$PALSU/docker.log" || false
   grep -qF 'return 444;' "$S/etc/router/conf.d/00-bawaan.conf"
 }
 
@@ -412,4 +473,12 @@ buat_situs() {
   run "$SKRIP" buat toko 8.1 "$ID"
   [ "$status" -eq 0 ]
   grep -qF "[-v][/run/desktop/mnt/host/d/repo/var/staging/$ID/files:/var/www/html]" "$PALSU/docker.log"
+  # jalan menerjemahkan balik sumber mount versi daemon sebelum memeriksanya.
+  printf 'situs:toko' > "$PALSU/wadah/wp-toko"
+  a=/run/desktop/mnt/host/d/repo/var
+  printf '%s|/var/www/html\n%s|/wpmgr-ekspor\n%s|/wpmgr-log\n%s|/usr/local/bin/wp\n' \
+    "$a/staging/$ID/files" "$a/staging/$ID/ekspor" "$a/staging/$ID/log" "$a/etc/wp-cli.phar" > "$PALSU/wadah/wp-toko.mounts"
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 0 ]
+  grep -qxF "[start][wp-toko]" "$PALSU/docker.log"
 }

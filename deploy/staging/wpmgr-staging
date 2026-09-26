@@ -10,6 +10,9 @@
 #     itu (setpriv), karena ia bisa mengganti apa pun di sana dengan symlink;
 #   - direktori yang di-bind mount diperiksa root dulu: direktori asli, bukan
 #     symlink, dengan pemilik yang diharapkan (putusan F2);
+#   - container site seluruhnya berjalan sebagai UID dashboard tanpa
+#     capability, sehingga mount yang ditukar di sela pemeriksaan tidak memberi
+#     akses lebih dari yang sudah dimiliki user itu di host (putusan R13);
 #   - container yang labelnya bukan milik staging tidak pernah disentuh,
 #     termasuk layanan bersama db/router/mail (RF5, putusan F14);
 #   - setiap panggilan docker/certbot/setpriv dibatasi `timeout` supaya
@@ -210,6 +213,16 @@ nama_db() { printf 'stg_%s' "${1//-/_}"; }
 
 sbg_pengguna() { dibatasi setpriv --reuid="$UID_W" --regid="$GID_W" --clear-groups -- "$@"; }
 
+# Kebalikan jalur_daemon: path sumber mount dari `docker inspect` ke path lokal.
+jalur_lokal() {
+  local p="$1"
+  if [[ -n "$AKAR_DAEMON" && -n "$AKAR_LOKAL" && "$p" == "$AKAR_DAEMON"/* ]]; then
+    printf '%s%s' "$AKAR_LOKAL" "${p#"$AKAR_DAEMON"}"
+  else
+    printf '%s' "$p"
+  fi
+}
+
 jalur_daemon() {
   local p="$1"
   if [[ -n "$AKAR_DAEMON" && -n "$AKAR_LOKAL" && "$p" == "$AKAR_LOKAL"/* ]]; then
@@ -381,6 +394,12 @@ cmd_siapkan() {
     "$img_db" --innodb-buffer-pool-size=256M --max-allowed-packet=64M
   rm -f "$env_db"
   jalankan_layanan wpmgr-stg-mail mail --memory 128m -p "$MAIL_PORT:8025" "$img_mail"
+  # Layanan bersama berjalan sebagai root di container, jadi tidak satu pun
+  # memasang path yang bisa ditulis user dashboard (putusan R13): db memakai
+  # volume bernama, mail tanpa mount, router hanya memasang KONF_DIR/router
+  # (berkas hasil render template tetap, ditulis root) read-only dan LOG_DIR
+  # milik root. Berkas kiriman dashboard di STAGING_DIR/router tidak pernah
+  # dipasang; router-muat membacanya, memvalidasi, lalu merender ulang.
   jalankan_layanan wpmgr-stg-router router --memory 128m -p "$ROUTER_PORT:80" \
     -v "$m_konf:/etc/nginx/conf.d:ro" \
     -v "$m_htpasswd:/etc/nginx/wpmgr-htpasswd:ro" \
@@ -419,10 +438,19 @@ cmd_buat() {
     fi
     dk rm -f "$wadah" >/dev/null || galat docker "container lama tidak dapat dihapus"
   fi
+  # Putusan R13: seluruh container (entrypoint, Apache, PHP) berjalan sebagai
+  # UID dashboard tanpa capability. Tanpa user namespace UID container sama
+  # dengan UID host, jadi bila sumber mount ditukar (TOCTOU terhadap
+  # cek_mount_pengguna, atau start ulang otomatis oleh Docker) container
+  # hanya mendapat akses yang memang sudah dimiliki user dashboard di host.
+  # Entrypoint image wordpress mendukung non-root: chown dilewati dan salinan
+  # WordPress (bila files/ kosong) ditulis sebagai UID ini; direktori
+  # run/lock/log Apache di image bermode 1777. Sysctl membuat Apache non-root
+  # boleh listen di port 80 (hanya di network namespace container ini).
   dk run -d --name "$wadah" --label "wpmgr.staging=situs:$nama" --network "$JARINGAN" \
     --restart unless-stopped --memory 384m --memory-swap 384m --cpus 1 --pids-limit 256 \
+    --user "$UID_W:$GID_W" --cap-drop ALL --sysctl net.ipv4.ip_unprivileged_port_start=0 \
     --security-opt no-new-privileges \
-    -e "APACHE_RUN_USER=#$UID_W" -e "APACHE_RUN_GROUP=#$GID_W" \
     -v "$m_files:/var/www/html" \
     -v "$m_ekspor:/wpmgr-ekspor" \
     -v "$m_log:/wpmgr-log" \
@@ -430,9 +458,48 @@ cmd_buat() {
     "$img" >/dev/null || galat docker "container staging tidak dapat dibuat"
 }
 
+# Putusan R13 (F2 untuk `jalan`): `jalan` tidak tahu site_id, jadi sumber
+# bind mount yang sebenarnya dibaca dari Docker. Harus persis files/, ekspor/,
+# log/ milik SATU site (plus wp-cli.phar read-only), masing-masing lolos
+# cek_mount_pengguna. Mount lain apa pun berarti container bukan buatan
+# `buat` dan ditolak.
+cek_mount_wadah() {
+  local wadah="$1" daftar sumber tujuan lokal sub s id="" terlihat=" "
+  daftar="$(dk inspect --format '{{range .Mounts}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' "$wadah")" \
+    || galat docker "container tidak terbaca"
+  while IFS='|' read -r sumber tujuan; do
+    [[ -z "$sumber" && -z "$tujuan" ]] && continue
+    [[ "$sumber" =~ $POLA_JALUR && "$sumber" != *..* ]] || galat ditolak "sumber mount container tidak sah"
+    lokal="$(jalur_lokal "$sumber")"
+    case "$tujuan" in
+      /var/www/html) sub=files ;;
+      /wpmgr-ekspor) sub=ekspor ;;
+      /wpmgr-log) sub=log ;;
+      /usr/local/bin/wp)
+        [[ "$lokal" == "$KONF_DIR/wp-cli.phar" ]] || galat ditolak "sumber mount container tidak sah"
+        cek_mount_root "$lokal" f
+        continue ;;
+      *) galat ditolak "container memuat mount yang tidak dikenal" ;;
+    esac
+    [[ "$terlihat" != *" $sub "* ]] || galat ditolak "sumber mount container tidak sah"
+    terlihat+="$sub "
+    [[ "$lokal" == "$STAGING_DIR"/*/"$sub" ]] || galat ditolak "sumber mount container tidak sah"
+    s="${lokal#"$STAGING_DIR"/}"
+    s="${s%/"$sub"}"
+    [[ "$s" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+      || galat ditolak "sumber mount container tidak sah"
+    [[ -z "$id" || "$id" == "$s" ]] || galat ditolak "sumber mount container tidak sah"
+    id="$s"
+    cek_mount_pengguna "$lokal"
+  done <<< "$daftar"
+  [[ "$terlihat" == *" files "* && "$terlihat" == *" ekspor "* && "$terlihat" == *" log "* ]] \
+    || galat ditolak "sumber mount container tidak lengkap"
+}
+
 cmd_jalan() {
   cek_nama "${1-}"
   pastikan_milik "wp-$1" "situs:$1" || galat ditolak "staging belum dibuat"
+  cek_mount_wadah "wp-$1"
   dk start "wp-$1" >/dev/null || galat docker "staging tidak dapat dijalankan"
 }
 
