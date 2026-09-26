@@ -269,37 +269,88 @@ final class ManifestTest extends TestCase {
     }
 
     public function test_tenggat_maju_meski_semua_entri_pertama_dilewati(): void {
-        // Item 1, fix round 1: sebelum perbaikan, tenggat/kemajuan hanya
-        // diperiksa setelah ADA berkas yang terkirim -- direktori berisi
-        // banyak entri yang dilewati (di sini: berkas *.log yang
-        // dikecualikan) tanpa satu pun berkas asli bisa berjalan lewat
-        // batas waktu tanpa kursor pernah maju, dan halaman berikutnya
-        // mengulang persis dari awal (macet selamanya). Sekarang kursor
-        // juga bisa menunjuk ke entri yang DILEWATI (asal namanya lolos
-        // normalisasi()), jadi paging bisa melewati direktori seperti ini
-        // walau tenggat sudah lewat sebelum satu pun berkas terkirim.
-        $this->tulis( 'a-debug.log' );
-        $this->tulis( 'b-debug.log' );
+        // Item 1, fix round 1, DIPERKUAT fix round 2: sebelum perbaikan,
+        // tenggat/kemajuan hanya diperiksa setelah ADA berkas yang
+        // terkirim -- direktori berisi banyak entri yang dilewati (di
+        // sini: 20 berkas *.log yang dikecualikan) tanpa satu pun berkas
+        // asli bisa berjalan lewat batas waktu tanpa kursor pernah maju,
+        // dan halaman berikutnya mengulang persis dari awal (macet
+        // selamanya). Diperkuat (review putaran 2): SETIAP halaman
+        // dipanggil dengan tenggat yang SUDAH LEWAT (bukan hanya halaman
+        // pertama), dan setiap kursor harus benar-benar berbeda dari
+        // kursor sebelumnya -- membuktikan paging tidak pernah berputar di
+        // tempat yang sama, bukan hanya maju sekali lalu macet.
+        for ( $i = 1; $i <= 20; $i++ ) {
+            $this->tulis( sprintf( 'f%02d-debug.log', $i ) );
+        }
         $this->tulis( 'z-asli.txt', 'isi' );
 
-        $h1 = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) - 1 );
-        $this->assertSame( array(), array_column( $h1['berkas'], 'path' ) );
-        $this->assertTrue( $h1['lagi'] );
-        $this->assertSame( 'a-debug.log', $h1['kursor'] );
-
-        $kursor    = $h1['kursor'];
+        $kursor    = '';
+        $riwayat   = array();
         $terkumpul = array();
-        for ( $i = 0; $i < 10; $i++ ) {
-            $h = WPMGR_Staging_Manifest::jalan( $this->akar, $kursor, 5000, microtime( true ) + 30 );
+        for ( $i = 0; $i <= 20; $i++ ) {
+            $h = WPMGR_Staging_Manifest::jalan( $this->akar, $kursor, 5000, microtime( true ) - 1 );
             foreach ( $h['berkas'] as $b ) {
                 $terkumpul[] = $b['path'];
             }
             if ( ! $h['lagi'] ) {
-                break;
+                $this->assertSame( array( 'z-asli.txt' ), $terkumpul );
+                return;
+            }
+            $this->assertNotSame( $kursor, $h['kursor'], "Kursor tidak maju dari '$kursor' pada iterasi $i." );
+            $riwayat[] = $h['kursor'];
+            $kursor    = $h['kursor'];
+        }
+        $this->assertSame( count( $riwayat ), count( array_unique( $riwayat ) ), 'Kursor berulang -- paging berputar di tempat.' );
+        $this->fail( 'Paging tidak selesai dalam 21 halaman.' );
+    }
+
+    public function test_kursor_tidak_macet_pada_direktori_dikecualikan(): void {
+        // Item 1, fix round 2: reproduksi PERSIS dari temuan review --
+        // kursor MASUK menunjuk ke sebuah DIREKTORI yang dikecualikan itu
+        // sendiri ('wp-content/cache'). Sebelum perbaikan, cabang 5c jatuh
+        // ke direktori_dikecualikan()/dikecualikan() dan mencatat ULANG
+        // kursor MASUK itu sendiri sebagai kandidat kursor KELUAR; tenggat
+        // yang sudah lewat lalu berhenti pada entri berikutnya dan
+        // mengembalikan kursor KELUAR yang identik dengan kursor MASUK --
+        // paging tidak pernah maju (dashboard memanggil ulang dengan
+        // kursor yang sama, selamanya).
+        $this->tulis( 'wp-content/cache/a.html' );
+        $this->tulis( 'wp-content/m.txt' );
+        $this->tulis( 'wp-content/z.txt' );
+
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, 'wp-content/cache', 5000, microtime( true ) - 1 );
+        // 'cache' (dikecualikan) tidak lagi mencatat kandidat kursor, jadi
+        // 'm.txt' langsung diperiksa (kandidat masih null di sana) dan
+        // berhasil dikirim -- tenggat baru berhenti pada 'z.txt' berikutnya.
+        $this->assertSame( array( 'wp-content/m.txt' ), array_column( $h['berkas'], 'path' ) );
+        $this->assertTrue( $h['lagi'] );
+        $this->assertNotSame( 'wp-content/cache', $h['kursor'] );
+        $this->assertSame( 'wp-content/m.txt', $h['kursor'] );
+    }
+
+    public function test_invarian_kursor_keluar_tidak_pernah_sama_dengan_kursor_masuk(): void {
+        // Item 1, fix round 2: invarian umum -- pada penelusuran mana pun
+        // dengan tenggat yang selalu lewat, kursor KELUAR halaman tidak
+        // pernah sama dengan kursor MASUK yang diberikan ke halaman itu
+        // (kalau sama, paging berhenti maju selamanya).
+        $this->tulis( 'wp-content/cache/a.html' );
+        $this->tulis( 'wp-content/updraft/b.zip' );
+        $this->tulis( 'wp-content/themes/t/style.css' );
+        $this->tulis( 'wp-content/uploads/2026/09/f.jpg' );
+        $this->tulis( 'index.php' );
+
+        $kursor = '';
+        for ( $i = 0; $i < 30; $i++ ) {
+            $h = WPMGR_Staging_Manifest::jalan( $this->akar, $kursor, 5000, microtime( true ) - 1 );
+            if ( $h['lagi'] ) {
+                $this->assertNotSame( $kursor, $h['kursor'], "Kursor tidak maju dari '$kursor'." );
+            } else {
+                return;
             }
             $kursor = $h['kursor'];
         }
-        $this->assertSame( array( 'z-asli.txt' ), $terkumpul );
+        $this->fail( 'Paging tidak berhenti dalam 30 halaman.' );
     }
 
     public function test_batas_ukuran_halaman_direspons(): void {
@@ -313,6 +364,26 @@ final class ManifestTest extends TestCase {
         $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
         $this->assertTrue( $h['lagi'] );
         $this->assertLessThan( 3, count( $h['berkas'] ) );
+    }
+
+    public function test_batas_ukuran_halaman_menghitung_json_sungguhan(): void {
+        // Item 2, fix round 2: perkiraan lama (strlen(path) + konstanta)
+        // meremehkan ukuran JSON SUNGGUHAN sampai ~3x untuk path berisi
+        // banyak karakter non-ASCII -- json_encode()/wp_json_encode()
+        // meng-escape tiap karakter seperti itu menjadi '\uXXXX' (6 byte),
+        // jauh lebih besar dari 2 byte UTF-8 mentahnya. Dengan 5 nama
+        // panjang seperti ini dan batas kecil, perkiraan LAMA tidak akan
+        // pernah mencapai batas (lagi: false, salah); perkiraan BARU
+        // (encode sungguhan per entri) harus berhenti sebelum kelimanya.
+        WPMGR_Staging_Manifest::$maks_bytes_halaman = 2000;
+        $nama = str_repeat( 'é', 100 ) . '.txt';
+        foreach ( array( 'a-', 'b-', 'c-', 'd-', 'e-' ) as $awalan ) {
+            $this->tulis( $awalan . $nama );
+        }
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
+        $this->assertTrue( $h['lagi'] );
+        $this->assertLessThan( 5, count( $h['berkas'] ) );
+        $this->assertNotNull( $h['kursor'] );
     }
 
     public function test_batas_dijepit(): void {

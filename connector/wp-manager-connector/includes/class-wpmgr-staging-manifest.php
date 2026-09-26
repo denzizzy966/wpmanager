@@ -50,7 +50,8 @@ class WPMGR_Staging_Manifest {
     }
 
     public static function jalan( $akar, $kursor, $batas, $tenggat ) {
-        $ctx = array(
+        $kursor = (string) $kursor;
+        $ctx    = array(
             'berkas'          => array(),
             'dilewati'        => array(),
             'jumlah_dilewati' => 0,
@@ -58,10 +59,10 @@ class WPMGR_Staging_Manifest {
             'tenggat'         => (float) $tenggat,
             'terhash'         => 0,
             'bytes_hal'       => 0,
+            'kursor_masuk'    => $kursor,
             'kursor_kandidat' => null,
             'berhenti'        => false,
         );
-        $kursor = (string) $kursor;
         $bagian = ( '' === $kursor ) ? array() : explode( '/', $kursor );
         self::telusuri( $akar, '', $bagian, ! empty( $bagian ), $ctx, 0 );
         return array(
@@ -91,8 +92,21 @@ class WPMGR_Staging_Manifest {
      * itu (nama bukan UTF-8, mengandung ':', berakhiran '.'/spasi, atau
      * terlalu panjang) tidak aman dijadikan kursor karena permintaan
      * lanjutan dengan kursor itu akan ditolak 400, bukan melanjutkan.
+     *
+     * Fix item 1 (review putaran 2): kursor KELUAR tidak pernah boleh sama
+     * dengan kursor MASUK ($ctx['kursor_masuk']). Tanpa pagar ini, direktori
+     * yang dikecualikan TEPAT di posisi kursor (mis. kursor menunjuk ke
+     * 'wp-content/cache' itu sendiri, sebuah direktori yang dikecualikan)
+     * mencatat ulang path yang sama persis sebagai kandidat kursor baru;
+     * bila tenggat lalu berhenti pada entri berikutnya, halaman itu
+     * mengembalikan kursor yang identik dengan kursor masuk -- paging
+     * tidak pernah maju (dashboard memanggil ulang dengan kursor yang sama
+     * selamanya). Lihat ManifestTest::test_kursor_tidak_macet_pada_direktori_dikecualikan.
      */
     private static function catat_kursor( array &$ctx, $rel ) {
+        if ( $rel === $ctx['kursor_masuk'] ) {
+            return;
+        }
         if ( ! is_wp_error( WPMGR_Staging_Path::normalisasi( $rel ) ) ) {
             $ctx['kursor_kandidat'] = $rel;
         }
@@ -109,31 +123,23 @@ class WPMGR_Staging_Manifest {
     }
 
     /**
-     * Item 5f (review putaran 1): WPMGR_Staging_Path::dikecualikan() (milik
-     * Task 2) menganggap NAMA yang berakhiran '.log' sebagai berkas log
-     * yang dikecualikan -- aturan itu hanya masuk akal untuk BERKAS (mis.
-     * wp-content/debug.log). Direktori yang kebetulan bernama serupa (mis.
-     * plugin yang keliru membuat folder seperti itu) tidak boleh ikut
-     * dikecualikan hanya karena akhiran namanya; direktori hanya
-     * dikecualikan bila termasuk pola KHUSUS direktori (cache, area
-     * sementara dorong, atau isi backup plugin). Diduplikasi secara sengaja
-     * dari dikecualikan() (bukan memodifikasi berkas itu, milik Task 2)
-     * supaya perilaku file-vs-direktori yang berbeda tetap jelas di sini.
+     * Item 2 (review putaran 2): perkiraan ukuran sebelumnya
+     * (strlen(path) + konstanta) meremehkan ukuran JSON SUNGGUHAN sampai
+     * ~3x untuk path yang berisi banyak karakter non-ASCII -- REST server
+     * WordPress meng-encode respons lewat wp_json_encode(), yang (seperti
+     * json_encode() dengan opsi bawaan) meng-escape setiap karakter
+     * non-ASCII menjadi '\uXXXX' (6 byte) dan setiap '/' menjadi '\/'
+     * (2 byte). Perkiraan yang meremehkan membuat $maks_bytes_halaman
+     * hampir tidak pernah tercapai justru pada kasus yang paling
+     * membutuhkannya (path panjang, banyak karakter non-ASCII). Di sini
+     * ukuran diambil dari hasil encode SUNGGUHAN per entri: wp_json_encode()
+     * bila tersedia (WordPress sungguhan), atau json_encode() dengan opsi
+     * bawaan yang sama (tanpa JSON_UNESCAPED_UNICODE/JSON_UNESCAPED_SLASHES)
+     * sebagai cadangan di lingkungan test PHP murni.
      */
-    private static function direktori_dikecualikan( $rel ) {
-        $rendah = strtolower( (string) $rel );
-        foreach ( array( 'wp-content/cache', 'wp-content/wpmgr-dorong' ) as $dir ) {
-            if ( $rendah === $dir || 0 === strpos( $rendah, $dir . '/' ) ) {
-                return true;
-            }
-        }
-        $bagian = explode( '/', $rendah );
-        if ( count( $bagian ) >= 2 && 'wp-content' === $bagian[0] ) {
-            if ( in_array( $bagian[1], WPMGR_Staging_Path::BACKUP_KONTEN, true ) || 0 === strpos( $bagian[1], 'backups-dup-' ) ) {
-                return true;
-            }
-        }
-        return false;
+    private static function ukuran_json_entri( array $entri ) {
+        $enc = function_exists( 'wp_json_encode' ) ? wp_json_encode( $entri ) : json_encode( $entri );
+        return false === $enc ? ( strlen( $entri['path'] ) + 96 ) : strlen( $enc );
     }
 
     private static function telusuri( $akar, $rel_dir, array $kursor, $selaras, array &$ctx, $kedalaman ) {
@@ -219,7 +225,18 @@ class WPMGR_Staging_Manifest {
                 continue;
             }
             if ( is_dir( $abs ) ) {
-                if ( self::direktori_dikecualikan( $rel ) ) {
+                // Item 3 (review putaran 2, sebelumnya duplikasi lokal
+                // direktori_dikecualikan()): dikecualikan() milik Task 2
+                // dipanggil dengan '/' di akhir supaya aturan yang hanya
+                // masuk akal untuk BERKAS (akhiran '.log', 'wp-config.php',
+                // '.maintenance') tidak pernah cocok -- karakter terakhir
+                // string yang diuji selalu '/', bukan huruf nama berkas --
+                // sementara aturan KHUSUS direktori (cache, area sementara
+                // dorong, isi backup plugin) tetap cocok seperti biasa,
+                // karena semuanya diuji lewat awalan direktori, bukan
+                // akhiran nama. Satu sumber kebenaran; berkas Task 2 tidak
+                // disentuh.
+                if ( WPMGR_Staging_Path::dikecualikan( $rel . '/' ) ) {
                     self::catat_kursor( $ctx, $rel );
                     continue;
                 }
@@ -256,8 +273,9 @@ class WPMGR_Staging_Manifest {
                 }
                 $ctx['terhash'] += $ukuran;
             }
-            $ctx['berkas'][]   = array( 'path' => $rel, 'ukuran' => (int) $ukuran, 'mtime' => (int) $mtime, 'hash' => $hash );
-            $ctx['bytes_hal'] += strlen( $rel ) + ( null === $hash ? 8 : 72 ); // perkiraan kasar, lihat $maks_bytes_halaman
+            $entri             = array( 'path' => $rel, 'ukuran' => (int) $ukuran, 'mtime' => (int) $mtime, 'hash' => $hash );
+            $ctx['berkas'][]   = $entri;
+            $ctx['bytes_hal'] += self::ukuran_json_entri( $entri );
             self::catat_kursor( $ctx, $rel );
             if ( count( $ctx['berkas'] ) >= $ctx['batas'] || $ctx['bytes_hal'] >= self::$maks_bytes_halaman ) {
                 $ctx['berhenti'] = true;
