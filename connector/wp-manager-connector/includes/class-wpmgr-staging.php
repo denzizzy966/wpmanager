@@ -85,9 +85,10 @@ class WPMGR_Staging {
     /** Jalur => array( metode, nama callback di kelas ini ). Diisi Task 3–8. */
     public static function rute() {
         return array(
-            '/staging/manifest' => array( 'GET', 'manifest' ),
-            '/staging/file'     => array( 'POST', 'file' ),
-            '/staging/tabel'    => array( 'POST', 'tabel' ),
+            '/staging/manifest'  => array( 'GET', 'manifest' ),
+            '/staging/file'      => array( 'POST', 'file' ),
+            '/staging/tabel'     => array( 'POST', 'tabel' ),
+            '/staging/tanda-air' => array( 'GET', 'tanda_air' ),
         );
     }
 
@@ -193,6 +194,29 @@ class WPMGR_Staging {
             return self::galat( 'wpmgr_staging_susun', 'Paket staging tidak dapat disusun.', 500 );
         }
         return self::respons_biner( $paket );
+    }
+
+    /**
+     * Tanda air data baru produksi (Task 6): validasi dan pengumpulan ada di
+     * WPMGR_Staging_TandaAir; di sini hanya penghubung ke respons REST.
+     *
+     * posts_sejak lewat query string (TIDAK tercakup HMAC Lapis 1) --
+     * pagar tipe SEBELUM dipakai, sama seperti manifest(): get_param() bisa
+     * mengembalikan array bila query string dikirim dalam bentuk itu (mis.
+     * '?posts_sejak[]=x'), dan (string) pada array memicu PHP Warning
+     * "Array to string conversion", bukan penolakan bersih. Nilai yang
+     * bukan string diperlakukan sama seperti string kosong: format yang
+     * dihasilkan tidak akan cocok regex kumpulkan(), jadi diubah_sejak
+     * tetap null (kontrak brief) -- tanpa query tambahan dan tanpa risiko
+     * SQL injection, karena kumpulkan() selalu menempelkannya lewat
+     * $wpdb->prepare(), bukan mentah.
+     */
+    public static function tanda_air( $request ) {
+        global $wpdb;
+        $sejak  = $request->get_param( 'posts_sejak' );
+        $sejak  = is_string( $sejak ) ? $sejak : '';
+        $hasil  = WPMGR_Staging_TandaAir::kumpulkan( $wpdb, $sejak, (int) $request->get_param( 'posts_maks' ) );
+        return is_wp_error( $hasil ) ? $hasil : rest_ensure_response( $hasil );
     }
 
     public static function daftarkan_route() {
