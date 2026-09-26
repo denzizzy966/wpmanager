@@ -1,3 +1,5 @@
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -92,6 +94,32 @@ def test_cek_dijalankan_untuk_setiap_url(sesi, site):
     dilihat = []
     jalankan_putaran(sesi, lambda url: dilihat.append(url) or NAIK, sekarang=T0)
     assert dilihat == [site.url]
+
+
+def test_cek_macet_dianggap_gagal_tanpa_menahan_putaran(sesi, site, monkeypatch):
+    monkeypatch.setattr("wpmgr.uptime.BATAS_PUTARAN", 0.3)
+    lambat = Site(id=uuid.uuid4(), nama="Zlambat", url="https://lambat.test",
+                  status=SiteStatus.active, secret_terenkripsi=b"x")
+    sesi.add(lambat)
+    sesi.commit()
+    lepas = threading.Event()
+
+    def cek(url):
+        if url == lambat.url:
+            lepas.wait(10)
+        return NAIK
+
+    mulai = time.monotonic()
+    try:
+        p = jalankan_putaran(sesi, cek, sekarang=T0)
+    finally:
+        lepas.set()
+    assert time.monotonic() - mulai < 3
+    assert (p.jumlah_site, p.jumlah_gagal, p.gangguan_dashboard) == (2, 1, False)
+    hasil = {c.site_id: c for c in sesi.query(UptimeCheck).all()}
+    assert hasil[site.id].hasil == UptimeHasil.naik
+    assert hasil[lambat.id].hasil == UptimeHasil.gagal
+    assert hasil[lambat.id].pesan == "Tidak selesai dalam batas waktu"
 
 
 def test_kunci_advisory_tidak_bisa_diambil_dua_kali(engine):

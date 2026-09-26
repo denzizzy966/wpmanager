@@ -1,9 +1,14 @@
+import threading
+import time
+
 import httpx
 import pytest
 
 from wpmgr.models import UptimeHasil, UptimeStatus
 from wpmgr.uptime import (
+    HasilCek,
     cek_satu,
+    cek_semua,
     gangguan_dashboard,
     nilai_kesalahan,
     nilai_respons,
@@ -93,6 +98,63 @@ def test_cek_satu_kesalahan_bukan_httperror_dianggap_gagal():
     h = cek_satu(client, "https://contoh.test")
     assert h.hasil == UptimeHasil.gagal
     assert h.pesan
+
+
+class _AliranBesar(httpx.SyncByteStream):
+    """Body 10 MB yang dihasilkan sepotong demi sepotong sambil menghitung
+    berapa byte yang benar-benar diminta pembaca."""
+
+    def __init__(self, total=10 * 1024 * 1024, potongan=64 * 1024):
+        self.total = total
+        self.potongan = potongan
+        self.terbaca = 0
+
+    def __iter__(self):
+        while self.terbaca < self.total:
+            self.terbaca += self.potongan
+            yield b"a" * self.potongan
+
+
+def test_cek_satu_hanya_membaca_awal_body_besar():
+    aliran = _AliranBesar()
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/html"}, stream=aliran)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    h = cek_satu(client, "https://contoh.test")
+    assert h.hasil == UptimeHasil.naik
+    assert h.http_status == 200
+    assert aliran.terbaca <= 128 * 1024
+
+
+def test_cek_satu_tetap_mengenali_halaman_blokir_dari_awal_body():
+    body = b"<title>Just a moment...</title>" + b"x" * (5 * 1024 * 1024)
+
+    def handler(request):
+        return httpx.Response(503, content=body)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert cek_satu(client, "https://contoh.test").hasil == UptimeHasil.terblokir
+
+
+def test_cek_semua_memutus_cek_yang_melewati_batas(monkeypatch):
+    monkeypatch.setattr("wpmgr.uptime.BATAS_PUTARAN", 0.3)
+    lepas = threading.Event()
+
+    def cek(url):
+        if url == "lambat":
+            lepas.wait(10)
+        return HasilCek(UptimeHasil.naik, 200, 5)
+
+    mulai = time.monotonic()
+    try:
+        hasil = cek_semua(["cepat", "lambat", "cepat2"], cek)
+    finally:
+        lepas.set()
+    assert time.monotonic() - mulai < 3
+    assert [h.hasil for h in hasil] == [UptimeHasil.naik, UptimeHasil.gagal, UptimeHasil.naik]
+    assert hasil[1].pesan == "Tidak selesai dalam batas waktu"
 
 
 @pytest.mark.parametrize(

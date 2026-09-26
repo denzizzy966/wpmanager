@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -126,6 +126,15 @@ UA = "WPManager-Uptime/2.0"
 TIMEOUT = 15.0
 MAKS_REDIRECT = 5
 MAKS_PARALEL = 10
+# Penanda blokir hanya dicari di 5000 karakter pertama (_halaman_blokir), jadi
+# body tidak perlu dibaca lebih dari itu. Tanpa batas, site yang mengirim body
+# raksasa atau menetes pelan menahan satu thread putaran jauh melewati TIMEOUT
+# (timeout httpx berlaku per operasi baca, bukan untuk seluruh body).
+MAKS_BODY = 5000
+# Batas keras satu putaran: satu cek bisa menghabiskan TIMEOUT untuk koneksi
+# ditambah hampir TIMEOUT untuk satu potongan baca terakhir sebelum tenggat
+# di cek_satu() diperiksa. Cek yang belum selesai sesudahnya dianggap gagal.
+BATAS_PUTARAN = TIMEOUT * 2 + 5
 
 
 def buat_klien_http(transport: httpx.BaseTransport | None = None) -> httpx.Client:
@@ -135,21 +144,55 @@ def buat_klien_http(transport: httpx.BaseTransport | None = None) -> httpx.Clien
     )
 
 
+def _decode_cuplikan(data: bytes, charset: str | None) -> str:
+    try:
+        return data.decode(charset or "utf-8", errors="replace")
+    except LookupError:
+        return data.decode("utf-8", errors="replace")
+
+
 def cek_satu(client: httpx.Client, url: str) -> HasilCek:
     mulai = time.monotonic()
     try:
-        r = client.get(url)
+        with client.stream("GET", url) as r:
+            cuplikan = bytearray()
+            for potongan in r.iter_bytes():
+                cuplikan += potongan
+                if len(cuplikan) >= MAKS_BODY or time.monotonic() - mulai > TIMEOUT:
+                    break
+            status, headers = r.status_code, dict(r.headers)
+            body = _decode_cuplikan(bytes(cuplikan[:MAKS_BODY]), r.charset_encoding)
     except httpx.HTTPError as exc:
         return nilai_kesalahan(exc)
     except Exception as exc:
         # mis. httpx.InvalidURL dari URL site yang tidak sah tersimpan di DB:
         # bukan subkelas HTTPError, jadi tanpa ini lolos dari except dan
-        # menghentikan seluruh putaran lewat ThreadPoolExecutor.map (satu
-        # site rusak wajib gagal sendiri, bukan menggagalkan semua site).
+        # menghentikan seluruh putaran lewat Future.result() di cek_semua
+        # (satu site rusak wajib gagal sendiri, bukan menggagalkan semua site).
         log.exception("Kesalahan tak terduga saat mengecek uptime %s", url)
         return nilai_kesalahan(exc)
-    return nilai_respons(r.status_code, dict(r.headers), r.text,
-                         int((time.monotonic() - mulai) * 1000))
+    return nilai_respons(status, headers, body, int((time.monotonic() - mulai) * 1000))
+
+
+def cek_semua(urls: Sequence[str], cek_fn: Callable[[str], HasilCek]) -> list[HasilCek]:
+    """Cek semua URL paralel dengan batas waktu keras; urutan hasil = urutan URL.
+
+    Tidak memakai `with ThreadPoolExecutor(...)`: keluarnya menunggu SEMUA
+    thread selesai, sehingga satu cek yang macet menahan putaran (dan kunci
+    advisory uptime) tanpa batas. Thread yang macet dibiarkan selesai sendiri
+    di latar belakang; hasilnya tidak dipakai.
+    """
+    ex = ThreadPoolExecutor(max_workers=MAKS_PARALEL)
+    try:
+        futs = [ex.submit(cek_fn, u) for u in urls]
+        wait(futs, timeout=BATAS_PUTARAN)
+        return [
+            f.result() if f.done() and not f.cancelled()
+            else HasilCek(UptimeHasil.gagal, pesan="Tidak selesai dalam batas waktu")
+            for f in futs
+        ]
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def _awal_deret_gagal(sesi: Session, site_id, sekarang: datetime) -> datetime:
@@ -200,8 +243,7 @@ def jalankan_putaran(
     if not sites:
         return None
 
-    with ThreadPoolExecutor(max_workers=MAKS_PARALEL) as ex:
-        hasil = list(ex.map(cek_fn, [s.url for s in sites]))
+    hasil = cek_semua([s.url for s in sites], cek_fn)
 
     sekarang = sekarang or datetime.now(timezone.utc)
     jumlah_gagal = sum(1 for h in hasil if h.hasil == UptimeHasil.gagal)
