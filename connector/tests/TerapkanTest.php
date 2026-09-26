@@ -354,10 +354,99 @@ final class TerapkanTest extends TestCase {
         $this->assertSame( array( 'wpmgr_b2_wp_posts', 'wpmgr_b1_wp_options' ), $k['tabel_batal'] );
         $this->assertSame( array(), $k['tabel_old'] );
         $this->assertSame( array(), $k['tabel_tmp'] );
+        foreach ( array( 'wpmgr_b2_wp_posts', 'wpmgr_b1_wp_options' ) as $t ) {
+            $this->assertGreaterThanOrEqual( time() - 5, $k['batal_dibuat'][ $t ] );
+        }
+
+        // Fix round 1b: bersihkan segera setelah pulihkan menahan tabel batal.
+        $h = $this->dorong()->bersihkan( self::ID );
+        $this->assertFalse( $h['lagi'] );
+        $this->assertTrue( $h['tahan_batal'] );
+        $this->assertGreaterThanOrEqual( time() + 86400 - 5, $h['sampai'] );
+        $this->assertLessThanOrEqual( time() + 86400, $h['sampai'] );
+        $this->assertContains( 'wpmgr_b2_wp_posts', $this->db->tabel );
+        $this->assertContains( 'wpmgr_b1_wp_options', $this->db->tabel );
+        $this->assertDirectoryExists( $this->dir() );
+        $this->assertSame( array( 'wpmgr_b2_wp_posts', 'wpmgr_b1_wp_options' ), $this->dorong()->keadaan( self::ID )['tabel_batal'] );
+        // Kunci dorong dilepas: dorongan baru tidak tertahan.
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+        $this->assertTrue( $this->dorong()->kunci( self::ID2 ) );
+        $this->dorong()->lepas_kunci( self::ID2 );
+
+        // Lebih dari 24 jam kemudian: dihapus normal.
+        $d                 = $this->dorong();
+        $k                 = $d->keadaan( self::ID );
+        $k['batal_dibuat'] = array_map( function () {
+            return time() - 86401;
+        }, $k['batal_dibuat'] );
+        $d->simpan_keadaan( self::ID, $k );
         $this->assertSame( array( 'lagi' => false ), $this->dorong()->bersihkan( self::ID ) );
         $this->assertNotContains( 'wpmgr_b2_wp_posts', $this->db->tabel );
         $this->assertNotContains( 'wpmgr_b1_wp_options', $this->db->tabel );
+        $this->assertDirectoryDoesNotExist( $this->dir() );
         // Milik pemulihan lain (tidak di jurnal ini) tidak disentuh.
+        $this->assertContains( 'wpmgr_b1_wp_posts', $this->db->tabel );
+    }
+
+    private function pulihkan_setelah_pertukaran_db() {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $this->sampai_selesai( 'tukar', array( 'token' => self::TOKEN ) );
+        $this->assertSame( 'dipulihkan', $this->sampai_selesai( 'pulihkan', array( 'token' => self::TOKEN ) )['status'] );
+        $this->assertContains( 'wpmgr_b1_wp_posts', $this->db->tabel );
+    }
+
+    public function test_cron_menahan_tabel_batal_sampai_24_jam_lalu_menghapusnya(): void {
+        $this->pulihkan_setelah_pertukaran_db();
+        $d           = $this->dorong();
+        $k           = $d->keadaan( self::ID );
+        // Area sudah diam 24 jam, tetapi tabel batal baru berumur 1 jam.
+        $k['diubah']       = time() - 90000;
+        $k['batal_dibuat'] = array_map( function () {
+            return time() - 3600;
+        }, $k['batal_dibuat'] );
+        $d->simpan_keadaan( self::ID, $k );
+        $this->dorong()->cron();
+        $this->assertContains( 'wpmgr_b1_wp_posts', $this->db->tabel );
+        $this->assertDirectoryExists( $this->dir() );
+
+        $k                 = $d->keadaan( self::ID );
+        $k['batal_dibuat'] = array_map( function () {
+            return time() - 86401;
+        }, $k['batal_dibuat'] );
+        $d->simpan_keadaan( self::ID, $k );
+        $this->dorong()->cron();
+        $this->assertNotContains( 'wpmgr_b1_wp_posts', $this->db->tabel );
+        $this->assertNotContains( 'wpmgr_b1_wp_options', $this->db->tabel );
+        $this->assertDirectoryDoesNotExist( $this->dir() );
+    }
+
+    public function test_dorongan_baru_merebut_kunci_walau_area_lama_hanya_berisi_tabel_batal(): void {
+        $this->pulihkan_setelah_pertukaran_db();
+        // Dashboard tidak pernah memanggil bersihkan: kunci basi 3 jam.
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $this->assertTrue( $this->dorong()->kunci( self::ID2 ) );
+        $this->assertSame( 'dipulihkan', $this->dorong()->keadaan( self::ID )['status'] );
+
+        // Dorongan baru berjalan sampai terimpor; jurnalnya hanya berisi
+        // tabel sementaranya sendiri, tidak pernah tabel batal milik dorongan lama.
+        $d    = $this->dorong();
+        $sql  = $this->sql_contoh();
+        $json = json_encode( array( 'versi' => 1, 'berkas' => array(), 'hapus' => array(), 'sql' => true, 'charset' => 'utf8mb4' ) );
+        foreach ( array( array( 'sql', $sql ), array( 'rencana', $json ) ) as $i => $p ) {
+            $d->unggah( WPMGR_Staging_Paket::susun( array( 'dorong_id' => self::ID2, 'nomor' => $i, 'jenis' => $p[0],
+                'berkas' => array( array( 'path' => $p[0] ) ) ), array( $p[1] ) ) );
+        }
+        $siap = $this->dorong()->terapkan( array( 'dorong_id' => self::ID2, 'langkah' => 'siapkan',
+            'jumlah_potongan' => 2, 'sha256_rencana' => hash( 'sha256', $json ) ) );
+        $this->assertSame( 'siap', $siap['status'] );
+        $impor = $this->dorong()->terapkan( array( 'dorong_id' => self::ID2, 'langkah' => 'impor' ) );
+        $this->assertSame( 'terimpor', $impor['status'] );
+        $k2 = $this->dorong()->keadaan( self::ID2 );
+        $this->assertSame( array( 'wpmgr_tmp_wp_posts', 'wpmgr_tmp_wp_options' ), $k2['tabel_tmp'] );
+        $this->assertArrayNotHasKey( 'tabel_batal', $k2 );
+        // Area lama tidak dibersihkan tabelnya selama kunci milik dorongan baru.
+        $this->assertSame( array( 'lagi' => true ), $this->dorong()->bersihkan( self::ID ) );
         $this->assertContains( 'wpmgr_b1_wp_posts', $this->db->tabel );
     }
 

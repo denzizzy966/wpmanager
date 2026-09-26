@@ -108,6 +108,10 @@ class WPMGR_Staging_Dorong {
     // Tukar/pulihkan yang tidak disentuh selama ini dianggap ditinggal
     // dashboard (worker mati, jaringan putus) dan dipulihkan cron().
     const DIAM_MACET        = 900;
+    // Fix round 1b: tabel batal (wpmgr_b<n>_*, tulisan produksi pasca-tukar
+    // yang dibatalkan) ditahan sekurangnya selama ini sejak dibuat, bahkan
+    // terhadap bersihkan() eksplisit, supaya masih bisa diselamatkan manual.
+    const UMUR_BATAL        = 86400;
     // Status di mana hasil sebuah langkah yang SUDAH selesai masih berlaku
     // (Ruling F4): ulangan langkah itu dibalas hasil tersimpan yang sama.
     // 'dipulihkan' sengaja tidak ada di daftar tukar/impor/siapkan: tukar
@@ -724,6 +728,9 @@ class WPMGR_Staging_Dorong {
                     $this->simpan_keadaan( $id, $k );
                     continue;
                 }
+                if ( 'tabel_batal' === $kunci_jurnal && $this->batal_ditahan_sampai( $k, $t ) > 0 ) {
+                    continue; // Fix round 1b: belum 24 jam -- tabel dan entrinya dipertahankan.
+                }
                 // Jaminan kemajuan: entri PERTAMA pada panggilan ini selalu
                 // diproses, walau tenggat sudah lewat sebelum mulai.
                 if ( $dijalankan > 0 && $this->waktu_habis() ) {
@@ -736,10 +743,32 @@ class WPMGR_Staging_Dorong {
                 $dijalankan++;
                 $sisa               = array_values( array_diff( $sisa, array( $t ) ) );
                 $k[ $kunci_jurnal ] = $sisa;
+                unset( $k['batal_dibuat'][ $t ] );
                 $this->simpan_keadaan( $id, $k );
             }
         }
         return true;
+    }
+
+    /**
+     * Fix round 1b: batas waktu (unix) penahanan tabel batal $t, atau --
+     * bila $t null -- yang paling akhir di antara semua tabel_batal yang
+     * masih tercatat; 0 bila tidak ada yang masih ditahan. Entri tanpa cap
+     * waktu (tidak pernah ditulis simpan_tabel_batal()) tidak ditahan.
+     */
+    protected function batal_ditahan_sampai( $k, $t = null ) {
+        if ( ! is_array( $k ) ) {
+            return 0;
+        }
+        $daftar = null === $t ? ( ( isset( $k['tabel_batal'] ) && is_array( $k['tabel_batal'] ) ) ? $k['tabel_batal'] : array() ) : array( $t );
+        $sampai = 0;
+        foreach ( $daftar as $nama ) {
+            $dibuat = isset( $k['batal_dibuat'][ (string) $nama ] ) ? (int) $k['batal_dibuat'][ (string) $nama ] : 0;
+            if ( $dibuat > 0 && $dibuat + self::UMUR_BATAL > time() ) {
+                $sampai = max( $sampai, $dibuat + self::UMUR_BATAL );
+            }
+        }
+        return $sampai;
     }
 
     /**
@@ -779,7 +808,7 @@ class WPMGR_Staging_Dorong {
         } finally {
             $this->lepas_kunci_langkah( $flock );
         }
-        if ( is_array( $hasil ) && false === $hasil['lagi'] ) {
+        if ( is_array( $hasil ) && false === $hasil['lagi'] && empty( $hasil['tahan_batal'] ) ) {
             @unlink( $this->berkas_kunci_langkah( $id ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
         }
         return $hasil;
@@ -813,6 +842,18 @@ class WPMGR_Staging_Dorong {
             }
             if ( false === $r ) {
                 return array( 'lagi' => true ); // Waktu habis di tengah -- jurnal sisa sudah tersimpan.
+            }
+            // Fix round 1b: tabel batal yang belum 24 jam tetap ada. Area
+            // (satu-satunya salinan jurnalnya) dipertahankan, tetapi kunci
+            // dorong DILEPAS -- dorongan baru tidak boleh tertahan olehnya.
+            // Bukan "macet": dashboard membaca tahan_batal/sampai.
+            $sampai = $this->batal_ditahan_sampai( $this->keadaan( $id ) );
+            if ( $sampai > 0 ) {
+                $lepas = $this->lepas_kunci( $id );
+                if ( is_wp_error( $lepas ) ) {
+                    return $lepas;
+                }
+                return array( 'lagi' => false, 'tahan_batal' => true, 'sampai' => $sampai );
             }
         } elseif ( null !== $k && ! $boleh_hapus_tabel ) {
             // Fix N4 (review putaran 3, Penting): push LAIN sedang memegang
@@ -2219,6 +2260,9 @@ class WPMGR_Staging_Dorong {
                 $batal            = ( isset( $k['tabel_batal'] ) && is_array( $k['tabel_batal'] ) ) ? $k['tabel_batal'] : array();
                 $batal[]          = $nama;
                 $k['tabel_batal'] = array_values( array_unique( $batal ) );
+                $dibuat           = ( isset( $k['batal_dibuat'] ) && is_array( $k['batal_dibuat'] ) ) ? $k['batal_dibuat'] : array();
+                $dibuat[ $nama ]  = time();
+                $k['batal_dibuat'] = $dibuat;
                 $simpan           = $this->sentuh_wajib( $id, $k );
                 if ( is_wp_error( $simpan ) ) {
                     return $simpan;
@@ -2228,6 +2272,7 @@ class WPMGR_Staging_Dorong {
                     // Nama itu tidak jadi milik kita: jangan sampai bersihkan()
                     // kelak men-DROP tabel lain yang memakainya.
                     $k['tabel_batal'] = array_values( array_diff( $k['tabel_batal'], array( $nama ) ) );
+                    unset( $k['batal_dibuat'][ $nama ] );
                     $k                = $this->sentuh( $id, $k );
                     return $this->galat( 'wpmgr_staging_pulihkan', 'Tabel yang dibatalkan tidak dapat disimpan.', 500 );
                 }
