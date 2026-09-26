@@ -55,22 +55,33 @@ class WPMGR_Staging_Dorong {
     const STATUS_BOLEH_BERSIHKAN = array(
         'baru', 'mengunggah', 'siap', 'selesai', 'gagal', 'direbut', 'ditukar', 'dipulihkan',
     );
-    // Subset STATUS_BOLEH_BERSIHKAN yang aman menghapus JURNAL 'tabel_old'
-    // (data produksi yang tergeser, disimpan untuk pemulihan): hanya status
-    // TERMINAL yang membuktikan tukar sudah selesai (atau sudah dipulihkan)
-    // -- status lain di STATUS_BOLEH_BERSIHKAN ('mengunggah', 'gagal',
-    // 'direbut', dst.) membiarkan berkas & tabel sementara dibuang, tetapi
-    // TIDAK PERNAH ikut membuang 'tabel_old' -- itu satu-satunya salinan
-    // data produksi lama bila proses tukar sendiri belum terbukti tuntas.
-    const STATUS_AMAN_HAPUS_LAMA = array( 'selesai', 'ditukar', 'dipulihkan' );
-    // Fix N3 (review putaran 2, Penting): status PRA-TUKAR -- satu-satunya
-    // status push LAMA yang aman direbut lewat kunci basi (kunci()). Belum
+    // Fix N4/Minor 5 (review putaran 3): status TERMINAL -- push yang sudah
+    // mencapai akhir riwayatnya sendiri, apa pun hasilnya (berhasil, gagal,
+    // direbut, atau sudah dipulihkan). Dipakai untuk DUA hal: (a) di
+    // bersihkan(), aman menghapus JURNAL 'tabel_old' (data produksi yang
+    // tergeser, disimpan untuk pemulihan) -- status lain di
+    // STATUS_BOLEH_BERSIHKAN ('mengunggah', 'baru', 'siap', 'ditukar')
+    // membiarkan berkas & tabel sementara dibuang, tetapi TIDAK PERNAH ikut
+    // membuang 'tabel_old'; (b) di cek_takeover_aman(), kunci basi yang
+    // pemiliknya SUDAH terminal boleh direbut juga (lock yang lupa
+    // dilepas setelah push itu sendiri sudah selesai bukan alasan menolak
+    // push BARU) -- lihat STATUS_PRA_TUKAR untuk status SEBELUM terminal
+    // yang juga boleh direbut. 'ditukar' SENGAJA tidak ada di sini: Task 8
+    // belum mendefinisikan apakah itu berarti "tukar selesai, aman" atau
+    // sekadar penanda antara -- diperlakukan konservatif (tidak aman
+    // menghapus tabel_old, tidak aman direbut) sampai jelas.
+    const STATUS_AMAN_TERMINAL = array( 'selesai', 'gagal', 'direbut', 'dipulihkan' );
+    // Fix N3 (review putaran 2, Penting): status PRA-TUKAR -- status push
+    // LAMA yang aman direbut lewat kunci basi (kunci()) KARENA belum
     // pernah menyentuh lama/ (produksi yang tergeser) atau tabel_old sama
-    // sekali, jadi merebutnya dan menandainya 'direbut' tidak pernah
-    // membuang apa pun yang masih dibutuhkan. Task 8 WAJIB memakai salah
-    // satu nama di sini untuk setiap status SEBELUM langkah 'menukar'
-    // dimulai -- status apa pun sesudahnya (termasuk 'menukar' sendiri,
-    // dan status pemulihan) TIDAK PERNAH ditambahkan ke sini.
+    // sekali. Task 8 WAJIB memakai salah satu nama di sini untuk setiap
+    // status SEBELUM langkah 'menukar' dimulai -- status apa pun sesudahnya
+    // TIDAK PERNAH ditambahkan ke sini. Kontrak untuk Task 8: status
+    // 'menukar' HANYA boleh diset setelah kunci() berhasil DISEGARKAN
+    // (dipanggil ulang dan mengembalikan true) tepat sebelum memulai
+    // langkah tukar -- supaya tenggat basi (UMUR_KUNCI, 2 jam) terhitung
+    // dari saat itu, bukan dari potongan terakhir yang diunggah jauh
+    // sebelumnya.
     const STATUS_PRA_TUKAR = array( 'baru', 'mengunggah', 'siap' );
 
     protected $akar;
@@ -305,7 +316,15 @@ class WPMGR_Staging_Dorong {
             }
             return true; // Tidak ada keadaan maupun area -- tidak ada apa pun untuk dilindungi.
         }
-        if ( ! in_array( $status_lama, self::STATUS_PRA_TUKAR, true ) ) {
+        // Fix Minor 5 (review putaran 3): kunci basi yang pemiliknya SUDAH
+        // TERMINAL (STATUS_AMAN_TERMINAL -- push itu sudah selesai sendiri,
+        // apa pun hasilnya) juga boleh direbut, bukan hanya pra-tukar --
+        // lock yang lupa dilepas SETELAH push itu sendiri selesai bukan
+        // alasan menahan push BARU. Hanya status di TENGAH menukar (mis.
+        // 'menukar') atau yang tidak dikenal/tidak bisa dibuktikan yang
+        // ditolak.
+        if ( ! in_array( $status_lama, self::STATUS_PRA_TUKAR, true )
+            && ! in_array( $status_lama, self::STATUS_AMAN_TERMINAL, true ) ) {
             return $this->galat( 'wpmgr_staging_perlu_pemulihan',
                 'Dorongan sebelumnya harus dipulihkan atau diselesaikan dulu sebelum direbut.', 409 );
         }
@@ -325,8 +344,17 @@ class WPMGR_Staging_Dorong {
         if ( ! self::id_sah( $id_lama ) ) {
             return;
         }
+        // Fix Minor 4 (review putaran 3): status dibaca ULANG tepat sebelum
+        // menulis, dan hanya ditulis bila MASIH pra-tukar pada saat ini --
+        // status push lama BISA SAJA sudah berubah (mis. mulai 'menukar',
+        // atau sudah mencapai status terminal sendiri) di antara pembacaan
+        // di cek_takeover_aman() dan baris ini, karena push lama itu
+        // sendiri mungkin masih berjalan di request lain. Push yang SUDAH
+        // terminal (STATUS_AMAN_TERMINAL) tidak perlu ditandai apa pun --
+        // riwayatnya sendiri sudah berakhir, menimpanya dengan 'direbut'
+        // hanya mengaburkan hasil aslinya (berhasil/gagal) tanpa manfaat.
         $k = $this->keadaan( $id_lama );
-        if ( null === $k ) {
+        if ( null === $k || ! in_array( $this->status( $k ), self::STATUS_PRA_TUKAR, true ) ) {
             return;
         }
         $k['status'] = 'direbut';
@@ -389,6 +417,14 @@ class WPMGR_Staging_Dorong {
             return $this->galat( 'wpmgr_staging_permintaan', 'Meta potongan tidak sah.', 400 );
         }
         if ( in_array( $jenis, array( 'berkas', 'rentang' ), true ) ) {
+            // Fix Minor 6 (review putaran 3): dijaga isset()/is_array()
+            // secara eksplisit sebelum di-foreach -- WPMGR_Staging_Paket::urai()
+            // saat ini SELALU menjamin 'berkas' berupa array sebelum
+            // sampai di sini, tapi baris ini tidak boleh bergantung diam-diam
+            // pada kontrak kelas lain yang bisa saja berubah.
+            if ( ! isset( $meta['berkas'] ) || ! is_array( $meta['berkas'] ) ) {
+                return $this->galat( 'wpmgr_staging_permintaan', 'Meta potongan tidak sah.', 400 );
+            }
             foreach ( $meta['berkas'] as $b ) {
                 if ( ! isset( $b['path'] ) || ! WPMGR_Staging_Path::boleh_ditulis( $b['path'] ) ) {
                     return $this->galat( 'wpmgr_staging_path', 'Path potongan tidak boleh ditulis.', 400 );
@@ -605,14 +641,14 @@ class WPMGR_Staging_Dorong {
      * mengembalikan true).
      *
      * true = jurnal (tabel_tmp, dan tabel_old bila $status ada di
-     * STATUS_AMAN_HAPUS_LAMA) sudah kosong sepenuhnya. false = waktu habis
+     * STATUS_AMAN_TERMINAL) sudah kosong sepenuhnya. false = waktu habis
      * di tengah (jurnal sisa sudah tersimpan). WP_Error = galat DROP atau
      * galat membaca listing tabel (jurnal sejauh yang sudah sukses juga
      * sudah tersimpan).
      */
     protected function kosongkan_jurnal_tabel( $id, array $k, $status ) {
         $jenis_list = array( 'tabel_tmp' );
-        if ( in_array( $status, self::STATUS_AMAN_HAPUS_LAMA, true ) ) {
+        if ( in_array( $status, self::STATUS_AMAN_TERMINAL, true ) ) {
             $jenis_list[] = 'tabel_old';
         }
         $dijalankan = 0;
@@ -684,7 +720,7 @@ class WPMGR_Staging_Dorong {
         }
         if ( null !== $k ) {
             $old_tersisa = ( isset( $k['tabel_old'] ) && is_array( $k['tabel_old'] ) ) ? $k['tabel_old'] : array();
-            if ( ! empty( $old_tersisa ) && ! in_array( $status, self::STATUS_AMAN_HAPUS_LAMA, true ) ) {
+            if ( ! empty( $old_tersisa ) && ! in_array( $status, self::STATUS_AMAN_TERMINAL, true ) ) {
                 // Fix N4: tabel_old (data produksi tergeser) belum aman
                 // dihapus untuk status ini -- jangan pernah lanjut ke
                 // pembersihan direktori (lihat docblock kosongkan_jurnal_tabel()).
@@ -696,13 +732,28 @@ class WPMGR_Staging_Dorong {
         if ( is_wp_error( $pemegang ) ) {
             return $pemegang;
         }
-        if ( null !== $k && ( '' === $pemegang || $pemegang === $id ) ) {
+        $boleh_hapus_tabel = ( '' === $pemegang || $pemegang === $id );
+        if ( null !== $k && $boleh_hapus_tabel ) {
             $r = $this->kosongkan_jurnal_tabel( $id, $k, $status );
             if ( is_wp_error( $r ) ) {
                 return $r;
             }
             if ( false === $r ) {
                 return array( 'lagi' => true ); // Waktu habis di tengah -- jurnal sisa sudah tersimpan.
+            }
+        } elseif ( null !== $k && ! $boleh_hapus_tabel ) {
+            // Fix N4 (review putaran 3, Penting): push LAIN sedang memegang
+            // kunci -- tabel jurnal TIDAK disentuh (lihat docblock kelas).
+            // Bila jurnalnya TIDAK KOSONG, direktori (satu-satunya salinan
+            // jurnal itu, lewat keadaan.php) TIDAK BOLEH ikut dihapus juga
+            // -- draf sebelumnya jatuh lewat ke hapus_rekursif() di bawah
+            // begitu saja, mengorphankan tabel yang masih tercatat di sana
+            // secara permanen. cron() bisa mencapai jalur ini (push lain
+            // baru merebut kunci di antara pemeriksaan status dan di sini).
+            $tmp_tersisa = ( isset( $k['tabel_tmp'] ) && is_array( $k['tabel_tmp'] ) ) ? $k['tabel_tmp'] : array();
+            $old_tersisa = ( isset( $k['tabel_old'] ) && is_array( $k['tabel_old'] ) ) ? $k['tabel_old'] : array();
+            if ( ! empty( $tmp_tersisa ) || ! empty( $old_tersisa ) ) {
+                return array( 'lagi' => true );
             }
         }
         if ( ! $this->hapus_rekursif( rtrim( $this->dir( $id ), '/' ) ) ) {

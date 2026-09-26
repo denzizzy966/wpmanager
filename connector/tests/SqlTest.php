@@ -57,8 +57,8 @@ final class SqlTest extends TestCase {
     public function test_ubah_mengganti_nama_tabel(): void {
         $this->assertSame( 'DROP TABLE IF EXISTS `wpmgr_tmp_wp_posts`',
             WPMGR_Staging_Sql::ubah( "\n-- x\nDROP TABLE IF EXISTS `wp_posts`", 'wp_' ) );
-        $this->assertSame( "CREATE TABLE `wpmgr_tmp_wp_posts` (\n `ID` int)",
-            WPMGR_Staging_Sql::ubah( "CREATE TABLE `wp_posts` (\n `ID` int)", 'wp_' ) );
+        $this->assertSame( "CREATE TABLE `wpmgr_tmp_wp_posts` (\n `ID` int) ENGINE=InnoDB",
+            WPMGR_Staging_Sql::ubah( "CREATE TABLE `wp_posts` (\n `ID` int) ENGINE=InnoDB", 'wp_' ) );
         $this->assertSame( "INSERT INTO `wpmgr_tmp_wp_posts` (`ID`) VALUES (1)",
             WPMGR_Staging_Sql::ubah( "INSERT INTO `wp_posts` (`ID`) VALUES (1)", 'wp_' ) );
         // /*!40000 ... */ adalah komentar berversi; pemecah memperlakukannya
@@ -173,9 +173,9 @@ final class SqlTest extends TestCase {
         // (string), bukan struktur SQL sungguhan -- pernyataan yang SAH ini
         // tidak boleh ditolak hanya karena topeng literal gagal.
         $hasil = WPMGR_Staging_Sql::ubah(
-            "CREATE TABLE `wp_a` (`b` varchar(50) DEFAULT 'SELECT * ENGINE=FEDERATED CREATE TABLE fake')", 'wp_' );
+            "CREATE TABLE `wp_a` (`b` varchar(50) DEFAULT 'SELECT * ENGINE=FEDERATED CREATE TABLE fake') ENGINE=InnoDB", 'wp_' );
         $this->assertSame(
-            "CREATE TABLE `wpmgr_tmp_wp_a` (`b` varchar(50) DEFAULT 'SELECT * ENGINE=FEDERATED CREATE TABLE fake')",
+            "CREATE TABLE `wpmgr_tmp_wp_a` (`b` varchar(50) DEFAULT 'SELECT * ENGINE=FEDERATED CREATE TABLE fake') ENGINE=InnoDB",
             $hasil );
     }
 
@@ -276,6 +276,127 @@ final class SqlTest extends TestCase {
         }
     }
 
+    // ---- Fix N1 (review putaran 3, KRITIS -- masih terbuka setelah
+    // putaran 2): probe reviewer atas MySQL 8.0.46/MariaDB 11.8 sungguhan
+    // -- allowlist ENGINE dan penolakan CONNECTION/UNION putaran 2 masih
+    // bisa dilewati lewat '=' opsional dan opsi yang DIULANG. ----
+
+    public function test_ubah_menolak_engine_bare_tanpa_tanda_sama_dengan(): void {
+        $hasil = WPMGR_Staging_Sql::ubah( 'CREATE TABLE `wp_posts` (`a` int) ENGINE FEDERATED', 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_engine_diulang_walau_pertama_sah(): void {
+        foreach ( array(
+            'CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB ENGINE=FEDERATED',
+            'CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB, ENGINE=MEMORY',
+            'CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB ENGINE=InnoDB',
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code(), $s );
+        }
+    }
+
+    public function test_ubah_menolak_connection_tanpa_tanda_sama_dengan(): void {
+        $hasil = WPMGR_Staging_Sql::ubah( "CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB CONNECTION 'mysql://x/y'", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_union_membuat_tabel_merge(): void {
+        // Dikonfirmasi reviewer: ini benar-benar membuat tabel MERGE yang
+        // membaca wp_users di MariaDB 11.
+        $hasil = WPMGR_Staging_Sql::ubah( 'CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB UNION (`wp_users`)', 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_partition_dengan_storage_engine(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB PARTITION p0 STORAGE ENGINE FEDERATED", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+        $this->assertStringContainsString( 'PARTITION', $hasil->get_error_message() );
+    }
+
+    public function test_ubah_menolak_table_type_file_name(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`a` int) TABLE_TYPE=CSV FILE_NAME='/etc/passwd'", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_storage_engine_di_daftar_kolom(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`a` int STORAGE ENGINE FEDERATED) ENGINE=InnoDB", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_data_directory_di_daftar_kolom(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`a` int, DATA DIRECTORY = '/tmp') ENGINE=InnoDB", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_partition_mariadb(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB PARTITION BY HASH (`id`) PARTITIONS 2", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+        $this->assertStringContainsString( 'PARTITION', $hasil->get_error_message() );
+    }
+
+    // ---- Keluaran SHOW CREATE TABLE sungguhan (MySQL 8/MariaDB 11, persis
+    // seperti yang ditempelkan reviewer) harus tetap DITERIMA. ----
+
+    public function test_ubah_menerima_ekor_opsi_tabel_mysql8_sungguhan(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`ID` bigint(20) unsigned NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+            'wp_' );
+        $this->assertSame(
+            "CREATE TABLE `wpmgr_tmp_wp_posts` (`ID` bigint(20) unsigned NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+            $hasil );
+    }
+
+    public function test_ubah_menerima_ekor_opsi_tabel_mariadb11_sungguhan(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`ID` bigint(20) unsigned NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci",
+            'wp_' );
+        $this->assertSame(
+            "CREATE TABLE `wpmgr_tmp_wp_posts` (`ID` bigint(20) unsigned NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci",
+            $hasil );
+    }
+
+    public function test_ubah_menerima_row_format(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB ROW_FORMAT=COMPRESSED", 'wp_' );
+        $this->assertSame( "CREATE TABLE `wpmgr_tmp_wp_posts` (`a` int) ENGINE=InnoDB ROW_FORMAT=COMPRESSED", $hasil );
+    }
+
+    public function test_ubah_menerima_comment_dengan_spasi_dan_kutip(): void {
+        $sql = "CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB COMMENT='Ini komentar; dengan spasi dan \\'kutip\\''";
+        $hasil = WPMGR_Staging_Sql::ubah( $sql, 'wp_' );
+        $this->assertSame( str_replace( '`wp_posts`', '`wpmgr_tmp_wp_posts`', $sql ), $hasil );
+    }
+
+    public function test_ubah_menolak_comment_bareword(): void {
+        $hasil = WPMGR_Staging_Sql::ubah( 'CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB COMMENT=tanpa_kutip', 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menerima_berbagai_opsi_tabel_sekaligus(): void {
+        $sql = 'CREATE TABLE `wp_posts` (`a` int) ENGINE=InnoDB AUTO_INCREMENT=100 KEY_BLOCK_SIZE=8 '
+            . 'PACK_KEYS=1 CHECKSUM=0 DELAY_KEY_WRITE=0 MAX_ROWS=1000 MIN_ROWS=1 AVG_ROW_LENGTH=64 '
+            . 'STATS_PERSISTENT=1 STATS_AUTO_RECALC=0 STATS_SAMPLE_PAGES=25 PAGE_CHECKSUM=1 TRANSACTIONAL=1';
+        $hasil = WPMGR_Staging_Sql::ubah( $sql, 'wp_' );
+        $this->assertSame( str_replace( '`wp_posts`', '`wpmgr_tmp_wp_posts`', $sql ), $hasil );
+    }
+
     // ---- Fix N1: isi VALUES divalidasi token demi token -- subquery dan
     // pemanggilan fungsi ditolak, bukan diterima apa pun setelah VALUES. ----
 
@@ -301,6 +422,35 @@ final class SqlTest extends TestCase {
             "INSERT INTO `wp_posts` (`a`,`b`,`c`,`d`) VALUES (1,'x',NULL,0x3b27),(-2.5,'y',NULL,0x00)", 'wp_' );
         $this->assertSame(
             "INSERT INTO `wpmgr_tmp_wp_posts` (`a`,`b`,`c`,`d`) VALUES (1,'x',NULL,0x3b27),(-2.5,'y',NULL,0x00)", $hasil );
+    }
+
+    // ---- Fix KRITIS BARU (review putaran 3): draf values_aman() putaran 2
+    // memakai regex dengan grup berulang bersarang -- di PCRE dengan
+    // pcre.jit=1 (default PHP 7.4/8.3), backtracking pada input besar
+    // memicu PREG_JIT_STACKLIMIT_ERROR (preg_match() mengembalikan false),
+    // yang diperlakukan sebagai "tidak cocok" -- diverifikasi reviewer:
+    // 2000 baris (156 KB, PERSIS jumlah $baris default
+    // WPMGR_Staging_Tabel) sudah cukup untuk gagal, dan pernyataan sebesar
+    // 1 MiB (ambang $maks_pernyataan default WPMGR_Staging_Tabel) juga
+    // gagal -- hampir SETIAP dorongan sungguhan ditolak. ----
+
+    public function test_ubah_menerima_insert_besar_seperti_pengekspor_tanpa_meledak(): void {
+        $baris = array();
+        for ( $i = 1; $i <= 5000; $i++ ) {
+            $baris[] = "({$i},{$i},'meta_key_{$i}','" . str_repeat( 'x', 200 ) . "')";
+        }
+        $sql = 'INSERT INTO `wp_postmeta` (`meta_id`,`post_id`,`meta_key`,`meta_value`) VALUES '
+            . implode( ',', $baris );
+        $this->assertGreaterThanOrEqual( 5000, count( $baris ) );
+        $this->assertGreaterThanOrEqual( 1048576, strlen( $sql ),
+            'Setup test tidak mencapai >= 1 MB seperti yang diminta -- perbesar padding.' );
+        $mulai = microtime( true );
+        $hasil = WPMGR_Staging_Sql::ubah( $sql, 'wp_' );
+        $lama  = microtime( true ) - $mulai;
+        $this->assertIsString( $hasil, 'INSERT besar seperti pengekspor harus DITERIMA, bukan ditolak/meledak.' );
+        $this->assertStringStartsWith( 'INSERT INTO `wpmgr_tmp_wp_postmeta`', $hasil );
+        $this->assertStringEndsWith( str_repeat( 'x', 200 ) . "')", $hasil );
+        $this->assertLessThan( 3.0, $lama, 'ubah() atas INSERT besar harus tetap cepat (tokenizer linear).' );
     }
 
     public function test_keluaran_ekspor_tabel_terpecah_benar(): void {

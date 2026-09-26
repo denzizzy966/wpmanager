@@ -328,62 +328,368 @@ class WPMGR_Staging_Sql {
     }
 
     /**
-     * Fix N1 (review putaran 2): ENGINE tabel diperiksa lewat ALLOWLIST
-     * (bukan denylist yang sebelumnya bisa dilewati lewat nilai berkutip --
-     * lihat catatan di bawah), dan CONNECTION=/UNION= (opsi tabel FEDERATED/
-     * MERGE) ditolak mutlak.
-     *
-     * $topeng dipakai untuk MENEMUKAN posisi klausa ENGINE= (aman dari kata
-     * kunci palsu di dalam literal, karena isi literal sudah ditopengi jadi
-     * 'x'), tapi NILAI-nya sendiri diambil dari $s ASLI pada offset yang
-     * SAMA PERSIS (tanpa_literal() menjaga panjang string tetap sama) --
-     * bukan dari topeng, yang MENOPENGI isi 'InnoDB'/"InnoDB" (kutip
-     * tunggal/ganda) jadi 'xxxxxxx'/"xxxxxxx" sehingga nilai sungguhannya
-     * tidak pernah bisa dibaca dari topeng itu sendiri. Itulah bagaimana
-     * `ENGINE='FEDERATED'` dan `` ENGINE=`FEDERATED` `` (backtick TIDAK
-     * ditopengi, tapi denylist lama tidak pernah memeriksanya juga) bisa
-     * lolos denylist draf sebelumnya.
+     * Fix N1 (review putaran 3, KRITIS -- masih terbuka setelah putaran 2):
+     * nama opsi tabel CREATE TABLE yang diizinkan, sebagai ALLOWLIST
+     * lengkap (bukan sekadar menolak ENGINE/CONNECTION/UNION tertentu).
+     * Terurut dari yang PALING PANJANG (kata majemuk) -- cocok_kata_kunci()
+     * memeriksa daftar ini berurutan, jadi 'DEFAULT CHARACTER SET' harus
+     * diperiksa sebelum 'CHARACTER SET' sendirian, dst., supaya tidak
+     * berhenti pada pencocokan sebagian yang lebih pendek.
      */
-    private static function periksa_opsi_tabel( $s, $topeng ) {
-        if ( 1 === preg_match( '/\bCONNECTION\s*=/i', $topeng ) || 1 === preg_match( '/\bUNION\s*=/i', $topeng ) ) {
+    const OPSI_TABEL = array(
+        'DEFAULT CHARACTER SET', 'DEFAULT CHARSET', 'CHARACTER SET', 'CHARSET',
+        'DEFAULT COLLATE', 'COLLATE',
+        'ENGINE',
+        'ROW_FORMAT', 'KEY_BLOCK_SIZE', 'AUTO_INCREMENT', 'COMMENT',
+        'STATS_PERSISTENT', 'STATS_AUTO_RECALC', 'STATS_SAMPLE_PAGES',
+        'PAGE_CHECKSUM', 'TRANSACTIONAL',
+        'PACK_KEYS', 'CHECKSUM', 'DELAY_KEY_WRITE', 'MAX_ROWS', 'MIN_ROWS', 'AVG_ROW_LENGTH',
+    );
+
+    /**
+     * Posisi ')' yang berpasangan dengan '(' di $buka pada $topeng (dihitung
+     * di atas TOPENG, bukan $s mentah -- tanda kurung di dalam literal
+     * string sudah ditopengi jadi 'x', jadi menghitung kedalaman di sini
+     * tidak bisa dikelabui oleh mis. `DEFAULT '(a)'` di dalam definisi
+     * kolom). false bila tidak seimbang sampai akhir teks.
+     */
+    private static function cari_penutup_kurung( $topeng, $buka ) {
+        $n     = strlen( $topeng );
+        $depth = 0;
+        for ( $i = $buka; $i < $n; $i++ ) {
+            $c = $topeng[ $i ];
+            if ( '(' === $c ) {
+                $depth++;
+            } elseif ( ')' === $c ) {
+                $depth--;
+                if ( 0 === $depth ) {
+                    return $i;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Mencocokkan kata kunci opsi (satu atau lebih kata dipisah SATU spasi
+     * di $kata_kunci, mis. 'DEFAULT CHARACTER SET') pada posisi $i di $s,
+     * mengizinkan spasi APA PUN (satu atau lebih) di antara kata-kata di
+     * teks sungguhan. Mengembalikan posisi TEPAT setelah kata kunci itu
+     * (selalu > $i, jadi aman dibedakan dari false) bila cocok DAN diikuti
+     * batas kata (bukan karakter identifier lain, supaya 'ENGINEX' tidak
+     * salah cocok sebagai 'ENGINE'); false bila tidak cocok.
+     */
+    private static function cocok_kata_kunci( $s, $i, $kata_kunci ) {
+        $n    = strlen( $s );
+        $kata = explode( ' ', $kata_kunci );
+        $pos  = $i;
+        foreach ( $kata as $idx => $k ) {
+            if ( $idx > 0 ) {
+                $spasi = strspn( $s, " \t\r\n", $pos );
+                if ( 0 === $spasi ) {
+                    return false;
+                }
+                $pos += $spasi;
+            }
+            $panjang = strlen( $k );
+            if ( $pos + $panjang > $n || 0 !== strncasecmp( substr( $s, $pos, $panjang ), $k, $panjang ) ) {
+                return false;
+            }
+            $pos += $panjang;
+        }
+        if ( $pos < $n && self::karakter_identifier( $s[ $pos ] ) ) {
+            return false;
+        }
+        return $pos;
+    }
+
+    /**
+     * Membaca SATU nilai opsi tabel (string berkutip/backtick, ATAU
+     * bareword identifier/angka) pada posisi $i di $topeng; memajukan $i.
+     * false bila tidak ada nilai yang bisa diurai di sana. $berkutip
+     * (lewat referensi) memberi tahu pemanggil apakah nilai itu literal
+     * string -- dipakai untuk mewajibkan COMMENT berupa string.
+     */
+    private static function baca_nilai_opsi( $topeng, $n, &$i, &$berkutip ) {
+        $berkutip = false;
+        if ( $i >= $n ) {
+            return false;
+        }
+        $c = $topeng[ $i ];
+        if ( "'" === $c || '"' === $c ) {
+            $tutup = strpos( $topeng, $c, $i + 1 );
+            if ( false === $tutup ) {
+                return false;
+            }
+            $i        = $tutup + 1;
+            $berkutip = true;
+            return true;
+        }
+        if ( '`' === $c ) {
+            $tutup = strpos( $topeng, '`', $i + 1 );
+            if ( false === $tutup ) {
+                return false;
+            }
+            $i = $tutup + 1;
+            return true;
+        }
+        $panjang = strspn( $topeng, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-', $i );
+        if ( 0 === $panjang ) {
+            return false;
+        }
+        $i += $panjang;
+        return true;
+    }
+
+    /**
+     * Fix N1 (review putaran 3, KRITIS): draf putaran 2 hanya mencari
+     * klausa ENGINE= dan menolak CONNECTION=/UNION= secara terpisah --
+     * diverifikasi reviewer atas server MySQL 8.0.46/MariaDB 11.8
+     * sungguhan bahwa itu masih bisa dilewati lewat: '=' yang OPSIONAL
+     * (`ENGINE FEDERATED` tanpa '='), opsi yang DIULANG (`ENGINE=InnoDB
+     * ENGINE=FEDERATED` -- ENGINE TERAKHIR yang menang di MySQL/MariaDB),
+     * `CONNECTION 'mysql://...'` tanpa '=', `ENGINE=InnoDB UNION
+     * (\`wp_users\`)` (membuat tabel MERGE yang membaca tabel lain --
+     * dikonfirmasi benar-benar terjadi di MariaDB 11), `PARTITION p0
+     * STORAGE ENGINE FEDERATED`, dan `TABLE_TYPE=CSV FILE_NAME=...`.
+     *
+     * Sekarang: EKOR opsi tabel (semua setelah ')' penutup daftar kolom)
+     * di-tokenize UTUH sebagai ALLOWLIST nama opsi (OPSI_TABEL) -- setiap
+     * opsi lain (CONNECTION, UNION, TABLE_TYPE, FILE_NAME, PASSWORD,
+     * ENCRYPTION, TABLESPACE, INSERT_METHOD, dst.) ditolak murni karena
+     * NAMANYA tidak dikenal, bukan lewat pencocokan pola per nama. PARTITION/
+     * SUBPARTITION ditolak mutlak di mana pun di ekor (pesan tersendiri
+     * yang jelas). ENGINE WAJIB muncul TEPAT SATU KALI dengan nilai
+     * InnoDB/MyISAM/Aria (huruf besar/kecil bebas, bentuk bare/berkutip/
+     * backtick) -- opsi ENGINE kedua (walau nilainya sendiri sah) tetap
+     * ditolak, menutup celah "yang terakhir menang". COMMENT wajib berupa
+     * literal string, bukan bareword.
+     *
+     * Bagian DAFTAR KOLOM (di antara '(' dan ')' pembukanya) juga diperiksa
+     * terpisah: tidak boleh memuat 'STORAGE ENGINE' atau 'DATA'/'INDEX
+     * DIRECTORY' -- klausa itu tidak pernah sah muncul di sana, hanya
+     * fitur PARTITION (yang sudah ditolak mutlak) yang memakainya.
+     *
+     * Semuanya berjalan di atas TOPENG (bukan $s mentah) -- posisi ')'
+     * penutup daftar kolom dihitung lewat cari_penutup_kurung() di topeng
+     * supaya tanda kurung di dalam literal string (mis. `DEFAULT '(a)'`)
+     * tidak mengacaukan hitungan kedalaman. Nilai ENGINE sendiri tetap
+     * diambil dari $s ASLI pada offset yang sama (topeng menopengi isi
+     * 'InnoDB'/"InnoDB" berkutip jadi 'xxxxxxx').
+     */
+    private static function periksa_opsi_tabel( $s, $topeng, $buka_kolom ) {
+        $tutup_kolom = self::cari_penutup_kurung( $topeng, $buka_kolom );
+        if ( false === $tutup_kolom ) {
+            return self::tolak( 'CREATE TABLE tidak seimbang tanda kurungnya.' );
+        }
+        $span_kolom = substr( $topeng, $buka_kolom + 1, $tutup_kolom - $buka_kolom - 1 );
+        if ( 1 === preg_match( '/\bSTORAGE\s+ENGINE\b/i', $span_kolom )
+            || 1 === preg_match( '/\b(DATA|INDEX)\s+DIRECTORY\b/i', $span_kolom ) ) {
             return self::tolak( 'Opsi CREATE TABLE ini tidak diizinkan.' );
         }
-        if ( 1 === preg_match( '/\bENGINE\s*=\s*/i', $topeng, $mp, PREG_OFFSET_CAPTURE ) ) {
-            $awal = $mp[0][1] + strlen( $mp[0][0] );
-            if ( 1 !== preg_match( '/\G(?:\'([^\']*)\'|"([^"]*)"|`([^`]*)`|([A-Za-z0-9_]+))/', $s, $mv, 0, $awal ) ) {
-                return self::tolak( 'ENGINE tabel tidak dapat diurai.' );
+
+        $n     = strlen( $topeng );
+        $ekor  = $tutup_kolom + 1;
+        $ekor_teks = substr( $topeng, $ekor );
+        if ( 1 === preg_match( '/\b(SUB)?PARTITION\b/i', $ekor_teks ) ) {
+            return self::tolak( 'CREATE TABLE dengan PARTITION tidak diizinkan.' );
+        }
+
+        $i          = $ekor;
+        $ada_engine = 0;
+        while ( true ) {
+            $i += strspn( $topeng, " \t\r\n,", $i );
+            if ( $i >= $n ) {
+                break;
             }
-            $nilai = '';
-            foreach ( array( 1, 2, 3, 4 ) as $g ) {
-                if ( isset( $mv[ $g ] ) && '' !== $mv[ $g ] ) {
-                    $nilai = $mv[ $g ];
+            $nama_cocok  = null;
+            $pos_setelah = false;
+            foreach ( self::OPSI_TABEL as $nama ) {
+                $hasil = self::cocok_kata_kunci( $topeng, $i, $nama );
+                if ( false !== $hasil ) {
+                    $nama_cocok  = $nama;
+                    $pos_setelah = $hasil;
                     break;
                 }
             }
-            if ( 1 !== preg_match( '/^(InnoDB|MyISAM|Aria)\z/i', $nilai ) ) {
-                return self::tolak( 'ENGINE tabel tidak diizinkan: ' . WPMGR_Staging::bersih( $nilai, 32 ) );
+            if ( null === $nama_cocok ) {
+                return self::tolak( 'Opsi CREATE TABLE ini tidak diizinkan.' );
             }
+            $i  = $pos_setelah;
+            $i += strspn( $topeng, " \t\r\n", $i );
+            if ( $i < $n && '=' === $topeng[ $i ] ) {
+                $i++;
+                $i += strspn( $topeng, " \t\r\n", $i );
+            }
+            $awal_nilai = $i;
+            $berkutip   = false;
+            if ( ! self::baca_nilai_opsi( $topeng, $n, $i, $berkutip ) ) {
+                return self::tolak( 'Nilai opsi CREATE TABLE tidak dapat diurai.' );
+            }
+            if ( 'ENGINE' === $nama_cocok ) {
+                $ada_engine++;
+                // Nilai SESUNGGUHNYA diambil dari $s ASLI (bukan topeng,
+                // yang menopengi isi 'InnoDB'/"InnoDB" berkutip) pada
+                // offset yang SAMA -- tanpa_literal() menjaga panjang tetap sama.
+                $nilai_asli = trim( substr( $s, $awal_nilai, $i - $awal_nilai ), "'\"`" );
+                if ( 1 !== $ada_engine || 1 !== preg_match( '/^(InnoDB|MyISAM|Aria)\z/i', $nilai_asli ) ) {
+                    return self::tolak( 'ENGINE tabel tidak diizinkan: ' . WPMGR_Staging::bersih( $nilai_asli, 32 ) );
+                }
+            } elseif ( 'COMMENT' === $nama_cocok && ! $berkutip ) {
+                return self::tolak( 'Nilai COMMENT harus berupa literal string.' );
+            }
+        }
+        if ( 1 !== $ada_engine ) {
+            return self::tolak( 'CREATE TABLE harus menyebut ENGINE tepat satu kali.' );
         }
         return null;
     }
 
+    /** true bila $c adalah karakter identifier ASCII ([A-Za-z0-9_]). */
+    private static function karakter_identifier( $c ) {
+        return ( $c >= 'a' && $c <= 'z' ) || ( $c >= 'A' && $c <= 'Z' ) || ( $c >= '0' && $c <= '9' ) || '_' === $c;
+    }
+
     /**
-     * Fix N1 (review putaran 2): isi VALUES divalidasi token demi token di
-     * atas topeng ($topeng_values, sudah dipotong mulai tepat setelah kata
-     * kunci VALUES) -- hanya literal yang BENAR-BENAR dipakai pengekspor
-     * kita (Task 5, class-wpmgr-staging-tabel.php: string berkutip lewat
-     * nilai()/esc(), NULL, dan literal hex 0x... untuk data biner -- tidak
-     * pernah literal berprawalan charset seperti _utf8mb4 0x.., itu hanya
-     * dipakai literal_kunci() untuk klausa WHERE kursor, tidak pernah
-     * ditulis ke dalam teks VALUES itu sendiri) yang diizinkan, ditambah
-     * tanda kurung/koma sebagai pemisah baris/tuple. Apa pun yang lain --
-     * SELECT, LOAD_FILE(...), pemanggilan fungsi, subquery -- ditolak.
+     * Fix N1 (review putaran 3, KRITIS BARU): membaca SATU token literal
+     * VALUES pada posisi $i di $s (topeng); memajukan $i dan mengembalikan
+     * true bila cocok, atau mengembalikan false TANPA mengubah $i bila
+     * tidak ada token yang cocok di sana. Dipakai values_aman() -- lihat
+     * docblock-nya untuk alasan ini LINEAR (bukan regex bersarang).
+     */
+    private static function baca_token_values( $s, $n, &$i ) {
+        if ( $i >= $n ) {
+            return false;
+        }
+        $c = $s[ $i ];
+        // Literal string bertopeng: 'x...x' -- tanpa_literal() menjamin
+        // SATU-SATUNYA kutip tunggal yang tersisa di dalam rentang ini
+        // adalah pembatas pembuka/penutupnya sendiri (lihat docblock
+        // tanpa_literal()), jadi kutip BERIKUTNYA (strpos biasa, bukan
+        // regex) sudah pasti penutup yang benar -- tidak perlu mengurai
+        // escape apa pun lagi di sini.
+        if ( "'" === $c ) {
+            $tutup = strpos( $s, "'", $i + 1 );
+            if ( false === $tutup ) {
+                return false;
+            }
+            $i = $tutup + 1;
+            return true;
+        }
+        // NULL (kata utuh -- tidak boleh diikuti karakter identifier lain,
+        // supaya 'NULLABLE' misalnya tidak salah cocok sebagai 'NULL').
+        if ( $i + 4 <= $n && 0 === strncasecmp( substr( $s, $i, 4 ), 'NULL', 4 )
+            && ( $i + 4 === $n || ! self::karakter_identifier( $s[ $i + 4 ] ) ) ) {
+            $i += 4;
+            return true;
+        }
+        // 0x... heksadesimal (literal biner Task 5, tanpa prawalan charset).
+        if ( '0' === $c && $i + 1 < $n && ( 'x' === $s[ $i + 1 ] || 'X' === $s[ $i + 1 ] ) ) {
+            $mulai = $i + 2;
+            $akhir = $mulai + strspn( $s, '0123456789abcdefABCDEF', $mulai );
+            if ( $akhir > $mulai ) {
+                $i = $akhir;
+                return true;
+            }
+            return false;
+        }
+        // Angka: -?digit+(.digit+)?([eE][+-]?digit+)? -- strspn/strcspn
+        // saja, tanpa regex sama sekali, supaya benar-benar linear.
+        $j = $i;
+        if ( '-' === $s[ $j ] ) {
+            $j++;
+        }
+        $mulai_digit = $j;
+        $j          += strspn( $s, '0123456789', $j );
+        if ( $j === $mulai_digit ) {
+            return false; // Bukan angka, NULL, hex, maupun string -- token tidak dikenal.
+        }
+        if ( $j < $n && '.' === $s[ $j ] ) {
+            $mulai_pecahan = $j + 1;
+            $akhir_pecahan = $mulai_pecahan + strspn( $s, '0123456789', $mulai_pecahan );
+            if ( $akhir_pecahan > $mulai_pecahan ) {
+                $j = $akhir_pecahan;
+            }
+        }
+        if ( $j < $n && ( 'e' === $s[ $j ] || 'E' === $s[ $j ] ) ) {
+            $k = $j + 1;
+            if ( $k < $n && ( '+' === $s[ $k ] || '-' === $s[ $k ] ) ) {
+                $k++;
+            }
+            $akhir_eksponen = $k + strspn( $s, '0123456789', $k );
+            if ( $akhir_eksponen > $k ) {
+                $j = $akhir_eksponen;
+            }
+        }
+        $i = $j;
+        return true;
+    }
+
+    /**
+     * Fix N1 (review putaran 2, lalu putaran 3 KRITIS): isi VALUES
+     * divalidasi token demi token di atas topeng ($topeng_values, sudah
+     * dipotong mulai tepat setelah kata kunci VALUES) -- hanya literal
+     * yang BENAR-BENAR dipakai pengekspor kita (Task 5,
+     * class-wpmgr-staging-tabel.php: string berkutip lewat nilai()/esc(),
+     * NULL, dan literal hex 0x... untuk data biner -- tidak pernah literal
+     * berprawalan charset seperti _utf8mb4 0x.., itu hanya dipakai
+     * literal_kunci() untuk klausa WHERE kursor, tidak pernah ditulis ke
+     * dalam teks VALUES itu sendiri) yang diizinkan, ditambah tanda
+     * kurung/koma sebagai pemisah baris/tuple. Apa pun yang lain -- SELECT,
+     * LOAD_FILE(...), pemanggilan fungsi, subquery -- ditolak.
+     *
+     * Fix KRITIS BARU (review putaran 3): draf putaran 2 memakai SATU
+     * regex dengan grup berulang bersarang (tuple berisi token berulang,
+     * masing-masing berisi alternasi). Regex seperti itu di PCRE (dengan
+     * pcre.jit=1, default PHP 7.4/8.3) memicu backtracking eksponensial
+     * pada input besar -- diverifikasi reviewer: 1000 baris (78 KB)
+     * diterima, 2000 baris (156 KB, jumlah yang persis dipakai
+     * WPMGR_Staging_Tabel::$baris) DITOLAK karena preg_match() mengembalikan
+     * false (PREG_JIT_STACKLIMIT_ERROR) -- yang oleh kode di sini
+     * (sebelum perbaikan ini) diperlakukan sebagai "tidak cocok" (`1 ===
+     * preg_match(...)` bernilai false untuk false ATAUPUN 0), jadi
+     * hampir SETIAP dorongan sungguhan (1 MiB, 2000 baris per potongan
+     * ekspor) gagal diimpor. Diganti dengan tokenizer LINEAR (satu lintasan,
+     * satu token per langkah lewat baca_token_values() -- strspn/strcspn/
+     * strncasecmp, TANPA regex bersarang atau backtracking sama sekali)
+     * yang menerima PERSIS token yang sama seperti draf regex sebelumnya.
      */
     private static function values_aman( $topeng_values ) {
-        $token = '(?:NULL|0[xX][0-9A-Fa-f]+|-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|\'[^\']*\')';
-        $tuple = '\(\s*' . $token . '\s*(?:,\s*' . $token . '\s*)*\)';
-        $pola  = '/^\s*' . $tuple . '\s*(?:,\s*' . $tuple . '\s*)*\z/i';
-        return 1 === preg_match( $pola, $topeng_values );
+        $s = (string) $topeng_values;
+        $n = strlen( $s );
+        $i = 0;
+        while ( true ) {
+            $i += strspn( $s, " \t\r\n", $i );
+            if ( $i >= $n || '(' !== $s[ $i ] ) {
+                return false;
+            }
+            $i++;
+            $i += strspn( $s, " \t\r\n", $i );
+            if ( ! self::baca_token_values( $s, $n, $i ) ) {
+                return false;
+            }
+            $i += strspn( $s, " \t\r\n", $i );
+            while ( $i < $n && ',' === $s[ $i ] ) {
+                $i++;
+                $i += strspn( $s, " \t\r\n", $i );
+                if ( ! self::baca_token_values( $s, $n, $i ) ) {
+                    return false;
+                }
+                $i += strspn( $s, " \t\r\n", $i );
+            }
+            if ( $i >= $n || ')' !== $s[ $i ] ) {
+                return false;
+            }
+            $i++;
+            $i += strspn( $s, " \t\r\n", $i );
+            if ( $i >= $n ) {
+                return true;
+            }
+            if ( ',' !== $s[ $i ] ) {
+                return false;
+            }
+            $i++;
+        }
     }
 
     /**
@@ -526,7 +832,13 @@ class WPMGR_Staging_Sql {
             if ( 1 === preg_match( '/\b(DATA|INDEX)\s+DIRECTORY\b/i', $topeng ) ) {
                 return self::tolak( 'Opsi CREATE TABLE ini tidak diizinkan.' );
             }
-            $galat_opsi = self::periksa_opsi_tabel( $s, $topeng );
+            // Posisi '(' pembuka daftar kolom -- tepat setelah head yang
+            // barusan cocok (nama tabel + backtick penutup).
+            $buka_kolom = strpos( $topeng, '(', $m[0][1] + strlen( $m[0][0] ) );
+            if ( false === $buka_kolom ) {
+                return self::tolak( 'CREATE TABLE tidak memiliki daftar kolom.' );
+            }
+            $galat_opsi = self::periksa_opsi_tabel( $s, $topeng, $buka_kolom );
             if ( null !== $galat_opsi ) {
                 return $galat_opsi;
             }

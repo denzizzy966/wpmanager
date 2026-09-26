@@ -364,6 +364,42 @@ final class DorongTest extends TestCase {
         $this->assertSame( 409, $galat->get_error_data()['status'] );
     }
 
+    // ---- Fix Minor 5 (review putaran 3): kunci basi milik push yang
+    // statusnya SUDAH TERMINAL (STATUS_AMAN_TERMINAL -- riwayatnya sendiri
+    // sudah berakhir, apa pun hasilnya) boleh direbut juga, bukan hanya
+    // pra-tukar. Lock yang lupa dilepas SETELAH push itu sendiri selesai
+    // bukan alasan menahan push BARU. ----
+
+    public function test_takeover_diizinkan_saat_status_lama_terminal(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        foreach ( array( 'selesai', 'gagal', 'direbut', 'dipulihkan' ) as $status ) {
+            $k           = $d->keadaan( self::ID );
+            $k['status'] = $status;
+            $d->simpan_keadaan( self::ID, $k );
+            $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+            $this->assertTrue( $d->kunci( self::ID2 ), $status );
+        }
+    }
+
+    // ---- Fix Minor 4 (review putaran 3): tandai_direbut() membaca ulang
+    // status TEPAT SEBELUM menulis -- push yang statusnya SUDAH TERMINAL
+    // (bukan hanya sekadar "diizinkan direbut") tidak perlu/tidak boleh
+    // ditandai 'direbut' -- riwayatnya sendiri sudah berakhir, menimpanya
+    // hanya mengaburkan hasil asli (selesai/gagal) tanpa manfaat. ----
+
+    public function test_takeover_tidak_menandai_direbut_bila_status_lama_sudah_terminal(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $k           = $d->keadaan( self::ID );
+        $k['status'] = 'selesai';
+        $d->simpan_keadaan( self::ID, $k );
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $this->assertTrue( $d->kunci( self::ID2 ) );
+        // Status TETAP 'selesai' -- TIDAK ditimpa jadi 'direbut'.
+        $this->assertSame( 'selesai', $d->keadaan( self::ID )['status'] );
+    }
+
     public function test_snapshot_berkas(): void {
         $hasil = $this->dorong()->snapshot_berkas( array( 'wp-content/themes/t/style.css', 'wp-content/themes/t/baru.php' ) );
         $this->assertSame( 'wp-content/themes/t/style.css', $hasil[0]['path'] );
@@ -433,7 +469,7 @@ final class DorongTest extends TestCase {
         $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
     }
 
-    // ---- Status TERMINAL (STATUS_AMAN_HAPUS_LAMA): 'tabel_old' (data
+    // ---- Status TERMINAL (STATUS_AMAN_TERMINAL): 'tabel_old' (data
     // produksi tergeser) sekarang juga aman dihapus bersama tabel sementara. ----
 
     public function test_bersihkan_status_terminal_menghapus_tabel_lama_juga(): void {
@@ -461,7 +497,13 @@ final class DorongTest extends TestCase {
         $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
         $d->catat_tabel( self::ID, 'old', 'wpmgr_old_wp_posts' );
         $k           = $d->keadaan( self::ID );
-        $k['status'] = 'gagal'; // Gagal DI TENGAH menukar -- tabel_old sudah ada, belum tentu aman dibuang.
+        // Fix Minor 5 (review putaran 3): STATUS_AMAN_TERMINAL sekarang
+        // mencakup 'gagal'/'direbut' juga (push yang riwayatnya sendiri
+        // sudah berakhir, apa pun hasilnya) -- 'ditukar' SENGAJA TIDAK ada
+        // di situ (Task 8 belum mendefinisikan artinya secara pasti),
+        // jadi itulah satu-satunya status di STATUS_BOLEH_BERSIHKAN yang
+        // masih memicu gerbang ini.
+        $k['status'] = 'ditukar';
         $d->simpan_keadaan( self::ID, $k );
         $this->db->tabel = array( 'wp_posts', 'wpmgr_old_wp_posts' );
         $galat = $d->bersihkan( self::ID );
@@ -499,11 +541,17 @@ final class DorongTest extends TestCase {
         $d->unggah( $this->paket( self::ID2, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 2;' ) ) );
         $d->catat_tabel( self::ID2, 'tmp', 'wpmgr_tmp_wp_posts' );
         $this->db->tabel = array( 'wp_posts', 'wpmgr_tmp_wp_posts' );
-        // Cron/dashboard membersihkan A (direbut, area lamanya dibuang) --
-        // tabel 'wpmgr_tmp_wp_posts' sekarang milik B, TIDAK BOLEH ikut
-        // terhapus, dan kunci B TIDAK BOLEH ikut terlepas.
-        $this->assertSame( array( 'lagi' => false ), $d->bersihkan( self::ID ) );
-        $this->assertDirectoryDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        // Cron/dashboard mencoba membersihkan A (direbut) -- tabel
+        // 'wpmgr_tmp_wp_posts' sekarang milik B, TIDAK BOLEH ikut terhapus,
+        // dan kunci B TIDAK BOLEH ikut terlepas. Fix N4 (review putaran 3):
+        // karena jurnal A TIDAK KOSONG (masih mencatat 'wpmgr_tmp_wp_posts')
+        // dan kunci dipegang push LAIN, area A (satu-satunya salinan
+        // jurnal itu) juga TIDAK BOLEH ikut dihapus -- draf sebelumnya
+        // jatuh lewat ke hapus_rekursif() begitu saja, mengorphankan
+        // catatan tabel itu permanen. bersihkan() sekarang melaporkan
+        // {lagi:true} dan area A tetap utuh untuk dicoba lagi nanti.
+        $this->assertSame( array( 'lagi' => true ), $d->bersihkan( self::ID ) );
+        $this->assertDirectoryExists( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
         $this->assertSame( array( 'wp_posts', 'wpmgr_tmp_wp_posts' ), $this->db->tabel );
         $this->assertStringStartsWith( self::ID2 . '|', $this->db->opsi['wpmgr_dorong_kunci'] );
     }
@@ -561,6 +609,26 @@ final class DorongTest extends TestCase {
         $this->assertSame( array( 'wp_posts' ), $this->db->tabel );
         $this->assertDirectoryDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
         $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+    }
+
+    // ---- Fix N4 (review putaran 3, Penting): bersihkan() sederhana
+    // (bukan skenario direbut) selagi push LAIN memegang kunci -- jurnal
+    // dan direktori tetap dipertahankan, bukan cuma kasus direbut. ----
+
+    public function test_bersihkan_saat_kunci_dipegang_push_lain_mempertahankan_direktori_dan_jurnal(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
+        // Push LAIN (ID2) entah bagaimana memegang kunci saat ini (mis.
+        // dashboard memanggil bersihkan() untuk id yang salah, atau id ini
+        // sendiri tidak pernah benar-benar memegang kuncinya).
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID2 . '|' . time();
+        $this->db->tabel                      = array( 'wp_posts', 'wpmgr_tmp_wp_posts' );
+        $this->assertSame( array( 'lagi' => true ), $d->bersihkan( self::ID ) );
+        $this->assertDirectoryExists( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        $this->assertSame( array( 'wpmgr_tmp_wp_posts' ), $d->keadaan( self::ID )['tabel_tmp'] );
+        $this->assertSame( array( 'wp_posts', 'wpmgr_tmp_wp_posts' ), $this->db->tabel );
+        $this->assertStringStartsWith( self::ID2 . '|', $this->db->opsi['wpmgr_dorong_kunci'] );
     }
 
     // ---- Fix I3 (review putaran 1): batas ruang disk, lewat penyedia yang
