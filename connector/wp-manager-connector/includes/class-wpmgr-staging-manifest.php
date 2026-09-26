@@ -297,7 +297,13 @@ class WPMGR_Staging_Manifest {
         $kolom = array();
         foreach ( $kunci as $k ) {
             $nama = isset( $k['Column_name'] ) ? (string) $k['Column_name'] : '';
-            if ( 1 !== preg_match( '/^[A-Za-z0-9_$]{1,64}\z/', $nama ) ) {
+            // Item 6f (Minor), fix round 1 (Task 5): disamakan dengan aturan
+            // nama kolom WPMGR_Staging_Tabel::kolom() -- backtick-quoting
+            // hanya butuh "tidak ada backtick/karakter kontrol", bukan
+            // identifier ASCII murni; regex lama menolak nama kolom PK yang
+            // SAH (mis. mengandung spasi atau huruf non-ASCII) sebagai
+            // "tidak bisa dikutip aman", padahal bisa.
+            if ( 1 !== preg_match( '/^[^\x00-\x1f`]{1,64}\z/u', $nama ) ) {
                 // Nama kolom yang tidak bisa kita kutip dengan aman: perlakukan
                 // tabel ini sebagai tanpa PK (LIMIT/OFFSET).
                 return array();

@@ -174,6 +174,9 @@ class WPMGR_Staging {
                     'kursor'  => $hasil['kursor'],
                     'selesai' => $hasil['selesai'],
                     'baris'   => $hasil['baris'],
+                    // Item 6h, fix round 1 (Task 5): dashboard bisa
+                    // memperingatkan tabel tanpa PK (mode 'offset').
+                    'mode'    => $hasil['mode'],
                     'berkas'  => array( array( 'path' => 'sql' ) ),
                 ),
                 array( $hasil['sql'] )
