@@ -20,8 +20,20 @@ class WPMGR_Skema {
 
     const TABEL = array( 'wpmgr_errors', 'wpmgr_logins', 'wpmgr_login_gagal', 'wpmgr_traffic', 'wpmgr_pengunjung' );
 
+    public static function monitoring_mati_dari( $disable, $staging ) {
+        return (bool) $disable || (bool) $staging;
+    }
+
+    /**
+     * Connector di salinan staging (WPMGR_STAGING, spec §7.4) tidak
+     * memantau apa pun: datanya adalah salinan produksi, dan kejadian di
+     * staging bukan kejadian di site client.
+     */
     public static function monitoring_mati() {
-        return defined( 'WPMGR_DISABLE_MONITORING' ) && WPMGR_DISABLE_MONITORING;
+        return self::monitoring_mati_dari(
+            defined( 'WPMGR_DISABLE_MONITORING' ) && WPMGR_DISABLE_MONITORING,
+            defined( 'WPMGR_STAGING' ) && WPMGR_STAGING
+        );
     }
 
     /**
@@ -55,6 +67,14 @@ class WPMGR_Skema {
     /**
      * Isi mu-plugin pemuat. Tetap diam bila connector dinonaktifkan atau
      * dihapus: menghentikan connector berarti menghentikan pemantauan.
+     *
+     * Guard WPMGR_STAGING ditulis langsung di sini (bukan sekadar diandalkan
+     * dari monitoring_mati() pemanggil): berkas mu-plugin yang dihasilkan
+     * bisa saja ikut tersalin apa adanya ke staging lewat proses tarik/buat
+     * staging (spec §6.2), bukan ditulis ulang oleh connector staging itu
+     * sendiri. Tanpa guard di badan berkasnya sendiri, salinan basi seperti
+     * itu akan tetap memasang penangkap error di staging walau connector
+     * staging sudah diam.
      */
     public static function isi_mu_plugin() {
         return <<<'PHP'
@@ -63,7 +83,8 @@ class WPMGR_Skema {
  * Plugin Name: WP Manager — penangkap error
  * Description: Dipasang otomatis oleh WP Manager Connector supaya fatal error dari plugin lain ikut tertangkap. Aman dihapus; connector akan memasangnya lagi saat pembaruan skema berikutnya.
  */
-if ( defined( 'WPMGR_DISABLE_MONITORING' ) && WPMGR_DISABLE_MONITORING ) {
+if ( ( defined( 'WPMGR_DISABLE_MONITORING' ) && WPMGR_DISABLE_MONITORING )
+    || ( defined( 'WPMGR_STAGING' ) && WPMGR_STAGING ) ) {
     return;
 }
 if ( ! in_array( 'wp-manager-connector/wp-manager-connector.php', (array) get_option( 'active_plugins', array() ), true ) ) {

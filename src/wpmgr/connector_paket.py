@@ -15,6 +15,11 @@ from pathlib import Path
 NAMA_DIREKTORI = "wp-manager-connector"
 NAMA_ZIP = "wp-manager-connector.zip"
 NAMA_MANIFEST = "manifest.json"
+NAMA_TEMPLATE_STAGING = "templates/wpmgr-staging.php.tpl"
+_PLACEHOLDER_NAMA = "__WPMGR_NAMA__"
+# Sama dengan wpmgr.staging.aman.POLA_NAMA; diulang di sini supaya modul
+# paket connector tidak bergantung pada paket staging.
+_POLA_NAMA_STAGING = re.compile(r"[a-z0-9-]{1,40}")
 _DIKECUALIKAN = frozenset({"tests", "vendor", "node_modules", "__pycache__"})
 
 
@@ -74,3 +79,19 @@ def baca_manifest(tujuan: Path) -> dict | None:
 
 def baca_zip(tujuan: Path) -> bytes:
     return (tujuan / NAMA_ZIP).read_bytes()
+
+
+def baca_template_staging(sumber: Path | None = None) -> str:
+    return ((sumber or sumber_bawaan()) / NAMA_TEMPLATE_STAGING).read_text(encoding="utf-8")
+
+
+def isi_mu_plugin_staging(nama: str, sumber: Path | None = None) -> str:
+    """Isi wp-content/mu-plugins/wpmgr-staging.php untuk satu staging.
+
+    Nama disisipkan ke literal PHP berkutip tunggal; hanya bentuk nama
+    staging yang sah yang boleh lewat, supaya tidak ada kutip atau baris
+    baru yang bisa keluar dari literal itu.
+    """
+    if not isinstance(nama, str) or not _POLA_NAMA_STAGING.fullmatch(nama):
+        raise ValueError("Nama staging tidak sah")
+    return baca_template_staging(sumber).replace(_PLACEHOLDER_NAMA, nama)
