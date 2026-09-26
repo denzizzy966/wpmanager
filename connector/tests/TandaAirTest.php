@@ -3,6 +3,9 @@ use PHPUnit\Framework\TestCase;
 
 final class WPMGR_FakeWpdbTandaAir {
     public $prefix     = 'wp_';
+    public $posts      = 'wp_posts';
+    public $comments   = 'wp_comments';
+    public $users      = 'wp_users';
     public $tabel      = array( 'wp_posts', 'wp_comments', 'wp_users' );
     public $kueri      = array();
     public $baris      = array();
@@ -37,7 +40,17 @@ final class WPMGR_FakeWpdbTandaAir {
         $this->last_error = '';
         if ( preg_match( "/^SHOW TABLES LIKE '(.*)'\z/", $sql, $m ) ) {
             $nama = stripslashes( $m[1] );
-            return in_array( $nama, $this->tabel, true ) ? $nama : null;
+            // Fix R6 #3: server dengan lower_case_table_names=1 mengembalikan
+            // nama tabel PERSIS seperti tersimpan (bisa beda huruf besar/
+            // kecil dari yang diminta) -- pencarian di sini karenanya
+            // case-insensitive, dan nilai balik memakai huruf tersimpan,
+            // bukan huruf permintaan.
+            foreach ( $this->tabel as $t ) {
+                if ( 0 === strcasecmp( $t, $nama ) ) {
+                    return $t;
+                }
+            }
+            return null;
         }
         foreach ( $this->nilai as $pola => $v ) {
             if ( false !== strpos( $sql, $pola ) ) {
@@ -108,35 +121,153 @@ final class TandaAirTest extends TestCase {
             $h['sumber']['posts'] );
         $this->assertSame( array( 'maks_id' => 55, 'jumlah' => 40 ), $h['sumber']['comments'] );
         $this->assertSame( array( 'maks_id' => 3, 'jumlah' => 3 ), $h['sumber']['users'] );
-        foreach ( array( 'pesanan', 'gravity_forms', 'wpforms', 'fluent_forms', 'flamingo' ) as $tidak ) {
+        // Fix R6 #1: pesanan_posts SELALU dilaporkan (tabel posts selalu
+        // ada), walau nol -- beda dari sumber lain yang hanya muncul bila
+        // tabelnya ada.
+        $this->assertSame( array( 'maks_id' => 0, 'jumlah' => 0 ), $h['sumber']['pesanan_posts'] );
+        foreach ( array( 'pesanan_hpos', 'gravity_forms', 'wpforms', 'fluent_forms', 'flamingo' ) as $tidak ) {
             $this->assertArrayNotHasKey( $tidak, $h['sumber'] );
         }
         $this->assertIsInt( $h['diambil'] );
     }
 
-    public function test_pesanan_hpos_didahulukan(): void {
+    // ---- Fix R6 #1 (Kritis): pesanan_hpos dan pesanan_posts independen ----
+
+    public function test_pesanan_hpos_dan_posts_dilaporkan_independen(): void {
         $w          = $this->wpdb();
         $w->tabel[] = 'wp_wc_orders';
-        $w->tabel[] = 'wp_woocommerce_order_items';
         $w->baris['FROM wp_wc_orders'] = array( 'maks' => '900', 'jumlah' => '850' );
+        $w->baris["post_type IN ('shop_order','shop_order_refund')"] = array( 'maks' => '15', 'jumlah' => '4' );
         $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
-        $this->assertSame( array( 'maks_id' => 900, 'jumlah' => 850, 'sumber' => 'hpos' ), $h['sumber']['pesanan'] );
+        $this->assertSame( array( 'maks_id' => 900, 'jumlah' => 850 ), $h['sumber']['pesanan_hpos'] );
+        $this->assertSame( array( 'maks_id' => 15, 'jumlah' => 4 ), $h['sumber']['pesanan_posts'] );
     }
 
-    public function test_pesanan_lama_dari_posts(): void {
-        $w          = $this->wpdb();
-        $w->tabel[] = 'wp_woocommerce_order_items';
-        $w->baris["post_type IN ('shop_order')"] = array( 'maks' => '77', 'jumlah' => '12' );
+    public function test_pesanan_posts_dilaporkan_walau_wc_orders_tidak_ada(): void {
+        $w = $this->wpdb();
+        $w->baris["post_type IN ('shop_order','shop_order_refund')"] = array( 'maks' => '77', 'jumlah' => '12' );
         $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
-        $this->assertSame( array( 'maks_id' => 77, 'jumlah' => 12, 'sumber' => 'posts' ), $h['sumber']['pesanan'] );
+        $this->assertSame( array( 'maks_id' => 77, 'jumlah' => 12 ), $h['sumber']['pesanan_posts'] );
+        $this->assertArrayNotHasKey( 'pesanan_hpos', $h['sumber'] );
+    }
+
+    /**
+     * New test (diminta review R6 #1): situs yang pernah mencoba HPOS lalu
+     * kembali ke posts, dengan sinkronisasi mati, terus menulis pesanan
+     * BARU hanya ke `posts` sementara `wc_orders` beku pada nilai lama.
+     * pesanan_posts wajib tetap melaporkan pesanan baru itu, TIDAK
+     * digantikan/disembunyikan oleh pesanan_hpos yang beku.
+     */
+    public function test_pesanan_posts_tetap_terdeteksi_saat_wc_orders_beku(): void {
+        $w          = $this->wpdb();
+        $w->tabel[] = 'wp_wc_orders';
+        $w->baris['FROM wp_wc_orders'] = array( 'maks' => '500', 'jumlah' => '480' ); // beku, lama
+        $w->baris["post_type IN ('shop_order','shop_order_refund')"] = array( 'maks' => '900', 'jumlah' => '30' ); // baru, di posts
+        $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
+        $this->assertSame( array( 'maks_id' => 500, 'jumlah' => 480 ), $h['sumber']['pesanan_hpos'] );
+        $this->assertSame( array( 'maks_id' => 900, 'jumlah' => 30 ), $h['sumber']['pesanan_posts'] );
+    }
+
+    // ---- Fix R6 #2 (Penting): shop_order_refund ikut disertakan ----
+
+    public function test_refund_pesanan_menggerakkan_maks_id_pada_kedua_sumber(): void {
+        $w          = $this->wpdb();
+        $w->tabel[] = 'wp_wc_orders';
+        // 905/81 > id pesanan biasa -- mensimulasikan baris REFUND terbaru.
+        $w->baris['FROM wp_wc_orders'] = array( 'maks' => '905', 'jumlah' => '851' );
+        $w->baris["post_type IN ('shop_order','shop_order_refund')"] = array( 'maks' => '81', 'jumlah' => '13' );
+        $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
+        $this->assertSame( array( 'maks_id' => 905, 'jumlah' => 851 ), $h['sumber']['pesanan_hpos'] );
+        $this->assertSame( array( 'maks_id' => 81, 'jumlah' => 13 ), $h['sumber']['pesanan_posts'] );
+        $semua = implode( "\n", $w->kueri );
+        $this->assertStringContainsString( "type IN ('shop_order','shop_order_refund')", $semua );
+        $this->assertStringContainsString( "post_type IN ('shop_order','shop_order_refund')", $semua );
+    }
+
+    // ---- Fix R6 #3 (Penting): deteksi tabel tidak peduli huruf besar/kecil ----
+
+    public function test_ada_tabel_tidak_peduli_huruf_besar_kecil(): void {
+        $w        = $this->wpdb();
+        $w->tabel = array( 'wp_wc_orders' );
+        $this->assertTrue( WPMGR_Staging_TandaAir::ada_tabel( $w, 'WP_WC_ORDERS' ) );
+        $this->assertFalse( WPMGR_Staging_TandaAir::ada_tabel( $w, 'wp_tidak_ada' ) );
+    }
+
+    /** Prefix bercampur huruf besar/kecil; server (lower_case_table_names=1) selalu balas huruf kecil. */
+    public function test_deteksi_tabel_case_insensitive_memakai_nama_dari_server(): void {
+        $w           = $this->wpdb();
+        $w->prefix   = 'WP_';
+        $w->posts    = 'WP_posts';
+        $w->comments = 'WP_comments';
+        $w->users    = 'WP_users';
+        $w->tabel    = array( 'wp_posts', 'wp_comments', 'wp_users', 'wp_wc_orders' );
+        $w->baris    = array(
+            'FROM WP_posts WHERE post_type NOT IN'                      => array( 'maks' => '1', 'jumlah' => '1', 'diubah' => null ),
+            'FROM WP_comments'                                          => array( 'maks' => '1', 'jumlah' => '1' ),
+            'FROM WP_users'                                             => array( 'maks' => '1', 'jumlah' => '1' ),
+            'FROM wp_wc_orders'                                         => array( 'maks' => '9', 'jumlah' => '9' ),
+        );
+        $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
+        $this->assertSame( array( 'maks_id' => 9, 'jumlah' => 9 ), $h['sumber']['pesanan_hpos'] );
+        $semua = implode( "\n", $w->kueri );
+        // Kueri lanjutan wajib memakai huruf PERSIS seperti dikembalikan
+        // server ('wp_wc_orders'), bukan huruf permintaan ('WP_wc_orders').
+        $this->assertStringContainsString( 'FROM wp_wc_orders', $semua );
+        $this->assertStringNotContainsString( 'WP_wc_orders', $semua );
+    }
+
+    // ---- Fix R6 #4 (Penting): baris agregat yang aneh -> 500, bukan 0/0 ----
+
+    public function test_baris_agregat_tanpa_kunci_wajib_menjadi_500(): void {
+        $w = $this->wpdb();
+        $w->baris['FROM wp_comments'] = array( 'maks' => '10' ); // kehilangan kunci 'jumlah'
+        $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
+        $this->assertInstanceOf( WP_Error::class, $h );
+        $this->assertSame( 'wpmgr_staging_tanda_air', $h->get_error_code() );
+        $this->assertSame( array( 'status' => 500 ), $h->get_error_data() );
+    }
+
+    public function test_baris_agregat_bukan_array_menjadi_500(): void {
+        $w = $this->wpdb();
+        $w->baris['FROM wp_users'] = false;
+        $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
+        $this->assertInstanceOf( WP_Error::class, $h );
+    }
+
+    public function test_baris_posts_tanpa_kunci_diubah_menjadi_500(): void {
+        $w = $this->wpdb();
+        $w->baris['FROM wp_posts WHERE post_type NOT IN'] = array( 'maks' => '1', 'jumlah' => '1' ); // kehilangan 'diubah'
+        $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
+        $this->assertInstanceOf( WP_Error::class, $h );
+    }
+
+    // ---- Fix R6 #5a: $wpdb->users dipakai apa adanya (CUSTOM_USER_TABLE) ----
+
+    public function test_users_memakai_properti_wpdb_bukan_prefix_manual(): void {
+        $w        = $this->wpdb();
+        $w->users = 'shared_users'; // CUSTOM_USER_TABLE, tidak mengikuti prefix
+        $w->baris['FROM shared_users'] = array( 'maks' => '42', 'jumlah' => '7' );
+        $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
+        $this->assertSame( array( 'maks_id' => 42, 'jumlah' => 7 ), $h['sumber']['users'] );
+    }
+
+    // ---- Fix R6 #5c: diubah_sejak mengecualikan auto-draft juga ----
+
+    public function test_diubah_sejak_mengecualikan_auto_draft(): void {
+        $w        = $this->wpdb();
+        $w->nilai = array( "post_modified_gmt > '2026-09-20 00:00:00'" => '4' );
+        WPMGR_Staging_TandaAir::kumpulkan( $w, '2026-09-20 00:00:00', 100 );
+        $semua = implode( "\n", $w->kueri );
+        // Muncul dua kali: agregat posts utama DAN kueri diubah_sejak.
+        $this->assertSame( 2, substr_count( $semua, "post_status <> 'auto-draft'" ) );
     }
 
     public function test_tabel_form_yang_ada(): void {
         $w = $this->wpdb();
         array_push( $w->tabel, 'wp_gf_entry', 'wp_wpforms_entries', 'wp_fluentform_submissions' );
-        $w->baris['MAX(`id`) AS maks, COUNT(*) AS jumlah FROM wp_gf_entry']             = array( 'maks' => '5', 'jumlah' => '5' );
-        $w->baris['MAX(`entry_id`) AS maks, COUNT(*) AS jumlah FROM wp_wpforms_entries'] = array( 'maks' => '9', 'jumlah' => '8' );
-        $w->baris['FROM wp_fluentform_submissions']                                     = array( 'maks' => '2', 'jumlah' => '2' );
+        $w->baris['MAX(`id`) AS maks, COUNT(*) AS jumlah FROM `wp_gf_entry`']             = array( 'maks' => '5', 'jumlah' => '5' );
+        $w->baris['MAX(`entry_id`) AS maks, COUNT(*) AS jumlah FROM `wp_wpforms_entries`'] = array( 'maks' => '9', 'jumlah' => '8' );
+        $w->baris['FROM `wp_fluentform_submissions`']                                     = array( 'maks' => '2', 'jumlah' => '2' );
         $h = WPMGR_Staging_TandaAir::kumpulkan( $w, '', 0 );
         $this->assertSame( array( 'maks_id' => 5, 'jumlah' => 5 ), $h['sumber']['gravity_forms'] );
         $this->assertSame( array( 'maks_id' => 9, 'jumlah' => 8 ), $h['sumber']['wpforms'] );
@@ -169,9 +300,10 @@ final class TandaAirTest extends TestCase {
         }
     }
 
-    // ---- Tambahan di luar brief: lesson Task 3-5, "jangan pernah melaporkan
-    // 'tidak ada data baru' yang palsu" -- galat query harus menghasilkan
-    // 500 WP_Error, tidak pernah watermark sebagian yang tampak lengkap. ----
+    // ---- Tambahan (Task 6, round 0): lesson Task 3-5, "jangan pernah
+    // melaporkan 'tidak ada data baru' yang palsu" -- galat query harus
+    // menghasilkan 500 WP_Error, tidak pernah watermark sebagian yang
+    // tampak lengkap. ----
 
     public function test_galat_query_posts_menghasilkan_500_bukan_nol(): void {
         $w             = $this->wpdb();
@@ -205,11 +337,11 @@ final class TandaAirTest extends TestCase {
     }
 
     public function test_galat_query_deteksi_tabel_pesanan_menghasilkan_500(): void {
-        // ada_tabel() yang gagal mengembalikan null (!== nama tabel), yang
+        // cari_tabel() yang gagal mengembalikan null (!== nama tabel), yang
         // secara naif tampak seperti "tabel tidak ada" -- padahal itu galat.
         // wc_orders ADA di daftar tabel, tapi SHOW TABLES-nya disimulasikan
-        // gagal; hasilnya wajib 500, bukan diam-diam jatuh ke jalur "posts"
-        // seolah situs ini tidak memakai HPOS.
+        // gagal; hasilnya wajib 500, bukan diam-diam melaporkan pesanan_hpos
+        // sebagai tidak ada.
         $w             = $this->wpdb();
         $w->tabel[]    = 'wp_wc_orders';
         $w->gagal_pola = 'SHOW TABLES';
