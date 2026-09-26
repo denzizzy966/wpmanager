@@ -87,6 +87,7 @@ class WPMGR_Staging {
         return array(
             '/staging/manifest' => array( 'GET', 'manifest' ),
             '/staging/file'     => array( 'POST', 'file' ),
+            '/staging/tabel'    => array( 'POST', 'tabel' ),
         );
     }
 
@@ -143,6 +144,44 @@ class WPMGR_Staging {
     public static function file( $request ) {
         $hasil = WPMGR_Staging_File::ambil( self::root(), json_decode( $request->get_body(), true ) );
         return is_wp_error( $hasil ) ? $hasil : self::respons_biner( $hasil );
+    }
+
+    /**
+     * SQL ekspor tabel untuk tarik/snapshot (Task 5): potongan berisi DROP+
+     * CREATE (kursor kosong) lalu INSERT bertahap, dikirim sebagai paket
+     * biner satu bagian. Validasi nama tabel, kursor, dan escaping ada di
+     * WPMGR_Staging_Tabel; di sini hanya penghubung ke respons REST.
+     */
+    public static function tabel( $request ) {
+        global $wpdb;
+        $p = json_decode( $request->get_body(), true );
+        if ( ! is_array( $p ) ) {
+            return self::galat( 'wpmgr_staging_permintaan', 'Body permintaan bukan objek.', 400 );
+        }
+        $nama   = isset( $p['tabel'] ) ? $p['tabel'] : null;
+        $kursor = ( isset( $p['kursor'] ) && is_string( $p['kursor'] ) ) ? $p['kursor'] : '';
+        $hasil  = WPMGR_Staging_Tabel::ekspor( $wpdb, $nama, $kursor );
+        if ( is_wp_error( $hasil ) ) {
+            return $hasil;
+        }
+        // susun() bisa melempar InvalidArgumentException (mis. meta melebihi
+        // MAKS_META) -- dibungkus supaya itu tidak pernah lolos ke WordPress
+        // sebagai fatal error, sama seperti WPMGR_Staging_File::bungkus_atau_500().
+        try {
+            $paket = WPMGR_Staging_Paket::susun(
+                array(
+                    'tabel'   => $nama,
+                    'kursor'  => $hasil['kursor'],
+                    'selesai' => $hasil['selesai'],
+                    'baris'   => $hasil['baris'],
+                    'berkas'  => array( array( 'path' => 'sql' ) ),
+                ),
+                array( $hasil['sql'] )
+            );
+        } catch ( InvalidArgumentException $e ) {
+            return self::galat( 'wpmgr_staging_susun', 'Paket staging tidak dapat disusun.', 500 );
+        }
+        return self::respons_biner( $paket );
     }
 
     public static function daftarkan_route() {

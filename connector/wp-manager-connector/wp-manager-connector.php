@@ -38,6 +38,7 @@ require_once WPMGR_DIR . 'includes/class-wpmgr-staging-path.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging-paket.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging-manifest.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging-file.php';
+require_once WPMGR_DIR . 'includes/class-wpmgr-staging-tabel.php';
 require_once WPMGR_DIR . 'includes/class-wpmgr-staging.php';
 
 add_action( 'plugins_loaded', array( 'WPMGR_Skema', 'pastikan' ) );
