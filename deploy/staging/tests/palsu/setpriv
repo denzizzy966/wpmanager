@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+printf '[%s]' "$@" >> "$PALSU/setpriv.log"
+printf '\n' >> "$PALSU/setpriv.log"
+uid="" gid=""
+while [[ $# -gt 0 && "$1" != "--" ]]; do
+  case "$1" in
+    --reuid=*) uid="${1#--reuid=}" ;;
+    --regid=*) gid="${1#--regid=}" ;;
+  esac
+  shift
+done
+shift
+# Container test berjalan sebagai root tanpa setpriv asli. Supaya pemeriksaan
+# pemilik direktori di skrip bisa diuji, direktori yang dibuat `mkdir` lewat
+# setpriv diberi pemilik --reuid/--regid, seperti bila dibuat user itu.
+if [[ "${1-}" == mkdir ]]; then
+  baru=()
+  for a in "${@:2}"; do
+    [[ "$a" == -* ]] && continue
+    p="$a"
+    while [[ -n "$p" && "$p" != / && ! -e "$p" ]]; do
+      baru+=("$p")
+      p="$(dirname "$p")"
+    done
+  done
+  "$@" || exit $?
+  [[ ${#baru[@]} -eq 0 ]] || chown "$uid:$gid" "${baru[@]}"
+  exit 0
+fi
+exec "$@"

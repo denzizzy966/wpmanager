@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+printf '[%s]' "$@" >> "$PALSU/iptables.log"
+printf '\n' >> "$PALSU/iptables.log"
+[[ "${1-}" == "-C" ]] && exit 1
+exit 0

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+printf '[%s]' "$@" >> "$PALSU/curl.log"
+printf '\n' >> "$PALSU/curl.log"
+keluar="" url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) keluar="$2"; shift ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+if [[ "$url" == *.sha512 ]]; then
+  printf 'phar-palsu' | sha512sum | cut -d' ' -f1
+else
+  printf 'phar-palsu' > "$keluar"
+fi

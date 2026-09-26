@@ -1,0 +1,5 @@
+deploy/staging/wpmgr-staging text eol=lf
+deploy/staging/tests/*.bats text eol=lf
+deploy/staging/tests/palsu/* text eol=lf
+deploy/staging/*.conf text eol=lf
+deploy/staging/*.contoh text eol=lf

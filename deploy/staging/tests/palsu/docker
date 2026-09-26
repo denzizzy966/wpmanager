@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# docker tiruan untuk test skrip pembantu: mencatat panggilan dan menjawab
+# dari berkas di $PALSU (wadah/<nama> = label, wadah/<nama>.image = image).
+printf '[%s]' "$@" >> "$PALSU/docker.log"
+printf '\n' >> "$PALSU/docker.log"
+case "${1-}" in
+  inspect)
+    nama="${*: -1}"
+    [[ -f "$PALSU/wadah/$nama" ]] || exit 1
+    if [[ "${3-}" == *Labels* ]]; then
+      cat "$PALSU/wadah/$nama"
+    else
+      cat "$PALSU/wadah/$nama.image" 2>/dev/null || true
+    fi
+    ;;
+  network)
+    if [[ "${2-}" == inspect ]]; then
+      [[ -f "$PALSU/jaringan" ]] || exit 1
+    else
+      touch "$PALSU/jaringan"
+    fi
+    ;;
+  image)
+    printf 'contoh/image@sha256:%s\n' "$(printf 'c%.0s' $(seq 1 64))"
+    ;;
+  exec)
+    if [[ " $* " == *" -i "* ]]; then
+      n=$(( $(cat "$PALSU/n" 2>/dev/null || echo 0) + 1 ))
+      echo "$n" > "$PALSU/n"
+      cat > "$PALSU/stdin-$n"
+    fi
+    if [[ "$*" == *"nginx -t"* && -f "$PALSU/nginx-gagal" ]]; then
+      exit 1
+    fi
+    if [[ -f "$PALSU/exec-gagal" ]]; then
+      exit 1
+    fi
+    ;;
+  ps)
+    cat "$PALSU/ps" 2>/dev/null || true
+    ;;
+esac
+exit 0

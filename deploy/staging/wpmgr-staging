@@ -1,0 +1,784 @@
+#!/usr/bin/env bash
+# wpmgr-staging -- satu-satunya jembatan dashboard WP Manager ke Docker
+# (spec §7.3). Dijalankan root lewat `sudo -n` oleh user dashboard.
+#
+# Aturan skrip ini:
+#   - setiap argumen divalidasi dengan pola tetap sebelum dipakai;
+#   - perintah Docker selalu disusun sebagai array, tidak pernah lewat eval
+#     atau string yang diurai ulang oleh shell;
+#   - berkas di direktori milik user dashboard dibaca/ditulis SEBAGAI user
+#     itu (setpriv), karena ia bisa mengganti apa pun di sana dengan symlink;
+#   - direktori yang di-bind mount diperiksa root dulu: direktori asli, bukan
+#     symlink, dengan pemilik yang diharapkan (putusan F2);
+#   - container yang labelnya bukan milik staging tidak pernah disentuh,
+#     termasuk layanan bersama db/router/mail (RF5, putusan F14);
+#   - setiap panggilan docker/certbot/setpriv dibatasi `timeout` supaya
+#     proses root ini tidak hidup lebih lama dari pemanggilnya (putusan F10b);
+#   - pesan galat tetap dan pendek, tidak pernah menggemakan masukan mentah.
+set -euo pipefail
+umask 077
+export LC_ALL=C
+PATH="${WPMGR_STG_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+KONF="${WPMGR_STG_KONF:-/etc/wpmgr-staging/staging.conf}"
+
+VERSI_PHP=(7.4 8.0 8.1 8.2 8.3)
+WPCLI_VERSI="2.11.0"
+JARINGAN="wpmgr-staging"
+JEMBATAN="br-wpmgrstg"
+OPSI_KLIEN=""
+SEMENTARA=()
+
+# Tenggat per subperintah = tenggat pembungkus Python (pembantu.py
+# TIMEOUT_*) ditambah margin. Python membunuh grup proses sudo lebih dulu;
+# batas di sini hanya jaring pengaman bila pemanggil mati tanpa membunuhnya.
+WAKTU_BAWAAN=180       # TIMEOUT_BAWAAN 120 + 60
+WAKTU_SIAPKAN=960      # TIMEOUT_SIAPKAN 900 + 60
+WAKTU_BUAT=660         # TIMEOUT_BUAT 600 + 60
+WAKTU_IMPOR=11100      # TIMEOUT_IMPOR 3 jam + 300
+WAKTU_WPCLI=960        # TIMEOUT_WPCLI 900 + 60
+WAKTU_SERTIFIKAT=360   # TIMEOUT_SERTIFIKAT 300 + 60
+TENGGAT=$(( SECONDS + WAKTU_BAWAAN ))
+
+galat() {
+  local kode="$1"
+  shift
+  printf 'GALAT %s: %s\n' "$kode" "$*" >&2
+  case "$kode" in
+    argumen) exit 2 ;;
+    ditolak) exit 3 ;;
+    docker) exit 4 ;;
+    sertifikat) exit 5 ;;
+    impor) exit 6 ;;
+    konfigurasi) exit 7 ;;
+    wpcli) exit 8 ;;
+    *) exit 1 ;;
+  esac
+}
+
+bersihkan() {
+  # Berkas opsi klien MariaDB memuat kata sandi: selalu dihapus, juga saat
+  # skrip berhenti karena galat. Batas waktunya sendiri, bukan sisa tenggat,
+  # supaya tenggat yang habis tidak mencegah pembersihan.
+  if [[ -n "$OPSI_KLIEN" ]]; then
+    timeout -k 5 20 docker exec wpmgr-stg-db rm -f "$OPSI_KLIEN" >/dev/null 2>&1 || true
+  fi
+  if [[ ${#SEMENTARA[@]} -gt 0 ]]; then
+    rm -rf -- "${SEMENTARA[@]}"
+  fi
+}
+trap bersihkan EXIT
+
+# ---- batas waktu ---------------------------------------------------------
+
+atur_tenggat() { TENGGAT=$(( SECONDS + $1 )); }
+
+# Menjalankan perintah dengan sisa tenggat subperintah ini.
+dibatasi() {
+  local sisa=$(( TENGGAT - SECONDS ))
+  (( sisa > 0 )) || galat docker "tenggat habis"
+  timeout -k 10 "$sisa" "$@"
+}
+
+dk() { dibatasi docker "$@"; }
+
+# ---- konfigurasi ---------------------------------------------------------
+
+POLA_JALUR='^/[A-Za-z0-9._/-]{1,200}$'
+
+muat_konf() {
+  [[ -r "$KONF" ]] || galat konfigurasi "berkas konfigurasi tidak ada"
+  local baris kunci nilai
+  while IFS= read -r baris || [[ -n "$baris" ]]; do
+    [[ -z "$baris" || "$baris" == \#* ]] && continue
+    [[ "$baris" =~ ^([A-Z_]+)=(.*)$ ]] || galat konfigurasi "baris konfigurasi tidak dikenal"
+    kunci="${BASH_REMATCH[1]}"
+    nilai="${BASH_REMATCH[2]}"
+    case "$kunci" in
+      DOMAIN|STAGING_DIR|KONF_DIR|CERT_DIR|ACME_DIR|LE_DIR|LOG_DIR|ACME_EMAIL|ROUTER_PORT|MAIL_PORT|SUBNET|\
+PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT|MEMINFO)
+        printf -v "K_$kunci" '%s' "$nilai" ;;
+      *) galat konfigurasi "kunci konfigurasi tidak dikenal" ;;
+    esac
+  done < "$KONF"
+
+  DOMAIN="${K_DOMAIN:-}"
+  STAGING_DIR="${K_STAGING_DIR:-/var/lib/wpmgr/staging}"
+  KONF_DIR="${K_KONF_DIR:-/etc/wpmgr-staging}"
+  CERT_DIR="${K_CERT_DIR:-/var/lib/wpmgr/certs}"
+  ACME_DIR="${K_ACME_DIR:-/var/lib/wpmgr/acme}"
+  LE_DIR="${K_LE_DIR:-/var/lib/wpmgr/letsencrypt}"
+  LOG_DIR="${K_LOG_DIR:-/var/log/wpmgr-staging}"
+  ACME_EMAIL="${K_ACME_EMAIL:-}"
+  ROUTER_PORT="${K_ROUTER_PORT:-127.0.0.1:8090}"
+  MAIL_PORT="${K_MAIL_PORT:-127.0.0.1:8025}"
+  SUBNET="${K_SUBNET:-172.31.250.0/24}"
+  AKAR_LOKAL="${K_AKAR_LOKAL:-}"
+  AKAR_DAEMON="${K_AKAR_DAEMON:-}"
+  TANPA_IPTABLES="${K_TANPA_IPTABLES:-0}"
+  TANPA_SERTIFIKAT="${K_TANPA_SERTIFIKAT:-0}"
+  MEMINFO="${K_MEMINFO:-/proc/meminfo}"
+  LOCK="$KONF_DIR/digest.lock"
+
+  [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] \
+    || galat konfigurasi "DOMAIN tidak sah"
+  # Path dipakai di `-v sumber:tujuan`; titik dua, spasi, atau `..` akan
+  # mengubah arti argumen itu, jadi hanya karakter aman yang diterima.
+  local p
+  for p in "$STAGING_DIR" "$KONF_DIR" "$CERT_DIR" "$ACME_DIR" "$LE_DIR" "$LOG_DIR" "$MEMINFO"; do
+    [[ "$p" =~ $POLA_JALUR && "$p" != *..* ]] || galat konfigurasi "path konfigurasi tidak sah"
+  done
+  if [[ -n "$AKAR_LOKAL" || -n "$AKAR_DAEMON" ]]; then
+    [[ "$AKAR_LOKAL" =~ $POLA_JALUR && "$AKAR_LOKAL" != *..* && "$AKAR_DAEMON" =~ $POLA_JALUR && "$AKAR_DAEMON" != *..* ]] \
+      || galat konfigurasi "AKAR_LOKAL/AKAR_DAEMON tidak sah"
+  fi
+  [[ -z "$ACME_EMAIL" || "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}$ ]] \
+    || galat konfigurasi "ACME_EMAIL tidak sah"
+  [[ "$ROUTER_PORT" =~ ^127\.0\.0\.1:[0-9]{2,5}$ && "$MAIL_PORT" =~ ^127\.0\.0\.1:[0-9]{2,5}$ ]] \
+    || galat konfigurasi "port router/mail harus di 127.0.0.1"
+  [[ "$SUBNET" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || galat konfigurasi "SUBNET tidak sah"
+
+  if [[ -n "${K_PENGGUNA_UID:-}" ]]; then
+    UID_W="$K_PENGGUNA_UID"
+    GID_W="${K_PENGGUNA_GID:-$K_PENGGUNA_UID}"
+  else
+    UID_W="$(stat -c %u "$STAGING_DIR" 2>/dev/null)" || galat konfigurasi "STAGING_DIR tidak ada"
+    GID_W="$(stat -c %g "$STAGING_DIR" 2>/dev/null)" || galat konfigurasi "STAGING_DIR tidak ada"
+  fi
+  [[ "$UID_W" =~ ^[0-9]{1,10}$ && "$GID_W" =~ ^[0-9]{1,10}$ && "$UID_W" != 0 ]] \
+    || galat konfigurasi "pemilik STAGING_DIR tidak boleh root"
+}
+
+# ---- validasi ------------------------------------------------------------
+# Di bash, `$` di [[ =~ ]] hanya cocok di akhir string, dan kelas karakter
+# ASCII (LC_ALL=C) tidak memuat baris baru, jadi argumen "nama\n" gagal.
+
+cek_nama() { [[ "${1-}" =~ ^[a-z0-9-]{1,40}$ ]] || galat argumen "nama staging tidak sah"; }
+cek_id() {
+  [[ "${1-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || galat argumen "id site tidak sah"
+}
+cek_versi() {
+  local v
+  for v in "${VERSI_PHP[@]}"; do
+    [[ "${1-}" == "$v" ]] && return 0
+  done
+  galat argumen "versi PHP tidak didukung"
+}
+cek_prefix() { [[ "${1-}" =~ ^[A-Za-z0-9_]{1,20}$ ]] || galat argumen "prefix tabel tidak sah"; }
+cek_url() {
+  [[ "${1-}" =~ ^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]{0,200})?$ ]] || galat argumen "URL tidak sah"
+}
+cek_slug() { [[ "${1-}" =~ ^[a-z0-9][a-z0-9._-]{0,99}$ ]] || galat argumen "slug paket tidak sah"; }
+
+# Putusan F2: sumber bind mount di bawah STAGING_DIR harus direktori asli
+# (bukan symlink) milik UID_W di setiap komponennya. Tanpa ini user dashboard
+# bisa mengganti files/ dengan symlink ke /etc dan Docker (root) akan
+# memasangnya ke container.
+cek_mount_pengguna() {
+  local jalur="$1" sisa p komponen pemilik bagian
+  [[ "$jalur" == "$STAGING_DIR"/* ]] || galat ditolak "direktori staging tidak sah"
+  sisa="${jalur#"$STAGING_DIR"/}"
+  p="$STAGING_DIR"
+  IFS=/ read -r -a komponen <<< "$sisa"
+  for bagian in "${komponen[@]}"; do
+    [[ -n "$bagian" && "$bagian" != . && "$bagian" != .. ]] || galat ditolak "direktori staging tidak sah"
+    p="$p/$bagian"
+    [[ -d "$p" && ! -L "$p" ]] || galat ditolak "direktori staging bukan direktori asli"
+    pemilik="$(stat -c %u -- "$p")" || galat ditolak "direktori staging tidak terbaca"
+    [[ "$pemilik" == "$UID_W" ]] || galat ditolak "direktori staging bukan milik user dashboard"
+  done
+}
+
+# Sumber bind mount milik root (konfigurasi router, log, wp-cli): bukan
+# symlink, jenisnya sesuai (d/f), dan milik root.
+cek_mount_root() {
+  local jalur="$1" jenis="$2" pemilik
+  [[ ! -L "$jalur" ]] || galat ditolak "sumber mount tidak sah"
+  if [[ "$jenis" == d ]]; then
+    [[ -d "$jalur" ]] || galat ditolak "sumber mount tidak sah"
+  else
+    [[ -f "$jalur" ]] || galat ditolak "sumber mount tidak sah"
+  fi
+  pemilik="$(stat -c %u -- "$jalur")" || galat ditolak "sumber mount tidak terbaca"
+  [[ "$pemilik" == 0 ]] || galat ditolak "sumber mount bukan milik root"
+}
+
+# ---- bantuan -------------------------------------------------------------
+
+acak() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+nama_db() { printf 'stg_%s' "${1//-/_}"; }
+
+sbg_pengguna() { dibatasi setpriv --reuid="$UID_W" --regid="$GID_W" --clear-groups -- "$@"; }
+
+jalur_daemon() {
+  local p="$1"
+  if [[ -n "$AKAR_DAEMON" && -n "$AKAR_LOKAL" && "$p" == "$AKAR_LOKAL"/* ]]; then
+    printf '%s%s' "$AKAR_DAEMON" "${p#"$AKAR_LOKAL"}"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+# 0 = ada dan milik label ini; 1 = tidak ada; galat bila ada tetapi milik
+# lain, atau bila docker gagal dengan cara lain (mis. tenggat habis) supaya
+# kegagalan itu tidak disalahartikan sebagai "container belum ada".
+pastikan_milik() {
+  local label rc=0
+  label="$(dk inspect --format '{{ index .Config.Labels "wpmgr.staging" }}' "$1" 2>/dev/null)" || rc=$?
+  if (( rc == 1 )); then
+    return 1
+  elif (( rc != 0 )); then
+    galat docker "status container tidak terbaca"
+  fi
+  [[ "$label" == "$2" ]] || galat ditolak "container sudah ada dan bukan milik staging"
+  return 0
+}
+
+# Putusan F14: exec ke layanan bersama hanya bila labelnya milik staging.
+pastikan_layanan() {
+  pastikan_milik "wpmgr-stg-$1" "layanan:$1" || galat ditolak "layanan staging belum disiapkan"
+}
+
+image() {
+  local kunci="$1" tag="$2" baris
+  baris="$(grep -E "^${kunci}=" "$LOCK" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+  if [[ -z "$baris" ]]; then
+    dk pull --quiet "$tag" >/dev/null || galat docker "image tidak dapat diunduh"
+    baris="$(dk image inspect --format '{{ index .RepoDigests 0 }}' "$tag")" || galat docker "digest image tidak terbaca"
+    [[ "$baris" =~ ^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$ ]] || galat docker "digest image tidak dikenali"
+    printf '%s=%s\n' "$kunci" "$baris" >> "$LOCK"
+  fi
+  [[ "$baris" =~ ^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$ ]] || galat konfigurasi "digest.lock rusak"
+  printf '%s' "$baris"
+}
+
+# Kata sandi MariaDB masuk lewat berkas opsi di dalam container (stdin),
+# bukan argumen/env proses, supaya tidak terbaca user lain lewat /proc.
+opsi_klien() {
+  pastikan_layanan db
+  OPSI_KLIEN="/run/wpmgr-klien-$$-$RANDOM.cnf"
+  # Path diteruskan sebagai argumen posisi, tidak disisipkan ke teks skrip sh.
+  # shellcheck disable=SC2016 # $1 memang harus diurai oleh sh di container.
+  printf '[client]\nuser=%s\npassword=%s\n' "$1" "$2" \
+    | dk exec -i wpmgr-stg-db sh -c 'umask 077 && cat > "$1"' sh "$OPSI_KLIEN" \
+    || galat docker "database staging tidak dapat dihubungi"
+}
+
+hapus_opsi_klien() {
+  if [[ -n "$OPSI_KLIEN" ]]; then
+    dk exec wpmgr-stg-db rm -f "$OPSI_KLIEN" >/dev/null 2>&1 || true
+    OPSI_KLIEN=""
+  fi
+}
+
+sql_root() {
+  local sandi
+  sandi="$(cat "$KONF_DIR/db-root")" || galat konfigurasi "kata sandi root database tidak ada"
+  opsi_klien root "$sandi"
+  printf '%s' "$1" | dk exec -i wpmgr-stg-db mariadb --defaults-extra-file="$OPSI_KLIEN" \
+    || galat docker "perintah database gagal"
+  hapus_opsi_klien
+}
+
+pastikan_siap() {
+  dk network inspect "$JARINGAN" >/dev/null 2>&1 || galat ditolak "jalankan 'wpmgr-staging siapkan' dulu"
+  [[ -s "$KONF_DIR/wp-cli.phar" ]] || galat ditolak "jalankan 'wpmgr-staging siapkan' dulu"
+}
+
+# ---- siapkan -------------------------------------------------------------
+
+pasang_iptables() {
+  # Container staging boleh ke internet (update plugin), tetapi tidak ke host
+  # (PostgreSQL dashboard, ERPNext) maupun jaringan privat mana pun.
+  iptables -C INPUT -i "$JEMBATAN" -j DROP 2>/dev/null || iptables -I INPUT -i "$JEMBATAN" -j DROP
+  local j
+  for j in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+    iptables -C DOCKER-USER -i "$JEMBATAN" ! -o "$JEMBATAN" -d "$j" -j DROP 2>/dev/null \
+      || iptables -I DOCKER-USER -i "$JEMBATAN" ! -o "$JEMBATAN" -d "$j" -j DROP
+  done
+}
+
+pastikan_wpcli() {
+  local phar="$KONF_DIR/wp-cli.phar" terkunci ada
+  local url="https://github.com/wp-cli/wp-cli/releases/download/v${WPCLI_VERSI}/wp-cli-${WPCLI_VERSI}.phar"
+  terkunci="$(grep -E '^wpcli=' "$LOCK" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+  if [[ ! -s "$phar" ]]; then
+    curl -fsSL --max-time 120 -o "$phar.tmp" "$url" || galat docker "wp-cli tidak dapat diunduh"
+    if [[ -z "$terkunci" ]]; then
+      terkunci="$(curl -fsSL --max-time 30 "$url.sha512" | awk '{print $1}')" || galat docker "hash wp-cli tidak dapat diunduh"
+      [[ "$terkunci" =~ ^[0-9a-f]{128}$ ]] || galat docker "hash wp-cli tidak dikenali"
+      printf 'wpcli=%s\n' "$terkunci" >> "$LOCK"
+    fi
+    mv "$phar.tmp" "$phar"
+    chmod 0644 "$phar"
+  fi
+  ada="$(sha512sum "$phar" | cut -d' ' -f1)"
+  if [[ -n "$terkunci" && "$ada" != "$terkunci" ]]; then
+    rm -f "$phar"
+    galat docker "hash wp-cli tidak cocok dengan digest.lock"
+  fi
+}
+
+tulis_router_bawaan() {
+  cat > "$KONF_DIR/router/conf.d/00-bawaan.conf" <<'KONF'
+log_format wpmgr_akses '$msec';
+resolver 127.0.0.11 valid=10s ipv6=off;
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+KONF
+  chmod 0644 "$KONF_DIR/router/conf.d/00-bawaan.conf"
+}
+
+jalankan_layanan() {
+  local nama="$1" peran="$2"
+  shift 2
+  if pastikan_milik "$nama" "layanan:$peran"; then
+    dk start "$nama" >/dev/null || galat docker "layanan staging tidak dapat dijalankan"
+  else
+    dk run -d --name "$nama" --label "wpmgr.staging=layanan:$peran" --network "$JARINGAN" \
+      --restart unless-stopped "$@" >/dev/null || galat docker "layanan staging tidak dapat dibuat"
+  fi
+}
+
+cmd_siapkan() {
+  install -d -m 0755 "$KONF_DIR" "$KONF_DIR/router" "$KONF_DIR/router/conf.d" "$KONF_DIR/router/htpasswd" \
+    "$CERT_DIR" "$ACME_DIR" "$LOG_DIR"
+  install -d -m 0700 "$KONF_DIR/db" "$LE_DIR"
+  [[ -f "$LOCK" ]] || install -m 0644 /dev/null "$LOCK"
+  if [[ ! -s "$KONF_DIR/db-root" ]]; then
+    acak 32 > "$KONF_DIR/db-root"
+    chmod 0600 "$KONF_DIR/db-root"
+  fi
+  if ! dk network inspect "$JARINGAN" >/dev/null 2>&1; then
+    dk network create --driver bridge --subnet "$SUBNET" --opt "com.docker.network.bridge.name=$JEMBATAN" \
+      --label wpmgr.staging=layanan:jaringan "$JARINGAN" >/dev/null || galat docker "jaringan staging tidak dapat dibuat"
+  fi
+  [[ "$TANPA_IPTABLES" == 1 ]] || pasang_iptables
+  pastikan_wpcli
+  tulis_router_bawaan
+
+  # Putusan F21: substitusi perintah disimpan ke variabel dulu, supaya
+  # kegagalannya menghentikan skrip lewat `set -e`.
+  local env_db sandi img_db img_mail img_router m_konf m_htpasswd m_log
+  sandi="$(cat "$KONF_DIR/db-root")"
+  img_db="$(image mariadb mariadb:11.4)"
+  img_mail="$(image mailpit axllent/mailpit:latest)"
+  img_router="$(image nginx nginx:1.27-alpine)"
+  cek_mount_root "$KONF_DIR/router/conf.d" d
+  cek_mount_root "$KONF_DIR/router/htpasswd" d
+  cek_mount_root "$LOG_DIR" d
+  m_konf="$(jalur_daemon "$KONF_DIR/router/conf.d")"
+  m_htpasswd="$(jalur_daemon "$KONF_DIR/router/htpasswd")"
+  m_log="$(jalur_daemon "$LOG_DIR")"
+
+  env_db="$(mktemp)"
+  SEMENTARA+=("$env_db")
+  printf 'MARIADB_ROOT_PASSWORD=%s\n' "$sandi" > "$env_db"
+  jalankan_layanan wpmgr-stg-db db --memory 1g --env-file "$env_db" -v wpmgr-stg-db:/var/lib/mysql \
+    "$img_db" --innodb-buffer-pool-size=256M --max-allowed-packet=64M
+  rm -f "$env_db"
+  jalankan_layanan wpmgr-stg-mail mail --memory 128m -p "$MAIL_PORT:8025" "$img_mail"
+  jalankan_layanan wpmgr-stg-router router --memory 128m -p "$ROUTER_PORT:80" \
+    -v "$m_konf:/etc/nginx/conf.d:ro" \
+    -v "$m_htpasswd:/etc/nginx/wpmgr-htpasswd:ro" \
+    -v "$m_log:/var/log/wpmgr-akses" \
+    "$img_router"
+  echo "staging siap"
+}
+
+# ---- container per staging -----------------------------------------------
+
+cmd_buat() {
+  cek_nama "${1-}"
+  cek_versi "${2-}"
+  cek_id "${3-}"
+  local nama="$1" versi="$2" situs="$STAGING_DIR/$3" wadah="wp-$1" img sekarang d
+  local m_files m_ekspor m_log m_wp
+  pastikan_siap
+  img="$(image "php${versi/./}" "wordpress:php${versi}-apache")"
+  sbg_pengguna mkdir -p "$situs/files" "$situs/ekspor" "$situs/log" 2>/dev/null \
+    || galat ditolak "direktori staging tidak dapat disiapkan"
+  # Diperiksa juga sebelum `start`: Docker menyelesaikan path bind mount
+  # setiap kali container dijalankan.
+  for d in files ekspor log; do
+    cek_mount_pengguna "$situs/$d"
+  done
+  cek_mount_root "$KONF_DIR/wp-cli.phar" f
+  m_files="$(jalur_daemon "$situs/files")"
+  m_ekspor="$(jalur_daemon "$situs/ekspor")"
+  m_log="$(jalur_daemon "$situs/log")"
+  m_wp="$(jalur_daemon "$KONF_DIR/wp-cli.phar")"
+  if pastikan_milik "$wadah" "situs:$nama"; then
+    sekarang="$(dk inspect --format '{{ .Config.Image }}' "$wadah")" || galat docker "container tidak terbaca"
+    if [[ "$sekarang" == "$img" ]]; then
+      dk start "$wadah" >/dev/null || galat docker "container staging tidak dapat dijalankan"
+      return 0
+    fi
+    dk rm -f "$wadah" >/dev/null || galat docker "container lama tidak dapat dihapus"
+  fi
+  dk run -d --name "$wadah" --label "wpmgr.staging=situs:$nama" --network "$JARINGAN" \
+    --restart unless-stopped --memory 384m --memory-swap 384m --cpus 1 --pids-limit 256 \
+    --security-opt no-new-privileges \
+    -e "APACHE_RUN_USER=#$UID_W" -e "APACHE_RUN_GROUP=#$GID_W" \
+    -v "$m_files:/var/www/html" \
+    -v "$m_ekspor:/wpmgr-ekspor" \
+    -v "$m_log:/wpmgr-log" \
+    -v "$m_wp:/usr/local/bin/wp:ro" \
+    "$img" >/dev/null || galat docker "container staging tidak dapat dibuat"
+}
+
+cmd_jalan() {
+  cek_nama "${1-}"
+  pastikan_milik "wp-$1" "situs:$1" || galat ditolak "staging belum dibuat"
+  dk start "wp-$1" >/dev/null || galat docker "staging tidak dapat dijalankan"
+}
+
+cmd_jeda() {
+  cek_nama "${1-}"
+  pastikan_milik "wp-$1" "situs:$1" || galat ditolak "staging belum dibuat"
+  dk stop -t 20 "wp-$1" >/dev/null || galat docker "staging tidak dapat dijeda"
+}
+
+muat_ulang_router() {
+  if pastikan_milik wpmgr-stg-router layanan:router; then
+    dk exec wpmgr-stg-router nginx -s reload >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_hapus() {
+  cek_nama "${1-}"
+  if pastikan_milik "wp-$1" "situs:$1"; then
+    dk rm -f "wp-$1" >/dev/null || galat docker "staging tidak dapat dihapus"
+  fi
+  rm -f "$KONF_DIR/router/conf.d/stg-$1.conf" "$KONF_DIR/router/htpasswd/$1" "$LOG_DIR/$1.log"
+  muat_ulang_router
+}
+
+# ---- database ------------------------------------------------------------
+
+wp_config() {
+  local nama="$1" db="$2" pw="$3" prefix="$4" k garam
+  printf '%s\n' "<?php" \
+    "// Dibuat oleh wpmgr-staging untuk staging $nama. Jangan disalin ke produksi." \
+    "define( 'DB_NAME', '$db' );" \
+    "define( 'DB_USER', '$db' );" \
+    "define( 'DB_PASSWORD', '$pw' );" \
+    "define( 'DB_HOST', 'wpmgr-stg-db' );" \
+    "define( 'DB_CHARSET', 'utf8mb4' );" \
+    "define( 'DB_COLLATE', '' );" \
+    "\$table_prefix = '$prefix';" \
+    "define( 'WP_HOME', 'https://$nama.$DOMAIN' );" \
+    "define( 'WP_SITEURL', 'https://$nama.$DOMAIN' );" \
+    "define( 'WPMGR_STAGING', true );" \
+    "define( 'WPMGR_DISABLE_MONITORING', true );" \
+    "define( 'DISABLE_WP_CRON', true );" \
+    "define( 'WP_ENVIRONMENT_TYPE', 'staging' );" \
+    "define( 'AUTOMATIC_UPDATER_DISABLED', true );" \
+    "define( 'WP_DEBUG', false );" \
+    "@ini_set( 'display_errors', '0' );" \
+    "@ini_set( 'log_errors', '1' );" \
+    "@ini_set( 'error_log', '/wpmgr-log/php-error.log' );" \
+    "// Router staging selalu mengirim X-Forwarded-Proto https (TLS diakhiri nginx host)." \
+    "if ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === \$_SERVER['HTTP_X_FORWARDED_PROTO'] ) {" \
+    "    \$_SERVER['HTTPS'] = 'on';" \
+    "}"
+  for k in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+    garam="$(acak 32)"
+    printf "define( '%s', '%s' );\n" "$k" "$garam"
+  done
+  printf '%s\n' "if ( ! defined( 'ABSPATH' ) ) {" "    define( 'ABSPATH', __DIR__ . '/' );" "}" \
+    "require_once ABSPATH . 'wp-settings.php';"
+}
+
+cmd_db_buat() {
+  cek_nama "${1-}"
+  cek_id "${2-}"
+  cek_prefix "${3-}"
+  local nama="$1" db pw
+  db="$(nama_db "$nama")"
+  pw="$(acak 24)"
+  # Koreksi #8: hanya DML/DDL atas database-nya sendiri; tanpa TRIGGER,
+  # EVENT, ROUTINE, FILE, dan tanpa GRANT OPTION.
+  sql_root "CREATE DATABASE IF NOT EXISTS \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pw';
+ALTER USER '$db'@'%' IDENTIFIED BY '$pw';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, LOCK TABLES, CREATE TEMPORARY TABLES, REFERENCES, CREATE VIEW, SHOW VIEW ON \`$db\`.* TO '$db'@'%';"
+  install -d -m 0700 "$KONF_DIR/db"
+  printf '%s' "$pw" > "$KONF_DIR/db/$nama"
+  chmod 0600 "$KONF_DIR/db/$nama"
+  wp_config "$nama" "$db" "$pw" "$3" | sbg_pengguna tee "$STAGING_DIR/$2/files/wp-config.php" >/dev/null \
+    || galat ditolak "wp-config.php staging tidak dapat ditulis"
+}
+
+cmd_db_hapus() {
+  cek_nama "${1-}"
+  local db
+  db="$(nama_db "$1")"
+  sql_root "DROP DATABASE IF EXISTS \`$db\`; DROP USER IF EXISTS '$db'@'%';"
+  rm -f "$KONF_DIR/db/$1"
+}
+
+cmd_db_impor() {
+  cek_nama "${1-}"
+  local nama="$1" db sandi
+  db="$(nama_db "$nama")"
+  [[ -s "$KONF_DIR/db/$nama" ]] || galat ditolak "database staging belum dibuat (db-buat)"
+  sandi="$(cat "$KONF_DIR/db/$nama")"
+  sql_root "DROP DATABASE IF EXISTS \`$db\`; CREATE DATABASE \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  # SQL berasal dari site produksi yang bisa saja disusupi: diimpor sebagai
+  # user staging ini, yang hanya berhak atas database-nya sendiri (Koreksi #8).
+  opsi_klien "$db" "$sandi"
+  dk exec -i wpmgr-stg-db mariadb --defaults-extra-file="$OPSI_KLIEN" --binary-mode \
+    --max-allowed-packet=64M "$db" || galat impor "impor database staging gagal"
+}
+
+# ---- wp-cli --------------------------------------------------------------
+
+cmd_wpcli() {
+  cek_nama "${1-}"
+  local nama="$1"
+  shift
+  local argumen=()
+  case "${1-} ${2-}" in
+    "search-replace "*)
+      cek_url "${2-}"
+      cek_url "${3-}"
+      argumen=(search-replace "$2" "$3" --all-tables-with-prefix --skip-columns=guid --precise --skip-plugins --skip-themes)
+      if [[ $# -eq 4 && "$4" == "--export" ]]; then
+        argumen+=(--export=/wpmgr-ekspor/dorong.sql)
+      elif [[ $# -ne 3 ]]; then
+        galat argumen "argumen search-replace tidak sah"
+      fi
+      ;;
+    "option update")
+      [[ $# -eq 4 && "$3" == "blog_public" && "$4" =~ ^[01]$ ]] || galat argumen "hanya blog_public 0/1 yang boleh diubah"
+      argumen=(option update blog_public "$4" --skip-plugins --skip-themes)
+      ;;
+    "plugin update"|"theme update")
+      cek_slug "${3-}"
+      argumen=("$1" update "$3")
+      if [[ $# -eq 4 ]]; then
+        [[ "$4" =~ ^--version=[0-9A-Za-z][0-9A-Za-z._-]{0,29}$ ]] || galat argumen "versi paket tidak sah"
+        argumen+=("$4")
+      elif [[ $# -ne 3 ]]; then
+        galat argumen "argumen update tidak sah"
+      fi
+      ;;
+    "core update")
+      argumen=(core update)
+      if [[ $# -eq 3 ]]; then
+        [[ "$3" =~ ^--version=[0-9][0-9A-Za-z._-]{0,29}$ ]] || galat argumen "versi core tidak sah"
+        argumen+=("$3")
+      elif [[ $# -ne 2 ]]; then
+        galat argumen "argumen update core tidak sah"
+      fi
+      ;;
+    "plugin list")
+      [[ $# -eq 2 ]] || galat argumen "argumen plugin list tidak sah"
+      argumen=(plugin list --format=json)
+      ;;
+    "core version"|"cache flush")
+      [[ $# -eq 2 ]] || galat argumen "argumen wp-cli tidak sah"
+      argumen=("$1" "$2")
+      ;;
+    *)
+      galat argumen "perintah wp-cli tidak ada di daftar putih"
+      ;;
+  esac
+  pastikan_milik "wp-$nama" "situs:$nama" || galat ditolak "staging belum dibuat"
+  dk exec -u "$UID_W:$GID_W" "wp-$nama" php -d memory_limit=512M /usr/local/bin/wp --path=/var/www/html \
+    "${argumen[@]}" || galat wpcli "wp-cli gagal"
+}
+
+# ---- router --------------------------------------------------------------
+
+konf_router() {
+  local n="$1" r="$2"
+  cat <<KONF
+server {
+    listen 80;
+    server_name $n.$DOMAIN;
+    client_max_body_size 64m;
+    access_log /var/log/wpmgr-akses/$n.log wpmgr_akses;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+
+    # Cookie bertanda tangan dari /__wpmgr_masuk mematikan Basic Auth
+    # sampai kedaluwarsa (SSO dan probe dashboard, Koreksi #5).
+    secure_link \$cookie_wpmgr_stg_m,\$cookie_wpmgr_stg_e;
+    secure_link_md5 "\$secure_link_expires\$host $r";
+    set \$wpmgr_auth "Staging $n";
+    if (\$secure_link = "1") {
+        set \$wpmgr_auth off;
+    }
+    auth_basic \$wpmgr_auth;
+    auth_basic_user_file /etc/nginx/wpmgr-htpasswd/$n;
+
+    location = /__wpmgr_masuk {
+        auth_basic off;
+        secure_link \$arg_m,\$arg_e;
+        secure_link_md5 "\$secure_link_expires\$host $r";
+        if (\$secure_link != "1") {
+            return 403;
+        }
+        add_header Set-Cookie "wpmgr_stg_m=\$arg_m; Path=/; Max-Age=43200; Secure; HttpOnly; SameSite=Lax" always;
+        add_header Set-Cookie "wpmgr_stg_e=\$arg_e; Path=/; Max-Age=43200; Secure; HttpOnly; SameSite=Lax" always;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        return 302 /?wpmgr_sso=\$arg_sso;
+    }
+
+    location / {
+        set \$wpmgr_hulu wp-$n;
+        proxy_pass http://\$wpmgr_hulu;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;
+    }
+}
+KONF
+}
+
+# Koreksi #6: dari dashboard hanya diambil rahasia 64 hex dan satu baris
+# htpasswd bcrypt; teks konfigurasi nginx selalu berasal dari template di
+# atas. Kedua berkas dibaca sebagai user dashboard dengan batas ukuran
+# (bisa saja berupa symlink atau FIFO).
+cmd_router_muat() {
+  local sumber="$STAGING_DIR/router" tujuan="$KONF_DIR/router" baru cadangan f nama rahasia baris
+  # shellcheck disable=SC2016 # `$` di sini literal regex (awalan bcrypt), bukan ekspansi.
+  local pola_htpasswd='^staging:\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$'
+  pastikan_layanan router
+  baru="$(mktemp -d)"
+  SEMENTARA+=("$baru")
+  cadangan="$(mktemp -d)"
+  SEMENTARA+=("$cadangan")
+  shopt -s nullglob
+  for f in "$sumber"/*.rahasia; do
+    nama="$(basename "$f" .rahasia)"
+    cek_nama "$nama"
+    rahasia="$(sbg_pengguna head -c 256 "$f" 2>/dev/null)" || galat argumen "rahasia router tidak terbaca"
+    [[ "$rahasia" =~ ^[0-9a-f]{64}$ ]] || galat argumen "rahasia router tidak sah"
+    baris="$(sbg_pengguna head -c 1024 "$sumber/$nama.htpasswd" 2>/dev/null)" || galat argumen "htpasswd router tidak ada"
+    [[ "$baris" =~ $pola_htpasswd ]] || galat argumen "htpasswd router tidak sah"
+    konf_router "$nama" "$rahasia" > "$baru/stg-$nama.conf"
+    printf '%s\n' "$baris" > "$baru/$nama.htpasswd"
+  done
+  mkdir -p "$cadangan/conf.d" "$cadangan/htpasswd"
+  cp -a "$tujuan/conf.d/." "$cadangan/conf.d/" 2>/dev/null || true
+  cp -a "$tujuan/htpasswd/." "$cadangan/htpasswd/" 2>/dev/null || true
+  rm -f "$tujuan/conf.d/"stg-*.conf "$tujuan/htpasswd/"*
+  for f in "$baru"/stg-*.conf; do
+    install -m 0644 "$f" "$tujuan/conf.d/"
+  done
+  for f in "$baru"/*.htpasswd; do
+    nama="$(basename "$f" .htpasswd)"
+    install -m 0644 "$f" "$tujuan/htpasswd/$nama"
+  done
+  if ! dk exec wpmgr-stg-router nginx -t >/dev/null 2>&1; then
+    rm -f "$tujuan/conf.d/"stg-*.conf "$tujuan/htpasswd/"*
+    cp -a "$cadangan/conf.d/." "$tujuan/conf.d/" 2>/dev/null || true
+    cp -a "$cadangan/htpasswd/." "$tujuan/htpasswd/" 2>/dev/null || true
+    galat docker "konfigurasi router ditolak nginx -t; konfigurasi lama dipulihkan"
+  fi
+  dk exec wpmgr-stg-router nginx -s reload >/dev/null || galat docker "router tidak dapat dimuat ulang"
+}
+
+# ---- sertifikat ----------------------------------------------------------
+
+cmd_sertifikat() {
+  cek_nama "${1-}"
+  local host="$1.$DOMAIN"
+  if [[ "$TANPA_SERTIFIKAT" == 1 ]]; then
+    echo "sertifikat dilewati (TANPA_SERTIFIKAT=1)"
+    return 0
+  fi
+  local email=(--register-unsafely-without-email)
+  [[ -n "$ACME_EMAIL" ]] && email=(-m "$ACME_EMAIL")
+  dibatasi certbot certonly --non-interactive --agree-tos "${email[@]}" --webroot -w "$ACME_DIR" -d "$host" \
+    --cert-name "$host" --config-dir "$LE_DIR/config" --work-dir "$LE_DIR/work" --logs-dir "$LE_DIR/logs" \
+    --keep-until-expiring >/dev/null 2>&1 || galat sertifikat "sertifikat belum dapat diterbitkan"
+  install -d -m 0755 "$CERT_DIR/$host"
+  install -m 0644 "$LE_DIR/config/live/$host/fullchain.pem" "$CERT_DIR/$host/fullchain.pem"
+  install -m 0600 "$LE_DIR/config/live/$host/privkey.pem" "$CERT_DIR/$host/privkey.pem"
+}
+
+# ---- status --------------------------------------------------------------
+
+cmd_status() {
+  local mem total bebas daftar wadah="" pisah="" nama keadaan berjalan akses="" pisah2="" f n t ukuran
+  # %.0f, bukan %d: awk busybox memotong %d ke 32 bit (-2147483648 untuk 4 GiB).
+  mem="$(awk '/^MemAvailable:/ { printf "%.0f", $2 * 1024 }' "$MEMINFO")"
+  read -r total bebas < <(df -B1 --output=size,avail "$STAGING_DIR" | tail -n 1)
+  [[ "$mem" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$bebas" =~ ^[0-9]+$ ]] || galat docker "status sistem tidak terbaca"
+  daftar="$(dk ps -a --filter label=wpmgr.staging --format '{{.Names}}|{{.State}}')" || galat docker "daftar container tidak terbaca"
+  while IFS='|' read -r nama keadaan; do
+    [[ "$nama" =~ ^wp-[a-z0-9-]{1,40}$ ]] || continue
+    berjalan=false
+    [[ "$keadaan" == running ]] && berjalan=true
+    wadah+="$pisah\"$nama\":{\"berjalan\":$berjalan}"
+    pisah=","
+  done <<< "$daftar"
+  shopt -s nullglob
+  for f in "$LOG_DIR"/*.log; do
+    n="$(basename "$f" .log)"
+    [[ "$n" =~ ^[a-z0-9-]{1,40}$ && -f "$f" && ! -L "$f" ]] || continue
+    t="$(stat -c %Y "$f")"
+    ukuran="$(stat -c %s "$f")"
+    # Log akses hanya dipakai untuk waktu akses terakhir (jeda otomatis);
+    # dipangkas bila besar dengan mtime dipertahankan.
+    if [[ "$ukuran" -gt 1048576 ]]; then
+      : > "$f"
+      touch -d "@$t" "$f"
+    fi
+    akses+="$pisah2\"$n\":$t"
+    pisah2=","
+  done
+  printf '{"mem_tersedia":%s,"disk_total":%s,"disk_bebas":%s,"container":{%s},"akses":{%s}}\n' \
+    "$mem" "$total" "$bebas" "$wadah" "$akses"
+}
+
+# ---- utama ---------------------------------------------------------------
+
+utama() {
+  local perintah="${1-}"
+  [[ $# -gt 0 ]] && shift
+  muat_konf
+  case "$perintah" in
+    siapkan|router-muat|status)
+      [[ $# -eq 0 ]] || galat argumen "subperintah ini tidak menerima argumen" ;;
+    buat|db-buat)
+      [[ $# -eq 3 ]] || galat argumen "jumlah argumen salah" ;;
+    jalan|jeda|hapus|db-hapus|db-impor|sertifikat)
+      [[ $# -eq 1 ]] || galat argumen "jumlah argumen salah" ;;
+    wpcli)
+      [[ $# -ge 3 && $# -le 5 ]] || galat argumen "jumlah argumen salah" ;;
+    *)
+      galat argumen "subperintah tidak dikenal" ;;
+  esac
+  case "$perintah" in
+    siapkan) atur_tenggat "$WAKTU_SIAPKAN" ;;
+    buat) atur_tenggat "$WAKTU_BUAT" ;;
+    db-impor) atur_tenggat "$WAKTU_IMPOR" ;;
+    wpcli) atur_tenggat "$WAKTU_WPCLI" ;;
+    sertifikat) atur_tenggat "$WAKTU_SERTIFIKAT" ;;
+    *) atur_tenggat "$WAKTU_BAWAAN" ;;
+  esac
+  case "$perintah" in
+    siapkan) cmd_siapkan ;;
+    buat) cmd_buat "$@" ;;
+    jalan) cmd_jalan "$@" ;;
+    jeda) cmd_jeda "$@" ;;
+    hapus) cmd_hapus "$@" ;;
+    db-buat) cmd_db_buat "$@" ;;
+    db-hapus) cmd_db_hapus "$@" ;;
+    db-impor) cmd_db_impor "$@" ;;
+    wpcli) cmd_wpcli "$@" ;;
+    router-muat) cmd_router_muat ;;
+    sertifikat) cmd_sertifikat "$@" ;;
+    status) cmd_status ;;
+  esac
+}
+
+utama "$@"

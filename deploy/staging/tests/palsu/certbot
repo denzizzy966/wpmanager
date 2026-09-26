@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+printf '[%s]' "$@" >> "$PALSU/certbot.log"
+printf '\n' >> "$PALSU/certbot.log"
+[[ -f "$PALSU/certbot-gagal" ]] && exit 1
+konfig="" nama=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config-dir) konfig="$2"; shift ;;
+    --cert-name) nama="$2"; shift ;;
+  esac
+  shift
+done
+mkdir -p "$konfig/live/$nama"
+echo "rantai" > "$konfig/live/$nama/fullchain.pem"
+echo "kunci" > "$konfig/live/$nama/privkey.pem"

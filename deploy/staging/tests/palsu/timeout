@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# timeout tiruan: mencatat opsi dan batas waktu (putusan F10b), lalu
+# menjalankan perintahnya tanpa batas supaya test tetap deterministik.
+printf '[%s]' "$@" >> "$PALSU/timeout.log"
+printf '\n' >> "$PALSU/timeout.log"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -k|-s) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+shift
+exec "$@"
