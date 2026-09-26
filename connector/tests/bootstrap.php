@@ -136,6 +136,18 @@ if ( ! function_exists( 'rest_ensure_response' ) ) {
     }
 }
 
+// register_rest_route() tiruan: hanya MENCATAT argumen yang dikirim (kunci
+// namespace+route => array metode/callback/permission_callback), dipakai
+// FileTest.php untuk memverifikasi bahwa /staging/file didaftarkan dengan
+// permission_callback WPMGR_Staging::guard yang sama seperti rute staging
+// lain (konteks global: "Setiap route baru punya test akses anonim (401)").
+if ( ! function_exists( 'register_rest_route' ) ) {
+    $GLOBALS['wpmgr_test_rute'] = array();
+    function register_rest_route( $namespace, $route, $args ) {
+        $GLOBALS['wpmgr_test_rute'][ $namespace . $route ] = $args;
+    }
+}
+
 // Stub WordPress minimal dipakai ManifestTest.php dan ManifestRestTest.php
 // (dipusatkan di sini, bukan diduplikasi di kedua berkas, supaya urutan
 // muat direktori-berbasis PHPUnit -- yang tidak menjamin urutan alfabet
