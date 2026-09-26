@@ -58,6 +58,11 @@ BATAS_IP_LOGIN_GAGAL = 200
 # bukan semuanya.
 BATAS_USERNAME_PER_IP = 5
 BATAS_UA_SAMPEL_PER_IP = 20
+# login_gagal disimpan per ember jam yang berlabel AWAL jam: ember berlabel
+# 24 jam 30 menit lalu masih memuat percobaan dari 23 jam 30 menit lalu.
+# Jendela `hari` dilonggarkan satu jam supaya ember di tepinya tidak hilang
+# (sama seperti jendela status keamanan, koreksi #11).
+_MARJIN_EMBER = timedelta(hours=1)
 
 
 @router.get("/api/kesehatan")
@@ -245,7 +250,7 @@ def logins_site(site_id: uuid.UUID, pengguna: PenggunaApi, hari: int = 30):
                 func.max(LoginGagal.negara).label("negara"),
                 func.array_agg(LoginGagal.jalur.distinct()).label("jalur"),
             )
-            .where(LoginGagal.site_id == site.id, LoginGagal.jam >= sejak)
+            .where(LoginGagal.site_id == site.id, LoginGagal.jam > sejak - _MARJIN_EMBER)
             .group_by(LoginGagal.ip)
             .order_by(func.sum(LoginGagal.jumlah).desc(), LoginGagal.ip)
             .limit(BATAS_IP_LOGIN_GAGAL)
@@ -269,7 +274,7 @@ def logins_site(site_id: uuid.UUID, pengguna: PenggunaApi, hari: int = 30):
                         order_by=func.sum(LoginGagal.jumlah).desc(),
                     ).label("rn"),
                 )
-                .where(LoginGagal.site_id == site.id, LoginGagal.jam >= sejak,
+                .where(LoginGagal.site_id == site.id, LoginGagal.jam > sejak - _MARJIN_EMBER,
                        LoginGagal.ip.in_(ip_teratas))
                 .group_by(LoginGagal.ip, LoginGagal.username)
             ).subquery()
@@ -295,7 +300,7 @@ def logins_site(site_id: uuid.UUID, pengguna: PenggunaApi, hari: int = 30):
                         partition_by=LoginGagal.ip, order_by=LoginGagal.jam.desc(),
                     ).label("rn"),
                 )
-                .where(LoginGagal.site_id == site.id, LoginGagal.jam >= sejak,
+                .where(LoginGagal.site_id == site.id, LoginGagal.jam > sejak - _MARJIN_EMBER,
                        LoginGagal.ip.in_(ip_teratas))
             ).subquery()
             baris_ua = sesi.execute(

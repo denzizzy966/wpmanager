@@ -166,6 +166,21 @@ def test_login_gagal_agregasi_sql_akurat_dan_ip_deras_tetap_ada(klien_web, sesi,
     assert len(per_ip["10.0.2.2"]["username"]) <= 5
 
 
+def test_ember_login_gagal_di_tepi_jendela_ikut_dihitung(klien_web, sesi, site, monkeypatch):
+    # Ember berlabel awal jam: ember 24 jam 30 menit lalu memuat percobaan
+    # hingga 23 jam 30 menit lalu, yang masih di dalam jendela hari=1.
+    sekarang = datetime(2026, 9, 22, 12, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr("wpmgr.web.routes_monitoring._sekarang", lambda: sekarang)
+    sesi.add(LoginGagal(site_id=site.id, jam=sekarang - timedelta(hours=24, minutes=30),
+                        ip="198.51.100.9", username="admin", jalur="form", jumlah=4))
+    sesi.add(LoginGagal(site_id=site.id, jam=sekarang - timedelta(hours=25, minutes=30),
+                        ip="198.51.100.10", username="admin", jalur="form", jumlah=6))
+    sesi.commit()
+
+    d = klien_web.get(f"/api/sites/{site.id}/logins?hari=1").json()
+    assert [(g["ip"], g["jumlah"]) for g in d["gagal"]] == [("198.51.100.9", 4)]
+
+
 def test_admin_baru_tidak_tertimbun_login_berhasil(klien_web, sesi, site):
     """Regresi: satu LIMIT bersama untuk semua jenis kejadian login membuat
     login berhasil yang deras menenggelamkan kejadian admin yang lebih lama
