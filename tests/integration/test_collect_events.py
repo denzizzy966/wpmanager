@@ -11,6 +11,7 @@ from wpmgr.errors import BAD_RESPONSE, SiteError
 from wpmgr.jobs import monitoring
 from wpmgr.jobs.monitoring import tangani_collect_events
 from wpmgr.jobs.queue import buat_job
+from wpmgr.keamanan import StatusKeamanan, nilai_keamanan
 from wpmgr.models import (
     CatatanError,
     Job,
@@ -389,3 +390,35 @@ def test_konteks_bersarang_terlalu_dalam_disimpan_none(sesi, site):
     assert e.konteks is None
     sesi.refresh(site)
     assert site.events_kursor == payload["kursor"]
+
+
+def _hanya_login(logins):
+    return {"errors": [], "logins": logins, "login_gagal": [], "kursor": "e=0:0;l=0:0;g=0:0",
+            "lagi": False}
+
+
+def test_id_sama_dengan_waktu_berbeda_disimpan_dua_baris(sesi, site):
+    # AUTO_INCREMENT site bisa mulai ulang (restore backup, atau MySQL 5.7
+    # setelah restart), sehingga id lama dipakai lagi untuk kejadian baru.
+    jalankan(sesi, site, [_hanya_login([PAYLOAD["logins"][0]])])
+    jalankan(sesi, site, [_hanya_login([{**PAYLOAD["logins"][0], "waktu": T + 3600}])])
+    assert sesi.query(KejadianLogin).count() == 2
+
+
+def test_id_dan_waktu_sama_tetap_satu_baris(sesi, site):
+    jalankan(sesi, site, [_hanya_login([PAYLOAD["logins"][0]])])
+    jalankan(sesi, site, [_hanya_login([dict(PAYLOAD["logins"][0])])])
+    assert sesi.query(KejadianLogin).count() == 1
+
+
+def test_admin_baru_dengan_id_terpakai_ulang_tetap_memerahkan_status(sesi, site):
+    jalankan(sesi, site, [_hanya_login([PAYLOAD["logins"][0]])])
+    # Login lama sudah "diperiksa"; yang tersisa hanya admin baru ber-id sama.
+    site.keamanan_diperiksa_pada = sesi.query(KejadianLogin).one().dicatat_pada
+    sesi.commit()
+    admin = {**PAYLOAD["logins"][0], "waktu": T + 7200, "jenis": "admin_baru",
+             "username": "penyusup"}
+    jalankan(sesi, site, [_hanya_login([admin])])
+    hasil = nilai_keamanan(sesi, site, WAKTU_T + timedelta(hours=3))
+    assert hasil.status == StatusKeamanan.perlu_diperiksa
+    assert any("penyusup" in a for a in hasil.alasan)

@@ -314,7 +314,7 @@ def simpan_logins(sesi: Session, site: Site, baris: list) -> int:
                 sesi.execute(
                     insert(KejadianLogin)
                     .values(site_id=site.id, **nilai)
-                    .on_conflict_do_nothing(constraint="uq_login_events_id_site")
+                    .on_conflict_do_nothing(constraint="uq_login_events_id_site_waktu")
                 )
         except (DBAPIError, UnicodeEncodeError):
             log.warning("Baris login dilewati karena ditolak database (site %s)", site.id)

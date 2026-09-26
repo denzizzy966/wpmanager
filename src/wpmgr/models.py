@@ -291,7 +291,7 @@ class KejadianLogin(Base):
 
     __tablename__ = "login_events"
     __table_args__ = (
-        UniqueConstraint("site_id", "id_di_site", name="uq_login_events_id_site"),
+        UniqueConstraint("site_id", "id_di_site", "waktu", name="uq_login_events_id_site_waktu"),
         Index("ix_login_events_site_waktu", "site_id", "waktu"),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
