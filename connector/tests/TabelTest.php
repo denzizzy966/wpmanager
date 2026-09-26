@@ -6,15 +6,20 @@ if ( ! defined( 'ARRAY_N' ) ) {
 }
 
 final class WPMGR_FakeWpdbTabel {
-    public $prefix     = 'wp_';
-    public $kueri      = array();
-    public $kolom      = array();
-    public $pk         = array();
-    public $baris      = array();
-    public $ada        = true;
-    public $tipe_tabel = 'BASE TABLE';
-    public $buat       = "CREATE TABLE `wp_x` (\n  `id` bigint(20) NOT NULL\n) ENGINE=InnoDB";
-    public $last_error = '';
+    public $prefix         = 'wp_';
+    public $kueri          = array();
+    public $kolom          = array();
+    public $pk             = array();
+    public $baris          = array();
+    public $ada            = true;
+    public $tipe_tabel     = 'BASE TABLE';
+    public $buat           = "CREATE TABLE `wp_x` (\n  `id` bigint(20) NOT NULL\n) ENGINE=InnoDB";
+    public $last_error     = '';
+    public $charset        = 'utf8mb4';
+    // Fix round 2, item 2: nilai Avg_row_length yang dikembalikan SHOW
+    // TABLE STATUS tiruan -- 0 (bawaan) berarti "tidak diketahui", jatuh
+    // balik ke $sub penuh persis seperti sebelum fix ini ada.
+    public $avg_row_length = 0;
     // Fix round 1, item 1: simulasikan get_results() ke-N (1-based, semua
     // panggilan get_results termasuk SHOW COLUMNS/SHOW KEYS) "gagal" --
     // mengembalikan array() (seperti wpdb sungguhan) TAPI mengisi
@@ -48,6 +53,9 @@ final class WPMGR_FakeWpdbTabel {
                 return null;
             }
             return array( stripslashes( $m[1] ), $this->tipe_tabel );
+        }
+        if ( 0 === strpos( $sql, 'SHOW TABLE STATUS' ) ) {
+            return array( 'Avg_row_length' => $this->avg_row_length );
         }
         return array( 'wp_x', $this->buat );
     }
@@ -515,5 +523,133 @@ final class TabelTest extends TestCase {
         $this->assertSame( '_binary 0x6162', WPMGR_Staging_Tabel::literal_kunci( array( 's' => 'ab' ), 'varbinary(16)' ) );
         $this->assertSame( '_utf8mb4 0x6162', WPMGR_Staging_Tabel::literal_kunci( array( 's' => 'ab' ), 'varchar(16)' ) );
         $this->assertSame( "''", WPMGR_Staging_Tabel::literal_kunci( array( 's' => '' ), 'varchar(16)' ) );
+    }
+
+    public function test_default_generated_bukan_kolom_generated(): void {
+        // Item 1, fix round 2 (Kritis, regresi): MySQL >= 8.0.13 menandai
+        // kolom BIASA berdefault EKSPRESI (mis. DEFAULT CURRENT_TIMESTAMP,
+        // atau ON UPDATE CURRENT_TIMESTAMP) sebagai Extra "DEFAULT_GENERATED"
+        // / "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" -- BUKAN kolom
+        // generated sungguhan. Kolom seperti ini harus TETAP ditulis di
+        // INSERT dengan nilai sungguhannya, bukan dilewati (yang membuat
+        // MySQL/MariaDB mengisinya NOW() saat impor -- kerusakan diam-diam).
+        WPMGR_Staging_Tabel::$baris = 2;
+        $w        = new WPMGR_FakeWpdbTabel();
+        $w->kolom = array(
+            array( 'Field' => 'a', 'Type' => 'int(11)', 'Extra' => '' ),
+            array( 'Field' => 'ts', 'Type' => 'timestamp', 'Extra' => 'DEFAULT_GENERATED' ),
+            array( 'Field' => 'tu', 'Type' => 'timestamp', 'Extra' => 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP' ),
+        );
+        $w->baris = array( array( 'a' => '1', 'ts' => '2024-01-01 00:00:00', 'tu' => '2024-01-02 00:00:00' ) );
+        $a        = WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', '' );
+        $this->assertStringContainsString( '`a`,`ts`,`tu`', $a['sql'] );
+        $this->assertStringContainsString( "('1','2024-01-01 00:00:00','2024-01-02 00:00:00')", $a['sql'] );
+    }
+
+    public function test_sub_awal_kecil_dari_avg_row_length_besar(): void {
+        // Item 2, fix round 2: LIMIT sub-query PERTAMA pada request
+        // dihitung dari Avg_row_length (SHOW TABLE STATUS), bukan selalu
+        // mulai buta di $sub penuh -- tabel berbaris lebar tidak lagi
+        // memuat ~200 baris besar ke memori hanya untuk memakai segelintir
+        // sebelum anggaran lunak habis.
+        WPMGR_Staging_Tabel::$baris     = 100;
+        WPMGR_Staging_Tabel::$sub       = 200;
+        WPMGR_Staging_Tabel::$maks_byte = 20000;
+        $w                 = new WPMGR_FakeWpdbTabel();
+        $w->avg_row_length = 5000;
+        $w->kolom          = array( array( 'Field' => 'id', 'Type' => 'int(11)' ), array( 'Field' => 'teks', 'Type' => 'text' ) );
+        for ( $i = 1; $i <= 100; $i++ ) {
+            $w->baris[] = array( 'id' => (string) $i, 'teks' => 'y' );
+        }
+        WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', '' );
+        $limit_pertama = null;
+        foreach ( $w->kueri as $q ) {
+            if ( 0 === strpos( $q, 'SELECT * FROM' ) && preg_match( '/LIMIT ([0-9]+)/', $q, $m ) ) {
+                $limit_pertama = (int) $m[1];
+                break;
+            }
+        }
+        // clamp(floor(20000/5000/2),1,200) = clamp(2,1,200) = 2.
+        $this->assertSame( 2, $limit_pertama );
+        $this->assertContains( "SHOW TABLE STATUS LIKE '" . addcslashes( 'wp_x', '_%\\' ) . "'", $w->kueri );
+    }
+
+    public function test_sub_tumbuh_kembali_setelah_batch_kecil(): void {
+        // Item 2, fix round 2: sub-batch yang mengecil karena satu baris
+        // lebar TIDAK boleh terkunci kecil untuk sisa request -- tumbuh
+        // kembali (dikali dua) setelah sub-batch yang seluruhnya kecil.
+        WPMGR_Staging_Tabel::$baris     = 40;
+        WPMGR_Staging_Tabel::$sub       = 8;
+        WPMGR_Staging_Tabel::$maks_byte = 2000;
+        $w          = new WPMGR_FakeWpdbTabel();
+        $w->kolom   = array( array( 'Field' => 'id', 'Type' => 'int(11)' ), array( 'Field' => 'teks', 'Type' => 'text' ) );
+        $w->baris[] = array( 'id' => '1', 'teks' => str_repeat( 'x', 300 ) ); // baris lebar pertama
+        for ( $i = 2; $i <= 40; $i++ ) {
+            $w->baris[] = array( 'id' => (string) $i, 'teks' => 'y' );
+        }
+        WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', '' );
+        $limit = array();
+        foreach ( $w->kueri as $q ) {
+            if ( 0 === strpos( $q, 'SELECT * FROM' ) && preg_match( '/LIMIT ([0-9]+)/', $q, $m ) ) {
+                $limit[] = (int) $m[1];
+            }
+        }
+        // batch0=8 (lebar -> mengecil), batch1=4 (kecil semua -> tumbuh),
+        // batch2=8 (dijepit ke $sub, bukan 16).
+        $this->assertSame( 8, $limit[0] );
+        $this->assertSame( 4, $limit[1] );
+        $this->assertSame( 8, $limit[2] );
+    }
+
+    public function test_baris_yang_akan_melampaui_anggaran_tidak_disertakan(): void {
+        // Item 2 (test tersemat), fix round 2: anggaran lunak dicek
+        // SEBELUM menambahkan, bukan sesudah -- baris yang akan melampaui
+        // anggaran TIDAK muncul di potongan ini sama sekali (diambil ulang
+        // lewat kursor pada request berikutnya). Gagal pada logika lama
+        // (tambah-lalu-cek) karena baris itu akan tetap muncul di sql
+        // sebelum potongan berhenti.
+        // Ambil baris pertama dulu SENDIRIAN ($baris=1) -- supaya DROP+
+        // CREATE TABLE di potongan pertama (dan baris 1 itu sendiri, yang
+        // selalu dikecualikan dari anggaran lunak sebagai baris pertama
+        // REQUEST) tidak ikut memakan anggaran lunak yang diuji di bawah.
+        $w                          = $this->wpdb_ber_pk( 3 );
+        WPMGR_Staging_Tabel::$baris = 1;
+        $awal                       = WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', '' );
+        $this->assertStringContainsString( "'judul 1'", $awal['sql'] );
+        $this->assertFalse( $awal['selesai'] );
+
+        WPMGR_Staging_Tabel::$baris     = 2000;
+        WPMGR_Staging_Tabel::$maks_byte = 60; // muat 1 baris ('judul 2'), tidak muat 2 ('judul 2'+'judul 3').
+        $a = WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', $awal['kursor'] );
+        $this->assertStringContainsString( "'judul 2'", $a['sql'] );
+        $this->assertStringNotContainsString( "'judul 3'", $a['sql'] );
+        $this->assertFalse( $a['selesai'] );
+        $this->assertSame( 1, $a['baris'] );
+    }
+
+    public function test_prawalan_utf8_ikuti_charset_wpdb(): void {
+        // Item 4, fix round 2: prawalan literal hex ikut $wpdb->charset
+        // sungguhan (bukan "_utf8mb4" tetap) bila charset itu sah.
+        WPMGR_Staging_Tabel::$baris = 1;
+        $w          = new WPMGR_FakeWpdbTabel();
+        $w->charset = 'latin1';
+        $w->kolom   = array( array( 'Field' => 'kode', 'Type' => 'varchar(64)' ) );
+        $w->pk      = array( array( 'Column_name' => 'kode', 'Seq_in_index' => '1' ) );
+        $w->baris   = array( array( 'kode' => 'a' ), array( 'kode' => 'b' ) );
+        $a          = WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', '' );
+        WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', $a['kursor'] );
+        $this->assertContains( 'SELECT * FROM `wp_x` WHERE `kode` > _latin1 0x61 ORDER BY `kode` LIMIT 1', $w->kueri );
+    }
+
+    public function test_prawalan_charset_tidak_sah_jatuh_ke_utf8mb4(): void {
+        WPMGR_Staging_Tabel::$baris = 1;
+        $w          = new WPMGR_FakeWpdbTabel();
+        $w->charset = "utf8mb4'; DROP"; // tidak sah -- harus jatuh ke default.
+        $w->kolom   = array( array( 'Field' => 'kode', 'Type' => 'varchar(64)' ) );
+        $w->pk      = array( array( 'Column_name' => 'kode', 'Seq_in_index' => '1' ) );
+        $w->baris   = array( array( 'kode' => 'a' ), array( 'kode' => 'b' ) );
+        $a          = WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', '' );
+        WPMGR_Staging_Tabel::ekspor( $w, 'wp_x', $a['kursor'] );
+        $this->assertContains( 'SELECT * FROM `wp_x` WHERE `kode` > _utf8mb4 0x61 ORDER BY `kode` LIMIT 1', $w->kueri );
     }
 }

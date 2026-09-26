@@ -158,7 +158,15 @@ class WPMGR_Staging {
         if ( ! is_array( $p ) ) {
             return self::galat( 'wpmgr_staging_permintaan', 'Body permintaan bukan objek.', 400 );
         }
-        $nama   = isset( $p['tabel'] ) ? $p['tabel'] : null;
+        $nama = isset( $p['tabel'] ) ? $p['tabel'] : null;
+        // Item 3 (Minor), fix round 2: kursor yang ADA di body tapi
+        // bukan string/null tidak boleh diam-diam diperlakukan sebagai ''
+        // (mengulang ekspor dari awal) -- itu bentuk permintaan yang
+        // tidak sah, harus 400 keras, bukan restart senyap yang membuang
+        // kemajuan tarik yang sedang berjalan.
+        if ( array_key_exists( 'kursor', $p ) && null !== $p['kursor'] && ! is_string( $p['kursor'] ) ) {
+            return self::galat( 'wpmgr_staging_permintaan', 'Kursor bukan string atau null.', 400 );
+        }
         $kursor = ( isset( $p['kursor'] ) && is_string( $p['kursor'] ) ) ? $p['kursor'] : '';
         $hasil  = WPMGR_Staging_Tabel::ekspor( $wpdb, $nama, $kursor );
         if ( is_wp_error( $hasil ) ) {

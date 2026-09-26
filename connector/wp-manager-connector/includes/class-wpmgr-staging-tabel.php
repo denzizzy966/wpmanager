@@ -18,6 +18,15 @@ if ( ! defined( 'ABSPATH' ) && ! defined( 'WPMGR_TESTING' ) ) {
  *   dan nama collation khas MySQL 8 (mis. `utf8mb4_0900_ai_ci`) yang
  *   diteruskan APA ADANYA. Penerjemahannya (bila perlu supaya cocok dengan
  *   MariaDB staging) adalah tugas proses impor staging, bukan connector ini.
+ * - Item 5, fix round 2: satu baris yang SQL ter-escape-nya SENDIRI sudah
+ *   melebihi $maks_respon gagal PERMANEN dengan wpmgr_staging_baris_terlalu_besar
+ *   (413) -- tidak pernah dicoba ulang berhasil (baris itu, tabel itu,
+ *   selalu menghasilkan galat yang sama). Karena nilai biner/bukan-UTF-8
+ *   ditulis sebagai literal hex (dua karakter teks per byte data), ini
+ *   mencakup satu kolom blob/text mana pun yang isinya melebihi kira-kira
+ *   4 MB (separuh $maks_respon 8 MiB). Bagaimana dashboard memetakan kode
+ *   galat ini menjadi "jangan diulang" adalah pekerjaan task lain (Python,
+ *   tidak disentuh di sini).
  */
 class WPMGR_Staging_Tabel {
 
@@ -150,7 +159,21 @@ class WPMGR_Staging_Tabel {
         return false;
     }
 
-    public static function literal_kunci( $entri, $tipe ) {
+    /**
+     * Item 4 (Minor), fix round 2: prawalan charset literal hex ikut
+     * charset koneksi SUNGGUHAN ($wpdb->charset), bukan "_utf8mb4" tetap --
+     * situs yang koneksinya BUKAN utf8mb4 (mis. latin1 lama) tetap
+     * menghasilkan literal yang mode-independen dan cocok dengan charset
+     * kolom teksnya. Nilai $wpdb->charset divalidasi ketat (huruf/angka
+     * saja) sebelum ditempel ke SQL -- itu properti wpdb, bukan masukan
+     * penyerang langsung, tapi tetap tidak pernah dipercaya mentah-mentah.
+     */
+    public static function utf8_charset( $wpdb ) {
+        $c = isset( $wpdb->charset ) ? (string) $wpdb->charset : '';
+        return 1 === preg_match( '/^[a-z0-9]+\z/', $c ) ? $c : 'utf8mb4';
+    }
+
+    public static function literal_kunci( $entri, $tipe, $charset = 'utf8mb4' ) {
         if ( isset( $entri['x'] ) ) {
             if ( 1 !== preg_match( '/^(?:[0-9a-f]{2})*\z/', $entri['x'] ) ) {
                 return false;
@@ -169,7 +192,7 @@ class WPMGR_Staging_Tabel {
         // escape, sehingga "\\'" yang kita tulis dibaca sebagai backslash
         // literal DIIKUTI penutup kutip, memutus kueri (kunci hostile bisa
         // menyuntik SQL; kunci SAH yang memuat "'" atau "\" ikut rusak).
-        // Literal HEX berprawalan charset (`_utf8mb4 0x..`/`_binary 0x..`)
+        // Literal HEX berprawalan charset (`_<charset> 0x..`/`_binary 0x..`)
         // tidak mengenal escape sequence sama sekali -- aman di SEMUA
         // sql_mode. Nilai 's' selalu UTF-8 sah (lihat posisi_berikut(): byte
         // bukan UTF-8 selalu masuk sebagai 'x'/hex, bukan 's'), jadi
@@ -177,7 +200,7 @@ class WPMGR_Staging_Tabel {
         if ( '' === $s ) {
             return "''"; // '0x' tanpa digit tidak selalu diterima parser.
         }
-        $prawalan = self::biner( $tipe ) ? '_binary' : '_utf8mb4';
+        $prawalan = self::biner( $tipe ) ? '_binary' : ( '_' . $charset );
         return $prawalan . ' 0x' . bin2hex( $s );
     }
 
@@ -188,9 +211,24 @@ class WPMGR_Staging_Tabel {
      * hasil fungsi ini secara langsung, jadi kolom generated otomatis tidak
      * pernah ikut ke keduanya sekaligus. MySQL/MariaDB menghitung nilainya
      * sendiri saat impor dan MENOLAK bila kita mencoba menuliskannya.
+     *
+     * Item 1 (Kritis, regresi), fix round 2: regex round 1 (`/GENERATED/i`
+     * polos) JUGA cocok dengan `DEFAULT_GENERATED` dan
+     * `DEFAULT_GENERATED on update CURRENT_TIMESTAMP` -- nilai Extra yang
+     * MySQL >= 8.0.13 berikan untuk kolom BIASA yang defaultnya berupa
+     * EKSPRESI (mis. `ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP`), bukan
+     * kolom generated sungguhan. Kolom seperti itu lazim di tabel plugin;
+     * ikut dilewati membuat NILAI ASLINYA hilang dari INSERT, sehingga
+     * setiap baris berubah jadi NOW() saat diimpor -- kerusakan diam-diam.
+     * Diperbaiki: hanya cocok "VIRTUAL GENERATED"/"STORED GENERATED"
+     * (kata "GENERATED" harus didahului VIRTUAL/STORED, bukan berdiri
+     * sendiri) atau MariaDB "VIRTUAL"/"PERSISTENT" TEPAT (tanpa embel-embel
+     * lain di depan/belakang).
      */
     private static function kolom_generated( $extra ) {
-        return 1 === preg_match( '/GENERATED|^VIRTUAL\z|^PERSISTENT\z/i', trim( (string) $extra ) );
+        $extra = trim( (string) $extra );
+        return 1 === preg_match( '/\b(VIRTUAL|STORED)\s+GENERATED\b/i', $extra )
+            || 1 === preg_match( '/^(VIRTUAL|PERSISTENT)\z/i', $extra );
     }
 
     public static function kolom( $wpdb, $tabel ) {
@@ -221,7 +259,7 @@ class WPMGR_Staging_Tabel {
         return array( 'pk' => $nilai );
     }
 
-    private static function kueri( $tabel, array $pk, array $kolom, $posisi, $batas ) {
+    private static function kueri( $tabel, array $pk, array $kolom, $posisi, $batas, $charset = 'utf8mb4' ) {
         if ( empty( $pk ) ) {
             if ( is_array( $posisi ) && isset( $posisi['pk'] ) ) {
                 return false;
@@ -237,7 +275,7 @@ class WPMGR_Staging_Tabel {
             }
             $lit = array();
             foreach ( $pk as $i => $k ) {
-                $l = self::literal_kunci( $posisi['pk'][ $i ], isset( $kolom[ $k ] ) ? $kolom[ $k ] : '' );
+                $l = self::literal_kunci( $posisi['pk'][ $i ], isset( $kolom[ $k ] ) ? $kolom[ $k ] : '', $charset );
                 if ( false === $l ) {
                     return false;
                 }
@@ -248,6 +286,39 @@ class WPMGR_Staging_Tabel {
                 : " WHERE ({$urut}) > (" . implode( ',', $lit ) . ')';
         }
         return "SELECT * FROM `{$tabel}`{$where} ORDER BY {$urut} LIMIT " . (int) $batas;
+    }
+
+    /**
+     * Item 2 (Penting), fix round 2: perkiraan MURAH panjang baris rata-
+     * rata dari metadata tabel (satu kueri per request) -- dipakai
+     * sub_awal() supaya sub-batch PERTAMA setiap request langsung
+     * berukuran wajar untuk tabel berbaris lebar, bukan selalu mulai buta
+     * di $sub penuh (200) lalu baru mengecil SETELAH satu batch penuh
+     * baris lebar sudah terlanjur dimuat ke memori.
+     */
+    private static function avg_row_length( $wpdb, $tabel ) {
+        $baris = $wpdb->get_row(
+            $wpdb->prepare( 'SHOW TABLE STATUS LIKE %s', $wpdb->esc_like( $tabel ) ), ARRAY_A
+        ); // phpcs:ignore WordPress.DB.PreparedSQL
+        if ( ! is_array( $baris ) || ! isset( $baris['Avg_row_length'] ) ) {
+            return 0;
+        }
+        return (int) $baris['Avg_row_length'];
+    }
+
+    /**
+     * clamp(floor($maks_byte / rata_rata / 2), 1, $sub) -- separuh anggaran
+     * lunak dibagi ukuran baris rata-rata, supaya SATU sub-batch penuh
+     * masih longgar di bawah anggaran walau perkiraannya meleset (mis.
+     * beberapa baris jauh di atas rata-rata). $avg 0/tidak diketahui
+     * (mis. tabel kosong atau metadata tidak terbaca) jatuh balik ke $sub
+     * penuh seperti sebelumnya (max(1,0) -> 1, hasil bagi jadi sangat
+     * besar, langsung dijepit ke $sub oleh min()).
+     */
+    private static function sub_awal( $avg_row_length ) {
+        $avg = max( 1, (int) $avg_row_length );
+        $n   = intdiv( intdiv( self::$maks_byte, $avg ), 2 );
+        return max( 1, min( self::$sub, $n ) );
     }
 
     /**
@@ -299,7 +370,8 @@ class WPMGR_Staging_Tabel {
                 break;
             }
         }
-        if ( false === self::kueri( $tabel, $pk, $kolom, $posisi, 1 ) ) {
+        $charset = self::utf8_charset( $wpdb );
+        if ( false === self::kueri( $tabel, $pk, $kolom, $posisi, 1, $charset ) ) {
             return self::galat_kursor();
         }
 
@@ -339,16 +411,24 @@ class WPMGR_Staging_Tabel {
         $selesai     = false;
         $penuh       = false;
         $pernyataan  = '';
-        // Item 3b (Penting), review putaran 1: ukuran sub-batch EFEKTIF,
-        // lokal untuk panggilan ini (tidak mengubah $sub statis) -- mengecil
-        // (dibagi dua, lantai 1) setiap kali sub-batch SEBELUMNYA memuat
-        // baris "lebar" (lebih besar dari jatah rata-rata per baris).
-        // Pendekatan paling sederhana yang tetap aman: tidak perlu kueri
-        // tambahan (SELECT LENGTH() dulu) atau state lintas-request di
-        // kursor -- cukup mengecilkan LIMIT permintaan BERIKUTNYA supaya
-        // tabel berisi baris besar (blob/text lebar) tidak memuat ratusan
-        // baris seperti itu sekaligus ke memori sebelum sempat diperiksa.
-        $sub_efektif = self::$sub;
+        // Item 3b (Penting, round 1) + item 2 (Penting, round 2): ukuran
+        // sub-batch EFEKTIF, lokal untuk panggilan ini (tidak mengubah
+        // $sub statis). Sub-batch PERTAMA request ini langsung disesuaikan
+        // dengan Avg_row_length tabel (sub_awal()) -- BUKAN selalu mulai
+        // buta di $sub penuh (200), yang pada tabel berbaris lebar memuat
+        // ~200 baris besar ke memori sebelum sempat diperiksa satu pun,
+        // dan galat kehabisan memori akan terulang PERSIS SAMA pada setiap
+        // percobaan berikutnya (kursor belum sempat maju sama sekali).
+        // Sesudah itu: mengecil (dibagi dua, lantai 1) setiap kali
+        // sub-batch SEBELUMNYA memuat baris "lebar" (lebih besar dari
+        // jatah rata-rata per baris), dan tumbuh KEMBALI (dikali dua,
+        // dijepit ke $sub) setiap kali sub-batch SEBELUMNYA semuanya
+        // kecil -- supaya SATU baris lebar di awal tidak mengunci ukuran
+        // sub-batch jadi 1 untuk SISA request walau baris berikutnya
+        // sudah normal lagi. Pendekatan paling sederhana yang tetap aman:
+        // tidak perlu kueri SELECT LENGTH() tambahan per baris, dan tidak
+        // ada state baru yang perlu disimpan di kursor lintas-request.
+        $sub_efektif = self::sub_awal( self::avg_row_length( $wpdb, $tabel ) );
         $batas_wajar = max( 1, intdiv( self::$maks_byte, max( 1, self::$sub ) ) );
 
         while ( ! $penuh && $jumlah < self::$baris ) {
@@ -356,7 +436,7 @@ class WPMGR_Staging_Tabel {
                 break; // Belum selesai; kursor sudah maju sejauh sub-batch terakhir.
             }
             $batas = min( $sub_efektif, self::$baris - $jumlah );
-            $rows  = $wpdb->get_results( self::kueri( $tabel, $pk, $kolom, $akhir, $batas ), ARRAY_A );
+            $rows  = $wpdb->get_results( self::kueri( $tabel, $pk, $kolom, $akhir, $batas, $charset ), ARRAY_A );
             // Item 1 (Kritis), review putaran 1: wpdb SUNGGUHAN mengembalikan
             // array() -- BUKAN null/false -- juga saat query GAGAL (lihat
             // implementasi get_results() inti WordPress). !is_array($rows)
@@ -417,6 +497,11 @@ class WPMGR_Staging_Tabel {
             }
             if ( $baris_lebar ) {
                 $sub_efektif = max( 1, intdiv( $sub_efektif, 2 ) );
+            } else {
+                // Item 2 (Penting), fix round 2: tumbuh kembali setelah
+                // sub-batch yang semua barisnya kecil -- dijepit ke $sub
+                // supaya tidak pernah melebihi konfigurasi.
+                $sub_efektif = min( self::$sub, $sub_efektif * 2 );
             }
             if ( ! $penuh && count( $rows ) < $batas ) {
                 $selesai = true;
