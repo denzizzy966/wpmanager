@@ -61,8 +61,10 @@ if ( ! defined( 'ARRAY_A' ) ) {
 // pengaturan khusus" (default apa adanya, tanpa unslash sungguhan) --
 // cukup untuk diuji, bukan tiruan perilaku WordPress yang lengkap.
 if ( ! function_exists( 'get_option' ) ) {
+    // Test yang butuh opsi tertentu (mis. versi skema) mengisinya lewat
+    // $GLOBALS['wpmgr_test_opsi'] dan wajib mengosongkannya di tearDown().
     function get_option( $name, $default = false ) {
-        return $default;
+        return isset( $GLOBALS['wpmgr_test_opsi'][ $name ] ) ? $GLOBALS['wpmgr_test_opsi'][ $name ] : $default;
     }
 }
 

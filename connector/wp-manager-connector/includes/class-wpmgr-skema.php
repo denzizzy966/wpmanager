@@ -162,6 +162,15 @@ PHP;
     public static function pastikan() {
         try {
             if ( ! self::perlu_migrasi( get_option( self::OPT_VERSI, 0 ), WPMGR_VERSI_SKEMA ) ) {
+                // Mu-plugin yang hilang (dihapus plugin keamanan, migrasi
+                // hosting) dipulihkan tanpa menunggu kenaikan skema berikutnya.
+                // Dijeda sehari lewat transient supaya hosting yang mengunci
+                // mu-plugins tidak dicoba tulis di setiap request.
+                if ( ! self::monitoring_mati() && 'terbatas' === self::mode_penangkap()
+                    && false === get_transient( 'wpmgr_coba_mu' ) ) {
+                    set_transient( 'wpmgr_coba_mu', 1, DAY_IN_SECONDS );
+                    self::tulis_mu_plugin();
+                }
                 return;
             }
             self::migrasi();
@@ -226,6 +235,13 @@ PHP;
         $wpdb->query( $wpdb->prepare(
             "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( 'wpmgr_garam_' ) . '%'
         ) );
+        // Transient connector (jeda mu-plugin, penanda tabel traffic penuh)
+        // disimpan di wp_options bila site tidak memakai object cache.
+        foreach ( array( '_transient_wpmgr_', '_transient_timeout_wpmgr_' ) as $awalan ) {
+            $wpdb->query( $wpdb->prepare(
+                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( $awalan ) . '%'
+            ) );
+        }
         wp_clear_scheduled_hook( self::HOOK_PANGKAS );
         self::hapus_mu_plugin();
     }

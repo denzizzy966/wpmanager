@@ -1,7 +1,113 @@
 <?php
 use PHPUnit\Framework\TestCase;
 
+// Stub minimal untuk pastikan()/hapus_semua(), dijaga function_exists/defined
+// seperti stub yang sama di TrafficTest.php.
+if ( ! defined( 'DAY_IN_SECONDS' ) ) {
+    define( 'DAY_IN_SECONDS', 86400 );
+}
+if ( ! defined( 'WPMGR_VERSI_SKEMA' ) ) {
+    define( 'WPMGR_VERSI_SKEMA', 2 );
+}
+if ( ! defined( 'WPMU_PLUGIN_DIR' ) ) {
+    define( 'WPMU_PLUGIN_DIR', sys_get_temp_dir() . '/wpmgr-test-mu-' . getmypid() );
+}
+if ( ! function_exists( 'get_transient' ) ) {
+    function get_transient( $kunci ) {
+        return isset( $GLOBALS['wpmgr_test_transient'][ $kunci ] ) ? $GLOBALS['wpmgr_test_transient'][ $kunci ] : false;
+    }
+}
+if ( ! function_exists( 'set_transient' ) ) {
+    function set_transient( $kunci, $nilai, $ttl = 0 ) {
+        $GLOBALS['wpmgr_test_transient'][ $kunci ] = (string) $nilai;
+        return true;
+    }
+}
+if ( ! function_exists( 'wp_mkdir_p' ) ) {
+    function wp_mkdir_p( $dir ) {
+        return is_dir( $dir ) || mkdir( $dir, 0777, true );
+    }
+}
+if ( ! function_exists( 'delete_option' ) ) {
+    function delete_option( $nama ) {
+        $GLOBALS['wpmgr_test_opsi_dihapus'][] = $nama;
+        return true;
+    }
+}
+if ( ! function_exists( 'wp_clear_scheduled_hook' ) ) {
+    function wp_clear_scheduled_hook( $hook ) {
+        return 0;
+    }
+}
+
+final class WPMGR_FakeWpdbSkema {
+    public $prefix  = 'wp_';
+    public $options = 'wp_options';
+    public $queries = array();
+
+    public function esc_like( $teks ) {
+        return addcslashes( $teks, '_%\\' );
+    }
+
+    public function prepare( $sql ) {
+        $args = array_slice( func_get_args(), 1 );
+        return vsprintf( str_replace( '%s', "'%s'", $sql ), $args );
+    }
+
+    public function query( $sql ) {
+        $this->queries[] = $sql;
+        return true;
+    }
+}
+
 final class SkemaTest extends TestCase {
+
+    private function berkas_mu() {
+        return WPMU_PLUGIN_DIR . '/' . WPMGR_Skema::MU_PLUGIN;
+    }
+
+    protected function tearDown(): void {
+        if ( file_exists( $this->berkas_mu() ) ) {
+            unlink( $this->berkas_mu() );
+        }
+        if ( is_dir( WPMU_PLUGIN_DIR ) ) {
+            @rmdir( WPMU_PLUGIN_DIR );
+        }
+        $GLOBALS['wpmgr_test_opsi']         = array();
+        $GLOBALS['wpmgr_test_transient']    = array();
+        $GLOBALS['wpmgr_test_opsi_dihapus'] = array();
+        unset( $GLOBALS['wpdb'] );
+    }
+
+    public function test_pastikan_memulihkan_mu_plugin_yang_hilang_sekali_per_hari(): void {
+        $GLOBALS['wpmgr_test_opsi'][ WPMGR_Skema::OPT_VERSI ] = WPMGR_VERSI_SKEMA;
+        $this->assertFileDoesNotExist( $this->berkas_mu() );
+
+        WPMGR_Skema::pastikan();
+        $this->assertFileExists( $this->berkas_mu() );
+        $this->assertSame( 'penuh', WPMGR_Skema::mode_penangkap() );
+
+        // Dihapus lagi (mis. oleh plugin keamanan): tidak ditulis ulang di
+        // setiap request selama transient jeda masih ada.
+        unlink( $this->berkas_mu() );
+        WPMGR_Skema::pastikan();
+        $this->assertFileDoesNotExist( $this->berkas_mu() );
+
+        $GLOBALS['wpmgr_test_transient'] = array();
+        WPMGR_Skema::pastikan();
+        $this->assertFileExists( $this->berkas_mu() );
+    }
+
+    public function test_hapus_semua_menghapus_transient_wpmgr(): void {
+        $wpdb            = new WPMGR_FakeWpdbSkema();
+        $GLOBALS['wpdb'] = $wpdb;
+
+        WPMGR_Skema::hapus_semua();
+
+        $semua = implode( "\n", $wpdb->queries );
+        $this->assertStringContainsString( 'option_name LIKE \'\\_transient\\_wpmgr\\_%\'', $semua );
+        $this->assertStringContainsString( 'option_name LIKE \'\\_transient\\_timeout\\_wpmgr\\_%\'', $semua );
+    }
 
     public function test_fitur_yang_diumumkan(): void {
         $this->assertSame( array( 'self_update', 'events', 'traffic' ), WPMGR_Skema::fitur( false ) );
