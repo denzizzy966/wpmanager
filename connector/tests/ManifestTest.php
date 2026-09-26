@@ -423,6 +423,31 @@ final class ManifestTest extends TestCase {
         $this->assertTrue( $luar['konten_di_luar'] );
     }
 
+    // ---- Fix I2 (review putaran 1, Task 7): prefix asing yang tumpang
+    // tindih ('wp_' vs 'wp_abc_') pada database bersama. ----
+
+    public function test_tabel_mengecualikan_prefix_asing_yang_tumpang_tindih(): void {
+        $wpdb          = new WPMGR_FakeWpdbManifest();
+        $wpdb->jawaban = array(
+            'SHOW TABLE STATUS' => array(
+                array( 'Name' => 'wp_posts', 'Rows' => '1', 'Data_length' => '1', 'Index_length' => '0', 'Engine' => 'InnoDB' ),
+                array( 'Name' => 'wp_options', 'Rows' => '1', 'Data_length' => '1', 'Index_length' => '0', 'Engine' => 'InnoDB' ),
+                // Site LAIN yang berbagi database ini, prefix 'wp_abc_'
+                // (memperpanjang prefix 'wp_' site ini) -- tabel opsinya
+                // SENDIRI ('wp_abc_options') membuktikan itu memang site
+                // lain, bukan sekadar tabel plugin site ini yang panjang.
+                array( 'Name' => 'wp_abc_posts', 'Rows' => '1', 'Data_length' => '1', 'Index_length' => '0', 'Engine' => 'InnoDB' ),
+                array( 'Name' => 'wp_abc_options', 'Rows' => '1', 'Data_length' => '1', 'Index_length' => '0', 'Engine' => 'InnoDB' ),
+            ),
+            'SHOW KEYS FROM' => array(),
+        );
+        list( $hasil, $dilewati ) = WPMGR_Staging_Manifest::tabel( $wpdb );
+        $nama = array_column( $hasil, 'nama' );
+        sort( $nama );
+        $this->assertSame( array( 'wp_options', 'wp_posts' ), $nama );
+        $this->assertSame( 2, $dilewati );
+    }
+
     public function test_konten_di_luar_symlink_wp_content(): void {
         // Item 3, fix round 1: wp-content yang di-symlink-kan tetap "tampak"
         // di dalam akar menurut strpos berawalan, padahal manifest yang

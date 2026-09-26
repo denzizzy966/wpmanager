@@ -57,4 +57,67 @@ class WPMGR_Staging_Db {
     public function suka( $t ) {
         return $this->wpdb->esc_like( $t );
     }
+
+    /**
+     * Fix I5 (review putaran 1): kolom()/nilai() (get_col/get_var) tidak
+     * membedakan "0 baris" dari "kueri gagal" lewat nilai baliknya saja --
+     * wpdb sungguhan mengosongkan last_error di awal SETIAP query() baru
+     * dan mengisinya hanya saat gagal (sama seperti dijelaskan di
+     * WPMGR_Staging_TandaAir). Pemanggil WAJIB memeriksa ini SEGERA
+     * setelah kolom()/nilai(), sebelum query lain berjalan di $wpdb yang
+     * sama.
+     */
+    public function galat_terakhir() {
+        return isset( $this->wpdb->last_error ) ? (string) $this->wpdb->last_error : '';
+    }
+
+    /**
+     * Fix I2 (review putaran 1): prefix "asing" yang tumpang tindih dengan
+     * $prefix -- pada database bersama, site LAIN dengan prefix lebih
+     * panjang yang MEMPERPANJANG prefix site ini (mis. site ini 'wp_', site
+     * lain 'wp_abc_') membuat tabelnya sendiri (mis. 'wp_abc_posts') lolos
+     * pencocokan awalan sederhana terhadap 'wp_'. Terdeteksi lewat
+     * keberadaan tabel OPSI milik prefix itu sendiri ('wp_abc_options') di
+     * $semua_tabel -- tanda kuat itu memang site WordPress lain, bukan
+     * sekadar tabel plugin site ini yang panjang namanya.
+     */
+    public static function prefix_asing( array $semua_tabel, $prefix ) {
+        $prefix = (string) $prefix;
+        $hasil  = array();
+        foreach ( $semua_tabel as $t ) {
+            $t = (string) $t;
+            if ( strlen( $t ) > strlen( $prefix ) + 7 && 'options' === substr( $t, -7 ) && 0 === strpos( $t, $prefix ) ) {
+                $kandidat = substr( $t, 0, -7 );
+                if ( $kandidat !== $prefix && ! in_array( $kandidat, $hasil, true ) ) {
+                    $hasil[] = $kandidat;
+                }
+            }
+        }
+        return $hasil;
+    }
+
+    /**
+     * Fix I2 (review putaran 1): menyaring $semua_tabel supaya hanya yang
+     * BENAR milik site dengan $prefix ini yang tersisa -- tabel di bawah
+     * prefix asing yang tumpang tindih (prefix_asing()) dibuang, walau ia
+     * sendiri lolos pencocokan awalan $prefix. Dipakai bersama oleh
+     * WPMGR_Staging_Manifest::tabel(), daftar tabel snapshot, dan jurnal
+     * tabel dorong (WPMGR_Staging_Dorong) -- satu tempat, satu definisi.
+     */
+    public static function tabel_milik_site( array $semua_tabel, $prefix ) {
+        $prefix       = (string) $prefix;
+        $prefix_asing = self::prefix_asing( $semua_tabel, $prefix );
+        return array_values( array_filter( $semua_tabel, function ( $t ) use ( $prefix, $prefix_asing ) {
+            $t = (string) $t;
+            if ( 0 !== strpos( $t, $prefix ) ) {
+                return false;
+            }
+            foreach ( $prefix_asing as $pa ) {
+                if ( 0 === strpos( $t, $pa ) ) {
+                    return false;
+                }
+            }
+            return true;
+        } ) );
+    }
 }

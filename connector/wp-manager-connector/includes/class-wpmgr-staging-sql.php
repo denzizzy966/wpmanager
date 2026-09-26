@@ -158,31 +158,208 @@ class WPMGR_Staging_Sql {
         }
     }
 
-    public static function ubah( $pernyataan, $prefix, $awalan = 'wpmgr_tmp_' ) {
-        $s = self::tanpa_komentar_awal( $pernyataan );
-        if ( '' === $s || 1 === preg_match( '/^(SET\s|LOCK\s+TABLES\s|UNLOCK\s+TABLES\b)/i', $s ) ) {
-            return null;
+    /**
+     * Fix I1 (review putaran 1): topeng level-token dari $s -- isi literal
+     * string ('...', "...") dan komentar diganti karakter netral ('x'/spasi)
+     * PANJANG SAMA (posisi tidak bergeser), sedangkan identifier backtick,
+     * kata kunci, spasi, tanda kurung, dan koma dibiarkan apa adanya.
+     * Pemeriksaan struktur pernyataan di ubah() berjalan di atas TOPENG ini,
+     * bukan $s mentah -- supaya kata kunci (mis. "SELECT", "ENGINE=") yang
+     * kebetulan muncul di DALAM nilai literal (mis. VALUES ('...SELECT...'))
+     * tidak pernah salah terdeteksi sebagai bagian struktur pernyataan, dan
+     * sebaliknya kata kunci sungguhan tidak bisa "disembunyikan" penyerang
+     * di dalam string untuk lolos dari pemeriksaan.
+     *
+     * Batasan yang diketahui: identifier backtick TIDAK ditopengi (isinya
+     * perlu dibaca strukturnya), jadi kolom yang sengaja diberi nama sama
+     * dengan kata kunci (mis. `` `select` ``) masih bisa memicu pencocokan
+     * `\bSELECT\b` di ubah(). Situasi itu tidak pernah muncul pada keluaran
+     * pengekspor sendiri (Task 5), wp search-replace --export, atau
+     * mysqldump -- satu-satunya sumber yang diterima ubah().
+     */
+    public static function tanpa_literal( $s ) {
+        $s       = (string) $s;
+        $n       = strlen( $s );
+        $keluar  = '';
+        $i       = 0;
+        $keadaan = self::NORMAL;
+        while ( $i < $n ) {
+            $c = $s[ $i ];
+            if ( self::NORMAL === $keadaan ) {
+                if ( "'" === $c ) {
+                    $keadaan = self::KUTIP_TUNGGAL;
+                    $keluar .= $c;
+                    $i++;
+                } elseif ( '"' === $c ) {
+                    $keadaan = self::KUTIP_GANDA;
+                    $keluar .= $c;
+                    $i++;
+                } elseif ( '`' === $c ) {
+                    $keadaan = self::BACKTICK;
+                    $keluar .= $c;
+                    $i++;
+                } elseif ( '#' === $c ) {
+                    $keadaan = self::KOMENTAR_BARIS;
+                    $keluar .= ' ';
+                    $i++;
+                } elseif ( '-' === $c && $i + 2 < $n && '-' === $s[ $i + 1 ] && ctype_space( $s[ $i + 2 ] ) ) {
+                    $keadaan = self::KOMENTAR_BARIS;
+                    $keluar .= '  ';
+                    $i      += 2;
+                } elseif ( '/' === $c && $i + 1 < $n && '*' === $s[ $i + 1 ] ) {
+                    $keadaan = self::KOMENTAR_BLOK;
+                    $keluar .= '  ';
+                    $i      += 2;
+                } else {
+                    $keluar .= $c;
+                    $i++;
+                }
+            } elseif ( self::BACKTICK === $keadaan ) {
+                $keluar .= $c;
+                if ( '`' === $c ) {
+                    $keadaan = self::NORMAL;
+                }
+                $i++;
+            } elseif ( self::KUTIP_TUNGGAL === $keadaan || self::KUTIP_GANDA === $keadaan ) {
+                $q = self::KUTIP_TUNGGAL === $keadaan ? "'" : '"';
+                if ( '\\' === $c && $i + 1 < $n ) {
+                    $keluar .= 'xx';
+                    $i      += 2;
+                } elseif ( $q === $c ) {
+                    if ( $i + 1 < $n && $q === $s[ $i + 1 ] ) {
+                        $keluar .= 'xx'; // kutip yang di-escape ('' atau "")
+                        $i      += 2;
+                    } else {
+                        $keluar .= $c;
+                        $keadaan = self::NORMAL;
+                        $i++;
+                    }
+                } else {
+                    $keluar .= 'x';
+                    $i++;
+                }
+            } elseif ( self::KOMENTAR_BARIS === $keadaan ) {
+                if ( "\n" === $c ) {
+                    $keluar .= "\n";
+                    $keadaan = self::NORMAL;
+                } else {
+                    $keluar .= ' ';
+                }
+                $i++;
+            } else { // KOMENTAR_BLOK
+                if ( '*' === $c && $i + 1 < $n && '/' === $s[ $i + 1 ] ) {
+                    $keluar .= '  ';
+                    $keadaan = self::NORMAL;
+                    $i      += 2;
+                } else {
+                    $keluar .= ' ';
+                    $i++;
+                }
+            }
         }
-        $pola = '/^(DROP\s+TABLE\s+IF\s+EXISTS|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+INTO|ALTER\s+TABLE)\s+`([A-Za-z0-9_$]{1,64})`/i';
-        if ( 1 !== preg_match( $pola, $s, $m, PREG_OFFSET_CAPTURE ) ) {
-            return WPMGR_Staging::galat( 'wpmgr_staging_sql',
-                'Pernyataan SQL tidak diizinkan: ' . WPMGR_Staging::bersih( substr( $s, 0, 60 ), 60 ), 400 );
-        }
-        $nama = $m[2][0];
+        return $keluar;
+    }
+
+    /**
+     * Tabel di luar prefix site ini, TERMASUK tabel yang berada di bawah
+     * prefix LEBIH PANJANG yang tumpang tindih dengan prefix kita (Koreksi
+     * #14 review, I2): site lain di database yang sama dengan prefix mis.
+     * 'wp_abc_' membuat tabelnya sendiri (mis. 'wp_abc_posts') lolos
+     * pencocokan awalan sederhana terhadap prefix site ini ('wp_'). $prefix_asing
+     * (dihitung sekali oleh pemanggil lewat WPMGR_Staging_Db::prefix_asing()
+     * dari SHOW TABLES sungguhan) berisi prefix-prefix asing semacam itu;
+     * kosong (default) berarti pemanggil tidak punya akses DB untuk
+     * menghitungnya (mis. unit test murni) -- perilaku jatuh balik ke
+     * pencocokan awalan biasa, TIDAK menolak apa pun tambahan.
+     */
+    private static function di_luar_prefix( $nama, $prefix, array $prefix_asing ) {
         if ( 0 !== strpos( $nama, $prefix ) ) {
+            return true;
+        }
+        foreach ( $prefix_asing as $pa ) {
+            if ( '' !== $pa && 0 === strpos( $nama, $pa ) ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static function tolak( $pesan ) {
+        return WPMGR_Staging::galat( 'wpmgr_staging_sql', $pesan, 400 );
+    }
+
+    /** Bagian akhir bersama: validasi prefix, lewati wpmgr_*, ganti nama. */
+    private static function ubah_nama_tabel( $s, $prefix, $awalan, $nama, $offset, array $prefix_asing ) {
+        if ( self::di_luar_prefix( $nama, $prefix, $prefix_asing ) ) {
             return WPMGR_Staging::galat( 'wpmgr_staging_sql', 'Tabel di luar prefix site ini: ' . $nama, 400 );
         }
-        if ( 0 === strpos( $nama, $prefix . 'wpmgr_' ) ) {
-            return null; // Koreksi #14: data pemantauan produksi tidak ditimpa salinan lama.
-        }
-        if ( 0 === stripos( $m[1][0], 'ALTER' )
-            && 1 !== preg_match( '/^ALTER\s+TABLE\s+`[^`]+`\s+(DISABLE|ENABLE)\s+KEYS\z/i', $s ) ) {
-            return WPMGR_Staging::galat( 'wpmgr_staging_sql', 'ALTER TABLE hanya boleh DISABLE/ENABLE KEYS.', 400 );
+        // Koreksi #14: data pemantauan produksi tidak ditimpa salinan lama.
+        // Dibandingkan huruf besar/kecil (fix minor, review putaran 1):
+        // server dengan lower_case_table_names bisa mengembalikan nama
+        // dalam huruf apa pun; 'WP_WPMGR_ERRORS' tetap harus dilewati.
+        if ( 0 === stripos( $nama, $prefix . 'wpmgr_' ) ) {
+            return null;
         }
         $baru = $awalan . $nama;
         if ( strlen( $baru ) > 64 ) {
             return WPMGR_Staging::galat( 'wpmgr_staging_sql', 'Nama tabel terlalu panjang untuk tabel sementara: ' . $nama, 400 );
         }
-        return substr( $s, 0, $m[2][1] ) . $baru . substr( $s, $m[2][1] + strlen( $nama ) );
+        return substr( $s, 0, $offset ) . $baru . substr( $s, $offset + strlen( $nama ) );
+    }
+
+    /**
+     * Fix I1 (review putaran 1, plan-mandated): draf awal hanya memvalidasi
+     * KEPALA setiap pernyataan (kata kerja + nama tabel), lalu menerima apa
+     * pun sesudahnya -- itu meloloskan `INSERT INTO t SELECT ...`,
+     * `INSERT INTO t ... ON DUPLICATE KEY UPDATE ...`, `CREATE TABLE t (...)
+     * AS SELECT ...`, `CREATE TABLE t (...) ENGINE=FEDERATED/CONNECT ...`,
+     * dan `DROP TABLE \`a\`, \`b\`` (menghapus tabel KEDUA yang tidak pernah
+     * diperiksa). Sekarang PERNYATAAN UTUH divalidasi per jenis, di atas
+     * topeng tanpa_literal() (bukan $s mentah -- lihat docblock-nya).
+     *
+     * $prefix_asing (I2, opsional): lihat di_luar_prefix().
+     */
+    public static function ubah( $pernyataan, $prefix, $awalan = 'wpmgr_tmp_', array $prefix_asing = array() ) {
+        $s = self::tanpa_komentar_awal( $pernyataan );
+        if ( '' === $s || 1 === preg_match( '/^(SET\s|LOCK\s+TABLES\s|UNLOCK\s+TABLES\b)/i', $s ) ) {
+            return null;
+        }
+        $topeng = self::tanpa_literal( $s );
+
+        if ( 1 === preg_match( '/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`([A-Za-z0-9_$]{1,64})`/i', $topeng, $m, PREG_OFFSET_CAPTURE ) ) {
+            if ( 1 !== preg_match( '/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`[A-Za-z0-9_$]{1,64}`\s*\z/i', $topeng ) ) {
+                return self::tolak( 'DROP TABLE hanya boleh menyebut satu tabel.' );
+            }
+            return self::ubah_nama_tabel( $s, $prefix, $awalan, $m[1][0], $m[1][1], $prefix_asing );
+        }
+        if ( 1 === preg_match( '/^INSERT\s+INTO\s+`([A-Za-z0-9_$]{1,64})`/i', $topeng, $m, PREG_OFFSET_CAPTURE ) ) {
+            if ( 1 === preg_match( '/\bON\s+DUPLICATE\s+KEY\s+UPDATE\b/i', $topeng ) ) {
+                return self::tolak( 'INSERT ... ON DUPLICATE KEY UPDATE tidak diizinkan.' );
+            }
+            if ( 1 === preg_match( '/^INSERT\s+INTO\s+`[A-Za-z0-9_$]{1,64}`\s+SET\b/i', $topeng ) ) {
+                return self::tolak( 'INSERT ... SET tidak diizinkan.' );
+            }
+            if ( 1 !== preg_match( '/^INSERT\s+INTO\s+`[A-Za-z0-9_$]{1,64}`\s*(?:\([^()]*\)\s*)?VALUES\b/i', $topeng ) ) {
+                return self::tolak( 'Hanya bentuk INSERT INTO ... VALUES yang diizinkan.' );
+            }
+            return self::ubah_nama_tabel( $s, $prefix, $awalan, $m[1][0], $m[1][1], $prefix_asing );
+        }
+        if ( 1 === preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`([A-Za-z0-9_$]{1,64})`/i', $topeng, $m, PREG_OFFSET_CAPTURE ) ) {
+            if ( 1 === preg_match( '/\bSELECT\b/i', $topeng ) ) {
+                return self::tolak( 'CREATE TABLE ... SELECT tidak diizinkan.' );
+            }
+            if ( 1 === preg_match( '/\bENGINE\s*=?\s*(FEDERATED|CONNECT)\b/i', $topeng )
+                || 1 === preg_match( '/\b(DATA|INDEX)\s+DIRECTORY\b/i', $topeng ) ) {
+                return self::tolak( 'Opsi CREATE TABLE ini tidak diizinkan.' );
+            }
+            return self::ubah_nama_tabel( $s, $prefix, $awalan, $m[1][0], $m[1][1], $prefix_asing );
+        }
+        if ( 1 === preg_match( '/^ALTER\s+TABLE\s+`([A-Za-z0-9_$]{1,64})`\s+/i', $topeng, $m, PREG_OFFSET_CAPTURE ) ) {
+            if ( 1 !== preg_match( '/^ALTER\s+TABLE\s+`[A-Za-z0-9_$]{1,64}`\s+(DISABLE|ENABLE)\s+KEYS\s*\z/i', $topeng ) ) {
+                return self::tolak( 'ALTER TABLE hanya boleh DISABLE/ENABLE KEYS.' );
+            }
+            return self::ubah_nama_tabel( $s, $prefix, $awalan, $m[1][0], $m[1][1], $prefix_asing );
+        }
+        return self::tolak( 'Pernyataan SQL tidak diizinkan: ' . WPMGR_Staging::bersih( substr( $s, 0, 60 ), 60 ) );
     }
 }

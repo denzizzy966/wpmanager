@@ -314,12 +314,25 @@ class WPMGR_Staging_Manifest {
     }
 
     public static function tabel( $wpdb ) {
-        $baris    = $wpdb->get_results( $wpdb->prepare( 'SHOW TABLE STATUS LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ), ARRAY_A );
+        $baris = $wpdb->get_results( $wpdb->prepare( 'SHOW TABLE STATUS LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ), ARRAY_A );
+        // Fix I2 (review putaran 1, Task 7): pada database bersama, site
+        // LAIN dengan prefix lebih panjang yang tumpang tindih (mis. site
+        // ini 'wp_', site lain 'wp_abc_') membuat tabelnya sendiri lolos
+        // pencocokan awalan sederhana nama_tabel_sah() di atas -- dihitung
+        // sekali dari SELURUH baris SHOW TABLE STATUS yang cocok (yang
+        // sudah tentu memuat tabel opsi milik site asing itu bila ada),
+        // lihat WPMGR_Staging_Db::tabel_milik_site().
+        $nama_milik = WPMGR_Staging_Db::tabel_milik_site(
+            array_map( function ( $b ) {
+                return isset( $b['Name'] ) ? (string) $b['Name'] : '';
+            }, (array) $baris ),
+            $wpdb->prefix
+        );
         $hasil    = array();
         $dilewati = 0;
         foreach ( (array) $baris as $b ) {
             $nama = isset( $b['Name'] ) ? (string) $b['Name'] : '';
-            if ( ! self::nama_tabel_sah( $nama, $wpdb->prefix ) ) {
+            if ( ! self::nama_tabel_sah( $nama, $wpdb->prefix ) || ! in_array( $nama, $nama_milik, true ) ) {
                 $dilewati++;
                 continue;
             }

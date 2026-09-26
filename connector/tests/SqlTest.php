@@ -88,6 +88,116 @@ final class SqlTest extends TestCase {
         }
     }
 
+    // ---- MINOR (review putaran 1): pemecah tidak boleh menganggap --, #,
+    // /* di DALAM literal string sebagai awal komentar, dan ';' di dalam
+    // literal string tidak pernah dihitung sebagai akhir pernyataan. ----
+
+    public function test_pemecah_tidak_menganggap_komentar_di_dalam_literal(): void {
+        $sql = "INSERT INTO `t` (`a`) VALUES ('-- x; bukan komentar'),\n"
+            . "('# y; bukan komentar'),\n"
+            . "('/* z; bukan komentar */');";
+        list( $hasil, $sisa ) = $this->pecah_sekaligus( $sql );
+        $this->assertSame( '', $sisa );
+        $this->assertCount( 1, $hasil );
+        $this->assertSame( rtrim( $sql, ';' ), trim( $hasil[0][0] ) );
+    }
+
+    // ---- Fix I1 (review putaran 1): draf awal hanya memvalidasi kepala
+    // setiap pernyataan -- sekarang pernyataan UTUH divalidasi per jenis. ----
+
+    public function test_ubah_menolak_drop_table_lebih_dari_satu(): void {
+        // Draf awal hanya memvalidasi kepala pernyataan: ini akan lolos
+        // sebagai "DROP TABLE IF EXISTS `wpmgr_tmp_wp_a`, `wp_users`" --
+        // tabel KEDUA (produksi, tidak diganti nama) ikut ter-DROP mentah
+        // saat Task 8 menjalankannya. Harus ditolak SELURUHNYA.
+        foreach ( array( 'DROP TABLE `wp_a`, `wp_users`', 'DROP TABLE IF EXISTS `wp_a`, `wp_users`' ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+        }
+    }
+
+    public function test_ubah_menolak_insert_select(): void {
+        foreach ( array(
+            'INSERT INTO `wp_posts` SELECT * FROM `wp_x`',
+            'INSERT INTO `wp_posts` (`a`) SELECT `a` FROM `wp_x`',
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+        }
+    }
+
+    public function test_ubah_menolak_insert_on_duplicate_key_update(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "INSERT INTO `wp_posts` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `a` = 2", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_insert_set(): void {
+        $hasil = WPMGR_Staging_Sql::ubah( "INSERT INTO `wp_posts` SET `a` = 1", 'wp_' );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+    }
+
+    public function test_ubah_menolak_create_table_select(): void {
+        foreach ( array(
+            "CREATE TABLE `wp_posts` (`a` int) AS SELECT * FROM `wp_x`",
+            "CREATE TABLE `wp_posts` SELECT * FROM `wp_x`",
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+        }
+    }
+
+    public function test_ubah_menolak_engine_dan_direktori_berbahaya(): void {
+        foreach ( array(
+            "CREATE TABLE `wp_posts` (`a` int) ENGINE=FEDERATED",
+            "CREATE TABLE `wp_posts` (`a` int) ENGINE=CONNECT",
+            "CREATE TABLE `wp_posts` (`a` int) DATA DIRECTORY='/tmp'",
+            "CREATE TABLE `wp_posts` (`a` int) INDEX DIRECTORY='/tmp'",
+        ) as $s ) {
+            $hasil = WPMGR_Staging_Sql::ubah( $s, 'wp_' );
+            $this->assertInstanceOf( WP_Error::class, $hasil, $s );
+            $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+        }
+    }
+
+    // ---- Tokenizer-level: kata kunci/nama tabel di DALAM literal string
+    // tidak boleh menipu (menolak yang sah) atau meloloskan (yang berbahaya). ----
+
+    public function test_ubah_tidak_tertipu_kata_kunci_di_dalam_literal(): void {
+        // "SELECT"/"ENGINE=FEDERATED" di sini murni ISI kolom DEFAULT
+        // (string), bukan struktur SQL sungguhan -- pernyataan yang SAH ini
+        // tidak boleh ditolak hanya karena topeng literal gagal.
+        $hasil = WPMGR_Staging_Sql::ubah(
+            "CREATE TABLE `wp_a` (`b` varchar(50) DEFAULT 'SELECT * ENGINE=FEDERATED CREATE TABLE fake')", 'wp_' );
+        $this->assertSame(
+            "CREATE TABLE `wpmgr_tmp_wp_a` (`b` varchar(50) DEFAULT 'SELECT * ENGINE=FEDERATED CREATE TABLE fake')",
+            $hasil );
+    }
+
+    public function test_ubah_case_insensitive_untuk_tabel_wpmgr(): void {
+        // Server lower_case_table_names bisa mengembalikan huruf apa pun.
+        $this->assertNull( WPMGR_Staging_Sql::ubah( 'INSERT INTO `wp_WPMGR_errors` VALUES (1)', 'wp_' ) );
+        $this->assertNull( WPMGR_Staging_Sql::ubah( 'DROP TABLE IF EXISTS `wp_WPMGR_traffic`', 'wp_' ) );
+    }
+
+    // ---- Fix I2 (review putaran 1): prefix asing yang tumpang tindih
+    // ('wp_' vs 'wp_abc_') ditolak bila pemanggil menyertakannya. ----
+
+    public function test_ubah_menolak_prefix_asing_yang_tumpang_tindih(): void {
+        $hasil = WPMGR_Staging_Sql::ubah(
+            'DROP TABLE IF EXISTS `wp_abc_posts`', 'wp_', 'wpmgr_tmp_', array( 'wp_abc_' ) );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $this->assertSame( 'wpmgr_staging_sql', $hasil->get_error_code() );
+        // Tanpa daftar prefix asing (perilaku lama, tanpa akses DB): tetap diterima.
+        $this->assertSame( 'DROP TABLE IF EXISTS `wpmgr_tmp_wp_abc_posts`',
+            WPMGR_Staging_Sql::ubah( 'DROP TABLE IF EXISTS `wp_abc_posts`', 'wp_' ) );
+    }
+
     public function test_keluaran_ekspor_tabel_terpecah_benar(): void {
         WPMGR_Staging_Tabel::$baris     = 2000;
         WPMGR_Staging_Tabel::$sub       = 200;

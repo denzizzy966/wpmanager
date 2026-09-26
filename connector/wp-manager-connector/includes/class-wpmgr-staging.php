@@ -262,9 +262,31 @@ class WPMGR_Staging {
             return $berkas;
         }
         $hasil = array( 'berkas' => $berkas );
-        if ( ! empty( $p['awal'] ) ) {
+        // MINOR (review putaran 1): 'awal' diurai KETAT sebagai boolean
+        // (true/1 saja) -- nilai lain (string "ya", array, dst.) yang lolos
+        // ! empty() draf awal tidak boleh diam-diam dianggap "tarik pertama".
+        $awal = isset( $p['awal'] ) && ( true === $p['awal'] || 1 === $p['awal'] );
+        if ( $awal ) {
             list( $hasil['tabel'] ) = WPMGR_Staging_Manifest::tabel( $wpdb );
-            $hasil['tanda_air']     = WPMGR_Staging_TandaAir::kumpulkan( $wpdb, '', 0 );
+            // Fix I4 (review putaran 1, Penting): Manifest::tabel() sendiri
+            // tidak memeriksa last_error (SHOW TABLE STATUS yang gagal
+            // mengembalikan array kosong, tampak seperti "site ini memang
+            // tidak punya tabel"). Diperiksa di sini supaya daftar tabel
+            // TIDAK PERNAH kembali kosong secara diam-diam akibat galat --
+            // dorong timpa penuh yang dijalankan atas daftar kosong seperti
+            // itu bisa menghapus tabel produksi yang seharusnya dipertahankan.
+            if ( isset( $wpdb->last_error ) && '' !== (string) $wpdb->last_error ) {
+                return self::galat( 'wpmgr_staging_tabel', 'Daftar tabel tidak dapat dibaca dari database.', 500 );
+            }
+            $tanda_air = WPMGR_Staging_TandaAir::kumpulkan( $wpdb, '', 0 );
+            // Fix I4 (review putaran 1, Penting): kumpulkan() sendiri SUDAH
+            // mengembalikan WP_Error saat galat query -- draf awal
+            // menyimpannya begitu saja ke 'tanda_air' seolah berhasil,
+            // membuat snapshot tampak sukses padahal tanda airnya rusak.
+            if ( is_wp_error( $tanda_air ) ) {
+                return $tanda_air;
+            }
+            $hasil['tanda_air'] = $tanda_air;
         }
         return rest_ensure_response( $hasil );
     }

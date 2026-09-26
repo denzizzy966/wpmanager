@@ -174,6 +174,15 @@ PHP;
                     set_transient( 'wpmgr_coba_mu', 1, DAY_IN_SECONDS );
                     self::tulis_mu_plugin();
                 }
+                // MINOR (review putaran 1, Task 7): dijadwalkan juga di jalur
+                // TANPA migrasi (idempoten lewat wp_next_scheduled) -- site
+                // yang sudah lama terpasang sebelum Task 7 ada tidak akan
+                // pernah lagi melewati migrasi() (versi skema tidak naik lagi
+                // setelahnya), jadi tanpa ini cron pembersihan dorong tidak
+                // akan pernah terjadwal di site tersebut.
+                if ( class_exists( 'WPMGR_Staging' ) && ! wp_next_scheduled( WPMGR_Staging::HOOK_BERSIHKAN ) ) {
+                    wp_schedule_event( time() + HOUR_IN_SECONDS, 'hourly', WPMGR_Staging::HOOK_BERSIHKAN );
+                }
                 return;
             }
             self::migrasi();

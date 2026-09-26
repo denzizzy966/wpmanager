@@ -7,6 +7,10 @@ final class WPMGR_FakeDbDorong {
     public $tabel      = array();
     public $opsi       = array();
     public $gagal_pada = null;
+    // Fix I5 (review putaran 1): meniru $wpdb->last_error sungguhan --
+    // dikosongkan di awal SETIAP kolom()/nilai()/kueri() baru, diisi hanya
+    // saat panggilan itu gagal (lihat WPMGR_Staging_Db::galat_terakhir()).
+    private $galat = '';
 
     public function prefix() {
         return 'wp_';
@@ -18,6 +22,10 @@ final class WPMGR_FakeDbDorong {
 
     public function suka( $t ) {
         return addcslashes( $t, '_%\\' );
+    }
+
+    public function galat_terakhir() {
+        return $this->galat;
     }
 
     public function siapkan( $sql ) {
@@ -34,8 +42,16 @@ final class WPMGR_FakeDbDorong {
         return '/^' . $r . '\z/';
     }
 
+    private function tandai_gagal_bila_cocok( $sql ) {
+        $this->galat = ( null !== $this->gagal_pada && false !== strpos( $sql, $this->gagal_pada ) ) ? 'galat tiruan' : '';
+        return '' !== $this->galat;
+    }
+
     public function kolom( $sql ) {
         $this->kueri[] = $sql;
+        if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
+            return array();
+        }
         if ( preg_match( "/^SHOW TABLES LIKE '(.*)'\z/", $sql, $m ) ) {
             $pola = self::pola_like( $m[1] );
             return array_values( array_filter( $this->tabel, function ( $t ) use ( $pola ) {
@@ -47,6 +63,9 @@ final class WPMGR_FakeDbDorong {
 
     public function nilai( $sql ) {
         $this->kueri[] = $sql;
+        if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
+            return null;
+        }
         if ( false !== strpos( $sql, "option_name = 'wpmgr_dorong_kunci'" ) ) {
             return isset( $this->opsi['wpmgr_dorong_kunci'] ) ? $this->opsi['wpmgr_dorong_kunci'] : null;
         }
@@ -55,14 +74,20 @@ final class WPMGR_FakeDbDorong {
 
     public function kueri( $sql ) {
         $this->kueri[] = $sql;
-        if ( null !== $this->gagal_pada && false !== strpos( $sql, $this->gagal_pada ) ) {
+        if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
             return 'galat tiruan';
         }
         if ( preg_match( "/^INSERT IGNORE INTO wp_options .*VALUES \('wpmgr_dorong_kunci', '([^']*)'/", $sql, $m ) ) {
             if ( ! isset( $this->opsi['wpmgr_dorong_kunci'] ) ) {
                 $this->opsi['wpmgr_dorong_kunci'] = $m[1];
             }
+        } elseif ( preg_match( "/^UPDATE wp_options SET option_value = '([^']*)' WHERE option_name = 'wpmgr_dorong_kunci' AND option_value LIKE '([0-9a-f]+)\|%'/", $sql, $m ) ) {
+            // Penyegaran oleh pemegang saat ini (fix C1) -- fencing lewat LIKE '<id>|%'.
+            if ( isset( $this->opsi['wpmgr_dorong_kunci'] ) && 0 === strpos( $this->opsi['wpmgr_dorong_kunci'], $m[2] . '|' ) ) {
+                $this->opsi['wpmgr_dorong_kunci'] = $m[1];
+            }
         } elseif ( preg_match( "/^UPDATE wp_options SET option_value = '([^']*)' WHERE option_name = 'wpmgr_dorong_kunci' AND option_value = '([^']*)'/", $sql, $m ) ) {
+            // Perebutan kunci basi (compare-and-swap atas nilai persis).
             if ( isset( $this->opsi['wpmgr_dorong_kunci'] ) && $this->opsi['wpmgr_dorong_kunci'] === $m[2] ) {
                 $this->opsi['wpmgr_dorong_kunci'] = $m[1];
             }
@@ -195,6 +220,45 @@ final class DorongTest extends TestCase {
         $this->assertTrue( $d->kunci( self::ID2 ) );
     }
 
+    // ---- Fix C1 (review putaran 1, Kritis): draf awal HANYA memasang
+    // kunci sekali di potongan pertama dan tidak pernah menyegarkannya lagi
+    // -- push yang masih AKTIF (potongan baru terus tiba) tapi berjalan
+    // lebih dari 2 jam bisa direbut push lain padahal belum berhenti. ----
+
+    public function test_kunci_disegarkan_setiap_unggah_tetap_dipegang_lebih_dari_dua_jam(): void {
+        $d    = $this->dorong();
+        $data = $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'a' ) );
+        $this->assertSame( array( 'ok' => true, 'nomor' => 0, 'sha256' => hash( 'sha256', $data ) ), $d->unggah( $data ) );
+        // Simulasikan waktu berlalu > 2 jam SEJAK potongan pertama TANPA
+        // pernah disegarkan -- ini seolah-olah push tidak pernah
+        // menyegarkan kuncinya (bug draf awal). Bila unggah() potongan
+        // KEDUA menyegarkan dengan benar, dorongan lain sesudahnya tetap
+        // ditolak sibuk -- BUKAN berhasil merebut kunci yang tampak basi.
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $data2                                = $this->paket( self::ID, 1, 'sql', array( array( 'path' => 'sql' ) ), array( 'b' ) );
+        $this->assertSame( array( 'ok' => true, 'nomor' => 1, 'sha256' => hash( 'sha256', $data2 ) ), $d->unggah( $data2 ) );
+        $galat = $d->kunci( self::ID2 );
+        $this->assertInstanceOf( WP_Error::class, $galat, 'Kunci push yang masih aktif tidak boleh bisa direbut.' );
+        $this->assertSame( 'wpmgr_staging_sibuk', $galat->get_error_code() );
+    }
+
+    // ---- Fix C1 (review putaran 1, Kritis): push yang DIREBUT tidak boleh
+    // bisa melanjutkan lagi walau kuncinya kelak bebas kembali (mis.
+    // perebutnya sendiri melepaskannya setelah selesai). ----
+
+    public function test_push_direbut_tetap_ditolak_walau_kunci_bebas_lagi(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'a' ) ) );
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $this->assertTrue( $d->kunci( self::ID2 ) ); // ID2 merebut, menandai ID sebagai 'direbut'.
+        $d->lepas_kunci( self::ID2 ); // Kunci sekarang BEBAS lagi.
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+        $galat = $d->unggah( $this->paket( self::ID, 1, 'sql', array( array( 'path' => 'sql' ) ), array( 'c' ) ) );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_direbut', $galat->get_error_code() );
+        $this->assertSame( 409, $galat->get_error_data()['status'] );
+    }
+
     public function test_snapshot_berkas(): void {
         $hasil = $this->dorong()->snapshot_berkas( array( 'wp-content/themes/t/style.css', 'wp-content/themes/t/baru.php' ) );
         $this->assertSame( 'wp-content/themes/t/style.css', $hasil[0]['path'] );
@@ -206,28 +270,196 @@ final class DorongTest extends TestCase {
         }
     }
 
+    // ---- MINOR (review putaran 1): snapshot_berkas() memakai path
+    // kanonik (WPMGR_Staging_Path::untuk_dibaca()), bukan hanya is_link()
+    // pada komponen TERAKHIR -- leluhur DIREKTORI yang di-symlink-kan ke
+    // luar root tidak pernah terlihat oleh is_link() sendirian. ----
+
+    public function test_snapshot_berkas_menolak_leluhur_symlink_keluar(): void {
+        $luar = sys_get_temp_dir() . '/wpmgr-drg-luar-' . bin2hex( random_bytes( 4 ) );
+        mkdir( $luar, 0777, true );
+        file_put_contents( $luar . '/rahasia.txt', 'rahasia' );
+        if ( ! @symlink( $luar, $this->akar . 'wp-content/tautan' ) ) {
+            StagingDasarTest::hapus( $luar );
+            $this->markTestSkipped( 'Sistem ini tidak mengizinkan symlink (Windows tanpa Developer Mode).' );
+        }
+        try {
+            $hasil = $this->dorong()->snapshot_berkas( array( 'wp-content/tautan/rahasia.txt' ) );
+            $this->assertInstanceOf( WP_Error::class, $hasil );
+        } finally {
+            StagingDasarTest::hapus( $luar );
+        }
+    }
+
+    // ---- MINOR (review putaran 1): kunci 'status' yang hilang di keadaan
+    // tidak boleh memicu PHP notice/warning di pemanggil. ----
+
+    public function test_keadaan_tanpa_status_tidak_memicu_notice(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $k = $d->keadaan( self::ID );
+        unset( $k['status'] );
+        $d->simpan_keadaan( self::ID, $k );
+        // 'status' yang hilang diperlakukan AMAN (bukan 'mengunggah', dan
+        // tidak ada di STATUS_BOLEH_BERSIHKAN) -- kedua panggilan berikut
+        // ditolak, tapi PALING PENTING tidak memicu PHP notice/warning
+        // ("Undefined array key") yang di bawah PHPUnit akan tampak
+        // sebagai test ERROR, bukan sekadar assertion gagal.
+        $hasil = $d->unggah( $this->paket( self::ID, 1, 'sql', array( array( 'path' => 'sql' ) ), array( 'y' ) ) );
+        $this->assertInstanceOf( WP_Error::class, $hasil );
+        $galat = $d->bersihkan( self::ID );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+    }
+
     public function test_bersihkan_menghapus_area_tabel_sementara_dan_kunci(): void {
         $d = $this->dorong();
         $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 1;' ) ) );
+        // Fix C2 (review putaran 1): tabel yang dihapus dibatasi JURNAL
+        // push ini sendiri -- catat_tabel() adalah API yang akan dipakai
+        // Task 8 setiap kali CREATE/RENAME sungguhan terjadi.
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
+        $d->catat_tabel( self::ID, 'old', 'wpmgr_old_wp_posts' );
         $this->db->tabel = array( 'wp_posts', 'wpmgr_tmp_wp_posts', 'wpmgr_old_wp_posts' );
         $this->assertSame( array( 'lagi' => false ), $d->bersihkan( self::ID ) );
         $this->assertDirectoryDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        // Status masih 'mengunggah' (bukan status TERMINAL di
+        // STATUS_AMAN_HAPUS_LAMA): tabel SEMENTARA dihapus, tetapi
+        // 'tabel_old' (data produksi tergeser, untuk pemulihan) tetap
+        // dipertahankan sampai statusnya membuktikan tukar benar tuntas.
         $this->assertSame( array( 'wp_posts', 'wpmgr_old_wp_posts' ), $this->db->tabel );
         $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
     }
 
-    // ---- Catatan Task 3 (dispatch): pada database bersama, prefix yang
-    // saling tumpang tindih (mis. site ini 'wp_', site lain di database yang
-    // sama 'wpmgr_tmp_lain_') tidak boleh membuat bersihkan() menghapus
-    // tabel sementara MILIK SITE LAIN -- hanya tabel berawalan
-    // 'wpmgr_tmp_<prefix_site_ini>'/'wpmgr_old_<prefix_site_ini>' yang boleh
-    // disentuh, bukan sekadar 'wpmgr_tmp_%'/'wpmgr_old_%' global. ----
+    // ---- Fix C2 (review putaran 1, Kritis): nama tabel sementara
+    // diturunkan dari nama tabel ASLI (WPMGR_Staging_Sql::ubah()), bukan
+    // dari id push -- dua push berurutan/tumpang-tindih di site yang sama
+    // memakai nama tabel sementara yang SAMA PERSIS. bersihkan() harus
+    // membatasi diri pada jurnal push itu SENDIRI, dan menolak men-DROP
+    // apa pun bila push LAIN sedang memegang kunci (kemungkinan sedang
+    // memakai nama tabel yang sama itu). Skenario: A selesai/direbut, B
+    // merebut lalu mengimpor (memakai nama tabel sementara yang SAMA), lalu
+    // cron membersihkan A -- tabel B tidak boleh ikut terhapus. ----
 
-    public function test_bersihkan_tidak_menyentuh_tabel_sementara_site_lain(): void {
+    public function test_bersihkan_push_direbut_tidak_menghapus_tabel_push_perebut(): void {
+        $d = $this->dorong();
+        // A mengunggah, lalu tabel sementaranya "dibuat" (dicatat jurnal).
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 1;' ) ) );
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
+        // Kunci A dibuat basi (> 2 jam), lalu B merebutnya -- ini juga
+        // menandai A sebagai 'direbut' (fix C1).
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 10800 );
+        $this->assertTrue( $d->kunci( self::ID2 ) );
+        $this->assertSame( 'direbut', $d->keadaan( self::ID )['status'] );
+        // B mengunggah dan mengimpor, memakai NAMA TABEL SEMENTARA YANG
+        // SAMA seperti yang tadinya milik A (nama diturunkan dari nama
+        // tabel asli, bukan dari id push).
+        $d->unggah( $this->paket( self::ID2, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 2;' ) ) );
+        $d->catat_tabel( self::ID2, 'tmp', 'wpmgr_tmp_wp_posts' );
+        $this->db->tabel = array( 'wp_posts', 'wpmgr_tmp_wp_posts' );
+        // Cron/dashboard membersihkan A (direbut, area lamanya dibuang) --
+        // tabel 'wpmgr_tmp_wp_posts' sekarang milik B, TIDAK BOLEH ikut
+        // terhapus, dan kunci B TIDAK BOLEH ikut terlepas.
+        $this->assertSame( array( 'lagi' => false ), $d->bersihkan( self::ID ) );
+        $this->assertDirectoryDoesNotExist( $this->akar . 'wp-content/wpmgr-dorong/' . self::ID );
+        $this->assertSame( array( 'wp_posts', 'wpmgr_tmp_wp_posts' ), $this->db->tabel );
+        $this->assertStringStartsWith( self::ID2 . '|', $this->db->opsi['wpmgr_dorong_kunci'] );
+    }
+
+    // ---- Fix I5 (review putaran 1): hasil kueri() diperiksa di setiap
+    // pemanggilan -- galat basis data adalah 500 KERAS, bukan 409, dan
+    // bukan {lagi:false} yang tampak bersih padahal sebagian gagal. ----
+
+    public function test_kunci_gagal_insert_menghasilkan_500_bukan_409(): void {
+        $d                    = $this->dorong();
+        $this->db->gagal_pada = 'INSERT IGNORE';
+        $galat                = $d->kunci( self::ID );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 500, $galat->get_error_data()['status'] );
+        $this->assertNotSame( 'wpmgr_staging_sibuk', $galat->get_error_code() );
+    }
+
+    public function test_bersihkan_gagal_drop_tabel_menghasilkan_500_bukan_lagi_false(): void {
         $d = $this->dorong();
         $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 1;' ) ) );
-        // 'wpmgr_tmp_lain_posts' meniru tabel sementara site LAIN yang
-        // berbagi database ini (prefix 'lain_', bukan 'wp_' milik site ini).
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
+        $this->db->tabel      = array( 'wp_posts', 'wpmgr_tmp_wp_posts' );
+        $this->db->gagal_pada = 'DROP TABLE';
+        $galat                = $d->bersihkan( self::ID );
+        $this->assertInstanceOf( WP_Error::class, $galat, 'Galat DROP TABLE harus 500 keras, bukan {lagi:false} yang tampak bersih.' );
+        $this->assertSame( 500, $galat->get_error_data()['status'] );
+        // Tabel yang gagal di-drop TETAP ada -- bukan hilang diam-diam.
+        $this->assertContains( 'wpmgr_tmp_wp_posts', $this->db->tabel );
+    }
+
+    // ---- Fix I3 (review putaran 1): batas ruang disk, lewat penyedia yang
+    // bisa disuntik untuk uji (tanpa memanggil disk_free_space() nyata). ----
+
+    public function test_unggah_ditolak_507_saat_disk_hampir_penuh(): void {
+        $d = $this->dorong();
+        WPMGR_Staging_Dorong::atur_penyedia_disk_untuk_uji( function () {
+            // Total 100 GB, bebas hanya 400 MB -- di bawah ambang max(512MB, 5%).
+            return array( 'bebas' => 400 * 1024 * 1024, 'total' => 100 * 1024 * 1024 * 1024 );
+        } );
+        try {
+            $galat = $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+            $this->assertInstanceOf( WP_Error::class, $galat );
+            $this->assertSame( 'wpmgr_staging_disk_penuh', $galat->get_error_code() );
+            $this->assertSame( 507, $galat->get_error_data()['status'] );
+        } finally {
+            WPMGR_Staging_Dorong::atur_penyedia_disk_untuk_uji( null );
+        }
+    }
+
+    public function test_unggah_diterima_saat_disk_masih_cukup(): void {
+        $d = $this->dorong();
+        WPMGR_Staging_Dorong::atur_penyedia_disk_untuk_uji( function () {
+            return array( 'bebas' => 50 * 1024 * 1024 * 1024, 'total' => 100 * 1024 * 1024 * 1024 );
+        } );
+        try {
+            $hasil = $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+            $this->assertArrayHasKey( 'ok', $hasil );
+        } finally {
+            WPMGR_Staging_Dorong::atur_penyedia_disk_untuk_uji( null );
+        }
+    }
+
+    public function test_unggah_ditolak_saat_total_push_melebihi_batas(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $k               = $d->keadaan( self::ID );
+        $k['byte_total'] = WPMGR_Staging_Dorong::MAKS_TOTAL_UNGGAH;
+        $d->simpan_keadaan( self::ID, $k );
+        $galat = $d->unggah( $this->paket( self::ID, 1, 'sql', array( array( 'path' => 'sql' ) ), array( 'y' ) ) );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_disk_penuh', $galat->get_error_code() );
+        $this->assertSame( 507, $galat->get_error_data()['status'] );
+    }
+
+    // ---- MINOR (review putaran 1): nomor yang sama dengan isi BERBEDA
+    // adalah 409; isi SAMA (retry aman) tetap idempoten. ----
+
+    public function test_unggah_nomor_sama_isi_berbeda_ditolak_409(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'x' ) ) );
+        $galat = $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'BERBEDA' ) ) );
+        $this->assertInstanceOf( WP_Error::class, $galat );
+        $this->assertSame( 'wpmgr_staging_nomor_bentrok', $galat->get_error_code() );
+        $this->assertSame( 409, $galat->get_error_data()['status'] );
+    }
+
+    // ---- Fix C2/I2 (review putaran 1): pertahanan berlapis di
+    // tabel_journal_aman() -- entri jurnal yang SALAH (mis. bug pemanggil
+    // Task 8 mencatat nama tabel di luar prefix site ini) tetap ditolak
+    // walau sudah tercatat di jurnal, bukan dipercaya begitu saja. ----
+
+    public function test_bersihkan_mengabaikan_entri_jurnal_di_luar_prefix_site_ini(): void {
+        $d = $this->dorong();
+        $d->unggah( $this->paket( self::ID, 0, 'sql', array( array( 'path' => 'sql' ) ), array( 'SELECT 1;' ) ) );
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_wp_posts' );
+        // Entri jurnal yang SALAH: nama asli 'lain_posts' di luar prefix
+        // site ini ('wp_') -- meniru tabel sementara site LAIN yang berbagi
+        // database ini (prefix 'lain_', sama sekali tidak tumpang tindih).
+        $d->catat_tabel( self::ID, 'tmp', 'wpmgr_tmp_lain_posts' );
         $this->db->tabel = array( 'wp_posts', 'wpmgr_tmp_wp_posts', 'wpmgr_tmp_lain_posts' );
         $this->assertSame( array( 'lagi' => false ), $d->bersihkan( self::ID ) );
         $this->assertSame( array( 'wp_posts', 'wpmgr_tmp_lain_posts' ), $this->db->tabel );

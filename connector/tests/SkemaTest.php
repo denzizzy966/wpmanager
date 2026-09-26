@@ -34,6 +34,26 @@ if ( ! function_exists( 'delete_option' ) ) {
         return true;
     }
 }
+if ( ! defined( 'HOUR_IN_SECONDS' ) ) {
+    define( 'HOUR_IN_SECONDS', 3600 );
+}
+// MINOR (review putaran 1, Task 7): pastikan() sekarang juga menjadwalkan
+// WPMGR_Staging::HOOK_BERSIHKAN di jalur TANPA migrasi -- stub minimal ini
+// hanya mencatat jadwal ke variabel global, cukup untuk diperiksa idempoten
+// (wp_next_scheduled) tanpa WP-Cron sungguhan.
+if ( ! function_exists( 'wp_next_scheduled' ) ) {
+    function wp_next_scheduled( $hook ) {
+        return isset( $GLOBALS['wpmgr_test_terjadwal'][ $hook ] ) ? $GLOBALS['wpmgr_test_terjadwal'][ $hook ] : false;
+    }
+}
+if ( ! function_exists( 'wp_schedule_event' ) ) {
+    function wp_schedule_event( $waktu, $jadwal, $hook ) {
+        $GLOBALS['wpmgr_test_terjadwal'][ $hook ] = $waktu;
+        $GLOBALS['wpmgr_test_terjadwal_panggilan'][ $hook ] = isset( $GLOBALS['wpmgr_test_terjadwal_panggilan'][ $hook ] )
+            ? $GLOBALS['wpmgr_test_terjadwal_panggilan'][ $hook ] + 1 : 1;
+        return true;
+    }
+}
 if ( ! function_exists( 'wp_clear_scheduled_hook' ) ) {
     function wp_clear_scheduled_hook( $hook ) {
         return 0;
@@ -76,7 +96,24 @@ final class SkemaTest extends TestCase {
         $GLOBALS['wpmgr_test_opsi']         = array();
         $GLOBALS['wpmgr_test_transient']    = array();
         $GLOBALS['wpmgr_test_opsi_dihapus'] = array();
+        $GLOBALS['wpmgr_test_terjadwal']            = array();
+        $GLOBALS['wpmgr_test_terjadwal_panggilan']  = array();
         unset( $GLOBALS['wpdb'] );
+    }
+
+    // ---- MINOR (review putaran 1, Task 7): HOOK_BERSIHKAN dijadwalkan
+    // juga dari jalur TANPA migrasi (idempoten). ----
+
+    public function test_pastikan_menjadwalkan_bersihkan_dorong_tanpa_migrasi(): void {
+        $GLOBALS['wpmgr_test_opsi'][ WPMGR_Skema::OPT_VERSI ] = WPMGR_VERSI_SKEMA;
+        $this->assertArrayNotHasKey( WPMGR_Staging::HOOK_BERSIHKAN,
+            isset( $GLOBALS['wpmgr_test_terjadwal'] ) ? $GLOBALS['wpmgr_test_terjadwal'] : array() );
+        WPMGR_Skema::pastikan();
+        $this->assertArrayHasKey( WPMGR_Staging::HOOK_BERSIHKAN, $GLOBALS['wpmgr_test_terjadwal'] );
+        $this->assertSame( 1, $GLOBALS['wpmgr_test_terjadwal_panggilan'][ WPMGR_Staging::HOOK_BERSIHKAN ] );
+        // Idempoten: panggilan kedua tidak menjadwalkan ULANG (wp_next_scheduled sudah ada).
+        WPMGR_Skema::pastikan();
+        $this->assertSame( 1, $GLOBALS['wpmgr_test_terjadwal_panggilan'][ WPMGR_Staging::HOOK_BERSIHKAN ] );
     }
 
     public function test_pastikan_memulihkan_mu_plugin_yang_hilang_sekali_per_hari(): void {
