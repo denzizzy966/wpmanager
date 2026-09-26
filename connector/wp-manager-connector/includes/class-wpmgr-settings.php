@@ -238,6 +238,8 @@ class WPMGR_Settings {
                     Aktifkan hanya bila server ini benar-benar berada di belakang proxy yang Anda
                     kendalikan. Bila diaktifkan tanpa proxy, pengunjung dapat memalsukan IP mereka
                     di riwayat login. Site di balik Cloudflare tidak perlu mengaktifkan ini.
+                    Walaupun diaktifkan dengan benar, klien yang berada di jaringan privat yang sama
+                    dengan server ini tetap dapat memalsukan IP mereka.
                 </p>
                 <?php submit_button( 'Simpan pengaturan' ); ?>
             </form>
