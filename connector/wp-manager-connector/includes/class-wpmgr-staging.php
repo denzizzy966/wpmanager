@@ -90,15 +90,45 @@ class WPMGR_Staging {
     }
 
     public static function manifest( $request ) {
-        $kursor = (string) $request->get_param( 'kursor' );
+        $kursor = $request->get_param( 'kursor' );
+        // Fix 5d (review putaran 1): pagar tipe SEBELUM cast ke string --
+        // get_param() bisa mengembalikan array/objek bila query string
+        // dikirim dalam bentuk itu (mis. '?kursor[]=x'); (string) pada
+        // array memicu PHP Notice/Warning "Array to string conversion",
+        // bukan penolakan bersih.
+        $kursor = is_string( $kursor ) ? $kursor : '';
         if ( '' !== $kursor && is_wp_error( WPMGR_Staging_Path::normalisasi( $kursor ) ) ) {
             return self::galat( 'wpmgr_staging_path', 'Kursor manifest tidak sah.', 400 );
         }
-        $hasil = WPMGR_Staging_Manifest::jalan( self::root(), $kursor, $request->get_param( 'batas' ),
-            microtime( true ) + self::anggaran_detik() );
+
+        $akar = self::root();
+        if ( ! WPMGR_Staging_Manifest::akar_bisa_dibaca( $akar ) ) {
+            // Fix 5e (review putaran 1): direktori WordPress yang tidak
+            // terbaca sama sekali adalah galat KERAS -- manifest kosong
+            // tanpa galat bisa disalahartikan dashboard sebagai "site ini
+            // memang tidak punya berkas" dan melanjutkan tarik seolah-olah
+            // itu benar (mis. menghapus semua berkas staging yang ada).
+            return self::galat( 'wpmgr_manifest_akar', 'Direktori WordPress tidak dapat dibaca.', 500 );
+        }
+
+        $anggaran = self::anggaran_detik();
+        $info     = null;
         if ( '' === $kursor ) {
+            // Fix 2 (review putaran 1): info() menjalankan SHOW TABLE
+            // STATUS + satu SHOW KEYS per tabel -- bisa ratusan query pada
+            // site dengan banyak plugin. Waktu itu dikurangi dari anggaran
+            // penelusuran berkas SEBELUM jalan() dipanggil, bukan
+            // dibiarkan memakan anggaran penuh diam-diam.
+            $mulai    = microtime( true );
             global $wpdb;
-            $hasil['info'] = WPMGR_Staging_Manifest::info( $wpdb, self::root(), WP_CONTENT_DIR );
+            $info     = WPMGR_Staging_Manifest::info( $wpdb, $akar, WP_CONTENT_DIR );
+            $anggaran = WPMGR_Staging_Manifest::anggaran_setelah( $anggaran, $mulai );
+        }
+
+        $hasil = WPMGR_Staging_Manifest::jalan( $akar, $kursor, $request->get_param( 'batas' ),
+            microtime( true ) + $anggaran );
+        if ( null !== $info ) {
+            $hasil['info'] = $info;
         }
         return rest_ensure_response( $hasil );
     }

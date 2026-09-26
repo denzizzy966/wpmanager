@@ -15,6 +15,20 @@ if ( ! defined( 'ABSPATH' ) && ! defined( 'WPMGR_TESTING' ) ) {
  * /staging/file -- symlink dicek langsung (penelusuran tidak pernah masuk
  * ke direktori symlink), dan nama berkas non-UTF-8/tidak sah dicek lewat
  * normalisasi() sebelum berkas itu dimasukkan ke hasil.
+ *
+ * Kontrak respons (fix R3, review putaran 1, item 1): `kursor` bisa menunjuk
+ * ke entri yang DILEWATI (symlink, dikecualikan, tidak terbaca), bukan
+ * hanya yang benar-benar dikirim -- tenggat waktu diperiksa pada SETIAP
+ * entri yang dikunjungi, termasuk yang dilewati, supaya direktori berisi
+ * banyak entri anomali tidak bisa berjalan lewat batas waktu tanpa kursor
+ * pernah maju. Akibatnya satu halaman bisa berisi `berkas: []` dengan
+ * `lagi: true` dan kursor yang tetap maju -- pemanggil (dashboard, task
+ * lanjutan) HARUS menerima halaman kosong seperti itu dan memakai kursor
+ * baru pada permintaan berikutnya, bukan menganggapnya selesai. Residu yang
+ * disengaja: nama bukan UTF-8 tidak pernah bisa dijadikan kursor (kursor
+ * dikirim balik sebagai string dan divalidasi ulang lewat normalisasi() di
+ * WPMGR_Staging::manifest()); nama seperti itu dilewati lagi dengan biaya
+ * murah (satu preg_match) pada setiap halaman berikutnya sampai terlewati.
  */
 class WPMGR_Staging_Manifest {
 
@@ -22,8 +36,13 @@ class WPMGR_Staging_Manifest {
     const MAKS_KEDALAMAN = 64;
     const MAKS_CONTOH    = 50;
 
-    public static $maks_hash     = 52428800;
-    public static $anggaran_hash = 536870912;
+    public static $maks_hash          = 52428800;
+    public static $anggaran_hash      = 536870912;
+    // Item 5a (review putaran 1): perkiraan ukuran terkode JSON tempat
+    // halaman berhenti walau batas jumlah entri (batas()) belum tercapai --
+    // path yang sangat panjang bisa membuat 5000 entri jauh melebihi batas
+    // ukuran request/respons connector (spec: <= 8 MB).
+    public static $maks_bytes_halaman = 6291456;
 
     public static function batas( $nilai ) {
         $n = (int) $nilai;
@@ -38,18 +57,19 @@ class WPMGR_Staging_Manifest {
             'batas'           => self::batas( $batas ),
             'tenggat'         => (float) $tenggat,
             'terhash'         => 0,
+            'bytes_hal'       => 0,
+            'kursor_kandidat' => null,
             'berhenti'        => false,
         );
         $kursor = (string) $kursor;
         $bagian = ( '' === $kursor ) ? array() : explode( '/', $kursor );
         self::telusuri( $akar, '', $bagian, ! empty( $bagian ), $ctx, 0 );
-        $jumlah = count( $ctx['berkas'] );
         return array(
             'berkas'          => $ctx['berkas'],
             'dilewati'        => $ctx['dilewati'],
             'jumlah_dilewati' => $ctx['jumlah_dilewati'],
-            'kursor'          => ( $ctx['berhenti'] && $jumlah ) ? $ctx['berkas'][ $jumlah - 1 ]['path'] : null,
-            'lagi'            => $ctx['berhenti'] && $jumlah > 0,
+            'kursor'          => $ctx['berhenti'] ? $ctx['kursor_kandidat'] : null,
+            'lagi'            => $ctx['berhenti'] && null !== $ctx['kursor_kandidat'],
         );
     }
 
@@ -62,9 +82,58 @@ class WPMGR_Staging_Manifest {
         }
     }
 
-    /** Tenggat dan anggaran hanya berlaku setelah ada berkas: kursor harus selalu maju. */
+    /**
+     * Kandidat kursor: path entri yang baru saja dikunjungi (dikirim MAUPUN
+     * dilewati), disimpan HANYA bila path itu sendiri lolos normalisasi().
+     * Kursor dikembalikan sebagai string dan dikirim balik oleh dashboard
+     * pada permintaan berikutnya, yang divalidasi ulang lewat normalisasi()
+     * juga (lihat WPMGR_Staging::manifest()) -- path yang gagal validasi
+     * itu (nama bukan UTF-8, mengandung ':', berakhiran '.'/spasi, atau
+     * terlalu panjang) tidak aman dijadikan kursor karena permintaan
+     * lanjutan dengan kursor itu akan ditolak 400, bukan melanjutkan.
+     */
+    private static function catat_kursor( array &$ctx, $rel ) {
+        if ( ! is_wp_error( WPMGR_Staging_Path::normalisasi( $rel ) ) ) {
+            $ctx['kursor_kandidat'] = $rel;
+        }
+    }
+
+    /**
+     * Tenggat hanya aktif setelah ADA kandidat kursor yang tercatat: ini
+     * menjamin setiap request memvisit setidaknya satu entri (terkirim
+     * ATAU dilewati) sebelum bisa berhenti, sehingga kursor selalu maju
+     * walau tenggat sudah lewat sebelum entri pertama diproses.
+     */
     private static function habis( array $ctx ) {
-        return count( $ctx['berkas'] ) > 0 && microtime( true ) >= $ctx['tenggat'];
+        return null !== $ctx['kursor_kandidat'] && microtime( true ) >= $ctx['tenggat'];
+    }
+
+    /**
+     * Item 5f (review putaran 1): WPMGR_Staging_Path::dikecualikan() (milik
+     * Task 2) menganggap NAMA yang berakhiran '.log' sebagai berkas log
+     * yang dikecualikan -- aturan itu hanya masuk akal untuk BERKAS (mis.
+     * wp-content/debug.log). Direktori yang kebetulan bernama serupa (mis.
+     * plugin yang keliru membuat folder seperti itu) tidak boleh ikut
+     * dikecualikan hanya karena akhiran namanya; direktori hanya
+     * dikecualikan bila termasuk pola KHUSUS direktori (cache, area
+     * sementara dorong, atau isi backup plugin). Diduplikasi secara sengaja
+     * dari dikecualikan() (bukan memodifikasi berkas itu, milik Task 2)
+     * supaya perilaku file-vs-direktori yang berbeda tetap jelas di sini.
+     */
+    private static function direktori_dikecualikan( $rel ) {
+        $rendah = strtolower( (string) $rel );
+        foreach ( array( 'wp-content/cache', 'wp-content/wpmgr-dorong' ) as $dir ) {
+            if ( $rendah === $dir || 0 === strpos( $rendah, $dir . '/' ) ) {
+                return true;
+            }
+        }
+        $bagian = explode( '/', $rendah );
+        if ( count( $bagian ) >= 2 && 'wp-content' === $bagian[0] ) {
+            if ( in_array( $bagian[1], WPMGR_Staging_Path::BACKUP_KONTEN, true ) || 0 === strpos( $bagian[1], 'backups-dup-' ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static function telusuri( $akar, $rel_dir, array $kursor, $selaras, array &$ctx, $kedalaman ) {
@@ -87,7 +156,8 @@ class WPMGR_Staging_Manifest {
             if ( '.' === $n || '..' === $n ) {
                 continue;
             }
-            $masuk_selaras = false;
+            $masuk_selaras      = false;
+            $lewati_leaf_kursor = false;
             if ( null !== $target ) {
                 $banding = strcmp( $n, $target );
                 if ( $banding < 0 ) {
@@ -95,48 +165,84 @@ class WPMGR_Staging_Manifest {
                 }
                 if ( 0 === $banding ) {
                     if ( $kedalaman === $terakhir ) {
-                        continue;
+                        $lewati_leaf_kursor = true;
+                    } else {
+                        $masuk_selaras = true;
                     }
-                    $masuk_selaras = true;
                 }
             }
+
             $rel = $rel_dir . $n;
             $abs = $akar . $rel;
+
+            // Fix 5c (review putaran 1): kursor menunjuk ke NAMA ini sebagai
+            // berkas yang sudah terkirim pada halaman sebelumnya. Bila di
+            // antara dua request berkas itu dihapus dan digantikan
+            // direktori BERNAMA SAMA, isi direktori itu belum pernah
+            // dikirim sama sekali -- melewatinya begitu saja (perilaku
+            // lama) akan menghilangkan semua berkas di dalamnya dari
+            // manifest selamanya. Hanya lewati bila nama ini SUNGGUH BUKAN
+            // direktori (symlink tetap ditangani lewat jalur symlink biasa
+            // di bawah, bukan di sini).
+            if ( $lewati_leaf_kursor ) {
+                if ( is_dir( $abs ) && ! is_link( $abs ) ) {
+                    $masuk_selaras = false; // tidak ada info penyelarasan lagi di bawah level ini
+                } else {
+                    continue;
+                }
+            }
+
+            // Item 1 (review putaran 1): tenggat waktu diperiksa di SINI,
+            // pada SETIAP entri yang benar-benar dikunjungi -- termasuk
+            // yang akan dilewati (symlink, dikecualikan, tidak terbaca,
+            // dst.), bukan hanya saat ada berkas yang terkirim. Tanpa ini,
+            // direktori berisi ribuan entri yang semuanya dilewati (mis.
+            // ribuan *.log, atau symlink) bisa berjalan lewat batas waktu
+            // 30 detik tanpa pernah berhenti, DAN tanpa kursor pernah maju
+            // -- request berikutnya mengulang dari awal dan macet
+            // selamanya. habis() hanya aktif setelah ADA kandidat kursor
+            // yang tercatat (lihat catat_kursor()), supaya setiap request
+            // tetap dijamin maju walau tenggat sudah lewat sebelum entri
+            // pertama diproses.
+            if ( self::habis( $ctx ) ) {
+                $ctx['berhenti'] = true;
+                return;
+            }
+
             if ( 1 !== preg_match( '//u', $n ) ) {
                 self::lewati( $ctx, $rel, 'nama_bukan_utf8' );
-                continue;
+                continue; // catat_kursor() TIDAK dipanggil -- lihat catatan residu di docblock kelas.
             }
             if ( is_link( $abs ) ) {
                 self::lewati( $ctx, $rel, 'symlink' );
+                self::catat_kursor( $ctx, $rel );
                 continue;
             }
             if ( is_dir( $abs ) ) {
-                if ( WPMGR_Staging_Path::dikecualikan( $rel ) ) {
+                if ( self::direktori_dikecualikan( $rel ) ) {
+                    self::catat_kursor( $ctx, $rel );
                     continue;
-                }
-                if ( self::habis( $ctx ) ) {
-                    $ctx['berhenti'] = true;
-                    return;
                 }
                 self::telusuri( $akar, $rel . '/', $kursor, $masuk_selaras, $ctx, $kedalaman + 1 );
                 continue;
             }
             if ( ! is_file( $abs ) || WPMGR_Staging_Path::dikecualikan( $rel ) ) {
+                self::catat_kursor( $ctx, $rel );
                 continue;
             }
             if ( is_wp_error( WPMGR_Staging_Path::normalisasi( $rel ) ) ) {
                 self::lewati( $ctx, $rel, 'path_tidak_sah' );
-                continue;
+                continue; // rel sendiri gagal normalisasi: tidak aman dijadikan kursor.
             }
             $ukuran = @filesize( $abs ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
             $mtime  = @filemtime( $abs ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
             if ( false === $ukuran || false === $mtime || ! is_readable( $abs ) ) {
                 self::lewati( $ctx, $rel, 'tidak_terbaca' );
+                self::catat_kursor( $ctx, $rel );
                 continue;
             }
             $perlu_hash = $ukuran <= self::$maks_hash;
-            if ( self::habis( $ctx )
-                || ( $perlu_hash && $ctx['terhash'] > 0 && $ctx['terhash'] + $ukuran > self::$anggaran_hash ) ) {
+            if ( $perlu_hash && $ctx['terhash'] > 0 && $ctx['terhash'] + $ukuran > self::$anggaran_hash ) {
                 $ctx['berhenti'] = true;
                 return;
             }
@@ -145,12 +251,15 @@ class WPMGR_Staging_Manifest {
                 $hash = @hash_file( 'sha256', $abs ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
                 if ( false === $hash ) {
                     self::lewati( $ctx, $rel, 'tidak_terbaca' );
+                    self::catat_kursor( $ctx, $rel );
                     continue;
                 }
                 $ctx['terhash'] += $ukuran;
             }
-            $ctx['berkas'][] = array( 'path' => $rel, 'ukuran' => (int) $ukuran, 'mtime' => (int) $mtime, 'hash' => $hash );
-            if ( count( $ctx['berkas'] ) >= $ctx['batas'] ) {
+            $ctx['berkas'][]   = array( 'path' => $rel, 'ukuran' => (int) $ukuran, 'mtime' => (int) $mtime, 'hash' => $hash );
+            $ctx['bytes_hal'] += strlen( $rel ) + ( null === $hash ? 8 : 72 ); // perkiraan kasar, lihat $maks_bytes_halaman
+            self::catat_kursor( $ctx, $rel );
+            if ( count( $ctx['berkas'] ) >= $ctx['batas'] || $ctx['bytes_hal'] >= self::$maks_bytes_halaman ) {
                 $ctx['berhenti'] = true;
                 return;
             }
@@ -191,7 +300,15 @@ class WPMGR_Staging_Manifest {
                 continue;
             }
             if ( empty( $b['Engine'] ) ) {
-                continue; // VIEW: tidak diekspor, dibuat ulang oleh plugin pemiliknya.
+                // VIEW (Comment = 'VIEW') tidak diekspor, dibuat ulang oleh
+                // plugin pemiliknya -- dilewati diam-diam seperti sebelumnya.
+                // Item 5g (review putaran 1): Engine NULL yang BUKAN view
+                // (mis. tabel rusak) dihitung di tabel_dilewati supaya
+                // dashboard bisa memperingatkan, bukan hilang tanpa jejak.
+                if ( 'VIEW' !== ( isset( $b['Comment'] ) ? (string) $b['Comment'] : '' ) ) {
+                    $dilewati++;
+                }
+                continue;
             }
             if ( count( $hasil ) >= 2000 ) {
                 $dilewati++;
@@ -199,32 +316,91 @@ class WPMGR_Staging_Manifest {
             }
             $hasil[] = array(
                 'nama'   => $nama,
+                // 'baris' (Rows) adalah ESTIMASI untuk InnoDB (statistik
+                // kardinalitas indeks), bukan hitungan pasti -- item 5h.
                 'baris'  => (int) $b['Rows'],
                 'ukuran' => (int) $b['Data_length'] + (int) $b['Index_length'],
-                'mesin'  => (string) $b['Engine'],
+                'mesin'  => WPMGR_Staging::bersih( isset( $b['Engine'] ) ? (string) $b['Engine'] : '', 64 ),
                 'pk'     => self::pk( $wpdb, $nama ),
             );
         }
         return array( $hasil, $dilewati );
     }
 
+    /**
+     * Meniru penguraian PHP untuk nilai bergaya "8M"/"512K"/"2G"
+     * (post_max_size, upload_max_filesize, dst.): angka di depan diambil
+     * sampai karakter bukan digit pertama (bagian desimal seperti '.5' pada
+     * '1.5M' diabaikan, seperti zend_atol()), lalu karakter TERAKHIR dari
+     * string dipakai sebagai akhiran satuan bila K/M/G. Fix item 4 (review
+     * putaran 1): regex lama menuntut string SELURUHNYA berupa digit +
+     * akhiran, sehingga '1.5M' gagal total dan dianggap 0 byte.
+     */
     public static function ke_byte( $nilai ) {
         $nilai = trim( (string) $nilai );
-        if ( ! preg_match( '/^([0-9]+)\s*([KkMmGg]?)\z/', $nilai, $m ) ) {
+        if ( ! preg_match( '/^([0-9]+)/', $nilai, $m ) ) {
             return 0;
         }
-        $n    = (int) $m[1];
-        $kali = array( '' => 1, 'k' => 1024, 'm' => 1048576, 'g' => 1073741824 );
-        return $n * $kali[ strtolower( $m[2] ) ];
+        $n     = (int) $m[1];
+        $akhir = strtolower( substr( $nilai, -1 ) );
+        $kali  = array( 'k' => 1024, 'm' => 1048576, 'g' => 1073741824 );
+        return $n * ( isset( $kali[ $akhir ] ) ? $kali[ $akhir ] : 1 );
     }
 
-    /** Koreksi #15: body 8 MB ditolak hosting dengan post_max_size=8M. */
+    /**
+     * Koreksi #15: body 8 MB ditolak hosting dengan post_max_size=8M --
+     * potongan unggah paling besar separuh post_max_size, dijepit ke 4 MB
+     * di atas.
+     *
+     * Fix item 4 (review putaran 1): batas BAWAH 256 KB HANYA berlaku bila
+     * itu tidak melebihi separuh post_max_size -- pada post_max_size <
+     * 512 KB, menjepit ke 256 KB membuat SATU potongan lebih besar dari
+     * post_max_size itu sendiri (ditolak PHP, persis masalah yang batas ini
+     * seharusnya mencegah). Pada kasus itu potongan mengikuti separuh
+     * post_max_size apa adanya (kecil tapi valid); unggah_kecil() menandai
+     * kasus ini supaya dashboard bisa memperingatkan operator.
+     */
     public static function batas_unggah( $post_max_size ) {
         $b = self::ke_byte( $post_max_size );
         if ( $b <= 0 ) {
             return 4194304;
         }
-        return max( 262144, min( 4194304, intdiv( $b, 2 ) ) );
+        $separuh = intdiv( $b, 2 );
+        if ( $separuh < 262144 ) {
+            return max( 1, $separuh );
+        }
+        return min( 4194304, $separuh );
+    }
+
+    public static function unggah_kecil( $post_max_size ) {
+        return self::batas_unggah( $post_max_size ) < 262144;
+    }
+
+    /**
+     * Item 3 (review putaran 1): perbandingan berawalan (strpos) terhadap
+     * path MENTAH tidak cukup -- wp-content yang di-symlink-kan (mis.
+     * ABSPATH/wp-content -> /mnt/data/wp-content) tetap "tampak" berada di
+     * dalam akar menurut strpos, padahal manifest yang hanya menelusuri
+     * ABSPATH tidak pernah masuk ke direktori symlink dan tidak akan
+     * pernah melihat isinya -- staging jadi dibuat tanpa tema, plugin,
+     * atau unggahan sama sekali tanpa peringatan. Di sini realpath(konten)
+     * dibandingkan PERSIS SAMA dengan realpath(akar) . '/wp-content'; wp-
+     * content yang di-symlink-kan, berada di luar akar sama sekali, atau
+     * realpath yang gagal (tidak terbaca/tidak ada), semuanya dilaporkan
+     * konten_di_luar = true.
+     */
+    private static function konten_di_luar( $akar_baku, $konten_baku ) {
+        if ( @is_link( $akar_baku . '/wp-content' ) ) {
+            return true;
+        }
+        $akar_nyata   = @realpath( $akar_baku );
+        $konten_nyata = @realpath( $konten_baku );
+        if ( false === $akar_nyata || false === $konten_nyata ) {
+            return true;
+        }
+        $akar_nyata   = rtrim( str_replace( '\\', '/', $akar_nyata ), '/' );
+        $konten_nyata = rtrim( str_replace( '\\', '/', $konten_nyata ), '/' );
+        return $konten_nyata !== ( $akar_nyata . '/wp-content' );
     }
 
     /**
@@ -234,20 +410,47 @@ class WPMGR_Staging_Manifest {
      */
     public static function info( $wpdb, $akar, $konten ) {
         list( $tabel, $dilewati ) = self::tabel( $wpdb );
-        $konten = rtrim( str_replace( '\\', '/', (string) $konten ), '/' ) . '/';
-        $akar   = rtrim( str_replace( '\\', '/', (string) $akar ), '/' ) . '/';
+        $akar_baku   = rtrim( str_replace( '\\', '/', (string) $akar ), '/' );
+        $konten_baku = rtrim( str_replace( '\\', '/', (string) $konten ), '/' );
+        $post_max    = ini_get( 'post_max_size' );
         return array(
-            'php'            => PHP_VERSION,
-            'wp'             => (string) get_bloginfo( 'version' ),
-            'table_prefix'   => (string) $wpdb->prefix,
-            'charset'        => (string) $wpdb->charset,
-            'home'           => (string) home_url(),
-            'siteurl'        => (string) site_url(),
-            'multisite'      => (bool) is_multisite(),
-            'konten_di_luar' => 0 !== strpos( $konten, (string) $akar ),
-            'batas_unggah'   => self::batas_unggah( ini_get( 'post_max_size' ) ),
-            'tabel'          => $tabel,
-            'tabel_dilewati' => $dilewati,
+            'php'                  => PHP_VERSION,
+            'wp'                   => (string) get_bloginfo( 'version' ),
+            'table_prefix'         => (string) $wpdb->prefix,
+            // Item 5b (review putaran 1): string dari WordPress/DB dibersihkan
+            // ke UTF-8 sah lewat WPMGR_Staging::bersih() sebelum dikirim --
+            // sama seperti aturan umum untuk teks dari sistem berkas/DB.
+            'charset'              => WPMGR_Staging::bersih( (string) $wpdb->charset, 64 ),
+            'home'                 => WPMGR_Staging::bersih( (string) home_url(), 255 ),
+            'siteurl'              => WPMGR_Staging::bersih( (string) site_url(), 255 ),
+            'multisite'            => (bool) is_multisite(),
+            'konten_di_luar'       => self::konten_di_luar( $akar_baku, $konten_baku ),
+            'batas_unggah'         => self::batas_unggah( $post_max ),
+            'unggah_terlalu_kecil' => self::unggah_kecil( $post_max ),
+            'tabel'                => $tabel,
+            'tabel_dilewati'       => $dilewati,
         );
+    }
+
+    /**
+     * Item 2 (review putaran 1): anggaran waktu tersisa setelah info()
+     * (query metadata tabel: SHOW TABLE STATUS + satu SHOW KEYS per tabel,
+     * bisa ratusan query) memakan sebagian waktu request -- dijepit
+     * minimal 1 detik supaya jalan() masih sempat memvisit setidaknya satu
+     * entri walau info() kebetulan lambat.
+     */
+    public static function anggaran_setelah( $anggaran_awal, $mulai ) {
+        return max( 1.0, (float) $anggaran_awal - ( microtime( true ) - (float) $mulai ) );
+    }
+
+    /**
+     * Item 5e (review putaran 1): direktori akar yang tidak terbaca sama
+     * sekali (hak akses salah, atau akar salah dikonfigurasi) dibedakan
+     * dari "site ini memang tidak punya berkas" -- dipakai
+     * WPMGR_Staging::manifest() untuk menolak dengan galat KERAS, bukan
+     * mengirim manifest kosong yang tampak seolah-olah sah.
+     */
+    public static function akar_bisa_dibaca( $akar ) {
+        return false !== @scandir( $akar ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
     }
 }

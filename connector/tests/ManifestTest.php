@@ -1,50 +1,9 @@
 <?php
 use PHPUnit\Framework\TestCase;
 
-if ( ! function_exists( 'get_bloginfo' ) ) {
-    function get_bloginfo( $apa = '' ) {
-        return 'version' === $apa ? '6.5' : '';
-    }
-}
-if ( ! function_exists( 'home_url' ) ) {
-    function home_url() {
-        return 'https://contoh.test';
-    }
-}
-if ( ! function_exists( 'site_url' ) ) {
-    function site_url() {
-        return 'https://contoh.test/wp';
-    }
-}
-if ( ! function_exists( 'is_multisite' ) ) {
-    function is_multisite() {
-        return false;
-    }
-}
-
-final class WPMGR_FakeWpdbManifest {
-    public $prefix  = 'wp_';
-    public $charset = 'utf8mb4';
-    public $jawaban = array();
-
-    public function esc_like( $t ) {
-        return addcslashes( $t, '_%\\' );
-    }
-
-    public function prepare( $sql ) {
-        $args = array_slice( func_get_args(), 1 );
-        return vsprintf( str_replace( '%s', "'%s'", $sql ), $args );
-    }
-
-    public function get_results( $sql, $format = null ) {
-        foreach ( $this->jawaban as $pola => $hasil ) {
-            if ( false !== strpos( $sql, $pola ) ) {
-                return $hasil;
-            }
-        }
-        return array();
-    }
-}
+// get_bloginfo()/home_url()/site_url()/is_multisite()/rest_ensure_response()
+// dan WPMGR_FakeWpdbManifest kini dipusatkan di tests/bootstrap.php (dipakai
+// juga oleh ManifestRestTest.php).
 
 final class ManifestTest extends TestCase {
 
@@ -53,8 +12,9 @@ final class ManifestTest extends TestCase {
     protected function setUp(): void {
         $this->akar = sys_get_temp_dir() . '/wpmgr-man-' . bin2hex( random_bytes( 6 ) ) . '/';
         mkdir( $this->akar, 0777, true );
-        WPMGR_Staging_Manifest::$maks_hash     = 52428800;
-        WPMGR_Staging_Manifest::$anggaran_hash = 536870912;
+        WPMGR_Staging_Manifest::$maks_hash          = 52428800;
+        WPMGR_Staging_Manifest::$anggaran_hash      = 536870912;
+        WPMGR_Staging_Manifest::$maks_bytes_halaman = 6291456;
     }
 
     protected function tearDown(): void {
@@ -104,6 +64,15 @@ final class ManifestTest extends TestCase {
         $this->assertIsInt( $h['berkas'][0]['mtime'] );
     }
 
+    public function test_direktori_berakhiran_log_tidak_dikecualikan(): void {
+        // Item (5f, review putaran 1): aturan '.log' di
+        // WPMGR_Staging_Path::dikecualikan() hanya masuk akal untuk BERKAS;
+        // direktori yang kebetulan bernama serupa harus tetap ditelusuri.
+        $this->tulis( 'wp-content/aneh.log/dalam.txt' );
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
+        $this->assertContains( 'wp-content/aneh.log/dalam.txt', array_column( $h['berkas'], 'path' ) );
+    }
+
     public function test_berkas_besar_tanpa_hash(): void {
         WPMGR_Staging_Manifest::$maks_hash = 5;
         $this->tulis( 'kecil.txt', '12345' );
@@ -130,6 +99,20 @@ final class ManifestTest extends TestCase {
         }
         $h = WPMGR_Staging_Manifest::jalan( $this->akar, 'a/xx.txt', 5000, microtime( true ) + 30 );
         $this->assertSame( array( 'a/z.txt', 'b.txt' ), array_column( $h['berkas'], 'path' ) );
+    }
+
+    public function test_kursor_menunjuk_berkas_yang_kini_jadi_direktori(): void {
+        // Item (5c, review putaran 1): berkas yang kursor tunjuk (sudah
+        // terkirim di halaman sebelumnya) dihapus dan digantikan direktori
+        // BERNAMA SAMA di antara dua request. Isi direktori baru itu belum
+        // pernah dikirim -- melewatinya (perilaku lama) akan menghilangkan
+        // semua berkas di dalamnya dari manifest selamanya.
+        $this->tulis( 'a/tandaku.txt' );
+        unlink( $this->akar . 'a/tandaku.txt' );
+        mkdir( $this->akar . 'a/tandaku.txt', 0777, true );
+        file_put_contents( $this->akar . 'a/tandaku.txt/baru.txt', 'x' );
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, 'a/tandaku.txt', 5000, microtime( true ) + 30 );
+        $this->assertSame( array( 'a/tandaku.txt/baru.txt' ), array_column( $h['berkas'], 'path' ) );
     }
 
     public function test_nama_non_ascii_bukan_utf8_dan_panjang(): void {
@@ -159,6 +142,91 @@ final class ManifestTest extends TestCase {
         $this->assertNotFalse( json_encode( $h ) );
     }
 
+    public function test_nama_mencapai_batas_segmen_255_byte(): void {
+        // RF1 lama hanya menguji 200 byte, jauh di bawah MAKS_SEGMEN (255
+        // byte) -- item 5i, fix round 1. Sisi TEPAT DI BATAS (masih sah)
+        // diuji lewat penelusuran manifest sungguhan. Sisi MELEWATI batas
+        // (256 byte) TIDAK BISA dibuat sebagai berkas sungguhan di disk:
+        // filesystem lazim (ext4/NTFS/APFS) sendiri membatasi NAME_MAX di
+        // sekitar 255 byte, jadi sisi itu diuji langsung lewat
+        // WPMGR_Staging_Path::normalisasi() (fungsi murni, tanpa I/O)
+        // alih-alih lewat penelusuran manifest.
+        $pas = str_repeat( 'a', 255 );
+        if ( ! $this->tulis( 'wp-content/uploads/' . $pas ) ) {
+            $this->markTestSkipped( 'Sistem berkas ini tidak mengizinkan nama sepanjang ini.' );
+        }
+        $h    = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
+        $path = array_column( $h['berkas'], 'path' );
+        $this->assertContains( 'wp-content/uploads/' . $pas, $path );
+
+        $lebih = str_repeat( 'a', 256 );
+        $this->assertInstanceOf(
+            WP_Error::class,
+            WPMGR_Staging_Path::normalisasi( 'wp-content/uploads/' . $lebih )
+        );
+    }
+
+    public function test_nama_titik_dua_atau_akhiran_titik_atau_spasi_dilewati(): void {
+        // Item 5i, fix round 1: ':' di tengah nama, atau '.'/spasi di akhir
+        // nama, ditolak WPMGR_Staging_Path::normalisasi() (aturan Task 2)
+        // dan harus dilaporkan 'path_tidak_sah', tidak pernah didaftar.
+        // Hanya benar-benar teruji di Linux -- Windows menolak ':' langsung
+        // saat file_put_contents(), dan API Win32 memangkas '.'/spasi akhir
+        // sebelum berkas tersimpan (lihat komentar path.php sendiri).
+        $kasus   = array( 'aneh:nama.txt', 'akhiran-titik.txt.', 'akhiran-spasi.txt ' );
+        $ditulis = array();
+        foreach ( $kasus as $nama ) {
+            $abs = $this->akar . 'wp-content/uploads/' . $nama;
+            if ( ! is_dir( dirname( $abs ) ) ) {
+                mkdir( dirname( $abs ), 0777, true );
+            }
+            if ( false === @file_put_contents( $abs, 'x' ) ) {
+                continue;
+            }
+            if ( in_array( $nama, scandir( dirname( $abs ) ), true ) ) {
+                $ditulis[] = $nama;
+            }
+        }
+        if ( empty( $ditulis ) ) {
+            $this->markTestSkipped( 'Sistem berkas ini tidak mengizinkan nama semacam ini (kemungkinan Windows).' );
+        }
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
+        foreach ( $ditulis as $nama ) {
+            $rel       = 'wp-content/uploads/' . $nama;
+            $ditemukan = false;
+            foreach ( $h['dilewati'] as $d ) {
+                if ( $rel === $d['path'] ) {
+                    $ditemukan = true;
+                    $this->assertSame( 'path_tidak_sah', $d['alasan'], $nama );
+                }
+            }
+            $this->assertTrue( $ditemukan, "Nama '$nama' seharusnya dilaporkan dilewati." );
+            $this->assertNotContains( $rel, array_column( $h['berkas'], 'path' ), $nama );
+        }
+    }
+
+    public function test_direktori_nama_bukan_utf8_dilewati(): void {
+        $abs = $this->akar . "wp-content/uploads/\xff\xfe-dir";
+        if ( ! @mkdir( $abs, 0777, true ) ) {
+            $this->markTestSkipped( 'Tidak bisa membuat direktori dengan nama ini.' );
+        }
+        file_put_contents( $abs . '/dalam.txt', 'x' );
+        $sungguhan_bukan_utf8 = false;
+        foreach ( scandir( $this->akar . 'wp-content/uploads' ) as $n ) {
+            $sungguhan_bukan_utf8 = $sungguhan_bukan_utf8 || 1 !== preg_match( '//u', $n );
+        }
+        if ( ! $sungguhan_bukan_utf8 ) {
+            $this->markTestSkipped( 'Sistem berkas ini tidak menyimpan nama bukan UTF-8 (kemungkinan Windows).' );
+        }
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
+        foreach ( $h['berkas'] as $b ) {
+            $this->assertStringNotContainsString( 'dalam.txt', $b['path'] );
+        }
+        $alasan = array_column( $h['dilewati'], 'alasan' );
+        $this->assertContains( 'nama_bukan_utf8', $alasan );
+        $this->assertNotFalse( json_encode( $h ) );
+    }
+
     public function test_symlink_dilewati(): void {
         $this->tulis( 'asli.txt' );
         if ( ! @symlink( $this->akar . 'asli.txt', $this->akar . 'tautan.txt' ) ) {
@@ -167,6 +235,22 @@ final class ManifestTest extends TestCase {
         $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
         $this->assertSame( array( 'asli.txt' ), array_column( $h['berkas'], 'path' ) );
         $this->assertSame( 'symlink', $h['dilewati'][0]['alasan'] );
+    }
+
+    public function test_symlink_direktori_dilewati(): void {
+        $this->tulis( 'nyata/dalam.txt' );
+        if ( ! @symlink( $this->akar . 'nyata', $this->akar . 'tautan-dir' ) ) {
+            $this->markTestSkipped( 'Symlink tidak didukung di sistem ini.' );
+        }
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
+        $this->assertSame( array( 'nyata/dalam.txt' ), array_column( $h['berkas'], 'path' ) );
+        $ditemukan = false;
+        foreach ( $h['dilewati'] as $d ) {
+            if ( 'symlink' === $d['alasan'] && 'tautan-dir' === $d['path'] ) {
+                $ditemukan = true;
+            }
+        }
+        $this->assertTrue( $ditemukan );
     }
 
     public function test_anggaran_hash_dan_tenggat_menjamin_kemajuan(): void {
@@ -184,6 +268,53 @@ final class ManifestTest extends TestCase {
         $this->assertTrue( $lewat['lagi'] );
     }
 
+    public function test_tenggat_maju_meski_semua_entri_pertama_dilewati(): void {
+        // Item 1, fix round 1: sebelum perbaikan, tenggat/kemajuan hanya
+        // diperiksa setelah ADA berkas yang terkirim -- direktori berisi
+        // banyak entri yang dilewati (di sini: berkas *.log yang
+        // dikecualikan) tanpa satu pun berkas asli bisa berjalan lewat
+        // batas waktu tanpa kursor pernah maju, dan halaman berikutnya
+        // mengulang persis dari awal (macet selamanya). Sekarang kursor
+        // juga bisa menunjuk ke entri yang DILEWATI (asal namanya lolos
+        // normalisasi()), jadi paging bisa melewati direktori seperti ini
+        // walau tenggat sudah lewat sebelum satu pun berkas terkirim.
+        $this->tulis( 'a-debug.log' );
+        $this->tulis( 'b-debug.log' );
+        $this->tulis( 'z-asli.txt', 'isi' );
+
+        $h1 = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) - 1 );
+        $this->assertSame( array(), array_column( $h1['berkas'], 'path' ) );
+        $this->assertTrue( $h1['lagi'] );
+        $this->assertSame( 'a-debug.log', $h1['kursor'] );
+
+        $kursor    = $h1['kursor'];
+        $terkumpul = array();
+        for ( $i = 0; $i < 10; $i++ ) {
+            $h = WPMGR_Staging_Manifest::jalan( $this->akar, $kursor, 5000, microtime( true ) + 30 );
+            foreach ( $h['berkas'] as $b ) {
+                $terkumpul[] = $b['path'];
+            }
+            if ( ! $h['lagi'] ) {
+                break;
+            }
+            $kursor = $h['kursor'];
+        }
+        $this->assertSame( array( 'z-asli.txt' ), $terkumpul );
+    }
+
+    public function test_batas_ukuran_halaman_direspons(): void {
+        // Item 5a, fix round 1: halaman berhenti sebelum jumlah entri
+        // mencapai $batas bila perkiraan ukuran terkode sudah melewati
+        // $maks_bytes_halaman -- di sini dijepit sangat kecil untuk diuji.
+        WPMGR_Staging_Manifest::$maks_bytes_halaman = 10;
+        $this->tulis( 'a.txt', 'x' );
+        $this->tulis( 'b.txt', 'x' );
+        $this->tulis( 'c.txt', 'x' );
+        $h = WPMGR_Staging_Manifest::jalan( $this->akar, '', 5000, microtime( true ) + 30 );
+        $this->assertTrue( $h['lagi'] );
+        $this->assertLessThan( 3, count( $h['berkas'] ) );
+    }
+
     public function test_batas_dijepit(): void {
         $this->assertSame( 5000, WPMGR_Staging_Manifest::batas( null ) );
         $this->assertSame( 5000, WPMGR_Staging_Manifest::batas( 0 ) );
@@ -192,11 +323,13 @@ final class ManifestTest extends TestCase {
     }
 
     public function test_info_dan_tabel(): void {
-        $wpdb = new WPMGR_FakeWpdbManifest();
+        mkdir( rtrim( $this->akar, '/' ) . '/wp-content', 0777, true );
+        $wpdb          = new WPMGR_FakeWpdbManifest();
         $wpdb->jawaban = array(
             'SHOW TABLE STATUS' => array(
                 array( 'Name' => 'wp_posts', 'Rows' => '12', 'Data_length' => '1000', 'Index_length' => '24', 'Engine' => 'InnoDB' ),
-                array( 'Name' => 'wp_tampilan', 'Rows' => null, 'Data_length' => null, 'Index_length' => null, 'Engine' => null ),
+                array( 'Name' => 'wp_tampilan', 'Rows' => null, 'Data_length' => null, 'Index_length' => null, 'Engine' => null, 'Comment' => 'VIEW' ),
+                array( 'Name' => 'wp_rusak', 'Rows' => null, 'Data_length' => null, 'Index_length' => null, 'Engine' => null ),
                 array( 'Name' => 'wp_bad-name', 'Rows' => '1', 'Data_length' => '1', 'Index_length' => '0', 'Engine' => 'MyISAM' ),
                 array( 'Name' => 'lain_posts', 'Rows' => '1', 'Data_length' => '1', 'Index_length' => '0', 'Engine' => 'MyISAM' ),
             ),
@@ -208,11 +341,35 @@ final class ManifestTest extends TestCase {
         $this->assertSame( 'wp_', $info['table_prefix'] );
         $this->assertSame( 'https://contoh.test', $info['home'] );
         $this->assertFalse( $info['konten_di_luar'] );
+        $this->assertIsBool( $info['unggah_terlalu_kecil'] );
         $this->assertSame( array( array( 'nama' => 'wp_posts', 'baris' => 12, 'ukuran' => 1024,
                                          'mesin' => 'InnoDB', 'pk' => array( 'ID' ) ) ), $info['tabel'] );
-        $this->assertSame( 2, $info['tabel_dilewati'] );
+        // 'wp_tampilan' (VIEW nyata) tetap dilewati diam-diam; 'wp_rusak'
+        // (Engine NULL, BUKAN view) + 'wp_bad-name' + 'lain_posts' (prefix
+        // tidak cocok) dihitung -- item 5g, fix round 1.
+        $this->assertSame( 3, $info['tabel_dilewati'] );
         $luar = WPMGR_Staging_Manifest::info( $wpdb, $this->akar, sys_get_temp_dir() . '/konten-lain' );
         $this->assertTrue( $luar['konten_di_luar'] );
+    }
+
+    public function test_konten_di_luar_symlink_wp_content(): void {
+        // Item 3, fix round 1: wp-content yang di-symlink-kan tetap "tampak"
+        // di dalam akar menurut strpos berawalan, padahal manifest yang
+        // hanya menelusuri ABSPATH tidak pernah melihat isinya lewat
+        // symlink itu (penelusuran tidak pernah masuk ke direktori
+        // symlink) -- staging jadi dibuat tanpa tema/plugin/unggahan.
+        $wpdb  = new WPMGR_FakeWpdbManifest();
+        $nyata = sys_get_temp_dir() . '/wpmgr-content-nyata-' . bin2hex( random_bytes( 4 ) );
+        mkdir( $nyata, 0777, true );
+        try {
+            if ( ! @symlink( $nyata, rtrim( $this->akar, '/' ) . '/wp-content' ) ) {
+                $this->markTestSkipped( 'Symlink tidak didukung di sistem ini.' );
+            }
+            $info = WPMGR_Staging_Manifest::info( $wpdb, $this->akar, rtrim( $this->akar, '/' ) . '/wp-content' );
+            $this->assertTrue( $info['konten_di_luar'] );
+        } finally {
+            StagingDasarTest::hapus( $nyata );
+        }
     }
 
     public function test_pk_komposit_berurutan(): void {
@@ -228,8 +385,37 @@ final class ManifestTest extends TestCase {
         $this->assertSame( 4194304, WPMGR_Staging_Manifest::batas_unggah( '8M' ) );
         $this->assertSame( 4194304, WPMGR_Staging_Manifest::batas_unggah( '64M' ) );
         $this->assertSame( 1048576, WPMGR_Staging_Manifest::batas_unggah( '2M' ) );
-        $this->assertSame( 262144, WPMGR_Staging_Manifest::batas_unggah( '100K' ) );
+        $this->assertSame( 524288, WPMGR_Staging_Manifest::batas_unggah( '1.5M' ) );
         $this->assertSame( 4194304, WPMGR_Staging_Manifest::batas_unggah( '0' ) );
         $this->assertSame( 2147483648, WPMGR_Staging_Manifest::ke_byte( '2G' ) );
+
+        // Item 4, fix round 1: batas bawah 256 KB tidak lagi dipaksakan bila
+        // itu akan melebihi separuh post_max_size (dulu membuat SATU
+        // potongan lebih besar dari post_max_size itu sendiri, ditolak PHP
+        // di hosting dengan post_max_size < 512 KB).
+        $this->assertSame( 51200, WPMGR_Staging_Manifest::batas_unggah( '100K' ) );
+        $this->assertTrue( WPMGR_Staging_Manifest::unggah_kecil( '100K' ) );
+        $this->assertFalse( WPMGR_Staging_Manifest::unggah_kecil( '2M' ) );
+        $this->assertFalse( WPMGR_Staging_Manifest::unggah_kecil( '1.5M' ) );
+        $this->assertFalse( WPMGR_Staging_Manifest::unggah_kecil( '0' ) );
+    }
+
+    public function test_anggaran_dikurangi_waktu_info(): void {
+        // Item 2, fix round 1: waktu yang dipakai info() (SHOW TABLE STATUS
+        // + SHOW KEYS per tabel) dikurangi dari anggaran penelusuran
+        // berkas, bukan dibiarkan memakan anggaran penuh diam-diam.
+        $mulai = microtime( true ) - 0.05;
+        $hasil = WPMGR_Staging_Manifest::anggaran_setelah( 20.0, $mulai );
+        $this->assertLessThan( 20.0, $hasil );
+        $this->assertGreaterThan( 19.0, $hasil );
+        // Dijepit minimal 1 detik: info() yang kebetulan lambat tidak boleh
+        // membuat anggaran jalan() negatif/nol (jalan() tetap harus
+        // sempat memvisit setidaknya satu entri).
+        $this->assertSame( 1.0, WPMGR_Staging_Manifest::anggaran_setelah( 2.0, microtime( true ) - 10 ) );
+    }
+
+    public function test_akar_bisa_dibaca(): void {
+        $this->assertTrue( WPMGR_Staging_Manifest::akar_bisa_dibaca( $this->akar ) );
+        $this->assertFalse( WPMGR_Staging_Manifest::akar_bisa_dibaca( $this->akar . 'tidak-ada/' ) );
     }
 }

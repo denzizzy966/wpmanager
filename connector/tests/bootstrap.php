@@ -120,6 +120,94 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
     }
 }
 
+// rest_ensure_response() minimal, dipakai WPMGR_Staging::manifest() dan
+// callback REST lain: lolos apa adanya bila sudah WP_Error atau
+// WP_REST_Response, selain itu dibungkus. Dipusatkan di sini (bukan di satu
+// berkas test) karena dipakai lebih dari satu berkas test Task 3.
+if ( ! function_exists( 'rest_ensure_response' ) ) {
+    function rest_ensure_response( $response ) {
+        if ( is_wp_error( $response ) ) {
+            return $response;
+        }
+        if ( $response instanceof WP_REST_Response ) {
+            return $response;
+        }
+        return new WP_REST_Response( $response );
+    }
+}
+
+// Stub WordPress minimal dipakai ManifestTest.php dan ManifestRestTest.php
+// (dipusatkan di sini, bukan diduplikasi di kedua berkas, supaya urutan
+// muat direktori-berbasis PHPUnit -- yang tidak menjamin urutan alfabet
+// antar berkas -- tidak pernah membuat salah satu berkas gagal karena
+// fungsi ini belum ada).
+if ( ! function_exists( 'get_bloginfo' ) ) {
+    function get_bloginfo( $apa = '' ) {
+        return 'version' === $apa ? '6.5' : '';
+    }
+}
+if ( ! function_exists( 'home_url' ) ) {
+    function home_url() {
+        return 'https://contoh.test';
+    }
+}
+if ( ! function_exists( 'site_url' ) ) {
+    function site_url() {
+        return 'https://contoh.test/wp';
+    }
+}
+if ( ! function_exists( 'is_multisite' ) ) {
+    function is_multisite() {
+        return false;
+    }
+}
+
+// wpdb tiruan untuk WPMGR_Staging_Manifest::info()/tabel()/pk() -- dipakai
+// ManifestTest.php dan ManifestRestTest.php.
+if ( ! class_exists( 'WPMGR_FakeWpdbManifest' ) ) {
+    final class WPMGR_FakeWpdbManifest {
+        public $prefix  = 'wp_';
+        public $charset = 'utf8mb4';
+        public $jawaban = array();
+
+        public function esc_like( $t ) {
+            return addcslashes( $t, '_%\\' );
+        }
+
+        public function prepare( $sql ) {
+            $args = array_slice( func_get_args(), 1 );
+            return vsprintf( str_replace( '%s', "'%s'", $sql ), $args );
+        }
+
+        public function get_results( $sql, $format = null ) {
+            foreach ( $this->jawaban as $pola => $hasil ) {
+                if ( false !== strpos( $sql, $pola ) ) {
+                    return $hasil;
+                }
+            }
+            return array();
+        }
+    }
+}
+
+// ABSPATH/WP_CONTENT_DIR nyata: hanya dibutuhkan untuk menguji
+// WPMGR_Staging::manifest() (callback REST, ManifestRestTest.php) secara
+// langsung -- root()-nya membaca konstanta ABSPATH mentah. Konstanta hanya
+// bisa didefinisikan sekali per proses PHP; tidak ada test lain di suite
+// ini yang memakainya, jadi aman didefinisikan sekali di sini dan
+// dibereskan lewat register_shutdown_function() di akhir proses test.
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', str_replace( '\\', '/', sys_get_temp_dir() ) . '/wpmgr-man-abspath-' . bin2hex( random_bytes( 6 ) ) . '/' );
+    @mkdir( ABSPATH . 'wp-content', 0777, true );
+    @file_put_contents( ABSPATH . 'index.php', '<?php' );
+    register_shutdown_function( function () {
+        StagingDasarTest::hapus( rtrim( ABSPATH, '/' ) );
+    } );
+}
+if ( ! defined( 'WP_CONTENT_DIR' ) ) {
+    define( 'WP_CONTENT_DIR', rtrim( ABSPATH, '/' ) . '/wp-content' );
+}
+
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-skema.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-penangkap.php';
 require_once __DIR__ . '/../wp-manager-connector/includes/class-wpmgr-settings.php';
