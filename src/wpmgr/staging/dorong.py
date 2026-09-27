@@ -340,7 +340,7 @@ def _pindah(sesi, job, langkah: str, **lain) -> str:
     return langkah
 
 
-def _galat_pra_tukar(exc: SiteError, langkah: str) -> Exception:
+def _galat_pra_tukar(exc: SiteError) -> Exception:
     """Galat siapkan/impor: produksi belum pernah disentuh, pesan tetap untuk UI."""
     if exc.kode in ("wpmgr_staging_kurang", "wpmgr_staging_tidak_ada"):
         return PotonganKurang()
@@ -362,7 +362,7 @@ def _langkah_pra_tukar(sesi, job, staging, klien, badan: dict) -> None:
         try:
             h = umum.ulangi(klien.staging_terapkan, badan, None)
         except SiteError as exc:
-            raise _galat_pra_tukar(exc, badan["langkah"]) from None
+            raise _galat_pra_tukar(exc) from None
         if h.get("selesai") is True:
             return
     raise umum.galat_gagal(f"Langkah {badan['langkah']} di produksi tidak selesai.")
@@ -587,11 +587,16 @@ def _tuntaskan_dorongan_lama(sesi, job, klien, dorong_id: str, token) -> bool:
         if exc.error_class == BERKAS_HILANG:
             return True
         if exc.kode != "wpmgr_staging_urutan":
-            raise SiteError(TRANSIENT if _ragu(exc) else STAGING_GAGAL, PESAN_LAMA_GAGAL) from None
+            if _ragu(exc):
+                raise SiteError(TRANSIENT, PESAN_LAMA_GAGAL) from None
+            # Dorongan baru belum menyentuh apa pun: ditolak tanpa menandai staging gagal.
+            raise umum.GalatDitolakTanpaUbah(PESAN_LAMA_GAGAL) from None
         try:
             _pulihkan(sesi, job, klien, dasar, token)
         except SiteError as exc2:
-            raise SiteError(exc2.error_class, PESAN_LAMA_GAGAL) from None
+            if exc2.error_class == TRANSIENT:
+                raise SiteError(TRANSIENT, PESAN_LAMA_GAGAL) from None
+            raise umum.GalatDitolakTanpaUbah(PESAN_LAMA_GAGAL) from None
     return _bersihkan_rinci(klien, dorong_id)[0]
 
 
@@ -726,7 +731,8 @@ class _Dorong:
         ta = _tanda_air_sekarang(self.klien, self.staging.tanda_air)
         perubahan = bandingkan_tanda_air(self.staging.tanda_air, ta)
         posts = ta["sumber"].get("posts")
-        if posts is not None and posts.get("diubah_sejak") is None:
+        tidak_pasti = posts is not None and posts.get("diubah_sejak") is None
+        if tidak_pasti and not any("dipastikan" in x for x in perubahan):
             # Connector tidak menghitung post yang diubah sejak tarik: data
             # baru mungkin ada. Timpa penuh tetap butuh konfirmasi nama.
             perubahan.append(PESAN_POST_TIDAK_PASTI)

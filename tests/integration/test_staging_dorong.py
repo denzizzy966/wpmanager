@@ -747,6 +747,25 @@ def test_dorongan_lama_dituntaskan_sebelum_dorongan_baru(sesi, site_staging, sta
     assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{color:red}"
 
 
+def test_dorongan_lama_yang_tidak_bisa_dituntaskan_menolak_dorongan_baru(sesi, site_staging, staging_aktif,
+                                                                        prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    lama_id, token = "a" * 32, "b" * 32
+    prod.dorongan[lama_id] = {"status": "memulihkan", "potongan": {}, "hasil": {},
+                              "token_hash": hashlib.sha256(token.encode()).hexdigest()}
+    prod.kunci = lama_id
+    prod.kejadian["pulihkan"] = [_galat(403, "wpmgr_staging_token", "Token pemulihan tidak cocok.")]
+    job_lama = _job_lama(sesi, site_staging, lama_id, token)
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert e.value.error_class == STAGING_DITOLAK and "belum dapat dituntaskan" in e.value.pesan
+    # Dorongan baru tidak memulai apa pun, dan staging tidak ditandai gagal.
+    assert not any(route == "/staging/manifest" for route, _ in prod.diminta[-4:])
+    assert prod.unggahan == {}
+    assert _staging(sesi, site_staging).status == StatusStaging.siap
+    assert _kemajuan(sesi, job_lama).get("produksi_bersih") is not True
+
+
 def test_dorongan_lama_yang_sudah_bersih_tidak_disentuh(sesi, site_staging, staging_aktif, prod, pb):
     _siap(sesi, site_staging, staging_aktif, prod)
     job_lama = _job_lama(sesi, site_staging, "a" * 32, "b" * 32)
