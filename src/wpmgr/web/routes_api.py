@@ -12,6 +12,7 @@ from wpmgr.crypto import dekripsi_secret
 from wpmgr.fitur import SELF_UPDATE, punya_fitur
 from wpmgr.jobs.queue import buat_job
 from wpmgr.models import (
+    JOB_STAGING,
     ActivityLog,
     Client,
     Job,
@@ -20,6 +21,7 @@ from wpmgr.models import (
     PackageType,
     Site,
     SitePackage,
+    StagingUji,
     User,
 )
 from wpmgr.sso import buat_token
@@ -70,6 +72,25 @@ def daftar_paket(pengguna: PenggunaApi, semua: int = 0):
         if not semua:
             q = q.where(SitePackage.versi_tersedia.is_not(None))
 
+        baris = sesi.execute(q).all()
+        # Hasil uji staging terbaru per (site, paket, versi tujuan): lencana
+        # di halaman Update. Dibatasi 500 uji terbaru supaya daftar paket
+        # tidak ikut membengkak bersama riwayat uji.
+        site_ids = {p.site_id for p, _, _ in baris}
+        uji_terbaru: dict[tuple, dict] = {}
+        if site_ids:
+            for u in sesi.scalars(select(StagingUji).where(StagingUji.site_id.in_(site_ids))
+                                  .order_by(StagingUji.dibuat_pada.desc(), StagingUji.id.desc()).limit(500)):
+                alasan = (u.pemeriksaan or {}).get("alasan") if isinstance(u.pemeriksaan, dict) else None
+                for pk in u.paket if isinstance(u.paket, list) else []:
+                    if not isinstance(pk, dict):
+                        continue
+                    kunci = (u.site_id, pk.get("tipe"), pk.get("slug"), pk.get("ke"))
+                    uji_terbaru.setdefault(kunci, {
+                        "hasil": u.hasil, "dibuat_pada": _waktu(u.dibuat_pada),
+                        "alasan": alasan[0] if isinstance(alasan, list) and alasan else None,
+                    })
+
         return [
             {
                 "id": p.id,
@@ -83,8 +104,9 @@ def daftar_paket(pengguna: PenggunaApi, semua: int = 0):
                 "versi_tersedia": p.versi_tersedia,
                 "aktif": p.aktif,
                 "last_scan_at": _waktu(p.last_scan_at),
+                "uji": uji_terbaru.get((p.site_id, p.tipe.value, p.slug, p.versi_tersedia)),
             }
-            for p, site_nama, client_nama in sesi.execute(q).all()
+            for p, site_nama, client_nama in baris
         ]
 
 
@@ -209,6 +231,9 @@ def buat_job_update_connector(req: PermintaanUpdateConnector, pengguna: Pengguna
 
 @router.get("/api/jobs/active")
 def job_aktif(pengguna: PenggunaApi):
+    # Diimpor di sini: routes_staging dimuat bersama app, bukan bersama modul ini.
+    from wpmgr.web.routes_staging import ringkas_kemajuan
+
     with db.SessionLocal() as sesi:
         q = (
             select(Job, Site.nama)
@@ -226,6 +251,7 @@ def job_aktif(pengguna: PenggunaApi):
                 "slug": j.payload.get("slug"),
                 "attempts": j.attempts,
                 "error": j.error,
+                "progres": ringkas_kemajuan(j)["teks"] if j.tipe in JOB_STAGING else None,
             }
             for j, site_nama in sesi.execute(q).all()
         ]
@@ -249,10 +275,19 @@ def url_sso(site_id: uuid.UUID, pengguna: PenggunaApi):
 
 @router.delete("/api/sites/{site_id}")
 def hapus_site(site_id: uuid.UUID, pengguna: PenggunaApi):
+    from wpmgr.staging.cron import _kunci_site
+    from wpmgr.web.routes_staging import bersihkan_untuk_hapus_site
+
     with db.SessionLocal() as sesi:
         site = sesi.get(Site, site_id)
         if site is None:
             raise HTTPException(status_code=404, detail="Site tidak ditemukan")
+        # Kaskade menghapus baris staging, tetapi container, database, dan
+        # akses router staging tetap hidup: dibongkar dulu, di bawah kunci
+        # sites yang sama dengan route staging dan cron. Galat pembantu
+        # menolak pencabutan (502) supaya tidak ada container yatim.
+        _kunci_site(sesi, site_id)
+        bersihkan_untuk_hapus_site(sesi, site)
         nama = site.nama
         sesi.delete(site)
         # ActivityLog untuk penghapusan sengaja dibuat tanpa site_id: baris
