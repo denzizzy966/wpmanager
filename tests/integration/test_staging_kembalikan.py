@@ -737,7 +737,7 @@ def test_kembalikan_tidak_menyembunyikan_staging_gagal(sesi, site_staging, stagi
     """Kembalikan menyangkut produksi: staging yang gagal tetap gagal dengan galatnya."""
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
     st = _staging(sesi, site_staging)
-    st.status, st.galat = StatusStaging.gagal, "Tarik gagal: disk penuh."
+    st.status, st.galat, st.gagal_asal = StatusStaging.gagal, "Tarik gagal: disk penuh.", "salinan"
     sesi.commit()
     hasil = _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
     assert hasil["dorong_gagal"] is False
@@ -749,7 +749,7 @@ def test_kembalikan_tidak_menyembunyikan_staging_gagal(sesi, site_staging, stagi
 
 def _staging_gagal(sesi, site_staging) -> None:
     st = _staging(sesi, site_staging)
-    st.status, st.galat = StatusStaging.gagal, "Tarik gagal: disk penuh."
+    st.status, st.galat, st.gagal_asal = StatusStaging.gagal, "Tarik gagal: disk penuh.", "salinan"
     sesi.commit()
 
 
@@ -805,7 +805,7 @@ def test_tolak_pra_tukar_final_gagal_produksi_dibersihkan(sesi, site_staging, st
 def test_batal_kembalikan_staging_gagal_tetap_gagal(sesi, site_staging, staging_aktif, prod, pb):
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
     st = _staging(sesi, site_staging)
-    st.status, st.galat = StatusStaging.gagal, "Tarik gagal: disk penuh."
+    st.status, st.galat, st.gagal_asal = StatusStaging.gagal, "Tarik gagal: disk penuh.", "salinan"
     sesi.commit()
     prod.sebelum["/staging/terapkan"] = lambda p, n, badan: _minta_batal(sesi, site_staging)
     with pytest.raises(umum.GalatDibatalkan):
@@ -819,19 +819,25 @@ def test_batal_kembalikan_staging_gagal_tetap_gagal(sesi, site_staging, staging_
 # ---- fix putaran 2 ------------------------------------------------------------------
 
 
-def _tarik_gagal(sesi, site_staging, galat="Tarik gagal: disk penuh."):
-    """Tarik (segarkan) yang gagal final: gagal milik salinan staging."""
-    j = buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
-    j.status = JobStatus.failed
+def _tarik_gagal(sesi, site_staging, prod, pb) -> str:
+    """Tarik (segarkan) sungguhan yang gagal final di tengah: gagal milik salinan staging (R20)."""
+    from wpmgr.staging.pembantu import GalatPembantu
+
+    site = sesi.get(Site, site_staging.site_id)
+    pb.gagal["db_impor"] = GalatPembantu("impor", "Impor database staging gagal.")
+    with pytest.raises(SiteError):
+        tarik.tangani_staging_tarik(sesi, buat_job(sesi, site.id, JobType.staging_tarik), prod.klien(site))
+    del pb.gagal["db_impor"]
+    _selesaikan_gagal(sesi)
     st = _staging(sesi, site_staging)
-    st.status, st.galat = StatusStaging.gagal, galat
-    sesi.commit()
+    assert st.status == StatusStaging.gagal and st.gagal_asal == "salinan"
+    return st.galat
 
 
 def test_tolak_di_tengah_kembalikan_mempertahankan_galat_staging(sesi, site_staging, staging_aktif, prod, pb):
     """GalatDitolakTanpaUbah di dalam pembungkus (R8 di tahap mulai): galat staging asli tetap."""
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod, "timpa_penuh")
-    _tarik_gagal(sesi, site_staging)
+    galat = _tarik_gagal(sesi, site_staging, prod, pb)
     min((staging_aktif / snap.path / "db").glob("*.sql")).write_bytes(
         b"CREATE TABLE `wp_posts` (`id` int) PARTITION BY HASH (`id`);\n")
     job = _job_balik(sesi, site, snap.id)
@@ -839,13 +845,13 @@ def test_tolak_di_tengah_kembalikan_mempertahankan_galat_staging(sesi, site_stag
         _jalankan(sesi, site, prod, job)
     assert e.value.error_class == STAGING_DITOLAK and "Kembalikan dibatalkan" in e.value.pesan
     st = _staging(sesi, site_staging)
-    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    assert st.status == StatusStaging.gagal and st.galat == galat
 
 
 def test_kembalikan_batal_lalu_sukses_tidak_mengangkat_gagal_tarik(sesi, site_staging, staging_aktif, prod, pb):
     """Skenario reviewer: tarik gagal, kembalikan #1 dibatalkan sebelum tukar, kembalikan #2 sukses."""
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
-    _tarik_gagal(sesi, site_staging)
+    galat = _tarik_gagal(sesi, site_staging, prod, pb)
     prod.sebelum["/staging/terapkan"] = lambda p, n, badan: _minta_batal(sesi, site_staging)
     with pytest.raises(umum.GalatDibatalkan):
         _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
@@ -854,27 +860,27 @@ def test_kembalikan_batal_lalu_sukses_tidak_mengangkat_gagal_tarik(sesi, site_st
     _kembalikan(sesi, site, prod, snap.id)
     assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
     st = _staging(sesi, site_staging)
-    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    assert st.status == StatusStaging.gagal and st.galat == galat
 
 
 def test_kembalikan_tolak_pra_tukar_lalu_sukses_tidak_mengangkat_gagal_tarik(sesi, site_staging, staging_aktif,
                                                                             prod, pb):
     """Varian lewat _staging_utuh: kembalikan #1 ditolak pra-pemeriksaan tukar (tidak pernah menukar)."""
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
-    _tarik_gagal(sesi, site_staging)
+    galat = _tarik_gagal(sesi, site_staging, prod, pb)
     prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
     with pytest.raises(SiteError):
         _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
     _selesaikan_gagal(sesi)
     _kembalikan(sesi, site, prod, snap.id)
     st = _staging(sesi, site_staging)
-    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    assert st.status == StatusStaging.gagal and st.galat == galat
 
 
 def test_gagal_produksi_sesudah_tarik_gagal_dibersihkan(sesi, site_staging, staging_aktif, prod, pb):
     """Kembalikan yang SUDAH menukar lalu gagal lebih baru dari tarik gagal: gagal itu milik produksi."""
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
-    _tarik_gagal(sesi, site_staging)
+    _tarik_gagal(sesi, site_staging, prod, pb)
     prod.kejadian["tukar"] = ["putus"] * (dorong.MAKS_RAGU_TUKAR + 1)
     job = _job_balik(sesi, site, snap.id)
     job.attempts = job.max_attempts

@@ -5,6 +5,7 @@ from datetime import date, datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -426,9 +427,18 @@ class Staging(Base):
     dibuka_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sertifikat_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     galat: Mapped[str | None] = mapped_column(Text)
+    # Putusan R20: asal status `gagal` -- 'salinan' (tarik/uji gagal: salinan
+    # staging bisa setengah jadi, dorong ditolak) atau 'produksi' (dorong/
+    # kembalikan gagal sesudah tukar). NULL bila tidak gagal atau tidak diketahui.
+    gagal_asal: Mapped[str | None] = mapped_column(Text)
     dorong_gagal_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     batal_diminta_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     dibuat_pada: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("gagal_asal IS NULL OR gagal_asal IN ('salinan', 'produksi')",
+                        name="ck_staging_gagal_asal"),
+    )
 
 
 class StagingSnapshot(Base):

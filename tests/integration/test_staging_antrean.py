@@ -690,6 +690,45 @@ def test_reaper_menandai_staging_gagal_saat_jatah_habis(sesi, site_staging):
     assert st.batal_diminta_pada is None
 
 
+@pytest.mark.parametrize("tipe,status_kerja,kemajuan,status,asal", [
+    # Tarik/uji yang ditinggalkan: salinan staging bisa setengah jadi.
+    (JobType.staging_tarik, StatusStaging.menyalin, {}, StatusStaging.gagal, "salinan"),
+    (JobType.staging_uji_update, StatusStaging.berjalan_uji, {}, StatusStaging.gagal, "salinan"),
+    # Dorong/kembalikan yang sudah menukar: gagal milik produksi.
+    (JobType.staging_dorong, StatusStaging.mendorong, {"status_staging_awal": "siap", "langkah_terapkan": "tukar"},
+     StatusStaging.gagal, "produksi"),
+    (JobType.staging_kembalikan, StatusStaging.mendorong,
+     {"status_staging_awal": "siap", "langkah_terapkan": "selesai"}, StatusStaging.gagal, "produksi"),
+    # Belum menukar (atau pemulihan terkonfirmasi): status sebelum job dikembalikan.
+    (JobType.staging_dorong, StatusStaging.mendorong, {"status_staging_awal": "siap", "langkah_terapkan": "siapkan"},
+     StatusStaging.siap, None),
+    (JobType.staging_dorong, StatusStaging.mendorong,
+     {"status_staging_awal": "siap", "langkah_terapkan": "dipulihkan", "pulih_terkonfirmasi": True},
+     StatusStaging.siap, None),
+    (JobType.staging_kembalikan, StatusStaging.mendorong,
+     {"status_staging_awal": "gagal", "gagal_asal_awal": "salinan"}, StatusStaging.gagal, "salinan"),
+    (JobType.staging_kembalikan, StatusStaging.mendorong, {"status_staging_awal": "dijeda"},
+     StatusStaging.dijeda, None),
+])
+def test_reaper_asal_gagal_per_tipe_job(sesi, site_staging, tipe, status_kerja, kemajuan, status, asal):
+    """Putusan R20: reaper memakai aturan asal yang sama dengan pembungkus."""
+    from wpmgr.jobs.reaper import pulihkan_job_yatim
+
+    site_staging.status = status_kerja
+    site_staging.ditarik_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    buat_job(sesi, site_staging.site_id, tipe, {"kemajuan": kemajuan})
+    job = ambil_job(sesi, "w1", "staging")
+    job.attempts = job.max_attempts
+    job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    sesi.commit()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    st = sesi.get(Staging, site_staging.id)
+    assert (st.status, st.gagal_asal) == (status, asal)
+    assert st.galat == "Proses terhenti tak terduga; coba lagi."
+
+
 def test_reaper_yang_menjadwalkan_ulang_tidak_mengubah_staging(sesi, site_staging):
     from wpmgr.jobs.reaper import pulihkan_job_yatim
 

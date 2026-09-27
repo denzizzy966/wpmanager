@@ -143,7 +143,7 @@ BATAS_HALAMAN = 1024 * 1024
 MAKS_JOB_LAMA = 20
 SALIN_BLOK = 1 << 20
 
-LANGKAH_SESUDAH_TUKAR = frozenset({"tukar", "pulihkan", "dipulihkan", "selesai", "beres"})
+LANGKAH_SESUDAH_TUKAR = umum.LANGKAH_SESUDAH_TUKAR
 # Galat tukar yang membuktikan tukar TIDAK tuntas di produksi dan perlu
 # pulihkan: connector sudah memulihkan/sedang memulihkan (gagal_tukar), atau
 # tukar dikirim ulang dan connector menjawab dorongan ini tidak lagi menunggu
@@ -165,6 +165,8 @@ PESAN_MODE = "Mode dorong tidak dikenal."
 PESAN_BELUM_TARIK = "Tarik staging dulu sebelum mendorong."
 PESAN_DIJEDA = "Staging sedang dijeda; jalankan staging dulu."
 PESAN_SALINAN_GAGAL = "Staging gagal disegarkan terakhir kali; segarkan ulang staging sebelum mendorong ke produksi."
+PESAN_SALINAN_SIBUK = ("Staging sedang disegarkan atau diuji (atau menunggu dilanjutkan); tunggu sampai selesai "
+                       "sebelum mendorong ke produksi.")
 PESAN_DIREBUT = "Dorongan ini direbut dorongan lain di produksi dan tidak dapat dilanjutkan; jalankan dorong lagi."
 PESAN_URUTAN = ("Dorongan di produksi tidak lagi menunggu langkah ini (sudah dibatalkan, dipulihkan, atau "
                 "dibersihkan); jalankan dorong lagi.")
@@ -608,13 +610,14 @@ def terapkan_terunggah(sesi, job, staging, klien, site_url: str, k: dict, kunci_
     return umum.simpan_kemajuan(sesi, job, **{kunci_tahap: "cek"})
 
 
-def tuntaskan_sukses(sesi, job, site, staging, klien, k: dict, judul: str, detail: dict,
-                     istirahat=umum.status_istirahat) -> dict:
+def tuntaskan_sukses(sesi, job, site, staging, klien, k: dict, judul: str, detail: dict) -> dict:
     """Akhir dorong/kembalikan yang sukses: halaman utama, bersihkan, status staging, log aktivitas.
 
     `dorong_gagal_pada` dikosongkan hanya bila halaman utama menjawab 2xx/3xx.
-    Tidak meng-commit: pemanggil menambahkan perubahannya sendiri (pangkas
-    snapshot, status snapshot) lalu meng-commit semuanya bersama.
+    `gagal` milik produksi dibersihkan; `gagal` milik salinan staging tetap
+    (R18: dorong/kembalikan tidak memperbaiki salinan). Tidak meng-commit:
+    pemanggil menambahkan perubahannya sendiri (pangkas snapshot, status
+    snapshot) lalu meng-commit semuanya bersama.
     """
     status = cek_halaman(site.url)
     if bersihkan(klien, k["dorong_id"], detak=lambda: umum.detak(sesi, job)):
@@ -622,7 +625,7 @@ def tuntaskan_sukses(sesi, job, site, staging, klien, k: dict, judul: str, detai
     ok = _hidup(status)
     if staging is not None:
         st = sesi.get(Staging, staging.id, populate_existing=True)
-        st.status = istirahat(st)
+        st.status = StatusStaging.gagal if umum.salinan_rusak_sebelum(job) else umum.status_istirahat(st)
         st.dorong_gagal_pada = None if ok else umum.sekarang()
     detail = {**detail, "halaman_utama": status}
     if not ok:
@@ -1208,91 +1211,35 @@ def boleh_batal(job) -> bool:
     return umum.kemajuan(job).get("langkah_terapkan") not in LANGKAH_SESUDAH_TUKAR
 
 
-# ---- putusan R18: siapa pemilik status `gagal` staging -------------------------
+# ---- putusan R18/R19/R20 --------------------------------------------------------
 #
-# Dorong/kembalikan menyangkut PRODUKSI. Staging yang sudah `gagal` karena
-# salinannya sendiri (tarik/uji) tetap `gagal` dengan galat aslinya, apa pun
-# hasil job ini (sukses, batal, atau ditolak). `gagal` yang ditinggalkan
-# dorong/kembalikan yang SUDAH menukar di produksi adalah kabar produksi, dan
-# dituntaskan oleh job yang sukses sesudahnya.
-#
-# Putusan R19: salinan staging yang gagal disegarkan bisa setengah jadi, jadi
-# dorong MENOLAKNYA sejak awal (`_periksa_awal`). Karena itu hanya kembalikan
-# yang pernah berjalan dari staging dengan `gagal` milik salinannya sendiri.
-
-_JOB_PRODUKSI = (JobType.staging_dorong, JobType.staging_kembalikan)
-_JOB_SALINAN = (JobType.staging_tarik, JobType.staging_uji_update)
-_JOB_GAGAL = (JobStatus.failed, JobStatus.unknown)
+# Pemilik status `gagal` dicatat eksplisit di `staging.gagal_asal` (R20),
+# diatur pembungkus `umum.jalankan_staging` dan reaper; lihat blok R18/R19/R20
+# di umum.py. Di sini hanya pemakainya: gerbang dorong (R19) dan penolakan
+# final yang tidak mengubah apa pun (`_staging_utuh`).
 
 
-def gagal_milik_salinan(sesi, staging: Staging, kecuali_job_id=None) -> bool:
-    """Staging berstatus `gagal` karena salinannya sendiri (tarik/uji), bukan karena produksi.
+def gagal_milik_salinan(staging: Staging) -> bool:
+    """Staging `gagal` karena salinannya sendiri (tarik/uji): dorong ditolak (R19).
 
-    `gagal` milik produksi hanya bila dorong/kembalikan gagal terbaru yang
-    SUDAH mengirim tukar (`langkah_terapkan` di LANGKAH_SESUDAH_TUKAR) lebih
-    baru daripada tarik/uji gagal terbaru. Dorong/kembalikan yang tidak
-    pernah menukar (batal, ditolak pra-pemeriksaan) tidak pernah menyentuh
-    produksi, jadi tidak ikut menentukan pemilik. `gagal` tanpa job gagal
-    yang menjelaskannya dianggap milik salinan staging. Publik: API (Task 19)
-    memakainya untuk pra-pemeriksaan dorong.
+    Publik: API (Task 19) memakainya untuk pra-pemeriksaan dorong. Asal NULL
+    atau 'produksi' tidak pernah menahan dorong.
     """
-    if staging.status != StatusStaging.gagal:
-        return False
-
-    def terbaru(*syarat):
-        q = select(func.max(Job.id)).where(Job.site_id == staging.site_id, Job.status.in_(_JOB_GAGAL), *syarat)
-        if kecuali_job_id is not None:
-            q = q.where(Job.id != kecuali_job_id)
-        return sesi.scalar(q)
-
-    salinan = terbaru(Job.tipe.in_(_JOB_SALINAN))
-    produksi = terbaru(Job.tipe.in_(_JOB_PRODUKSI),
-                       Job.payload["kemajuan"]["langkah_terapkan"].astext.in_(LANGKAH_SESUDAH_TUKAR))
-    return not (produksi is not None and (salinan is None or produksi > salinan))
-
-
-def _status_staging_awal(sesi, job, staging) -> str:
-    """Status staging yang dicatat di awal job; "gagal" hanya bila gagalnya milik salinan staging."""
-    if staging.status != StatusStaging.gagal:
-        return staging.status.value
-    return (StatusStaging.gagal if gagal_milik_salinan(sesi, staging, job.id) else StatusStaging.siap).value
-
-
-def catat_status_awal(sesi, job, staging) -> None:
-    """Sekali per job, sebelum pembungkus menimpa status dengan `mendorong` (percobaan ulang melihatnya)."""
-    if staging is not None and "status_staging_awal" not in umum.kemajuan(job):
-        umum.simpan_kemajuan(sesi, job, status_staging_awal=_status_staging_awal(sesi, job, staging),
-                             galat_staging_awal=staging.galat)
-
-
-def _gagal_milik_staging(job) -> bool:
-    return umum.kemajuan(job).get("status_staging_awal") == StatusStaging.gagal.value
-
-
-def istirahat_r18(job):
-    """Status staging tanpa job berjalan menurut R18 (untuk pembungkus dan `tuntaskan_sukses`)."""
-    def istirahat(st) -> StatusStaging:
-        return StatusStaging.gagal if _gagal_milik_staging(job) else umum.status_istirahat(st)
-
-    return istirahat
-
-
-def galat_r18(job) -> str | None:
-    """Galat staging yang dipertahankan R18, atau None bila tidak ada yang dipertahankan."""
-    return umum.kemajuan(job).get("galat_staging_awal") if _gagal_milik_staging(job) else None
+    return staging.status == StatusStaging.gagal and staging.gagal_asal == umum.ASAL_SALINAN
 
 
 def _staging_utuh(sesi, job, site_id, pesan: str) -> SiteError:
-    """Kegagalan final yang tidak menyentuh produksi maupun staging: staging tidak dibiarkan gagal.
+    """Kegagalan final yang tidak menyentuh produksi maupun staging: status sebelum job dikembalikan.
 
-    Kecuali staging memang sudah gagal karena salinannya sendiri (R18):
-    status dan galat aslinya dipertahankan; pesan ini tetap tampil di job.
+    Status `gagal` (beserta asal dan galatnya) yang sudah ada sebelum job ini
+    dipertahankan; pesan ini tetap tampil di job.
     """
     st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
     if st is not None:
-        st.status = istirahat_r18(job)(st)
-        dipertahankan = galat_r18(job)
-        st.galat = dipertahankan if dipertahankan is not None else pesan
+        status, asal = umum.status_sebelum(job, st)
+        st.status = status
+        st.gagal_asal = asal if status == StatusStaging.gagal else None
+        st.galat = bersih_teks(umum.galat_tetap(job, status, pesan), 1000)
         sesi.commit()
     return SiteError(STAGING_DITOLAK, pesan)
 
@@ -1338,6 +1285,8 @@ def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None, pesa
         return None
     st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
     if st is not None:
+        st.status = StatusStaging.gagal
+        st.gagal_asal = umum.ASAL_PRODUKSI
         st.dorong_gagal_pada = umum.sekarang()
         st.galat = pesan
         sesi.commit()
@@ -1388,7 +1337,10 @@ def _periksa_awal(sesi, job) -> None:
         raise umum.galat_ditolak(PESAN_BELUM_TARIK)
     if not st.aktif:
         raise umum.galat_ditolak(PESAN_DIJEDA)
-    if gagal_milik_salinan(sesi, st, job.id):
+    if st.status in (StatusStaging.menyalin, StatusStaging.berjalan_uji):
+        # Tarik/uji sedang berjalan atau menunggu percobaan ulang: salinannya belum utuh.
+        raise umum.GalatDitolakTanpaUbah(PESAN_SALINAN_SIBUK)
+    if gagal_milik_salinan(st):
         # Putusan R19: salinan yang gagal disegarkan bisa setengah jadi.
         raise umum.GalatDitolakTanpaUbah(PESAN_SALINAN_GAGAL)
 
@@ -1682,8 +1634,7 @@ class _Kembalikan:
         detail = {"snapshot_id": k["snapshot_id"], "mode": k["mode"], "berkas": k["jumlah_ganti"],
                   "hapus": k["jumlah_hapus"], "db": bool(k["db"])}
         hasil = tuntaskan_sukses(self.sesi, self.job, self.site, self.staging, self.klien, k,
-                                 f"Produksi dikembalikan dari snapshot #{k['snapshot_id']}", detail,
-                                 istirahat=istirahat_r18(self.job))
+                                 f"Produksi dikembalikan dari snapshot #{k['snapshot_id']}", detail)
         row = self.sesi.get(StagingSnapshot, k["snapshot_id"], populate_existing=True)
         if row is not None:
             row.status = "dipakai"
@@ -1728,11 +1679,8 @@ def tangani_staging_kembalikan(sesi, job, klien) -> dict:
     site_id = job.site_id
     try:
         if staging is not None:
-            catat_status_awal(sesi, job, staging)
             return umum.jalankan_staging(sesi, job, lambda s, j, site_, st: kembalikan(s, j, site_, st, klien),
-                                         StatusStaging.mendorong, "Kembalikan produksi", boleh_batal=boleh_batal,
-                                         istirahat=istirahat_r18(job), galat_sukses=galat_r18,
-                                         galat_istirahat=galat_r18)
+                                         StatusStaging.mendorong, "Kembalikan produksi", boleh_batal=boleh_batal)
         # Staging sudah dihapus tetapi snapshot produksi masih ada: tetap bisa
         # dipulihkan, tanpa status staging dan tanpa batal.
         try:
