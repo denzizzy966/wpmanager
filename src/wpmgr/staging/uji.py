@@ -10,6 +10,7 @@ masukan penyerang: dibaca dengan tenggat dan batas byte, diurai secara
 linear, dan dibersihkan sebelum masuk database atau UI.
 """
 
+import html
 import os
 import re
 import time
@@ -39,10 +40,12 @@ JALUR_TETAP = ("/", "/wp-login.php")
 JUMLAH_JALUR_TRAFFIC = 3
 MAKS_PAKET = 20
 BATAS_HTML = 5 * 1024 * 1024
+# Log dibaca per blok BATAS_LOG (memori terbatas) sampai seluruh wilayah
+# baru terpindai, atau sampai TENGGAT_LOG detik habis. Log yang dibanjiri
+# peringatan tidak boleh menyembunyikan fatal sesudahnya; bila tenggat habis,
+# uji gagal tertutup.
 BATAS_LOG = 1024 * 1024
-# Log yang dibanjiri peringatan tidak boleh menyembunyikan fatal sesudahnya:
-# dibaca per BATAS_LOG, paling banyak sekian blok per pembacaan.
-MAKS_BLOK_LOG = 8
+TENGGAT_LOG = 10.0
 # Satu baris log yang lebih panjang dari ini dipotong sebelum diurai.
 MAKS_BARIS_LOG = 64 * 1024
 MAKS_FATAL = 10
@@ -157,8 +160,10 @@ def judul_html(isi: bytes) -> str | None:
     if tutup == -1:
         return None
     mentah = data[buka + 1:min(tutup, buka + 1 + BATAS_JUDUL_MENTAH)]
-    teks = " ".join(mentah.decode("utf-8", "replace").replace("\x00", "").split())
-    return bersih_teks(teks, 200) or None
+    # Entitas didekode dulu (&amp; &nbsp; &#0; ...), baru dibersihkan: hasil
+    # dekode juga masukan staging. html.unescape linear pada 4 KiB ini.
+    teks = html.unescape(mentah.decode("utf-8", "replace")).replace("\x00", "")
+    return bersih_teks(" ".join(teks.split()), 200) or None
 
 
 def probe(http: httpx.Client, dasar: str, host: str, cookie: str, jalur: str) -> dict:
@@ -205,31 +210,43 @@ def ukuran_log(akar: Path, relatif: str = LOG_PHP) -> int:
         return 0
 
 
-def _fatal_dari(baris: bytes, hasil: list[str]) -> None:
+def _fatal_dari(baris: bytes, hasil: list[str]) -> int:
+    """1 bila baris ini fatal (disimpan selama belum MAKS_FATAL), selain itu 0."""
     teks = baris[:MAKS_BARIS_LOG].decode("utf-8", "replace")
-    if POLA_FATAL.search(teks):
+    if not POLA_FATAL.search(teks):
+        return 0
+    if len(hasil) < MAKS_FATAL:
         # Path di dalam container, bukan path VPS; dipendekkan supaya terbaca.
         hasil.append(bersih_teks(teks.rstrip("\r").replace("/var/www/html/", ""), 300))
+    return 1
 
 
-def baca_log_baru(berkas: Path, posisi: int, akar: Path | None = None) -> list[str]:
-    """Baris `PHP Fatal error`/`PHP Parse error` yang ditulis sesudah `posisi`.
+def periksa_log_baru(berkas: Path, posisi: int, akar: Path | None = None) -> dict:
+    """Fatal di log PHP staging sesudah `posisi`: `{baris, jumlah, terpotong, tidak_terbaca}`.
 
     `log/` di-bind mount ke container staging: berkasnya dibuka lewat
     `aman.buka_baca` (tanpa symlink, hanya berkas biasa) relatif terhadap
-    `akar` (bawaan: direktori berkas itu sendiri), dan dibaca paling banyak
-    MAKS_BLOK_LOG x BATAS_LOG byte. Log yang dipangkas atau diputar sejak
-    "sebelum" (ukurannya kini lebih kecil dari posisi) dibaca dari awal.
+    `akar` (bawaan: direktori berkas itu sendiri). Seluruh wilayah baru
+    dipindai per blok BATAS_LOG (memori terbatas) sampai TENGGAT_LOG detik;
+    bila tenggat habis sebelum akhir berkas, `terpotong` bernilai True.
+    `jumlah` menghitung semua fatal, `baris` hanya menyimpan MAKS_FATAL
+    pertama. Log yang dipangkas atau diputar sejak "sebelum" (ukurannya kini
+    lebih kecil dari posisi) dibaca dari awal. Log yang tidak ada berarti
+    tidak ada fatal; log yang ada tetapi tidak aman dibaca (symlink, FIFO)
+    ditandai `tidak_terbaca`.
     """
-    hasil: list[str] = []
+    baris_fatal: list[str] = []
+    jumlah = 0
+    terpotong = False
     try:
         akar, relatif = _akar_dan_relatif(berkas, akar)
         with buka_baca(akar, relatif) as f:
             if os.fstat(f.fileno()).st_size < posisi:
                 posisi = 0
             f.seek(max(0, posisi))
+            mulai = time.monotonic()
             sisa = b""
-            for _ in range(MAKS_BLOK_LOG):
+            while True:
                 blok = f.read(BATAS_LOG)
                 if not blok:
                     break
@@ -237,28 +254,80 @@ def baca_log_baru(berkas: Path, posisi: int, akar: Path | None = None) -> list[s
                 # Baris tanpa akhir yang sangat panjang tidak ditampung utuh.
                 sisa = sisa[:MAKS_BARIS_LOG]
                 for b in baris:
-                    _fatal_dari(b, hasil)
-                    if len(hasil) >= MAKS_FATAL:
-                        return hasil
-            if sisa:
-                _fatal_dari(sisa, hasil)
+                    jumlah += _fatal_dari(b, baris_fatal)
+                if time.monotonic() - mulai > TENGGAT_LOG:
+                    terpotong = bool(f.read(1))
+                    break
+            if sisa and not terpotong:
+                jumlah += _fatal_dari(sisa, baris_fatal)
+    except FileNotFoundError:
+        return {"baris": [], "jumlah": 0, "terpotong": False, "tidak_terbaca": False}
     except (PathTidakAman, OSError, ValueError):
-        return []
-    return hasil[:MAKS_FATAL]
+        return {"baris": [], "jumlah": 0, "terpotong": False, "tidak_terbaca": True}
+    return {"baris": baris_fatal, "jumlah": jumlah, "terpotong": terpotong, "tidak_terbaca": False}
 
 
-def nilai_uji(sebelum: dict, sesudah: dict, fatal_baru: list, update_gagal: list) -> tuple[str, list[str]]:
+def baca_log_baru(berkas: Path, posisi: int, akar: Path | None = None) -> list[str]:
+    """Baris `PHP Fatal error`/`PHP Parse error` (paling banyak MAKS_FATAL) sesudah `posisi`."""
+    return periksa_log_baru(berkas, posisi, akar)["baris"]
+
+
+def _hidup(status: int) -> bool:
+    return 200 <= status < 400
+
+
+def _teks_status(status: int) -> str:
+    return f"membalas HTTP {status}" if status else "tidak dapat dihubungi"
+
+
+def _sudah_gagal(sebelum: dict, jalur: str) -> int | None:
+    """Status "sebelum" bila halaman itu sudah tidak hidup sebelum update, selain itu None."""
+    s = sebelum.get(jalur) or {}
+    if "status" not in s:
+        # Tanpa data "sebelum" tidak ada bukti ia sudah gagal.
+        return None
+    status = s.get("status") or 0
+    return None if _hidup(status) else status
+
+
+def catatan_uji(sebelum: dict, sesudah: dict) -> list[str]:
+    """Halaman yang gagal sesudah update tetapi sudah gagal sebelumnya (putusan R17)."""
+    catatan = []
+    for jalur, h in sesudah.items():
+        lama = _sudah_gagal(sebelum, jalur)
+        if lama is not None and not _hidup(h.get("status") or 0):
+            catatan.append(f"{jalur} sudah {_teks_status(lama)} sebelum update")
+    return catatan
+
+
+def nilai_uji(sebelum: dict, sesudah: dict, fatal_baru: list, update_gagal: list,
+              jumlah_fatal: int | None = None, log_terpotong: bool = False,
+              log_tidak_terbaca: bool = False) -> tuple[str, list[str]]:
+    """Hanya regresi yang dihitung (putusan R17).
+
+    Halaman yang sudah gagal sebelum update dan masih gagal sesudahnya
+    dicatat lewat `catatan_uji`, bukan menjadi alasan. Aturan menyusut
+    hanya berlaku untuk halaman yang 2xx sebelum update. Log yang tidak
+    terpindai penuh membuat uji gagal (gagal tertutup).
+    """
     alasan = [f"Update {u['slug']} gagal: {u['pesan']}" for u in update_gagal]
     for jalur, h in sesudah.items():
         status = h.get("status") or 0
-        if not 200 <= status < 400:
-            alasan.append(f"{jalur} membalas HTTP {status}" if status else f"{jalur} tidak dapat dihubungi")
+        if not _hidup(status):
+            if _sudah_gagal(sebelum, jalur) is None:
+                alasan.append(f"{jalur} {_teks_status(status)}")
             continue
         s = sebelum.get(jalur) or {}
-        if s.get("ukuran", 0) > 0 and h.get("ukuran", 0) < s["ukuran"] * 0.5:
+        if 200 <= (s.get("status") or 0) < 300 and s.get("ukuran", 0) > 0 \
+                and h.get("ukuran", 0) < s["ukuran"] * 0.5:
             alasan.append(f"{jalur} menyusut dari {format_byte(s['ukuran'])} ke {format_byte(h.get('ukuran', 0))}")
-    if fatal_baru:
-        alasan.append(f"{len(fatal_baru)} error fatal baru di log PHP staging")
+    jumlah = len(fatal_baru) if jumlah_fatal is None else max(jumlah_fatal, len(fatal_baru))
+    if jumlah:
+        alasan.append(f"{jumlah} error fatal baru di log PHP staging")
+    if log_terpotong:
+        alasan.append("log PHP terlalu besar untuk diperiksa penuh")
+    if log_tidak_terbaca:
+        alasan.append("log PHP staging tidak dapat diperiksa")
     return ("lolos" if not alasan else "gagal"), alasan
 
 
@@ -277,21 +346,35 @@ def _argumen_update(p: dict) -> tuple[str, ...]:
     return (p["tipe"], "update", p["wpcli"], f"--version={p['ke']}")
 
 
+PESAN_AKSES_BELUM = "Akses preview staging belum dibuat; buat ulang kata sandi preview."
+PESAN_KONFIRMASI = ("Staging diubah sejak tarik terakhir; perubahan itu akan tertimpa oleh uji ini. "
+                    "Konfirmasi dulu untuk melanjutkan.")
+
+
+def _cookie(staging: Staging, host: str) -> str:
+    """Cookie secure_link router (Koreksi #5), dihitung dari jam saat ini."""
+    return "; ".join(f"{a}={b}" for a, b in cookie_akses(
+        dekripsi_secret(staging.rahasia_router_terenkripsi), host, int(time.time())).items())
+
+
 def uji(sesi, job, site, staging: Staging, klien, pb) -> dict:
+    # Sudah diperiksa tangani_staging_uji_update sebelum status staging
+    # disentuh; diulang di sini untuk pemanggil langsung.
     try:
         paket = urai_paket((job.payload or {}).get("paket"))
     except PaketTidakSah as exc:
-        raise umum.galat_ditolak(exc.args[0]) from None
-    if not staging.rahasia_router_terenkripsi:
-        raise umum.galat_ditolak("Akses preview staging belum dibuat; buat ulang kata sandi preview.")
+        raise umum.GalatDitolakTanpaUbah(exc.args[0]) from None
+    if not staging.rahasia_router_terenkripsi or not staging.sandi_hash:
+        raise umum.GalatDitolakTanpaUbah(PESAN_AKSES_BELUM)
     umum.perbarui_diubah(staging)
     sesi.commit()
     k = umum.kemajuan(job)
     if "tahap_uji" not in k:
         if staging.diubah_pada and staging.ditarik_pada and staging.diubah_pada > staging.ditarik_pada \
                 and not (job.payload or {}).get("konfirmasi"):
-            raise umum.galat_ditolak("Staging diubah sejak tarik terakhir; perubahan itu akan tertimpa oleh uji ini. "
-                                     "Konfirmasi dulu untuk melanjutkan.")
+            # Ditolak sebelum apa pun berubah: status staging dikembalikan
+            # pembungkus, bukan ditandai gagal.
+            raise umum.GalatDitolakTanpaUbah(PESAN_KONFIRMASI)
         k = umum.simpan_kemajuan(sesi, job, tahap_uji="tarik")
 
     akar = umum.dir_site(site.id)
@@ -301,11 +384,10 @@ def uji(sesi, job, site, staging: Staging, klien, pb) -> dict:
 
     host = umum.host_staging(staging)
     dasar = get_settings().staging_router_url
-    cookie = "; ".join(f"{a}={b}" for a, b in cookie_akses(
-        dekripsi_secret(staging.rahasia_router_terenkripsi), host, int(time.time())).items())
     http = umum.buat_http()
     try:
         if k["tahap_uji"] == "sebelum":
+            cookie = _cookie(staging, host)
             tunggu_siap(http, dasar, host, cookie)
             jalur = jalur_uji(sesi, site.id, umum.sekarang().date())
             sebelum = _probe_semua(sesi, job, staging, http, dasar, host, cookie, jalur)
@@ -337,21 +419,30 @@ def uji(sesi, job, site, staging: Staging, klien, pb) -> dict:
                 pass
             k = umum.simpan_kemajuan(sesi, job, tahap_uji="sesudah")
         if k["tahap_uji"] == "sesudah":
+            # Dihitung ulang: update bisa berjalan berjam-jam dan cookie
+            # dari tahap "sebelum" (atau putaran sebelumnya) bisa kedaluwarsa.
+            cookie = _cookie(staging, host)
             tunggu_siap(http, dasar, host, cookie)
             sesudah = _probe_semua(sesi, job, staging, http, dasar, host, cookie, k["jalur"])
-            k = umum.simpan_kemajuan(sesi, job, tahap_uji="nilai", sesudah=sesudah,
-                                     fatal_baru=baca_log_baru(akar / LOG_PHP, k["log_posisi"], akar=akar))
+            log = periksa_log_baru(akar / LOG_PHP, k["log_posisi"], akar=akar)
+            k = umum.simpan_kemajuan(sesi, job, tahap_uji="nilai", sesudah=sesudah, fatal_baru=log["baris"],
+                                     fatal_jumlah=log["jumlah"], log_terpotong=log["terpotong"],
+                                     log_tidak_terbaca=log["tidak_terbaca"])
     finally:
         http.close()
 
     # JSONB tidak menyimpan urutan kunci: urutan halaman selalu dari k["jalur"].
     sebelum = {j: k["sebelum"].get(j) or {} for j in k["jalur"]}
     sesudah = {j: k["sesudah"].get(j) or {} for j in k["jalur"]}
-    hasil, alasan = nilai_uji(sebelum, sesudah, k["fatal_baru"], [u for u in k["update"] if not u["ok"]])
+    jumlah_fatal = k.get("fatal_jumlah", len(k["fatal_baru"]))
+    hasil, alasan = nilai_uji(sebelum, sesudah, k["fatal_baru"], [u for u in k["update"] if not u["ok"]],
+                              jumlah_fatal=jumlah_fatal, log_terpotong=bool(k.get("log_terpotong")),
+                              log_tidak_terbaca=bool(k.get("log_tidak_terbaca")))
     paket_simpan = [{"tipe": p["tipe"], "slug": p["slug"], "dari": p["dari"], "ke": p["ke"]} for p in paket]
     sesi.add(StagingUji(site_id=site.id, job_id=job.id, paket=paket_simpan, hasil=hasil, pemeriksaan=bersih_json({
         "halaman": [{"jalur": j, "sebelum": k["sebelum"].get(j), "sesudah": k["sesudah"].get(j)} for j in k["jalur"]],
-        "fatal_baru": k["fatal_baru"], "update": k["update"], "alasan": alasan,
+        "fatal_baru": k["fatal_baru"], "jumlah_fatal": jumlah_fatal, "update": k["update"], "alasan": alasan,
+        "catatan": catatan_uji(sebelum, sesudah),
     })))
     st = sesi.get(Staging, staging.id, populate_existing=True)
     st.status = StatusStaging.siap
@@ -368,10 +459,28 @@ def uji(sesi, job, site, staging: Staging, klien, pb) -> dict:
     return {"hasil": hasil, "alasan": alasan}
 
 
+def _periksa_awal(sesi, job) -> None:
+    """Penolakan yang tidak butuh apa pun dari staging, sebelum statusnya disentuh.
+
+    `jalankan_staging` memasang status `berjalan_uji` begitu dimulai, dan
+    penolakan biasa sesudahnya menandai staging gagal. Payload rusak atau
+    akses preview yang belum dibuat bukan kerusakan staging, jadi ditolak
+    di sini. Staging yang tidak ada dibiarkan ditolak `muat_staging`.
+    """
+    try:
+        urai_paket((job.payload or {}).get("paket"))
+    except PaketTidakSah as exc:
+        raise umum.galat_ditolak(exc.args[0]) from None
+    st = sesi.scalar(select(Staging).where(Staging.site_id == job.site_id))
+    if st is not None and (not st.rahasia_router_terenkripsi or not st.sandi_hash):
+        raise umum.galat_ditolak(PESAN_AKSES_BELUM)
+
+
 def tangani_staging_uji_update(sesi, job, klien) -> dict:
     def inti(sesi, job, site, staging):
         return uji(sesi, job, site, staging, klien, umum.buat_pembantu())
 
+    _periksa_awal(sesi, job)
     site_id = job.site_id
     try:
         return umum.jalankan_staging(sesi, job, inti, StatusStaging.berjalan_uji, "Uji update di staging")

@@ -160,7 +160,11 @@ def test_probe_judul_dibatasi_dan_tahan_masukan_jahat():
     # <titlebar> bukan <title>; atribut dan huruf besar diterima.
     isi = "<TITLEBAR>x</TITLEBAR><Title lang='id'>Beranda &amp; Toko</TITLE>"
     assert probe(_klien(lambda r: httpx.Response(200, text=isi)), "http://x", "h", "", "/")["judul"] == \
-        "Beranda &amp; Toko"
+        "Beranda & Toko"
+    # Entitas didekode sebelum dibersihkan: &#0; dan &nbsp; tidak lolos mentah.
+    isi = "<title>A&#0;B&nbsp;&lt;C&gt;&#x27;</title>"
+    assert probe(_klien(lambda r: httpx.Response(200, text=isi)), "http://x", "h", "", "/")["judul"] == \
+        "A�B <C>'"
 
 
 @pytest.mark.parametrize("tipe,slug,ke", [
@@ -182,25 +186,41 @@ def test_urai_paket_core_dan_dari_dibersihkan():
     assert "\x00" not in hasil[0]["dari"] and len(hasil[0]["dari"]) <= 30
 
 
-def test_baca_log_baru_dibatasi_dan_berbaris_panjang(tmp_path, monkeypatch):
+def test_baca_log_baru_berbaris_panjang_dan_jumlah_sebenarnya(tmp_path, monkeypatch):
     monkeypatch.setattr(uji, "BATAS_LOG", 4096)
     log = tmp_path / "php-error.log"
-    # Peringatan yang membanjir (lebih dari satu kali BATAS_LOG) tidak
-    # menyembunyikan fatal sesudahnya, selama total baca dalam batas.
-    log.write_bytes(b"[w] PHP Warning: " + b"w" * 10_000 + b"\n" + b"[f] PHP Fatal error: " + b"z" * 900 + b"\n")
+    # Peringatan yang membanjir (berkali-kali BATAS_LOG) tidak menyembunyikan
+    # fatal sesudahnya: seluruh wilayah baru dipindai per blok.
+    log.write_bytes(b"[w] PHP Warning: " + b"w" * 100_000 + b"\n" + b"[f] PHP Fatal error: " + b"z" * 900 + b"\n")
     baru = baca_log_baru(log, 0)
     assert len(baru) == 1 and baru[0].startswith("[f] PHP Fatal error") and len(baru[0]) <= 300
-    # Lebih dari MAKS_FATAL baris fatal: dipotong.
+    # Lebih dari MAKS_FATAL baris fatal: yang disimpan dipotong, jumlahnya tidak.
     log.write_bytes(b"PHP Fatal error: x\n" * 50)
     assert len(baca_log_baru(log, 0)) == uji.MAKS_FATAL
+    hasil = uji.periksa_log_baru(log, 0)
+    assert hasil["jumlah"] == 50 and len(hasil["baris"]) == uji.MAKS_FATAL and hasil["terpotong"] is False
 
 
-def test_baca_log_baru_total_baca_dibatasi(tmp_path, monkeypatch):
+def test_baca_log_baru_memindai_seluruh_wilayah_baru(tmp_path, monkeypatch):
     monkeypatch.setattr(uji, "BATAS_LOG", 1024)
     log = tmp_path / "php-error.log"
-    # Fatal jauh di luar total batas baca tidak dibaca (memori terbatas).
-    log.write_bytes(b"x" * (1024 * uji.MAKS_BLOK_LOG + 10) + b"\nPHP Fatal error: jauh\n")
-    assert baca_log_baru(log, 0) == []
+    log.write_bytes(b"x" * (1024 * 20 + 10) + b"\nPHP Fatal error: jauh\n")
+    assert baca_log_baru(log, 0) == ["PHP Fatal error: jauh"]
+
+
+def test_periksa_log_berhenti_di_tenggat_waktu_dan_melapor(tmp_path, monkeypatch):
+    monkeypatch.setattr(uji, "BATAS_LOG", 1024)
+    monkeypatch.setattr(uji, "TENGGAT_LOG", -1)
+    log = tmp_path / "php-error.log"
+    log.write_bytes(b"x" * (1024 * 5) + b"\nPHP Fatal error: jauh\n")
+    hasil = uji.periksa_log_baru(log, 0)
+    assert hasil["terpotong"] is True and hasil["jumlah"] == 0
+    # Selesai tepat di blok terakhir: bukan terpotong.
+    log.write_bytes(b"PHP Fatal error: dekat\n")
+    assert uji.periksa_log_baru(log, 0) == {"baris": ["PHP Fatal error: dekat"], "jumlah": 1, "terpotong": False,
+                                            "tidak_terbaca": False}
+    # Log yang tidak ada: tidak ada fatal, bukan "tidak terbaca".
+    assert uji.periksa_log_baru(tmp_path / "tidak-ada.log", 0)["tidak_terbaca"] is False
 
 
 def test_baca_log_baru_menolak_symlink_dan_bukan_berkas(tmp_path):
@@ -213,6 +233,9 @@ def test_baca_log_baru_menolak_symlink_dan_bukan_berkas(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("symlink tidak dapat dibuat di sistem ini")
     assert baca_log_baru(tautan, 0, akar=tmp_path) == []
+    # Gagal tertutup: log yang ditukar container dengan symlink membuat uji gagal.
+    assert uji.periksa_log_baru(tautan, 0, akar=tmp_path)["tidak_terbaca"] is True
+    assert uji.nilai_uji({}, {}, [], [], log_tidak_terbaca=True) == ("gagal", ["log PHP staging tidak dapat diperiksa"])
     assert uji.ukuran_log(tmp_path, "log/php-error.log") == 0
 
 
@@ -232,3 +255,36 @@ def test_baca_log_baru_direktori_log_berupa_symlink(tmp_path):
 def test_nilai_sebelum_nol_tidak_dianggap_menyusut():
     assert nilai_uji({"/": {"status": 0, "judul": None, "ukuran": 0}}, {"/": H}, [], []) == ("lolos", [])
     assert nilai_uji({}, {"/": H}, [], []) == ("lolos", [])
+
+
+# ---- putusan R17: hanya regresi yang dihitung ------------------------------
+
+
+def test_halaman_yang_sudah_gagal_sebelum_update_bukan_alasan():
+    sebelum = {"/": {**H, "status": 500}, "/a/": {"status": 0, "judul": None, "ukuran": 0}, "/b/": H}
+    sesudah = {"/": {**H, "status": 500}, "/a/": {"status": 0, "judul": None, "ukuran": 0}, "/b/": H}
+    assert nilai_uji(sebelum, sesudah, [], []) == ("lolos", [])
+    assert uji.catatan_uji(sebelum, sesudah) == [
+        "/ sudah membalas HTTP 500 sebelum update",
+        "/a/ sudah tidak dapat dihubungi sebelum update",
+    ]
+    # Hidup sebelum, mati sesudah: regresi.
+    assert nilai_uji({"/": H}, {"/": {**H, "status": 503}}, [], []) == ("gagal", ["/ membalas HTTP 503"])
+    # Tanpa data sebelum: tidak ada bukti ia sudah gagal, jadi dihitung gagal.
+    assert nilai_uji({}, {"/": {**H, "status": 500}}, [], [])[0] == "gagal"
+    assert uji.catatan_uji({}, {"/": {**H, "status": 500}}) == []
+
+
+def test_aturan_menyusut_hanya_untuk_halaman_2xx_sebelum():
+    # 3xx sebelum (mis. redirect ke login) lalu 200 kecil: bukan penyusutan.
+    assert nilai_uji({"/": {**H, "status": 302}}, {"/": {**H, "ukuran": 100}}, [], []) == ("lolos", [])
+    # 500 sebelum lalu 200 kecil: halaman membaik, bukan penyusutan.
+    assert nilai_uji({"/": {**H, "status": 500}}, {"/": {**H, "ukuran": 100}}, [], []) == ("lolos", [])
+    assert nilai_uji({"/": H}, {"/": {**H, "ukuran": 100}}, [], [])[0] == "gagal"
+
+
+def test_jumlah_fatal_sebenarnya_dan_log_terpotong_gagal_tertutup():
+    hasil, alasan = nilai_uji({}, {}, ["PHP Fatal error: x"] * 10, [], jumlah_fatal=37)
+    assert hasil == "gagal" and alasan == ["37 error fatal baru di log PHP staging"]
+    hasil, alasan = nilai_uji({}, {}, [], [], jumlah_fatal=0, log_terpotong=True)
+    assert hasil == "gagal" and alasan == ["log PHP terlalu besar untuk diperiksa penuh"]

@@ -85,6 +85,18 @@ class GalatBerhenti(SiteError):
         super().__init__(TRANSIENT, "Worker dihentikan; job staging dilanjutkan otomatis.")
 
 
+class GalatDitolakTanpaUbah(SiteError):
+    """Permintaan ditolak sebelum staging disentuh (mis. konfirmasi belum ada).
+
+    Penolakan seperti ini tidak berarti staging rusak: pembungkus
+    mengembalikan statusnya seperti `_batalkan` (siap bila pernah ditarik),
+    bukan menandainya gagal. Job tetap berakhir gagal dengan pesan tetap ini.
+    """
+
+    def __init__(self, pesan: str) -> None:
+        super().__init__(STAGING_DITOLAK, pesan)
+
+
 def galat_ditolak(pesan: str) -> SiteError:
     return SiteError(STAGING_DITOLAK, pesan)
 
@@ -363,6 +375,11 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
     except Dibatalkan:
         raise _batalkan(sesi, job, site_id, staging_id, nama) from None
     except KlaimHilang:
+        raise
+    except GalatDitolakTanpaUbah as exc:
+        sesi.rollback()
+        st = sesi.get(Staging, staging_id, populate_existing=True)
+        _tandai(sesi, staging_id, StatusStaging.siap if st.ditarik_pada else StatusStaging.gagal, exc.pesan)
         raise
     except GalatPembantu as exc:
         _tandai(sesi, staging_id, StatusStaging.gagal, exc.pesan)
