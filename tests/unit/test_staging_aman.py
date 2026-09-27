@@ -1,4 +1,5 @@
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from wpmgr.staging.aman import (
     bersih_teks,
     boleh_didorong,
     buka_baca,
+    daftar_direktori,
     dikecualikan,
     hapus_berkas,
     jalur_di_dalam,
@@ -260,3 +262,21 @@ def test_linux_tanpa_dir_fd_adalah_galat_keras():
     assert _dukung_dir_fd(tanpa, "win32") is False
     if sys.platform == "linux":
         assert _dukung_dir_fd(os, sys.platform) is True
+
+
+def test_daftar_direktori_memakai_lstat_dan_menolak_induk_symlink(pohon):
+    akar, luar = pohon
+    (akar / "wp-content" / "a.txt").write_bytes(b"abc")
+    (akar / "wp-content" / "d").mkdir()
+    isi = dict(daftar_direktori(akar, "wp-content"))
+    assert set(isi) == {"a.txt", "d"}
+    assert isi["a.txt"].st_size == 3
+    assert set(dict(daftar_direktori(akar, ""))) == {"wp-content"}
+    _symlink(luar / "rahasia.env", akar / "wp-content" / "t.env", False)
+    _symlink(luar, akar / "wp-content" / "uploads", True)
+    isi = dict(daftar_direktori(akar, "wp-content"))
+    # Entri symlink dilaporkan apa adanya (lstat), tidak diikuti.
+    assert stat.S_ISLNK(isi["t.env"].st_mode)
+    assert stat.S_ISLNK(isi["uploads"].st_mode)
+    with pytest.raises(PathTidakAman):
+        daftar_direktori(akar, "wp-content/uploads")

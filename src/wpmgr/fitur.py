@@ -9,6 +9,7 @@ hilang".
 EVENTS = "events"
 TRAFFIC = "traffic"
 SELF_UPDATE = "self_update"
+STAGING = "staging"
 
 
 def punya_fitur(site, nama: str) -> bool:

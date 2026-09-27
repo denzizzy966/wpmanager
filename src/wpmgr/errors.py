@@ -14,6 +14,18 @@ PACKAGE_MISSING = "package_missing"
 # Handler melempar sesuatu yang bukan SiteError -- bug di sisi dashboard,
 # bukan kondisi site. Tidak diulang dan tidak menyentuh status site.
 INTERNAL_ERROR = "internal_error"
+# Lapis 3. Tidak satu pun mengubah status site produksi: staging yang mati,
+# ditolak, atau gagal bukan diagnosis tentang koneksi ke site.
+STAGING_MATI = "staging_mati"
+STAGING_DITOLAK = "staging_ditolak"
+STAGING_GAGAL = "staging_gagal"
+# 413 dari connector: satu permintaan potongan melebihi 8 MB (berkas tumbuh
+# sejak manifest). Pemanggil memecah permintaannya, bukan mengulang.
+TERLALU_BESAR = "terlalu_besar"
+# 404 wpmgr_staging_tidak_ada: berkas dihapus di produksi sejak manifest.
+# Bukan "connector hilang"; berkas itu dihapus juga di staging.
+BERKAS_HILANG = "berkas_hilang"
+KELAS_STAGING = frozenset({STAGING_MATI, STAGING_DITOLAK, STAGING_GAGAL, TERLALU_BESAR, BERKAS_HILANG})
 
 DAPAT_DIULANG = frozenset({TRANSIENT, BAD_RESPONSE})
 
@@ -27,6 +39,12 @@ KODE_SIBUK = "wpmgr_sibuk"
 KODE_UPGRADE_GAGAL = "wpmgr_upgrade_gagal"
 KODE_PASANG_GAGAL = "wpmgr_pasang_gagal"
 KODE_PAKET_RUSAK = "wpmgr_paket_rusak"
+KODE_STAGING_MATI = "wpmgr_staging_mati"
+KODE_TERLALU_BESAR = "wpmgr_staging_terlalu_besar"
+KODE_STAGING_TIDAK_ADA = "wpmgr_staging_tidak_ada"
+# Satu baris tabel yang SQL-nya sendiri melebihi batas respons connector:
+# baris itu selalu gagal dengan cara yang sama, jadi mengulang tidak berguna.
+KODE_BARIS_TERLALU_BESAR = "wpmgr_staging_baris_terlalu_besar"
 
 
 class SiteError(Exception):
@@ -51,7 +69,9 @@ def _json_plugin(body: str) -> dict | None:
     """
     try:
         data = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: body "[[[[..." sangat dalam dari pihak mana pun di
+        # depan connector; itu jelas bukan balasan connector.
         return None
     if isinstance(data, dict) and str(data.get("code", "")).startswith(_PREFIX_KODE_PLUGIN):
         return data
@@ -88,6 +108,17 @@ def _terlihat_firewall(headers: dict[str, str], body: str) -> bool:
 
 def klasifikasi_respons(status: int, headers: dict[str, str], body: str) -> str | None:
     kode = kode_plugin(body)
+    if kode == KODE_STAGING_MATI:
+        # Admin site mematikan "Izinkan staging". Tanpa cabang ini 403 ini
+        # dibaca auth_error dan site sehat berubah menjadi needs_reconnect.
+        return STAGING_MATI
+    if kode == KODE_TERLALU_BESAR:
+        return TERLALU_BESAR
+    if kode == KODE_STAGING_TIDAK_ADA:
+        return BERKAS_HILANG
+    if kode == KODE_BARIS_TERLALU_BESAR:
+        # Tanpa cabang ini 413 jatuh ke BAD_RESPONSE, yang diulang sia-sia.
+        return STAGING_GAGAL
     if status in (401, 403):
         if kode is not None:
             return AUTH_ERROR

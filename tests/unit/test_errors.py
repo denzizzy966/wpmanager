@@ -217,3 +217,32 @@ def test_paket_connector_rusak_menjadi_bad_response():
 
     body = '{"code":"wpmgr_paket_rusak","message":"Hash paket tidak cocok dengan isinya."}'
     assert klasifikasi_respons(400, {}, body) == BAD_RESPONSE
+
+
+def test_json_bersarang_dalam_tidak_meledak_saat_klasifikasi():
+    dalam = "[" * 60000 + "]" * 60000
+    assert klasifikasi_respons(200, {}, dalam) is None
+    assert klasifikasi_respons(400, {}, dalam) == BAD_RESPONSE
+    assert pesan_plugin(dalam) is None
+
+
+def test_kode_staging_dipetakan_sebelum_cabang_status():
+    from wpmgr.errors import (
+        BERKAS_HILANG,
+        KELAS_STAGING,
+        STAGING_GAGAL,
+        STAGING_MATI,
+        TERLALU_BESAR,
+    )
+
+    def kode(k):
+        return json.dumps({"code": k, "message": "x"})
+
+    # 403 wpmgr_staging_mati bukan auth_error: site produksi tetap sehat.
+    assert klasifikasi_respons(403, {}, kode("wpmgr_staging_mati")) == STAGING_MATI
+    assert klasifikasi_respons(413, {}, kode("wpmgr_staging_terlalu_besar")) == TERLALU_BESAR
+    assert klasifikasi_respons(404, {}, kode("wpmgr_staging_tidak_ada")) == BERKAS_HILANG
+    # Satu baris tabel melebihi batas respons: mengulang selalu gagal sama.
+    assert klasifikasi_respons(413, {}, kode("wpmgr_staging_baris_terlalu_besar")) == STAGING_GAGAL
+    assert STAGING_GAGAL not in DAPAT_DIULANG
+    assert KELAS_STAGING == {"staging_mati", "staging_ditolak", "staging_gagal", "terlalu_besar", "berkas_hilang"}

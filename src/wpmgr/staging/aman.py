@@ -317,6 +317,33 @@ def buka_baca(akar: Path, relatif: str) -> BinaryIO:
         raise
 
 
+def adalah_tautan(st: os.stat_result) -> bool:
+    """Hasil lstat ini symlink (atau junction/reparse point Windows)."""
+    return _tautan(st)
+
+
+def daftar_direktori(akar: Path, relatif: str) -> list[tuple[str, os.stat_result]]:
+    """Isi direktori `akar/relatif` ("" = akar) sebagai (nama, lstat), tanpa mengikuti symlink.
+
+    Setiap komponen menuju direktori itu dibuka tanpa mengikuti symlink,
+    jadi direktori yang ditukar container dengan symlink ke luar ditolak
+    (`PathTidakAman`), bukan didaftar isinya. Entri symlink di dalamnya
+    dilaporkan dengan lstat-nya sendiri; pemanggil yang melewatinya.
+    """
+    bagian = relatif.split("/") if relatif else []
+    if relatif:
+        path_sah(relatif)
+    if _ADA_DIR_FD:
+        dfd = _fd_induk(akar, bagian, buat=False)
+        try:
+            with os.scandir(dfd) as it:
+                return [(d.name, d.stat(follow_symlinks=False)) for d in it]
+        finally:
+            os.close(dfd)
+    with os.scandir(_periksa_jalur(akar, bagian, buat=False)) as it:
+        return [(d.name, d.stat(follow_symlinks=False)) for d in it]
+
+
 def baca_terbatas(akar: Path, relatif: str, maks: int, dari: int = 0) -> bytes:
     """Paling banyak `maks` byte dari `akar/relatif` mulai posisi `dari`."""
     if maks < 0 or dari < 0:

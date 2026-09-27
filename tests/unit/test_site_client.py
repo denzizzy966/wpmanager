@@ -195,6 +195,15 @@ def test_respons_bukan_json_menjadi_bad_response():
     assert exc.value.error_class == "bad_response"
 
 
+def test_json_bersarang_sangat_dalam_menjadi_bad_response():
+    def handler(request):
+        return httpx.Response(200, content="[" * 100000 + "]" * 100000)
+
+    with pytest.raises(SiteError) as exc:
+        buat_klien(handler).ping()
+    assert exc.value.error_class == "bad_response"
+
+
 def test_warning_php_sebelum_json_menjadi_bad_response():
     """Kegagalan rutin di shared hosting: plugin lain mencetak warning sebelum
     body JSON. Body ini bukan HTML, sehingga klasifikasi_respons meloloskannya
