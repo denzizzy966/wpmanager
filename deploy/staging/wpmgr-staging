@@ -858,7 +858,18 @@ server {
 
     # Cookie bertanda tangan dari /__wpmgr_masuk mematikan Basic Auth
     # sampai kedaluwarsa (SSO dan probe dashboard, Koreksi #5).
-    secure_link \$cookie_wpmgr_stg_m,\$cookie_wpmgr_stg_e;
+    # nginx menyimpan \$secure_link sekali per request, pada pembacaan
+    # pertamanya (if server di bawah). Karena itu sumbernya dipilih di sini:
+    # query untuk /__wpmgr_masuk, cookie untuk selainnya. secure_link kedua
+    # di location masuk tidak akan pernah dievaluasi (tautan sah ditolak,
+    # tautan palsu lolos bila cookie sah).
+    set \$wpmgr_m \$cookie_wpmgr_stg_m;
+    set \$wpmgr_e \$cookie_wpmgr_stg_e;
+    if (\$uri = /__wpmgr_masuk) {
+        set \$wpmgr_m \$arg_m;
+        set \$wpmgr_e \$arg_e;
+    }
+    secure_link \$wpmgr_m,\$wpmgr_e;
     secure_link_md5 "\$secure_link_expires\$host $r";
     set \$wpmgr_auth "Staging $n";
     if (\$secure_link = "1") {
@@ -869,8 +880,6 @@ server {
 
     location = /__wpmgr_masuk {
         auth_basic off;
-        secure_link \$arg_m,\$arg_e;
-        secure_link_md5 "\$secure_link_expires\$host $r";
         if (\$secure_link != "1") {
             return 403;
         }

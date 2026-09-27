@@ -447,6 +447,33 @@ tulis_mounts() {
   [ "$status" -eq 2 ]
 }
 
+@test "router-muat: tautan masuk diverifikasi dari query, bukan dari nilai cookie yang tersimpan" {
+  # nginx menyimpan $secure_link sekali per request. Bila server membacanya
+  # dari cookie lebih dulu, `secure_link $arg_m,$arg_e` di location masuk tidak
+  # pernah dievaluasi: tautan SSO sah ditolak 403 tanpa cookie, dan tautan
+  # palsu diterima bila cookie sah (ditemukan e2e Task 22). Sumbernya harus
+  # dipilih per URI SEBELUM $secure_link dibaca, dengan satu direktif saja.
+  printf 'layanan:router' > "$PALSU/wadah/wpmgr-stg-router"
+  printf '%s' "$(printf 'e%.0s' $(seq 1 64))" > "$S/staging/router/toko.rahasia"
+  printf 'staging:%s\n' '$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ01234' > "$S/staging/router/toko.htpasswd"
+  run "$SKRIP" router-muat
+  [ "$status" -eq 0 ]
+  konf="$S/etc/router/conf.d/stg-toko.conf"
+  [ "$(grep -c '^ *secure_link ' "$konf")" -eq 1 ]
+  [ "$(grep -c '^ *secure_link_md5 ' "$konf")" -eq 1 ]
+  grep -qF 'secure_link $wpmgr_m,$wpmgr_e;' "$konf"
+  # Urutan: sumber cookie, lalu query khusus URI masuk, lalu secure_link, lalu if pertama yang membacanya.
+  n_cookie="$(grep -nF 'set $wpmgr_m $cookie_wpmgr_stg_m;' "$konf" | cut -d: -f1)"
+  n_uri="$(grep -nF 'if ($uri = /__wpmgr_masuk) {' "$konf" | cut -d: -f1)"
+  n_arg="$(grep -nF 'set $wpmgr_m $arg_m;' "$konf" | cut -d: -f1)"
+  n_sl="$(grep -nF 'secure_link $wpmgr_m,$wpmgr_e;' "$konf" | cut -d: -f1)"
+  n_baca="$(grep -nF '$secure_link = "1"' "$konf" | head -n 1 | cut -d: -f1)"
+  [ -n "$n_cookie" ] && [ -n "$n_uri" ] && [ -n "$n_arg" ] && [ -n "$n_baca" ]
+  [ "$n_cookie" -lt "$n_uri" ] && [ "$n_uri" -lt "$n_arg" ] && [ "$n_arg" -lt "$n_sl" ] && [ "$n_sl" -lt "$n_baca" ]
+  grep -qF 'set $wpmgr_e $arg_e;' "$konf"
+  grep -qF 'set $wpmgr_e $cookie_wpmgr_stg_e;' "$konf"
+}
+
 @test "router-muat memulihkan konfigurasi lama bila nginx -t gagal" {
   printf 'layanan:router' > "$PALSU/wadah/wpmgr-stg-router"
   printf 'lama' > "$S/etc/router/conf.d/stg-lama.conf"
