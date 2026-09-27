@@ -1349,3 +1349,72 @@ def test_tarik_ditolak_sesudah_salinan_disentuh_tetap_menandai_salinan(sesi, sit
         tarik.tangani_staging_tarik(sesi, job, prod.klien(site))
     st = _staging(sesi, site_staging)
     assert st.status == StatusStaging.gagal and st.gagal_asal == umum.ASAL_SALINAN
+
+
+# ---- putusan R22: 'salinan' menang; tarik/uji yang dibatalkan ------------------------
+
+
+def _tarik_dibatalkan(sesi, site_staging, prod, route: str, ke: int) -> Job:
+    """Tarik yang dibatalkan pengguna saat permintaan `route` ke-`ke` ke produksi."""
+    def minta_batal(p, n, badan):
+        if n == ke:
+            st = sesi.get(Staging, site_staging.id)
+            st.batal_diminta_pada = umum.sekarang()
+            sesi.commit()
+
+    prod.hitung.clear()
+    prod.sebelum[route] = minta_batal
+    site = sesi.get(Site, site_staging.site_id)
+    job = buat_job(sesi, site.id, JobType.staging_tarik)
+    with pytest.raises(umum.GalatDibatalkan):
+        tarik.tangani_staging_tarik(sesi, job, prod.klien(site))
+    del prod.sebelum[route]
+    _selesaikan_gagal(sesi)
+    return job
+
+
+def _dorong_ditolak_salinan(sesi, site_staging, prod):
+    sebelum = len(prod.diminta)
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "hanya_kode")
+    _selesaikan_gagal(sesi)
+    assert isinstance(e.value, umum.GalatDitolakTanpaUbah) and e.value.pesan == dorong.PESAN_SALINAN_GAGAL
+    assert len(prod.diminta) == sebelum
+
+
+def test_r22_tarik_gagal_lalu_tarik_baru_dibatalkan_segera_tetap_salinan(sesi, site_staging, staging_aktif,
+                                                                         prod, pb):
+    """Skenario A: batal sebelum salinan disentuh mengembalikan gagal 'salinan' beserta galat aslinya."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    galat = _tarik_gagal(sesi, site_staging, prod, pb)
+    st = _staging(sesi, site_staging)
+    st.batal_diminta_pada = umum.sekarang()
+    sesi.commit()
+    with pytest.raises(umum.GalatDibatalkan):
+        _tarik(sesi, site_staging, prod)
+    _selesaikan_gagal(sesi)
+    st = _staging(sesi, site_staging)
+    assert (st.status, st.gagal_asal, st.galat) == (StatusStaging.gagal, umum.ASAL_SALINAN, galat)
+    assert st.batal_diminta_pada is None
+    _dorong_ditolak_salinan(sesi, site_staging, prod)
+
+
+def test_r22_tarik_dibatalkan_saat_berkas_menandai_salinan(sesi, site_staging, staging_aktif, prod, pb):
+    """Skenario B: tarik pada staging yang baik dibatalkan saat `berkas` -> gagal 'salinan', dorong ditolak."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    job = _tarik_dibatalkan(sesi, site_staging, prod, "/staging/manifest", ke=2)
+    assert _kemajuan(sesi, job)["tahap"] == "berkas"
+    st = _staging(sesi, site_staging)
+    assert (st.status, st.gagal_asal) == (StatusStaging.gagal, umum.ASAL_SALINAN)
+    assert st.galat == umum.PESAN_BATAL_TENGAH
+    _dorong_ditolak_salinan(sesi, site_staging, prod)
+
+
+def test_r22_tarik_dibatalkan_saat_manifest_tetap_siap(sesi, site_staging, staging_aktif, prod, pb):
+    """Batal di tahap manifest: salinan belum disentuh, staging tetap siap tanpa penanda, dorong boleh."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    job = _tarik_dibatalkan(sesi, site_staging, prod, "/staging/manifest", ke=1)
+    assert _kemajuan(sesi, job)["tahap"] == "manifest"
+    st = _staging(sesi, site_staging)
+    assert (st.status, st.gagal_asal) == (StatusStaging.siap, None)
+    assert _dorong(sesi, site_staging, prod, "hanya_kode")["dorong_gagal"] is False

@@ -614,8 +614,9 @@ def tuntaskan_sukses(sesi, job, site, staging, klien, k: dict, judul: str, detai
     """Akhir dorong/kembalikan yang sukses: halaman utama, bersihkan, status staging, log aktivitas.
 
     `dorong_gagal_pada` dikosongkan hanya bila halaman utama menjawab 2xx/3xx.
-    `gagal` milik produksi dibersihkan; `gagal` milik salinan staging tetap
-    (R18: dorong/kembalikan tidak memperbaiki salinan). Tidak meng-commit:
+    `gagal` milik produksi dibersihkan; salinan yang belum utuh (`gagal`
+    'salinan', tarik/uji tertunda) tetap dalam keadaannya (R18/R22:
+    dorong/kembalikan tidak memperbaiki salinan). Tidak meng-commit:
     pemanggil menambahkan perubahannya sendiri (pangkas snapshot, status
     snapshot) lalu meng-commit semuanya bersama.
     """
@@ -625,7 +626,7 @@ def tuntaskan_sukses(sesi, job, site, staging, klien, k: dict, judul: str, detai
     ok = _hidup(status)
     if staging is not None:
         st = sesi.get(Staging, staging.id, populate_existing=True)
-        st.status = StatusStaging.gagal if umum.salinan_rusak_sebelum(job) else umum.status_istirahat(st)
+        st.status = umum.status_sukses_produksi(job, st)
         st.dorong_gagal_pada = None if ok else umum.sekarang()
     detail = {**detail, "halaman_utama": status}
     if not ok:
@@ -1285,10 +1286,12 @@ def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None, pesa
         return None
     st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
     if st is not None:
-        st.status = StatusStaging.gagal
-        st.gagal_asal = umum.ASAL_PRODUKSI
+        # gagal 'produksi', kecuali salinan sudah belum utuh sebelum job ini (R22).
+        status, asal, galat = umum.status_gagal_final(job, st, pesan)
+        st.status = status
+        st.gagal_asal = asal if status == StatusStaging.gagal else None
         st.dorong_gagal_pada = umum.sekarang()
-        st.galat = pesan
+        st.galat = bersih_teks(galat, 1000)
         sesi.commit()
     return SiteError(STAGING_GAGAL, pesan)
 

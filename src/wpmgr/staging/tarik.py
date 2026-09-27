@@ -633,14 +633,9 @@ def _bangun_ulang_indeks(sesi, job, akar: Path, peringatan: list[str]) -> None:
 # ---- job ----------------------------------------------------------------------
 
 
-# Tahap tarik sebelum salinan (files/ dan database staging) mulai ditulis.
-# Manifest hanya ditulis ke area kerja tarik/, bukan ke salinan.
-TAHAP_SEBELUM_SALINAN = (None, "manifest")
-
-
-def salinan_belum_disentuh(job) -> bool:
-    """Putusan R21: tarik ini belum menulis apa pun ke salinan staging (termasuk percobaan sebelumnya)."""
-    return umum.kemajuan(job).get("tahap") in TAHAP_SEBELUM_SALINAN
+# Putusan R21/R22: batasnya tinggal di umum (pembungkus memakainya untuk batal).
+TAHAP_SEBELUM_SALINAN = umum.TAHAP_SEBELUM_SALINAN
+salinan_belum_disentuh = umum.salinan_belum_disentuh
 
 
 def _tolak(job, pesan: str) -> SiteError:

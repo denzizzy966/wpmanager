@@ -29,19 +29,20 @@ def _lepas_staging(sesi: Session, job: Job) -> None:
     sini; rekonsiliasi dorong yang menanganinya. Ditulis di transaksi yang
     sama dengan penanda job `unknown`.
 
-    Asal status (putusan R20) sama dengan gagal final di pembungkus
-    (`umum.status_gagal_final`): tarik/uji -> `gagal` 'salinan'; dorong/
-    kembalikan -> `gagal` 'produksi' hanya bila tukar sudah dikirim, selain itu
-    status staging sebelum job itu dikembalikan.
+    Status, asal, dan galat (putusan R20/R22) sama dengan gagal final di
+    pembungkus (`umum.status_gagal_final`): tarik/uji -> `gagal` 'salinan';
+    dorong/kembalikan -> `gagal` 'produksi' hanya bila tukar sudah dikirim pada
+    salinan yang utuh, selain itu status staging sebelum job itu dikembalikan
+    (salinan yang belum utuh tetap dengan galatnya).
     """
     st =sesi.scalar(select(Staging).where(Staging.site_id == job.site_id,
                                            Staging.status.in_(STATUS_KERJA_STAGING)).with_for_update())
     if st is None:
         return
-    status, asal = umum.status_gagal_final(job, st)
+    status, asal, galat = umum.status_gagal_final(job, st, PESAN_STAGING_TERHENTI)
     st.status = status
     st.gagal_asal = asal if status == StatusStaging.gagal else None
-    st.galat = PESAN_STAGING_TERHENTI
+    st.galat = galat
     st.batal_diminta_pada = None
 
 

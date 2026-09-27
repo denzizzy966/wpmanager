@@ -565,6 +565,8 @@ def _jalankan_lewat_worker(sesi, monkeypatch, tipe, inti, status_kerja=StatusSta
 def test_batal_lalu_potongan_gagal_sementara_tetap_batal(sesi, site_staging, monkeypatch, kelas):
     """Batal yang diminta sebelum potongan gagal sementara tidak hilang; dorong tidak berlanjut."""
     site_staging.ditarik_pada = datetime.now(timezone.utc)
+    # Status bawaan fixture `menyalin` berarti tarik tertunda; R22 mempertahankannya.
+    site_staging.status = StatusStaging.siap
     sesi.commit()
     panggilan = []
 
@@ -727,6 +729,31 @@ def test_reaper_asal_gagal_per_tipe_job(sesi, site_staging, tipe, status_kerja, 
     st = sesi.get(Staging, site_staging.id)
     assert (st.status, st.gagal_asal) == (status, asal)
     assert st.galat == "Proses terhenti tak terduga; coba lagi."
+
+
+@pytest.mark.parametrize("langkah", [None, "siapkan", "tukar", "selesai"])
+def test_reaper_kembalikan_pada_salinan_rusak_mempertahankan_galat(sesi, site_staging, langkah):
+    """Putusan R22: kembalikan yang ditinggalkan (sebelum atau sesudah tukar) tidak menimpa 'salinan' dan galatnya."""
+    from wpmgr.jobs.reaper import pulihkan_job_yatim
+
+    galat = "Impor database staging gagal."
+    site_staging.status, site_staging.gagal_asal, site_staging.galat = StatusStaging.gagal, "salinan", galat
+    site_staging.ditarik_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    buat_job(sesi, site_staging.site_id, JobType.staging_kembalikan)
+    job = ambil_job(sesi, "w1", "staging")
+    # Seperti pembungkus: status awal dicatat, lalu status kerja dipasang.
+    umum.catat_status_awal(sesi, job, site_staging)
+    if langkah is not None:
+        umum.simpan_kemajuan(sesi, job, langkah_terapkan=langkah)
+    site_staging.status, site_staging.galat = StatusStaging.mendorong, None
+    job.attempts = job.max_attempts
+    job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    sesi.commit()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    st = sesi.get(Staging, site_staging.id)
+    assert (st.status, st.gagal_asal, st.galat) == (StatusStaging.gagal, "salinan", galat)
 
 
 def test_reaper_yang_menjadwalkan_ulang_tidak_mengubah_staging(sesi, site_staging):

@@ -877,10 +877,110 @@ def test_kembalikan_tolak_pra_tukar_lalu_sukses_tidak_mengangkat_gagal_tarik(ses
     assert st.status == StatusStaging.gagal and st.galat == galat
 
 
-def test_gagal_produksi_sesudah_tarik_gagal_dibersihkan(sesi, site_staging, staging_aktif, prod, pb):
-    """Kembalikan yang SUDAH menukar lalu gagal lebih baru dari tarik gagal: gagal itu milik produksi."""
+def _dorong_ditolak(sesi, site, prod, pesan):
+    sebelum = len(prod.diminta)
+    job = buat_job(sesi, site.id, JobType.staging_dorong, {"mode": "hanya_kode", "konfirmasi_nama": None})
+    with pytest.raises(SiteError) as e:
+        dorong.tangani_staging_dorong(sesi, job, prod.klien(site))
+    _selesaikan_gagal(sesi)
+    assert isinstance(e.value, umum.GalatDitolakTanpaUbah) and e.value.pesan == pesan
+    assert len(prod.diminta) == sebelum
+
+
+def test_r22_kembalikan_gagal_sesudah_tukar_tidak_menimpa_salinan(sesi, site_staging, staging_aktif, prod, pb):
+    """Putusan R22 (menggantikan R20 untuk kasus ini): 'salinan' menang atas kegagalan produksi sesudah tukar."""
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
-    _tarik_gagal(sesi, site_staging, prod, pb)
+    galat = _tarik_gagal(sesi, site_staging, prod, pb)
+    prod.kejadian["tukar"] = ["putus"] * (dorong.MAKS_RAGU_TUKAR + 1)
+    job = _job_balik(sesi, site, snap.id)
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, job)
+    # Kegagalan produksinya tetap sampai ke job dan ke dorong_gagal_pada.
+    assert e.value.pesan == dorong.PESAN_AKHIR_BALIK["tukar"]
+    _selesaikan_gagal(sesi)
+    st = _staging(sesi, site_staging)
+    assert (st.status, st.gagal_asal, st.galat) == (StatusStaging.gagal, "salinan", galat)
+    assert st.dorong_gagal_pada is not None
+    _dorong_ditolak(sesi, site, prod, dorong.PESAN_SALINAN_GAGAL)
+    # Kembalikan berikutnya yang sukses juga tidak menghapusnya.
+    _kembalikan(sesi, site, prod, snap.id)
+    st = _staging(sesi, site_staging)
+    assert (st.status, st.gagal_asal, st.galat) == (StatusStaging.gagal, "salinan", galat)
+
+
+# ---- putusan R22: kembalikan saat tarik/uji tertunda -------------------------------------
+
+
+def _menyalin(sesi, site_staging, status=StatusStaging.menyalin) -> str:
+    """Tarik/uji sedang menunggu percobaan ulang: salinan belum utuh."""
+    st = _staging(sesi, site_staging)
+    st.status, st.galat, st.gagal_asal = status, "Terputus, dilanjutkan otomatis: koneksi putus", None
+    sesi.commit()
+    return st.galat
+
+
+@pytest.mark.parametrize("status_kerja", [StatusStaging.menyalin, StatusStaging.berjalan_uji])
+def test_r22_kembalikan_sukses_saat_tarik_tertunda_tidak_mengangkat_ke_siap(sesi, site_staging, staging_aktif,
+                                                                           prod, pb, status_kerja):
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _menyalin(sesi, site_staging, status_kerja)
+    assert _kembalikan(sesi, site, prod, snap.id)["dorong_gagal"] is False
+    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
+    st = _staging(sesi, site_staging)
+    assert (st.status, st.gagal_asal) == (status_kerja, None)
+    _dorong_ditolak(sesi, site, prod, dorong.PESAN_SALINAN_SIBUK)
+
+
+def test_r22_kembalikan_gagal_pra_tukar_saat_tarik_tertunda_tetap_menyalin(sesi, site_staging, staging_aktif,
+                                                                          prod, pb):
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _menyalin(sesi, site_staging)
+    prod.kejadian["unggah"] = ["putus_awal"] * 20
+    job = _job_balik(sesi, site, snap.id)
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError):
+        _jalankan(sesi, site, prod, job)
+    _selesaikan_gagal(sesi)
+    assert "tukar" not in prod.langkah
+    st = _staging(sesi, site_staging)
+    assert (st.status, st.gagal_asal) == (StatusStaging.menyalin, None)
+    prod.kejadian.pop("unggah")
+    _dorong_ditolak(sesi, site, prod, dorong.PESAN_SALINAN_SIBUK)
+
+
+def test_r22_kembalikan_ditolak_pra_tukar_saat_tarik_tertunda_tetap_menyalin(sesi, site_staging, staging_aktif,
+                                                                            prod, pb):
+    """Lewat _staging_utuh (pra-pemeriksaan tukar menolak)."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _menyalin(sesi, site_staging)
+    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    with pytest.raises(SiteError):
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    _selesaikan_gagal(sesi)
+    assert _staging(sesi, site_staging).status == StatusStaging.menyalin
+    _dorong_ditolak(sesi, site, prod, dorong.PESAN_SALINAN_SIBUK)
+
+
+def test_r22_kembalikan_dibatalkan_saat_tarik_tertunda_tetap_menyalin(sesi, site_staging, staging_aktif, prod, pb):
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _menyalin(sesi, site_staging)
+    prod.sebelum["/staging/terapkan"] = lambda p, n, badan: _minta_batal(sesi, site_staging)
+    with pytest.raises(umum.GalatDibatalkan):
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    _selesaikan_gagal(sesi)
+    del prod.sebelum["/staging/terapkan"]
+    assert _staging(sesi, site_staging).status == StatusStaging.menyalin
+    _dorong_ditolak(sesi, site, prod, dorong.PESAN_SALINAN_SIBUK)
+
+
+def test_r22_kembalikan_gagal_sesudah_tukar_saat_tarik_tertunda_tetap_menyalin(sesi, site_staging, staging_aktif,
+                                                                              prod, pb):
+    """Seperti 'salinan': kegagalan produksi hanya ditandai dorong_gagal_pada, gerbang dorong tetap."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _menyalin(sesi, site_staging)
     prod.kejadian["tukar"] = ["putus"] * (dorong.MAKS_RAGU_TUKAR + 1)
     job = _job_balik(sesi, site, snap.id)
     job.attempts = job.max_attempts
@@ -888,9 +988,10 @@ def test_gagal_produksi_sesudah_tarik_gagal_dibersihkan(sesi, site_staging, stag
     with pytest.raises(SiteError):
         _jalankan(sesi, site, prod, job)
     _selesaikan_gagal(sesi)
-    _kembalikan(sesi, site, prod, snap.id)
     st = _staging(sesi, site_staging)
-    assert st.status == StatusStaging.siap and st.galat is None
+    assert (st.status, st.gagal_asal) == (StatusStaging.menyalin, None)
+    assert st.dorong_gagal_pada is not None
+    _dorong_ditolak(sesi, site, prod, dorong.PESAN_SALINAN_SIBUK)
 
 
 @pytest.mark.parametrize("langkah,sah", [

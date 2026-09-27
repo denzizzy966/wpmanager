@@ -60,6 +60,7 @@ BATAS_KUNCI_DETAK = "5s"
 TUNGGU_UTAS_DETAK = 10.0
 PESAN_TAK_TERDUGA = "Galat tak terduga; lihat log server"
 PESAN_DIBATALKAN = "Dibatalkan oleh pengguna."
+PESAN_BATAL_TENGAH = "Penyegaran dibatalkan di tengah; salinan staging belum utuh, segarkan ulang."
 
 
 class KlaimHilang(Exception):
@@ -380,16 +381,22 @@ def status_istirahat(st: Staging) -> StatusStaging:
     return StatusStaging.siap if st.aktif else StatusStaging.dijeda
 
 
-# ---- putusan R18/R19/R20: asal status `gagal` ---------------------------------
+# ---- putusan R18-R22: asal status `gagal` -------------------------------------
 #
 # `staging.gagal_asal` menandai siapa pemilik status `gagal`:
-# - 'salinan': tarik/uji gagal final -- berkas atau database staging bisa
-#   setengah disegarkan. Dorong ditolak (R19); dorong/kembalikan yang sukses
-#   atau gagal tidak pernah menghapusnya (R18).
-# - 'produksi': dorong/kembalikan gagal final SESUDAH tukar dikirim. Job
-#   dorong/kembalikan berikutnya yang sukses membersihkannya.
+# - 'salinan': tarik/uji gagal final, atau dibatalkan sesudah menyentuh
+#   salinan -- berkas atau database staging bisa setengah disegarkan. Dorong
+#   ditolak (R19). Hanya tarik/uji yang sukses menghapusnya (R22).
+# - 'produksi': dorong/kembalikan gagal final SESUDAH tukar dikirim pada
+#   salinan yang utuh. Job dorong/kembalikan berikutnya yang sukses
+#   membersihkannya.
 # Dorong/kembalikan tidak pernah menandai SALINAN rusak: gagal final sebelum
 # tukar, batal, dan penolakan mengembalikan status staging sebelum job itu.
+# R22: salinan yang belum utuh sebelum dorong/kembalikan (`gagal` 'salinan',
+# atau tarik/uji tertunda: `menyalin`/`berjalan_uji`) tidak pernah ditimpa job
+# itu -- apa pun hasilnya, status, penanda, dan galat salinan dikembalikan;
+# masalah produksi hanya ditandai `dorong_gagal_pada`
+# (`salinan_tidak_utuh_sebelum`).
 
 ASAL_SALINAN = "salinan"
 ASAL_PRODUKSI = "produksi"
@@ -397,6 +404,11 @@ JOB_PRODUKSI = frozenset({JobType.staging_dorong, JobType.staging_kembalikan})
 # Langkah terapkan sejak tukar dikirim ke produksi (tulis-lebih-dulu di dorong).
 LANGKAH_SESUDAH_TUKAR = frozenset({"tukar", "pulihkan", "dipulihkan", "selesai", "beres"})
 STATUS_KERJA = frozenset({StatusStaging.menyalin, StatusStaging.berjalan_uji, StatusStaging.mendorong})
+# Status kerja tarik/uji: salinan sedang (atau menunggu untuk) disegarkan.
+STATUS_SALINAN_KERJA = frozenset({StatusStaging.menyalin.value, StatusStaging.berjalan_uji.value})
+# Tahap tarik (juga tarik di awal uji) sebelum salinan (files/ dan database
+# staging) mulai ditulis. Manifest hanya ditulis ke area kerja tarik/.
+TAHAP_SEBELUM_SALINAN = (None, "manifest")
 
 
 def catat_status_awal(sesi: Session, job: Job, st: Staging) -> None:
@@ -414,16 +426,44 @@ def status_sebelum(job: Job, st: Staging) -> tuple[StatusStaging, str | None]:
         return StatusStaging.gagal, k.get("gagal_asal_awal")
     if awal in (StatusStaging.siap.value, StatusStaging.dijeda.value):
         return StatusStaging(awal), None
+    if awal in STATUS_SALINAN_KERJA and job.tipe in JOB_PRODUKSI:
+        # R22: kembalikan dimulai saat tarik/uji tertunda; tidak pernah diangkat ke siap.
+        return StatusStaging(awal), None
     # Tidak tercatat, atau status kerja yang basi: seperti sebelum R20.
     if st.ditarik_pada:
         return StatusStaging.siap, None
     return StatusStaging.gagal, ASAL_SALINAN
 
 
-def salinan_rusak_sebelum(job: Job) -> bool:
-    """Sebelum job ini staging sudah `gagal` milik salinannya sendiri (R18)."""
+def salinan_belum_disentuh(job: Job) -> bool:
+    """R21/R22: tarik (atau tarik di awal uji) ini belum menulis apa pun ke salinan, termasuk percobaan sebelumnya."""
+    return kemajuan(job).get("tahap") in TAHAP_SEBELUM_SALINAN
+
+
+def salinan_tidak_utuh_sebelum(job: Job) -> bool:
+    """R22: sebelum dorong/kembalikan ini salinan belum utuh; apa pun hasil job ini, keadaan itu dipertahankan."""
+    if job.tipe not in JOB_PRODUKSI:
+        return False
     k = kemajuan(job)
-    return k.get("status_staging_awal") == StatusStaging.gagal.value and k.get("gagal_asal_awal") == ASAL_SALINAN
+    awal = k.get("status_staging_awal")
+    return (awal == StatusStaging.gagal.value and k.get("gagal_asal_awal") == ASAL_SALINAN) \
+        or awal in STATUS_SALINAN_KERJA
+
+
+def galat_salinan(job: Job, pesan: str | None) -> str | None:
+    """Galat staging untuk hasil dorong/kembalikan: galat salinan yang belum utuh menang (R22)."""
+    if salinan_tidak_utuh_sebelum(job):
+        galat = kemajuan(job).get("galat_staging_awal")
+        if galat is not None:
+            return galat
+    return pesan
+
+
+def status_sukses_produksi(job: Job, st: Staging) -> StatusStaging:
+    """Status staging sesudah dorong/kembalikan yang sukses (R18/R22)."""
+    if salinan_tidak_utuh_sebelum(job):
+        return status_sebelum(job, st)[0]
+    return status_istirahat(st)
 
 
 def menyentuh_produksi(job: Job) -> bool:
@@ -432,13 +472,14 @@ def menyentuh_produksi(job: Job) -> bool:
     return k.get("langkah_terapkan") in LANGKAH_SESUDAH_TUKAR and not k.get("pulih_terkonfirmasi")
 
 
-def status_gagal_final(job: Job, st: Staging) -> tuple[StatusStaging, str | None]:
-    """(status, asal) staging untuk kegagalan FINAL job ini (pembungkus dan reaper)."""
+def status_gagal_final(job: Job, st: Staging, pesan: str) -> tuple[StatusStaging, str | None, str]:
+    """(status, asal, galat) staging untuk kegagalan FINAL job ini (pembungkus, `akhiri_gagal`, reaper)."""
     if job.tipe in JOB_PRODUKSI:
-        if menyentuh_produksi(job):
-            return StatusStaging.gagal, ASAL_PRODUKSI
-        return status_sebelum(job, st)
-    return StatusStaging.gagal, ASAL_SALINAN
+        if menyentuh_produksi(job) and not salinan_tidak_utuh_sebelum(job):
+            return StatusStaging.gagal, ASAL_PRODUKSI, pesan
+        status, asal = status_sebelum(job, st)
+        return status, asal, galat_salinan(job, pesan)
+    return StatusStaging.gagal, ASAL_SALINAN, pesan
 
 
 def galat_tetap(job: Job, status: StatusStaging, pesan: str) -> str:
@@ -447,25 +488,25 @@ def galat_tetap(job: Job, status: StatusStaging, pesan: str) -> str:
     if status == StatusStaging.gagal and k.get("status_staging_awal") == StatusStaging.gagal.value \
             and k.get("galat_staging_awal") is not None:
         return k["galat_staging_awal"]
-    return pesan
+    return galat_salinan(job, pesan)
 
 
-def _status_batal(job: Job, st: Staging) -> tuple[StatusStaging, str | None]:
-    if job.tipe in JOB_PRODUKSI:
-        # Batal dorong/kembalikan hanya berlaku sebelum tukar: tidak ada yang berubah.
-        return status_sebelum(job, st)
-    # Tarik/uji yang dibatalkan: perilaku sejak Task 13.
-    if st.ditarik_pada:
-        return StatusStaging.siap, None
-    return StatusStaging.gagal, ASAL_SALINAN
+def _status_batal(job: Job, st: Staging) -> tuple[StatusStaging, str | None, str]:
+    if job.tipe in JOB_PRODUKSI or salinan_belum_disentuh(job):
+        # Batal dorong/kembalikan hanya berlaku sebelum tukar, dan tarik/uji
+        # yang belum menyentuh salinan tidak mengubah apa pun (R22).
+        status, asal = status_sebelum(job, st)
+        return status, asal, galat_tetap(job, status, PESAN_DIBATALKAN)
+    # Salinan sudah mulai ditulis (atau uji sudah menjalankan update): belum utuh.
+    return StatusStaging.gagal, ASAL_SALINAN, PESAN_BATAL_TENGAH
 
 
 def _batalkan(sesi: Session, job: Job, site_id, staging_id, nama: str) -> GalatDibatalkan:
     sesi.rollback()
     st = sesi.get(Staging, staging_id, populate_existing=True)
-    status, asal = _status_batal(job, st)
+    status, asal, galat = _status_batal(job, st)
     # Pesan pembatalan tetap sampai ke job dan log aktivitas di bawah.
-    _tandai(sesi, staging_id, status, galat_tetap(job, status, PESAN_DIBATALKAN), asal=asal)
+    _tandai(sesi, staging_id, status, galat, asal=asal)
     catat_aktivitas(sesi, site_id, job, f"{nama} dibatalkan", level="warning")
     sesi.commit()
     return GalatDibatalkan()
@@ -474,8 +515,8 @@ def _batalkan(sesi: Session, job: Job, site_id, staging_id, nama: str) -> GalatD
 def _tandai_gagal_final(sesi: Session, job: Job, staging_id, pesan: str) -> None:
     sesi.rollback()
     st = sesi.get(Staging, staging_id, populate_existing=True)
-    status, asal = status_gagal_final(job, st)
-    _tandai(sesi, staging_id, status, pesan, asal=asal)
+    status, asal, galat = status_gagal_final(job, st, pesan)
+    _tandai(sesi, staging_id, status, galat, asal=asal)
 
 
 def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging, nama: str,
@@ -554,10 +595,9 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
         _tandai_gagal_final(sesi, job, staging_id, PESAN_TAK_TERDUGA)
         raise
     st = sesi.get(Staging, staging_id, populate_existing=True)
-    # R18: dorong/kembalikan yang sukses tidak menghapus gagal milik salinan
-    # (statusnya dipertahankan inti lewat `tuntaskan_sukses`).
-    st.galat = kemajuan(job).get("galat_staging_awal") \
-        if job.tipe in JOB_PRODUKSI and salinan_rusak_sebelum(job) else None
+    # R18/R22: dorong/kembalikan yang sukses tidak menghapus keadaan salinan
+    # yang belum utuh (statusnya dipertahankan inti lewat `tuntaskan_sukses`).
+    st.galat = galat_salinan(job, None)
     if st.status != StatusStaging.gagal:
         st.gagal_asal = None
     st.batal_diminta_pada = None

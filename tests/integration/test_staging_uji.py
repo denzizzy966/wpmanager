@@ -380,9 +380,34 @@ def test_batal_sebelum_paket_kedua(sesi, site_staging, prod, pb, web):
         uji.tangani_staging_uji_update(sesi, job, prod.klien(site))
     assert not [p for p in pb.panggilan if p[:3] == ("wpcli", "contoh-test", "theme")]
     sesi.refresh(site_staging)
-    assert site_staging.status == StatusStaging.siap
+    # Putusan R22: uji yang sudah melewati tarik dan menjalankan update meninggalkan
+    # salinan yang tidak lagi sama dengan produksi -> gagal 'salinan', segarkan ulang.
+    assert (site_staging.status, site_staging.gagal_asal) == (StatusStaging.gagal, umum.ASAL_SALINAN)
+    assert site_staging.galat == umum.PESAN_BATAL_TENGAH
     assert site_staging.batal_diminta_pada is None
     assert sesi.query(StagingUji).count() == 0
+
+
+def test_batal_di_tarik_uji_sebelum_salinan_disentuh_mengembalikan_status(sesi, site_staging, prod, pb, web):
+    """Putusan R22: batal saat tahap tarik uji masih di manifest -> status sebelumnya, tanpa penanda."""
+    _siap(sesi, site_staging)
+    prod.halaman_kosong = 1
+
+    def minta_batal(p, n, badan):
+        if n == 1:
+            sesi.execute(update(Staging).where(Staging.id == site_staging.id)
+                         .values(batal_diminta_pada=datetime.now(timezone.utc)))
+            sesi.commit()
+
+    prod.sebelum["/staging/manifest"] = minta_batal
+    site = sesi.get(Site, site_staging.site_id)
+    job = buat_job(sesi, site.id, JobType.staging_uji_update, {"paket": PAKET})
+    with pytest.raises(umum.GalatDibatalkan):
+        uji.tangani_staging_uji_update(sesi, job, prod.klien(site))
+    assert umum.kemajuan(sesi.get(Job, job.id, populate_existing=True))["tahap"] == "manifest"
+    assert not [p for p in pb.panggilan if p[0] == "wpcli"]
+    sesi.refresh(site_staging)
+    assert (site_staging.status, site_staging.gagal_asal) == (StatusStaging.siap, None)
 
 
 def test_halaman_yang_sudah_rusak_sebelum_update_dicatat_bukan_gagal(sesi, site_staging, prod, pb, web):
