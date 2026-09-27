@@ -1,4 +1,5 @@
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -6,7 +7,7 @@ import bcrypt
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import sessionmaker
 from staging_palsu import GB, PembantuPalsu, ProduksiPalsu
 
@@ -445,6 +446,36 @@ def test_sso_staging(klien_web, sesi, siap):
     assert sesi.query(ActivityLog).filter(ActivityLog.pesan.like("SSO staging dibuka%")).count() == 1
 
 
+def test_sso_ditolak_saat_dijeda(klien_web, sesi, siap):
+    siap.aktif = False
+    siap.status = StatusStaging.dijeda
+    sesi.commit()
+    r = klien_web.get(f"/api/sites/{siap.site_id}/staging/sso")
+    assert r.status_code == 409 and r.json()["detail"] == "Staging sedang dijeda; jalankan dulu."
+    sesi.refresh(siap)
+    assert siap.dibuka_pada is None
+
+
+def test_sandi_ditolak_saat_job_staging_aktif(klien_web, sesi, siap, staging_aktif, pb):
+    lama = siap.sandi_hash
+    buat_job(sesi, siap.site_id, JobType.staging_tarik)
+    r = klien_web.post(f"/api/sites/{siap.site_id}/staging/sandi")
+    assert r.status_code == 409 and "pekerjaan staging" in r.json()["detail"]
+    sesi.refresh(siap)
+    assert siap.sandi_hash == lama and pb.panggilan == []
+    assert not (staging_aktif / "router" / "contoh-test.htpasswd").exists()
+
+
+def test_uji_banyak_dibatasi_jumlah_item_dan_site(klien_web, sesi, siap, pb):
+    satu = {"site_id": str(siap.site_id), "tipe": "plugin", "slug": "a/a.php", "ke_versi": "1.0"}
+    r = klien_web.post("/api/staging/uji", json={"items": [satu] * 201})
+    assert r.status_code == 400 and "200" in r.json()["detail"]
+    banyak = [dict(satu, site_id=str(uuid.uuid4())) for _ in range(51)]
+    r = klien_web.post("/api/staging/uji", json={"items": banyak})
+    assert r.status_code == 400 and "50" in r.json()["detail"]
+    assert _jumlah_job(sesi) == 0
+
+
 def test_email_mailpit_disaring_per_staging(klien_web, siap, monkeypatch):
     diminta = []
 
@@ -456,7 +487,10 @@ def test_email_mailpit_disaring_per_staging(klien_web, siap, monkeypatch):
                  "Subject": "Pesanan \x00baru", "Created": "2026-09-26T01:02:03Z", "Tags": ["contoh-test"],
                  "Snippet": "halo"},
                 {"ID": "../jahat", "From": {}, "To": [], "Subject": "x", "Tags": ["contoh-test"]},
-            ], "total": 2})
+                # Pencarian Mailpit tidak dipercaya: tag milik staging lain disaring ulang.
+                {"ID": "lain77", "From": {}, "To": [], "Subject": "rahasia", "Tags": ["staging-lain"]},
+                {"ID": "tanpa1", "From": {}, "To": [], "Subject": "rahasia", "Tags": "contoh-test"},
+            ], "total": 4})
         if r.url.path == "/api/v1/message/abc123":
             return httpx.Response(200, json={"ID": "abc123", "Subject": "Pesanan", "From": {"Address": "x@y.id"},
                                              "To": [{"Address": "c@d.id"}], "Date": "2026-09-26T01:02:03Z",
@@ -485,6 +519,25 @@ def test_email_mailpit_dibatasi_ukurannya(klien_web, siap, monkeypatch):
     assert r.status_code == 502 and "terlalu besar" in r.json()["detail"]
 
 
+def test_email_mailpit_punya_tenggat_total(klien_web, siap, monkeypatch):
+    lepas = threading.Event()
+
+    def lambat(r):
+        # Mailpit yang tidak menjawab: ditahan sampai test selesai.
+        lepas.wait(10)
+        return httpx.Response(200, json={"messages": []})
+
+    monkeypatch.setattr("wpmgr.web.routes_staging.TENGGAT_EMAIL", 0.5)
+    monkeypatch.setattr(umum, "buat_http", lambda: httpx.Client(transport=httpx.MockTransport(lambat)))
+    mulai = time.monotonic()
+    try:
+        r = klien_web.get(f"/api/sites/{siap.site_id}/staging/email")
+    finally:
+        lepas.set()
+    assert time.monotonic() - mulai < 5
+    assert r.status_code == 502 and r.json()["detail"] == "Kotak email staging tidak dapat dibaca."
+
+
 def test_daftar_uji_dan_snapshot_dibatasi(klien_web, sesi, siap):
     for i in range(60):
         sesi.add(StagingSnapshot(site_id=siap.site_id, jenis="sebelum_dorong", status="tersedia", ukuran=i, path=f"s{i}"))
@@ -503,7 +556,20 @@ RUTE_TERKUNCI = [
     ("POST", "/api/sites/{id}/staging/dorong", {"mode": "hanya_kode"}),
     ("POST", "/api/sites/{id}/staging/uji", {"paket": [{"tipe": "plugin", "slug": "a/a.php", "ke": "1.0"}],
                                              "konfirmasi": True}),
+    ("POST", "/api/sites/{id}/staging/sandi", None),
+    ("POST", "/api/sites/{id}/staging/kembalikan", {"snapshot_id": "SNAP", "konfirmasi_nama": "Contoh"}),
+    ("POST", "/api/staging/uji", {"items": [{"site_id": "SITE", "tipe": "plugin", "slug": "a/a.php",
+                                             "ke_versi": "1.0"}], "konfirmasi": True}),
 ]
+
+
+def _isi_body(body, site_id, snap_id):
+    """Ganti penanda SITE/SNAP di body parametrize dengan id sungguhan."""
+    if isinstance(body, dict):
+        return {k: _isi_body(v, site_id, snap_id) for k, v in body.items()}
+    if isinstance(body, list):
+        return [_isi_body(v, site_id, snap_id) for v in body]
+    return {"SITE": str(site_id), "SNAP": snap_id}.get(body, body) if isinstance(body, str) else body
 
 
 @pytest.mark.parametrize("sql", [
@@ -511,8 +577,12 @@ RUTE_TERKUNCI = [
     "SELECT id FROM staging WHERE site_id = :site FOR UPDATE",
 ])
 @pytest.mark.parametrize("metode,path,body", RUTE_TERKUNCI)
-def test_rute_menunggu_kunci_lalu_memeriksa_ulang(klien_web, engine, siap, pb, sql, metode, path, body):
-    """Route antre dan hapus/jeda memeriksa "sibuk" di bawah kunci yang sama dengan cron (F29)."""
+def test_rute_menunggu_kunci_lalu_memeriksa_ulang(klien_web, engine, sesi, siap, pb, sql, metode, path, body):
+    """Route antre dan hapus/jeda/sandi memeriksa "sibuk" di bawah kunci yang sama dengan cron (F29)."""
+    snap = StagingSnapshot(site_id=siap.site_id, jenis="sebelum_dorong", status="tersedia", ukuran=1, path="x")
+    sesi.add(snap)
+    sesi.commit()
+    body = _isi_body(body, siap.site_id, snap.id)
     lain = sessionmaker(bind=engine, future=True)()
     lain.execute(text(sql), {"site": siap.site_id})
     hasil = []
@@ -566,3 +636,109 @@ def test_hapus_site_ditolak_saat_job_staging_berjalan(klien_web, sesi, siap, pb)
 def test_hapus_site_tanpa_staging_tidak_memanggil_pembantu(klien_web, sesi, site, staging_aktif, pb):
     assert klien_web.delete(f"/api/sites/{site.id}").status_code == 200
     assert pb.panggilan == []
+
+
+def test_hapus_site_ditolak_saat_dorong_tertunda_sudah_berjalan(klien_web, sesi, siap, pb):
+    """Dorong yang menunggu percobaan ulang sesudah mulai bisa sudah menyentuh produksi."""
+    job = buat_job(sesi, siap.site_id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.payload = {"mode": "hanya_kode", "kemajuan": {"tahap_dorong": "unggah"}}
+    sesi.commit()
+    r = klien_web.delete(f"/api/sites/{siap.site_id}")
+    assert r.status_code == 409 and "titik kembali" in r.json()["detail"]
+    assert pb.panggilan == []
+    sesi.expire_all()
+    assert sesi.query(Site).count() == 1
+
+
+def test_hapus_site_ditolak_saat_kembalikan_berjalan_tanpa_staging(klien_web, sesi, site, staging_aktif, pb):
+    job = buat_job(sesi, site.id, JobType.staging_kembalikan, {"snapshot_id": 1})
+    job.status = JobStatus.running
+    sesi.commit()
+    r = klien_web.delete(f"/api/sites/{site.id}")
+    assert r.status_code == 409
+    sesi.expire_all()
+    assert sesi.query(Site).count() == 1
+
+
+def test_hapus_site_dorong_tertunda_tanpa_kemajuan_ikut_terhapus(klien_web, sesi, siap, pb):
+    buat_job(sesi, siap.site_id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    assert klien_web.delete(f"/api/sites/{siap.site_id}").status_code == 200
+    assert _jumlah_job(sesi) == 0 and sesi.query(Site).count() == 0
+
+
+def test_hapus_site_ditolak_saat_snapshot_dibutuhkan_rekonsiliasi(klien_web, sesi, site, staging_aktif, pb):
+    """Dorongan lama yang belum terbukti bersih: snapshot-nya satu-satunya titik kembali produksi."""
+    job = buat_job(sesi, site.id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.failed
+    job.payload = {"mode": "hanya_kode", "kemajuan": {"unggah_mulai": True, "tahap_dorong": "terapkan"}}
+    sesi.commit()
+    r = klien_web.delete(f"/api/sites/{site.id}")
+    assert r.status_code == 409 and "titik kembali" in r.json()["detail"]
+    sesi.expire_all()
+    assert sesi.query(Site).count() == 1
+
+
+def test_hapus_staging_baris_dihapus_sebelum_berkas(klien_web, sesi, engine, siap, staging_aktif, pb, monkeypatch):
+    """Berkas baru dipindah ke nisan sesudah penghapusan baris ter-commit: tidak pernah ada baris tanpa berkas."""
+    from wpmgr.web import routes_staging
+
+    (staging_aktif / str(siap.site_id) / "files").mkdir(parents=True)
+    asli = routes_staging._nisan_selain_snapshot
+    terlihat = []
+
+    def periksa(akar, nama, site_id):
+        with sessionmaker(bind=engine, future=True)() as s:
+            terlihat.append(s.scalar(select(func.count()).select_from(Staging)))
+        return asli(akar, nama, site_id)
+
+    monkeypatch.setattr(routes_staging, "_nisan_selain_snapshot", periksa)
+    assert klien_web.delete(f"/api/sites/{siap.site_id}/staging").status_code == 200
+    assert terlihat == [0]
+    assert not (staging_aktif / str(siap.site_id) / "files").exists()
+
+
+def test_jalan_memeriksa_ulang_di_bawah_kunci(klien_web, engine, sesi, siap, pb):
+    """Staging dijalankan pemegang kunci: route melihatnya sesudah kunci lepas dan tidak memanggil pembantu."""
+    siap.aktif = False
+    siap.status = StatusStaging.dijeda
+    sesi.commit()
+    lain = sessionmaker(bind=engine, future=True)()
+    lain.execute(text("SELECT id FROM sites WHERE id = :site FOR NO KEY UPDATE"), {"site": siap.site_id})
+    hasil = []
+    t = threading.Thread(target=lambda: hasil.append(klien_web.post(f"/api/sites/{siap.site_id}/staging/jalan")))
+    t.start()
+    try:
+        t.join(1.0)
+        menunggu = t.is_alive()
+        lain.execute(text("UPDATE staging SET aktif = true, status = 'siap' WHERE site_id = :site"),
+                     {"site": siap.site_id})
+        lain.commit()
+    finally:
+        lain.rollback()
+        lain.close()
+        t.join(10)
+    assert menunggu, "jalan tidak menunggu kunci baris"
+    assert hasil[0].status_code == 200 and pb.nama_panggilan() == []
+
+
+@pytest.mark.parametrize("metode,path", [
+    ("GET", "/api/sites/{id}/staging"),
+    ("GET", "/api/sites/{id}/staging/sso"),
+    ("POST", "/api/sites/{id}/staging/batal"),
+])
+def test_tulis_lain_menunggu_kunci_staging(klien_web, engine, sesi, siap, metode, path):
+    buat_job(sesi, siap.site_id, JobType.staging_tarik)
+    lain = sessionmaker(bind=engine, future=True)()
+    lain.execute(text("SELECT id FROM staging WHERE site_id = :site FOR UPDATE"), {"site": siap.site_id})
+    hasil = []
+    t = threading.Thread(target=lambda: hasil.append(klien_web.request(metode, path.format(id=siap.site_id))))
+    t.start()
+    try:
+        t.join(1.0)
+        menunggu = t.is_alive()
+    finally:
+        lain.rollback()
+        lain.close()
+        t.join(10)
+    assert menunggu, "route tidak menunggu kunci baris staging"
+    assert hasil[0].status_code == 200, hasil[0].text

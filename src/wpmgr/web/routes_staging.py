@@ -57,6 +57,8 @@ from wpmgr.staging import uji as uji_mod
 from wpmgr.staging import umum
 from wpmgr.staging.aman import angka, bersih_teks, nama_dari_url
 from wpmgr.staging.cron import (
+    _ada_job_staging,
+    _ada_staging,
     _dir_nyata,
     _hapus_nisan,
     _kunci_site,
@@ -92,6 +94,10 @@ TIMEOUT_EMAIL = 10.0
 TENGGAT_EMAIL = 15.0
 POLA_ID_EMAIL = re.compile(r"[A-Za-z0-9]{1,64}")
 MAKS_NAMA_PAKET_SALAH = 10
+# /api/staging/uji: satu permintaan mengunci baris sites/staging sebanyak
+# jumlah site-nya; dibatasi supaya tidak menahan kunci terlalu banyak baris.
+MAKS_ITEM_UJI = 200
+MAKS_SITE_UJI = 50
 PENGGUNA_PREVIEW = "staging"
 TEKS_STATUS = {"menyalin": "Menyalin dari produksi", "siap": "Siap", "berjalan_uji": "Menjalankan uji update",
                "mendorong": "Mendorong ke produksi", "dijeda": "Dijeda", "gagal": "Gagal"}
@@ -118,6 +124,7 @@ PESAN_SIBUK_NONAKTIF = (" Site ini dinonaktifkan, jadi pekerjaan staging yang te
 PESAN_BELUM_DISALIN = "Staging belum selesai disalin; segarkan staging dulu."
 PESAN_DIUBAH_SEGARKAN = ("Staging diubah sejak tarik terakhir; perubahan itu akan tertimpa. Konfirmasi untuk tetap "
                          "menyegarkan.")
+PESAN_DIJEDA_SSO = "Staging sedang dijeda; jalankan dulu."
 PESAN_EMAIL_GAGAL = "Kotak email staging tidak dapat dibaca."
 PESAN_EMAIL_HILANG = "Email tidak ditemukan."
 
@@ -295,10 +302,12 @@ def status_staging(site_id: uuid.UUID, pengguna: PenggunaApi):
         return {"aktif_fitur": False}
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
-        st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
+        # `perbarui_diubah` bisa menulis: lewat kontrak kunci yang sama, lalu
+        # commit segera supaya GET tidak memegang kunci selama membaca daftar.
+        st = _kunci(sesi, site_id)
         if st is not None:
             umum.perbarui_diubah(st)
-            sesi.commit()
+        sesi.commit()
         job = _job_aktif(sesi, site_id)
         return {
             "aktif_fitur": True,
@@ -441,39 +450,71 @@ def hapus(site_id: uuid.UUID, pengguna: PenggunaApi):
             _bongkar_staging(umum.buat_pembantu(), st)
         except GalatPembantu as exc:
             raise _pembantu_gagal(exc) from None
-        # Snapshot adalah cadangan produksi: `snapshot/` dipertahankan supaya
-        # kembalikan tetap bisa berjalan tanpa baris Staging; cron memangkas
-        # sisanya. Selain itu dipindah ke nisan di bawah kunci sites yang
-        # sama dengan pemangkasan cron (rename atomik, tanpa mengikuti
-        # symlink), lalu dihapus sesudah commit.
-        nama_dir = str(site_id)
-        nisan = _nisan_selain_snapshot(akar, nama_dir, site_id) if _dir_nyata(akar / nama_dir) else []
         nama = st.nama
         sesi.delete(st)
         umum.catat_aktivitas(sesi, site_id, None, f"Staging dihapus ({nama})", user_id=pengguna.id)
+        # Baris dihapus (commit) lebih dulu, berkas sesudahnya: commit yang
+        # gagal tidak pernah meninggalkan baris Staging tanpa berkasnya.
+        sesi.commit()
+
+        # Transaksi kedua, seperti pemangkasan cron: kunci sites diambil lagi
+        # dan keadaan diperiksa ulang, karena staging baru (dengan tarik yang
+        # menulis ke direktori yang sama) bisa dibuat di sela dua transaksi.
+        # Snapshot adalah cadangan produksi: `snapshot/` dipertahankan supaya
+        # kembalikan tetap bisa berjalan tanpa baris Staging; cron memangkas
+        # sisanya. Selain itu dipindah ke nisan (rename atomik, tanpa
+        # mengikuti symlink), lalu dihapus sesudah kunci dilepas.
+        _kunci_site(sesi, site_id)
+        nama_dir = str(site_id)
+        nisan = []
+        if not _ada_staging(sesi, site_id) and not _ada_job_staging(sesi, site_id) and _dir_nyata(akar / nama_dir):
+            nisan = _nisan_selain_snapshot(akar, nama_dir, site_id)
         sesi.commit()
     for n in nisan:
         _hapus_nisan(akar, n)
     return {"ok": True}
 
 
+PESAN_HAPUS_SITE_BERJALAN = "Tunggu pekerjaan staging yang sedang berjalan selesai sebelum mencabut site ini."
+PESAN_HAPUS_SITE_DORONG = ("Dorong atau kembalikan untuk site ini sudah mulai dan belum tuntas; snapshot-nya adalah "
+                           "titik kembali produksi. Tunggu sampai selesai sebelum mencabut site ini.")
+PESAN_HAPUS_SITE_REKONSILIASI = ("Dorongan sebelumnya di produksi belum terbukti bersih; snapshot-nya adalah satu-satunya "
+                                 "titik kembali produksi. Tuntaskan dulu (jalankan dorong atau kembalikan) sebelum "
+                                 "mencabut site ini.")
+# Kunci kemajuan yang ditulis dorong/kembalikan begitu mulai bekerja.
+KUNCI_KEMAJUAN_PRODUKSI = ("tahap_dorong", "tahap_balik", "langkah_terapkan")
+
+
 def bersihkan_untuk_hapus_site(sesi, site: Site) -> None:
     """Dipanggil `DELETE /api/sites/{id}` di bawah kunci sites, sebelum baris site dihapus.
 
-    Baris staging ikut terhapus kaskade, tetapi container, database, dan akses
-    router tidak: dibongkar dulu di sini. Berkas `<site_id>/` dipangkas cron
-    (tanpa baris Staging maupun snapshot, seluruh direktori dibuang).
+    Kaskade site menghapus job, snapshot, dan staging-nya. Karena itu site
+    ditolak dicabut, dengan atau tanpa baris Staging, selama:
+    - job staging sedang berjalan (ia terus menulis ke container dan produksi);
+    - dorong/kembalikan tertunda sudah punya kemajuan (menunggu percobaan
+      ulang; produksi bisa setengah diterapkan);
+    - ada dorongan lama yang belum terbukti bersih: snapshot-nya satu-satunya
+      titik kembali produksi (`dorong.syarat_dorongan_lama_belum_bersih`).
+    Job tertunda tanpa kemajuan belum menyentuh apa pun dan ikut terhapus.
+
+    Container, database, dan akses router staging tidak ikut kaskade: dibongkar
+    di sini. Berkas `<site_id>/` dipangkas cron (tanpa baris Staging maupun
+    snapshot, seluruh direktori dibuang).
     """
-    st = _kunci_staging(sesi, site.id)
-    if st is None:
-        return
     berjalan = sesi.scalar(select(Job.id).where(
         Job.site_id == site.id, Job.tipe.in_(JOB_STAGING), Job.status == JobStatus.running).limit(1))
     if berjalan is not None:
-        # Job tertunda ikut terhapus kaskade dan tidak pernah berjalan; job
-        # yang sedang berjalan akan terus menulis ke container dan produksi.
-        raise HTTPException(status_code=409, detail="Tunggu pekerjaan staging yang sedang berjalan selesai "
-                                                    "sebelum mencabut site ini.")
+        raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_BERJALAN)
+    tertunda = sesi.scalars(select(Job).where(
+        Job.site_id == site.id, Job.tipe.in_((JobType.staging_dorong, JobType.staging_kembalikan)),
+        Job.status == JobStatus.pending)).all()
+    if any(any(k in umum.kemajuan(j) for k in KUNCI_KEMAJUAN_PRODUKSI) for j in tertunda):
+        raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_DORONG)
+    if sesi.scalar(select(Job.id).where(*dorong_mod.syarat_dorongan_lama_belum_bersih(site.id)).limit(1)) is not None:
+        raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_REKONSILIASI)
+    st = _kunci_staging(sesi, site.id)
+    if st is None:
+        return
     try:
         _bongkar_staging(umum.buat_pembantu(), st)
     except GalatPembantu as exc:
@@ -586,10 +627,13 @@ def sandi_preview_baru(site_id: uuid.UUID, pengguna: PenggunaApi):
     _fitur()
     akar = get_settings().jalur_staging
     with db.SessionLocal() as sesi:
-        _site(sesi, site_id)
+        site = _site(sesi, site_id)
         st = _kunci(sesi, site_id)
         if st is None:
             raise HTTPException(status_code=409, detail=PESAN_BELUM_DIBUAT)
+        # Tarik (juga tarik di awal uji) menulis berkas router dari hash di
+        # baris staging yang dibacanya: hash baru bisa tertimpa hash lama.
+        _tolak_bila_sibuk(sesi, site)
         # Dibalas sekali; yang disimpan hanya hash bcrypt.
         sandi = sandi_baru()
         hash_baru = hash_sandi(sandi)
@@ -700,6 +744,10 @@ class PermintaanUjiBanyak(BaseModel):
 def uji_banyak(req: PermintaanUjiBanyak, pengguna: PenggunaApi):
     """Satu job per site dari halaman Update; semua atau tidak sama sekali (F16)."""
     _fitur()
+    if len(req.items) > MAKS_ITEM_UJI:
+        raise HTTPException(status_code=400, detail=f"Paling banyak {MAKS_ITEM_UJI} paket per permintaan uji.")
+    if len({item.site_id for item in req.items}) > MAKS_SITE_UJI:
+        raise HTTPException(status_code=400, detail=f"Paling banyak {MAKS_SITE_UJI} site per permintaan uji.")
     mentah: dict[uuid.UUID, list[dict]] = {}
     for item in req.items:
         mentah.setdefault(item.site_id, []).append({"tipe": item.tipe.value, "slug": item.slug, "ke": item.ke_versi})
@@ -750,7 +798,10 @@ def daftar_snapshot(site_id: uuid.UUID, pengguna: PenggunaApi):
 def batal(site_id: uuid.UUID, pengguna: PenggunaApi):
     _fitur()
     with db.SessionLocal() as sesi:
-        st = _staging(sesi, site_id)
+        _site(sesi, site_id)
+        st = _kunci(sesi, site_id)
+        if st is None:
+            raise HTTPException(status_code=409, detail=PESAN_BELUM_DIBUAT)
         if _job_aktif(sesi, site_id) is None:
             raise HTTPException(status_code=409, detail="Tidak ada pekerjaan staging yang bisa dibatalkan.")
         st.batal_diminta_pada = datetime.now(timezone.utc)
@@ -764,9 +815,15 @@ def sso_staging(site_id: uuid.UUID, pengguna: PenggunaApi):
     _fitur()
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
-        st = _staging(sesi, site_id)
+        st = _kunci(sesi, site_id)
+        if st is None:
+            raise HTTPException(status_code=409, detail=PESAN_BELUM_DIBUAT)
         if st.ditarik_pada is None:
             raise HTTPException(status_code=409, detail=PESAN_BELUM_DISALIN)
+        if not st.aktif:
+            # Container mati: tautan tidak akan terbuka, dan `dibuka_pada`
+            # tidak boleh maju untuk akses yang tidak pernah terjadi.
+            raise HTTPException(status_code=409, detail=PESAN_DIJEDA_SSO)
         if not st.rahasia_router_terenkripsi:
             raise HTTPException(status_code=409, detail=uji_mod.PESAN_AKSES_BELUM)
         host = umum.host_staging(st)
