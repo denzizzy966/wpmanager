@@ -1156,17 +1156,42 @@ def _tarik_gagal(sesi, site_staging, galat="Tarik gagal: disk penuh."):
     sesi.commit()
 
 
-def test_dorong_tolak_pra_tukar_tidak_mengangkat_gagal_staging(sesi, site_staging, staging_aktif, prod, pb):
-    """R18: penolakan pra-pemeriksaan tukar dorong mempertahankan gagal milik salinan staging."""
+def test_dorong_ditolak_bila_tarik_terakhir_gagal(sesi, site_staging, staging_aktif, prod, pb):
+    """R19: salinan staging yang setengah disegarkan tidak pernah didorong ke produksi."""
     _siap(sesi, site_staging, staging_aktif, prod)
     _tarik_gagal(sesi, site_staging)
-    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    sebelum = len(prod.diminta)
     with pytest.raises(SiteError) as e:
-        _dorong(sesi, site_staging, prod, "hanya_kode")
-    assert e.value.error_class == STAGING_DITOLAK
+        _dorong(sesi, site_staging, prod, "timpa_penuh", konfirmasi="Contoh")
+    assert e.value.error_class == STAGING_DITOLAK and e.value.pesan == dorong.PESAN_SALINAN_GAGAL
+    assert isinstance(e.value, umum.GalatDitolakTanpaUbah)
+    assert len(prod.diminta) == sebelum and prod.langkah == []
     st = _staging(sesi, site_staging)
     assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
-    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
+    assert sesi.query(StagingSnapshot).count() == 0
+    assert not pb.panggilan[-1:] or pb.panggilan[-1][0] != "wpcli"
+
+
+def test_dorong_boleh_bila_gagal_milik_produksi(sesi, site_staging, staging_aktif, prod, pb):
+    """R19: gagal dari dorong sebelumnya yang SUDAH menukar tidak menahan dorong baru (memperbaiki produksi)."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    # Tarik gagal yang LEBIH LAMA dari dorong gagal di bawah: gagal terakhir milik produksi.
+    lama = buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
+    lama.status = JobStatus.failed
+    sesi.commit()
+    prod.kejadian["tukar"] = ["putus"] * (dorong.MAKS_RAGU_TUKAR + 1)
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError):
+        _jalankan(sesi, site_staging, prod, job)
+    job.status = JobStatus.failed
+    sesi.commit()
+    assert _staging(sesi, site_staging).status == StatusStaging.gagal
+    hasil = _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert hasil["dorong_gagal"] is False
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.galat is None
 
 
 def test_dorong_tolak_pra_tukar_tanpa_gagal_staging_tetap_siap(sesi, site_staging, staging_aktif, prod, pb):
