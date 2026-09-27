@@ -98,6 +98,9 @@ pulihkan_router() {
 
 bersihkan() {
   local rc=$?
+  # Pembersihan tidak boleh terpotong: SIGTERM/SIGINT di tengah
+  # pulihkan_router akan meninggalkan conf.d router kosong.
+  trap '' TERM INT
   trap - ERR
   if [[ -n "$ROUTER_CADANGAN" ]]; then
     pulihkan_router

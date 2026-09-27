@@ -77,6 +77,7 @@ BATAS_KELUARAN = 4 * 1024 * 1024
 BATAS_STDERR = 64 * 1024
 BATAS_STDERR_LOG = 2000
 PESAN_MELIMPAH = "Keluaran skrip pembantu melebihi batas; perintah dihentikan."
+PESAN_TIDAK_TUNTAS = "Keluaran skrip pembantu tidak tuntas terbaca; hasilnya diabaikan."
 _BLOK = 64 * 1024
 # Tenggat habis: SIGTERM ke grup proses sudo, tunggu sebentar, lalu SIGKILL
 # (putusan F10a).
@@ -342,6 +343,13 @@ class Pembantu:
             raise self._galat_berhenti("keluaran", subperintah, timeout)
         if kode != 0:
             raise self._galat(subperintah, kode, galat.data.decode("utf-8", "replace"))
+        if pembaca[0].is_alive():
+            # Keluar 0, tetapi stdout masih dipegang proses lain (mis. anak
+            # root yang tertinggal): keluarannya belum tentu lengkap, jadi
+            # tidak boleh diperlakukan sebagai hasil (mis. JSON status/plugin).
+            log.warning("Keluaran skrip pembantu %s tidak tuntas dibaca dalam %s detik",
+                        subperintah or "-", TENGGANG_AKHIR)
+            raise GalatPembantu("lain", PESAN_TIDAK_TUNTAS)
         return keluar.data.decode("utf-8", "replace")
 
     @staticmethod

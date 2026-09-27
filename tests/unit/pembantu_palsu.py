@@ -35,6 +35,17 @@ def main() -> int:
         _catat(catatan, {"anak": anak.pid})
         time.sleep(60)
         return 0
+    if perintah == "pegang-pipa":
+        # Keluar 0 dengan keluaran sebagian, tetapi cucunya (sesi lain) tetap
+        # memegang stdout: pembaca pipa dashboard tidak pernah melihat EOF.
+        cucu = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=1, stderr=2, start_new_session=hasattr(os, "setsid"),
+        )
+        _catat(catatan, {"cucu": cucu.pid})
+        sys.stdout.write("sebagian")
+        sys.stdout.flush()
+        return 0
     if perintah == "tuli":
         # Tidak pernah membaca stdin, dan punya cucu di sesi lain yang memegang
         # stdin/stdout/stderr: seperti anak root `docker exec -i` di bawah sudo

@@ -290,6 +290,26 @@ def test_db_impor_berhenti_mengalirkan_setelah_tenggat(pembantu, catatan, tmp_pa
     assert lama < 1 + modul_pembantu.JEDA_HENTI + 3
 
 
+def test_pembaca_belum_selesai_bukan_keberhasilan(pembantu, catatan):
+    """Skrip keluar 0 tetapi cucunya masih memegang stdout: keluarannya mungkin
+    belum lengkap, jadi hasilnya galat tetap, bukan teks yang terpotong."""
+    mulai = time.monotonic()
+    try:
+        with pytest.raises(GalatPembantu) as e:
+            pembantu.jalankan("pegang-pipa", timeout=30)
+        lama = time.monotonic() - mulai
+    finally:
+        for c in catatan():
+            if "cucu" in c:
+                try:
+                    os.kill(c["cucu"], getattr(signal, "SIGKILL", signal.SIGTERM))
+                except OSError:
+                    pass
+    assert e.value.kode == "lain"
+    assert e.value.pesan == modul_pembantu.PESAN_TIDAK_TUNTAS
+    assert lama < modul_pembantu.TENGGANG_AKHIR + 3
+
+
 def test_status_diurai_dan_disaring(pembantu, monkeypatch):
     monkeypatch.setenv("PALSU_STATUS", json.dumps({
         "mem_tersedia": 4294967296, "disk_total": 200, "disk_bebas": 60,

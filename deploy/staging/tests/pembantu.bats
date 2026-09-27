@@ -636,3 +636,44 @@ tulis_mounts() {
   grep -q '^GALAT internal: dihentikan' "$BATS_TEST_TMPDIR/keluar"
   [ "$(grep -c '^GALAT' "$BATS_TEST_TMPDIR/keluar")" -eq 1 ]
 }
+
+@test "SIGTERM saat memulihkan router tidak memotong pemulihan konfigurasi lama" {
+  printf 'layanan:router' > "$PALSU/wadah/wpmgr-stg-router"
+  printf 'lama' > "$S/etc/router/conf.d/stg-lama.conf"
+  printf 'staging:lama\n' > "$S/etc/router/htpasswd/lama"
+  printf '%s' "$(printf 'e%.0s' $(seq 1 64))" > "$S/staging/router/toko.rahasia"
+  printf 'staging:%s\n' '$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ01234' > "$S/staging/router/toko.htpasswd"
+  touch "$PALSU/nginx-gagal"
+  # cp tiruan khusus test ini: salinan pemulihan ke conf.d aktif berhenti
+  # sampai test mengirim SIGTERM, supaya sinyal pasti tiba di tengah pemulihan.
+  local jeda="$BATS_TEST_TMPDIR/jeda"
+  mkdir -p "$jeda"
+  cat > "$jeda/cp" <<CP
+#!/usr/bin/env bash
+if [[ "\${*: -1}" == "$S/etc/router/conf.d/" ]]; then
+  touch "$BATS_TEST_TMPDIR/pulih-mulai"
+  for _ in \$(seq 1 100); do
+    [[ -e "$BATS_TEST_TMPDIR/lanjut" ]] && break
+    sleep 0.1
+  done
+fi
+exec $(command -v cp) "\$@"
+CP
+  chmod +x "$jeda/cp"
+  WPMGR_STG_PATH="$jeda:$WPMGR_STG_PATH" "$SKRIP" router-muat > "$BATS_TEST_TMPDIR/keluar" 2>&1 3>&- &
+  pid=$!
+  for _ in $(seq 1 100); do
+    [[ -e "$BATS_TEST_TMPDIR/pulih-mulai" ]] && break
+    sleep 0.1
+  done
+  [ -e "$BATS_TEST_TMPDIR/pulih-mulai" ]
+  kill -TERM "$pid"
+  sleep 0.3
+  touch "$BATS_TEST_TMPDIR/lanjut"
+  rc=0
+  wait "$pid" || rc=$?
+  [ "$rc" -eq 4 ]
+  [ "$(cat "$S/etc/router/conf.d/stg-lama.conf")" = "lama" ]
+  [ "$(cat "$S/etc/router/htpasswd/lama")" = "staging:lama" ]
+  [ ! -e "$S/etc/router/conf.d/stg-toko.conf" ]
+}
