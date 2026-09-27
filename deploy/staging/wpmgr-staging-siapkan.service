@@ -3,6 +3,13 @@
 [Unit]
 Description=Siapkan jaringan, isolasi, dan layanan staging WP Manager
 After=docker.service network-online.target
+# Requires= hanya menjamin docker.service AKTIF sebelum unit oneshot ini
+# dijalankan sekali saat boot; ia TIDAK membuat unit ini otomatis berjalan
+# ulang bila Docker di-restart belakangan (mis. `systemctl restart docker`
+# setelah upgrade paket) tanpa reboot host penuh. Aturan iptables yang
+# dipasang `pasang_iptables` TIDAK ikut bertahan otomatis pada kasus itu --
+# restart Docker manual harus diikuti `systemctl restart
+# wpmgr-staging-siapkan` supaya isolasi jaringan staging terpasang lagi.
 Requires=docker.service
 Wants=network-online.target
 

@@ -3,6 +3,10 @@ DOMAIN=staging.halosocia.my.id
 STAGING_DIR=/var/lib/wpmgr/staging
 KONF_DIR=/etc/wpmgr-staging
 CERT_DIR=/var/lib/wpmgr/certs
+# Grup pemilik kunci privat sertifikat (0640 root:NGINX_GROUP), supaya proses
+# worker nginx host bisa membacanya. Opsional -- default www-data (Debian/
+# Ubuntu); ganti bila paket nginx di VPS memakai grup lain (mis. nginx).
+NGINX_GROUP=www-data
 ACME_DIR=/var/lib/wpmgr/acme
 LE_DIR=/var/lib/wpmgr/letsencrypt
 LOG_DIR=/var/log/wpmgr-staging

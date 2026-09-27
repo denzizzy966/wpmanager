@@ -462,9 +462,36 @@ tulis_mounts() {
   [ "$status" -eq 0 ]
   grep -qxF "[certonly][--non-interactive][--agree-tos][-m][admin@contoh.id][--webroot][-w][$S/acme][-d][toko.staging.contoh.id][--cert-name][toko.staging.contoh.id][--config-dir][$S/le/config][--work-dir][$S/le/work][--logs-dir][$S/le/logs][--keep-until-expiring]" "$PALSU/certbot.log"
   [ "$(cat "$S/certs/toko.staging.contoh.id/fullchain.pem")" = "rantai" ]
+  # Kunci privat harus terbaca worker nginx host (bukan cuma root), karena
+  # ssl_certificate_key di nginx-wpmgr-staging.conf berbasis variabel dan
+  # dibaca proses worker (bukan master) setiap handshake (review Task 21).
+  # Direktori sertifikat dan fullchain (publik) tetap root:root biasa.
+  [ "$(stat -c '%a %U:%G' "$S/certs/toko.staging.contoh.id")" = "755 root:root" ]
+  [ "$(stat -c '%a %U:%G' "$S/certs/toko.staging.contoh.id/fullchain.pem")" = "644 root:root" ]
+  [ "$(stat -c '%a %U:%G' "$S/certs/toko.staging.contoh.id/privkey.pem")" = "640 root:www-data" ]
   touch "$PALSU/certbot-gagal"
   run "$SKRIP" sertifikat toko
   [ "$status" -eq 5 ]
+}
+
+@test "NGINX_GROUP menentukan grup kunci privat dan divalidasi ketat" {
+  # Nilai kustom yang sah (grup "root" pasti ada di semua sistem) dipakai
+  # apa adanya, bukan default www-data yang diam-diam di-hardcode.
+  printf 'NGINX_GROUP=root\n' >> "$WPMGR_STG_KONF"
+  run "$SKRIP" sertifikat toko
+  [ "$status" -eq 0 ]
+  [ "$(stat -c '%a %U:%G' "$S/certs/toko.staging.contoh.id/privkey.pem")" = "640 root:root" ]
+
+  # Pola tidak sah (spasi) ditolak sebelum sampai ke pengecekan grup sistem.
+  sed -i 's/^NGINX_GROUP=.*/NGINX_GROUP=grup tidak sah/' "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"NGINX_GROUP"* ]]
+
+  # Pola sah tetapi grupnya tidak ada di sistem juga ditolak (getent group).
+  sed -i 's/^NGINX_GROUP=.*/NGINX_GROUP=grup-yang-tidak-ada/' "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
 }
 
 @test "status mencetak JSON dengan memori, disk, container, dan akses" {

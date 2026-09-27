@@ -15,7 +15,7 @@ def test_nginx_host_memuat_direktif_wajib():
         "map $ssl_server_name $wpmgr_stg_host {",
         r"~^(?<wpmgr_stg_nama>[a-z0-9-]{1,40})\.staging\.halosocia\.my\.id$",
         "listen 80;",
-        "listen 443 ssl http2;",
+        "listen 443 ssl;",
         "location ^~ /.well-known/acme-challenge/ {",
         "root /var/lib/wpmgr/acme;",
         "return 301 https://$host$request_uri;",
@@ -30,6 +30,38 @@ def test_nginx_host_memuat_direktif_wajib():
     # SNI mentah tidak boleh menjadi bagian path berkas yang dibuka root.
     assert "certs/$ssl_server_name" not in t
     assert "default_server" not in t
+    # http2 di nginx 1.24 adalah opsi per soket, bukan per server block:
+    # mengaktifkannya di sini akan ikut menyalakan HTTP/2 untuk site lain
+    # yang berbagi soket :443 (review Task 21, item penting #4). Diperiksa
+    # per baris "listen", bukan seluruh berkas, supaya komentar yang
+    # menjelaskan alasannya (yang sah menyebut kata "http2") tidak ikut
+    # menggagalkan test ini.
+    for baris in t.splitlines():
+        if baris.strip().startswith("listen"):
+            assert "http2" not in baris, baris
+    # Router staging (bukan host) yang memasang X-Robots-Tag di setiap
+    # respons; host tidak boleh menggandakannya (review Task 21, minor).
+    assert "add_header X-Robots-Tag" not in t
+
+
+def test_server_name_wildcard_bukan_regex():
+    """Review Task 21 item penting #5: server_name memakai wildcard nginx
+    biasa di kedua server, bukan regex -- map $ssl_server_name tetap
+    satu-satunya validator nama staging."""
+    t = _teks("nginx-wpmgr-staging.conf")
+    assert t.count("server_name *.staging.halosocia.my.id;") == 2
+    assert "server_name ~" not in t
+
+
+def test_pola_regex_yang_tersisa_dikutip_f6():
+    """Putusan F6: setiap pola regex nginx yang memuat "{" wajib dikutip,
+    supaya nginx tidak membacanya sebagai awal blok, bukan bagian pola."""
+    t = _teks("nginx-wpmgr-staging.conf")
+    baris_regex = [b for b in t.splitlines() if "~^" in b and "{" in b]
+    # Pola map $ssl_server_name seharusnya masih ada dan jadi satu-satunya
+    # pola regex berkurung kurawal di berkas ini (server_name bukan regex).
+    assert len(baris_regex) == 1
+    assert re.search(r'"~\^', baris_regex[0]), baris_regex[0]
 
 
 def test_sudoers_hanya_untuk_skrip_pembantu():
@@ -43,6 +75,7 @@ def test_sudoers_hanya_untuk_skrip_pembantu():
 def test_unit_siapkan_setelah_docker():
     t = _teks("wpmgr-staging-siapkan.service")
     assert "After=docker.service" in t and "Requires=docker.service" in t
+    assert "network-online.target" in t
     assert "ExecStart=/usr/local/sbin/wpmgr-staging siapkan" in t
     assert "Type=oneshot" in t
 
@@ -67,5 +100,11 @@ def test_readme_menjelaskan_pemasangan():
     readme = (AKAR / "README.md").read_text(encoding="utf-8")
     for wajib in ("## Staging (Lapis 3)", "wpmgr-worker@staging", "/etc/sudoers.d/wpmgr-staging",
                   "visudo -cf", "wpmgr-staging siapkan", "/etc/nginx/sites-enabled/wpmgr-staging.conf",
-                  "WPMGR_STAGING_DOMAIN", "Izinkan staging", "digest.lock"):
+                  "WPMGR_STAGING_DOMAIN", "Izinkan staging", "digest.lock",
+                  # Review Task 21 fix round 1:
+                  "NGINX_GROUP",  # kunci staging.conf baru untuk grup pemilik privkey
+                  "sedang diterbitkan",  # perilaku sebelum sertifikat terbit (item penting #3)
+                  r"grep -rn 'server_name.*\*\.halosocia' /etc/nginx/sites-enabled",  # pra-cek item #5
+                  "root-owned",  # /var/lib/wpmgr harus tetap root-owned (minor)
+                  ):
         assert wajib in readme, wajib

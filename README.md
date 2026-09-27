@@ -433,7 +433,11 @@ HTTP-01, bukan DNS-01 — lihat langkah 4 di bawah).
 install -o root -g root -m 0755 deploy/staging/wpmgr-staging /usr/local/sbin/wpmgr-staging
 install -d -o root -g root -m 0755 /etc/wpmgr-staging
 install -o root -g root -m 0644 deploy/staging/staging.conf.contoh /etc/wpmgr-staging/staging.conf
-#    isi DOMAIN dan ACME_EMAIL (sama dengan WPMGR_STAGING_EMAIL_ACME) di staging.conf
+#    isi DOMAIN dan ACME_EMAIL (sama dengan WPMGR_STAGING_EMAIL_ACME) di staging.conf; DOMAIN di
+#    sini HARUS persis sama dengan domain yang dipakai di deploy/staging/nginx-wpmgr-staging.conf
+#    (staging.halosocia.my.id) -- keduanya tidak saling membaca, jadi tidak ada validasi otomatis
+#    kalau salah satu diubah tanpa yang lain. NGINX_GROUP (opsional, default www-data) juga di
+#    sini -- lihat catatan "Kunci privat sertifikat" di bawah.
 install -d -o wpmgr -g wpmgr -m 0700 /var/lib/wpmgr/staging
 install -o root -g root -m 0440 deploy/staging/sudoers-wpmgr-staging /etc/sudoers.d/wpmgr-staging
 visudo -cf /etc/sudoers.d/wpmgr-staging
@@ -443,7 +447,15 @@ wpmgr-staging siapkan
 cp deploy/staging/wpmgr-staging-siapkan.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable wpmgr-staging-siapkan
 
-# 4. nginx host (SEKALI; staging baru tidak butuh reload)
+# 4. nginx host (SEKALI; staging baru tidak butuh reload). Pra-cek dulu: pastikan tidak ada site
+#    lain yang sudah mengklaim wildcard serupa yang bisa menabrak host staging.
+grep -rn 'server_name.*\*\.halosocia' /etc/nginx/sites-enabled
+#    nginx memilih server_name paling SPESIFIK (*.staging.halosocia.my.id mengalahkan
+#    *.halosocia.my.id untuk host yang cocok keduanya), jadi kecocokan yang lebih umum di atas
+#    biasanya aman diabaikan. Tapi bila ada site lain yang PERSIS memakai
+#    *.staging.halosocia.my.id, atau site lain punya `default_server` di :443, host staging bisa
+#    salah dirutekan atau menabrak sertifikat site itu -- selesaikan tabrakan itu dulu (persempit
+#    pola site lain, atau hapus default_server-nya) sebelum lanjut.
 cp deploy/staging/nginx-wpmgr-staging.conf /etc/nginx/sites-enabled/wpmgr-staging.conf
 nginx -t && systemctl reload nginx
 
@@ -458,7 +470,10 @@ systemctl restart 'wpmgr-worker@*' wpmgr-web
 tidak boleh ditulisi `wpmgr` — pada Ubuntu 24.04 baku ini sudah begitu; jangan mengubah pemiliknya.
 Sudoers hanya memberi `wpmgr` hak menjalankan skrip itu (`env_reset` aktif, tanpa baris `env_keep`),
 jadi variabel lingkungan yang dikirim `wpmgr` (termasuk dua kait test skrip pembantu,
-`WPMGR_STG_PATH`/`WPMGR_STG_KONF`) tidak pernah ikut lewat ke proses root.
+`WPMGR_STG_PATH`/`WPMGR_STG_KONF`) tidak pernah ikut lewat ke proses root. `/var/lib/wpmgr` dan semua
+turunannya (`certs/`, `acme/`, `letsencrypt/`, `staging/` termasuk) harus tetap root-owned dan tidak
+bisa ditulisi `wpmgr` — direktori itu memuat kunci privat TLS dan konfigurasi router yang tidak boleh
+bisa diubah proses dashboard (F2, cek_mount_root di skrip pembantu menolak start bila ini dilanggar).
 
 Lalu aktifkan **Izinkan staging** di **Pengaturan → WP Manager** di wp-admin setiap site yang akan
 distaging. Tanpa setelan itu connector membalas 403 untuk semua endpoint staging.
@@ -487,11 +502,31 @@ Catatan:
   (`halosocia.my.id`). Membuat/menghapus banyak staging dalam waktu singkat bisa memicu batas itu;
   `wpmgr-staging sertifikat` memakai `--keep-until-expiring` supaya penerbitan ulang untuk host yang
   sama tidak ikut menghitung.
+- **Sebelum sertifikat sebuah staging terbit, handshake TLS-nya ditolak.** `ssl_certificate`/
+  `ssl_certificate_key` di nginx host dibaca dari `/var/lib/wpmgr/certs/<host>/`, yang baru ada
+  setelah `wpmgr-staging sertifikat <nama>` sukses; sebelum itu klien yang membuka
+  `https://<nama>.staging.halosocia.my.id` mendapat galat TLS, bukan halaman WordPress. Dashboard
+  menandai staging seperti ini dengan status "sedang diterbitkan" di UI, dan cron
+  `renew-staging-certs` (harian) MENCOBA ULANG penerbitan yang gagal di percobaan sebelumnya --
+  jadi kondisi ini biasanya sembuh sendiri dalam 24 jam tanpa campur tangan operator.
+- **Kunci privat sertifikat (`privkey.pem`) dipasang `0640 root:$NGINX_GROUP`**, bukan `0600
+  root:root`, karena `ssl_certificate_key` berbasis variabel di sini dibaca proses WORKER nginx
+  (mis. `www-data`) setiap handshake, bukan cuma master yang start sebagai root; tanpa grup yang
+  tepat setiap handshake staging gagal "Permission denied". `NGINX_GROUP` di
+  `/etc/wpmgr-staging/staging.conf` defaultnya `www-data` (Debian/Ubuntu); ganti kalau paket nginx
+  di VPS memakai grup lain (mis. `nginx`) -- skrip pembantu menolak jalan (`GALAT konfigurasi`)
+  bila grup itu tidak ada di sistem.
 - **Image dipin lewat digest** di `/etc/wpmgr-staging/digest.lock`, yang diisi pada pemakaian pertama
   setiap image. Untuk memperbarui image (mis. rilis keamanan PHP), hapus barisnya lalu jalankan
   `wpmgr-staging siapkan`. Container staging memakai image baru pada tarik berikutnya.
 - **Isolasi:** container staging boleh ke internet (update plugin), tetapi tidak ke host atau jaringan
   privat. Aturan itu ada di rantai `INPUT` dan `DOCKER-USER` untuk jembatan `br-wpmgrstg`.
+- **`listen [::]:80`/`listen [::]:443`** di `nginx-wpmgr-staging.conf` menjadikan berkas ini
+  *default* untuk IPv6 bila belum ada site lain di `sites-enabled` yang mendengarkan IPv6 di port
+  itu (nginx menandai `listen` IPv6 pertama sebagai default secara implisit). Ini tidak berbahaya
+  (map dan `server_name` tetap memvalidasi), tapi kalau `staging.halosocia.my.id` tidak punya
+  rekaman DNS `AAAA`, kedua baris `[::]` ini boleh dihapus -- tidak ada trafik yang akan
+  memakainya.
 - **Kata sandi preview** ditampilkan sekali saat staging dibuat atau kata sandinya dibuat ulang
   (pengguna `staging`). Tombol **Masuk admin staging** melewati Basic Auth dengan tautan bertanda
   tangan yang berlaku 12 jam.
