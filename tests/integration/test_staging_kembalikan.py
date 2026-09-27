@@ -810,7 +810,81 @@ def test_batal_kembalikan_staging_gagal_tetap_gagal(sesi, site_staging, staging_
     prod.sebelum["/staging/terapkan"] = lambda p, n, badan: _minta_batal(sesi, site_staging)
     with pytest.raises(umum.GalatDibatalkan):
         _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
-    assert _staging(sesi, site_staging).status == StatusStaging.gagal
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    # Pembatalannya tetap tercatat di log aktivitas.
+    assert sesi.query(ActivityLog).filter(ActivityLog.pesan.like("Kembalikan produksi dibatalkan%")).count() == 1
+
+
+# ---- fix putaran 2 ------------------------------------------------------------------
+
+
+def _tarik_gagal(sesi, site_staging, galat="Tarik gagal: disk penuh."):
+    """Tarik (segarkan) yang gagal final: gagal milik salinan staging."""
+    j = buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
+    j.status = JobStatus.failed
+    st = _staging(sesi, site_staging)
+    st.status, st.galat = StatusStaging.gagal, galat
+    sesi.commit()
+
+
+def test_tolak_di_tengah_kembalikan_mempertahankan_galat_staging(sesi, site_staging, staging_aktif, prod, pb):
+    """GalatDitolakTanpaUbah di dalam pembungkus (R8 di tahap mulai): galat staging asli tetap."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod, "timpa_penuh")
+    _tarik_gagal(sesi, site_staging)
+    min((staging_aktif / snap.path / "db").glob("*.sql")).write_bytes(
+        b"CREATE TABLE `wp_posts` (`id` int) PARTITION BY HASH (`id`);\n")
+    job = _job_balik(sesi, site, snap.id)
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, job)
+    assert e.value.error_class == STAGING_DITOLAK and "Kembalikan dibatalkan" in e.value.pesan
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+
+
+def test_kembalikan_batal_lalu_sukses_tidak_mengangkat_gagal_tarik(sesi, site_staging, staging_aktif, prod, pb):
+    """Skenario reviewer: tarik gagal, kembalikan #1 dibatalkan sebelum tukar, kembalikan #2 sukses."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _tarik_gagal(sesi, site_staging)
+    prod.sebelum["/staging/terapkan"] = lambda p, n, badan: _minta_batal(sesi, site_staging)
+    with pytest.raises(umum.GalatDibatalkan):
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    _selesaikan_gagal(sesi)
+    del prod.sebelum["/staging/terapkan"]
+    _kembalikan(sesi, site, prod, snap.id)
+    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+
+
+def test_kembalikan_tolak_pra_tukar_lalu_sukses_tidak_mengangkat_gagal_tarik(sesi, site_staging, staging_aktif,
+                                                                            prod, pb):
+    """Varian lewat _staging_utuh: kembalikan #1 ditolak pra-pemeriksaan tukar (tidak pernah menukar)."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _tarik_gagal(sesi, site_staging)
+    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    with pytest.raises(SiteError):
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    _selesaikan_gagal(sesi)
+    _kembalikan(sesi, site, prod, snap.id)
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+
+
+def test_gagal_produksi_sesudah_tarik_gagal_dibersihkan(sesi, site_staging, staging_aktif, prod, pb):
+    """Kembalikan yang SUDAH menukar lalu gagal lebih baru dari tarik gagal: gagal itu milik produksi."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _tarik_gagal(sesi, site_staging)
+    prod.kejadian["tukar"] = ["putus"] * (dorong.MAKS_RAGU_TUKAR + 1)
+    job = _job_balik(sesi, site, snap.id)
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError):
+        _jalankan(sesi, site, prod, job)
+    _selesaikan_gagal(sesi)
+    _kembalikan(sesi, site, prod, snap.id)
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.galat is None
 
 
 @pytest.mark.parametrize("langkah,sah", [

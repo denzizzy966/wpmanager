@@ -369,19 +369,27 @@ def _istirahat_bawaan(st: Staging) -> StatusStaging:
     return StatusStaging.siap if st.ditarik_pada else StatusStaging.gagal
 
 
+def _galat_istirahat(job: Job, galat_istirahat, pesan: str) -> str:
+    """Galat staging sesudah batal/penolakan: yang dipertahankan pemanggil, atau pesan itu sendiri."""
+    dipertahankan = galat_istirahat(job) if galat_istirahat is not None else None
+    return dipertahankan if dipertahankan is not None else pesan
+
+
 def _batalkan(sesi: Session, job: Job, site_id, staging_id, nama: str,
-              istirahat=_istirahat_bawaan) -> GalatDibatalkan:
+              istirahat=_istirahat_bawaan, galat_istirahat=None) -> GalatDibatalkan:
     sesi.rollback()
     st = sesi.get(Staging, staging_id, populate_existing=True)
     status = istirahat(st)
-    _tandai(sesi, staging_id, status, PESAN_DIBATALKAN)
+    # Pesan pembatalan tetap sampai ke job dan log aktivitas di bawah.
+    _tandai(sesi, staging_id, status, _galat_istirahat(job, galat_istirahat, PESAN_DIBATALKAN))
     catat_aktivitas(sesi, site_id, job, f"{nama} dibatalkan", level="warning")
     sesi.commit()
     return GalatDibatalkan()
 
 
 def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging, nama: str,
-                     boleh_batal=None, istirahat=_istirahat_bawaan, galat_sukses=None) -> dict:
+                     boleh_batal=None, istirahat=_istirahat_bawaan, galat_sukses=None,
+                     galat_istirahat=None) -> dict:
     """Pembungkus bersama job staging: status, batal, dan pemetaan galat.
 
     `boleh_batal(job) -> bool` (opsional) dibaca dari kemajuan yang sudah
@@ -396,6 +404,9 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
     `galat_sukses(job) -> str | None` (opsional) menentukan `staging.galat`
     sesudah sukses (bawaan: dikosongkan); kembalikan memakainya supaya galat
     staging yang gagal tidak hilang oleh pengembalian produksi.
+    `galat_istirahat(job) -> str | None` (opsional) sama untuk batal dan
+    penolakan tanpa ubah: bukan None berarti galat staging itu dipertahankan
+    (pesan batal/penolakan tetap tercatat di job dan log aktivitas).
     """
     site, staging = muat_staging(sesi, job)
     staging_id, job_id, site_id = staging.id, job.id, site.id
@@ -411,13 +422,13 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
             periksa_batal(sesi, staging)
         hasil = inti(sesi, job, site, staging)
     except Dibatalkan:
-        raise _batalkan(sesi, job, site_id, staging_id, nama, istirahat) from None
+        raise _batalkan(sesi, job, site_id, staging_id, nama, istirahat, galat_istirahat) from None
     except KlaimHilang:
         raise
     except GalatDitolakTanpaUbah as exc:
         sesi.rollback()
         st = sesi.get(Staging, staging_id, populate_existing=True)
-        _tandai(sesi, staging_id, istirahat(st), exc.pesan)
+        _tandai(sesi, staging_id, istirahat(st), _galat_istirahat(job, galat_istirahat, exc.pesan))
         raise
     except GalatPembantu as exc:
         _tandai(sesi, staging_id, StatusStaging.gagal, exc.pesan)
@@ -429,7 +440,7 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
         if batal_berlaku() and _batal_diminta(sesi, staging_id):
             # Pembatalan menang atas percobaan ulang: tanpa ini dorong yang
             # dibatalkan tetap berlanjut pada putaran berikutnya.
-            raise _batalkan(sesi, job, site_id, staging_id, nama, istirahat) from None
+            raise _batalkan(sesi, job, site_id, staging_id, nama, istirahat, galat_istirahat) from None
         # Keputusan "final atau diulang" harus sama persis dengan worker
         # (queue.akan_diulang), termasuk batas bad_response dan UNKNOWN yang
         # oleh worker diulang sebagai TRANSIENT untuk job staging (F26).

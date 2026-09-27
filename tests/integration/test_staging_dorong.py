@@ -1143,3 +1143,36 @@ def test_pulihkan_pra_tukar_menolak_token_tidak_sah(prod):
     r = prod._terapkan_inti({"dorong_id": "a" * 32, "langkah": "pulihkan", "token": "bukan-token"}, "pulihkan")
     assert r.status_code == 400 and r.json()["code"] == "wpmgr_staging_permintaan"
     assert prod.dorongan["a" * 32]["status"] == "siap"
+
+
+# ---- Task 17 fix putaran 2 (putusan R18) ---------------------------------------
+
+
+def _tarik_gagal(sesi, site_staging, galat="Tarik gagal: disk penuh."):
+    j = buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
+    j.status = JobStatus.failed
+    st = _staging(sesi, site_staging)
+    st.status, st.galat = StatusStaging.gagal, galat
+    sesi.commit()
+
+
+def test_dorong_tolak_pra_tukar_tidak_mengangkat_gagal_staging(sesi, site_staging, staging_aktif, prod, pb):
+    """R18: penolakan pra-pemeriksaan tukar dorong mempertahankan gagal milik salinan staging."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    _tarik_gagal(sesi, site_staging)
+    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert e.value.error_class == STAGING_DITOLAK
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
+
+
+def test_dorong_tolak_pra_tukar_tanpa_gagal_staging_tetap_siap(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "hanya_kode")
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.galat == e.value.pesan

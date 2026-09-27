@@ -69,7 +69,6 @@ from wpmgr.errors import (
 )
 from wpmgr.jobs.queue import akan_diulang
 from wpmgr.models import (
-    JOB_STAGING,
     Job,
     JobStatus,
     JobType,
@@ -1151,7 +1150,8 @@ class _Dorong:
                   "perubahan": k.get("perubahan", []), "snapshot_id": k.get("snapshot_id"),
                   "peringatan": list(k.get("peringatan") or [])[:10]}
         hasil = tuntaskan_sukses(self.sesi, self.job, self.site, self.staging, self.klien, k,
-                                 f"Dorong ke produksi ({LABEL_MODE[self.mode]})", detail)
+                                 f"Dorong ke produksi ({LABEL_MODE[self.mode]})", detail,
+                                 istirahat=istirahat_r18(self.job))
         pangkas_snapshot(self.sesi, self.site.id, get_settings().staging_snapshot)
         self.sesi.commit()
         shutil.rmtree(self.kerja, ignore_errors=True)
@@ -1208,15 +1208,65 @@ def boleh_batal(job) -> bool:
     return umum.kemajuan(job).get("langkah_terapkan") not in LANGKAH_SESUDAH_TUKAR
 
 
-def _gagal_milik_staging(job) -> bool:
-    """Putusan R18: staging sudah `gagal` karena salinannya sendiri (tarik/uji) sebelum job ini.
+# ---- putusan R18: siapa pemilik status `gagal` staging -------------------------
+#
+# Dorong/kembalikan menyangkut PRODUKSI. Staging yang sudah `gagal` karena
+# salinannya sendiri (tarik/uji) tetap `gagal` dengan galat aslinya, apa pun
+# hasil job ini (sukses, batal, atau ditolak). `gagal` yang ditinggalkan
+# dorong/kembalikan yang SUDAH menukar di produksi adalah kabar produksi, dan
+# dituntaskan oleh job yang sukses sesudahnya.
 
-    Dicatat kembalikan di kemajuan (`status_staging_awal`, lihat
-    `_status_staging_awal`); gagal akibat dorong/kembalikan sebelumnya adalah
-    kabar produksi dan tidak dicatat sebagai `gagal`. Staging seperti itu
-    tetap `gagal` dengan galat aslinya apa pun hasil job ini.
+_JOB_PRODUKSI = (JobType.staging_dorong, JobType.staging_kembalikan)
+_JOB_SALINAN = (JobType.staging_tarik, JobType.staging_uji_update)
+_JOB_GAGAL = (JobStatus.failed, JobStatus.unknown)
+
+
+def _status_staging_awal(sesi, job, staging) -> str:
+    """Status staging yang dicatat di awal job; "gagal" hanya bila gagalnya milik salinan staging.
+
+    `gagal` milik produksi hanya bila dorong/kembalikan gagal terbaru yang
+    SUDAH mengirim tukar (`langkah_terapkan` di LANGKAH_SESUDAH_TUKAR) lebih
+    baru daripada tarik/uji gagal terbaru. Dorong/kembalikan yang tidak
+    pernah menukar (batal, ditolak pra-pemeriksaan) tidak pernah menyentuh
+    produksi, jadi tidak ikut menentukan pemilik.
     """
+    if staging.status != StatusStaging.gagal:
+        return staging.status.value
+
+    def terbaru(*syarat):
+        return sesi.scalar(select(func.max(Job.id)).where(Job.site_id == job.site_id, Job.id != job.id,
+                                                          Job.status.in_(_JOB_GAGAL), *syarat))
+
+    salinan = terbaru(Job.tipe.in_(_JOB_SALINAN))
+    produksi = terbaru(Job.tipe.in_(_JOB_PRODUKSI),
+                       Job.payload["kemajuan"]["langkah_terapkan"].astext.in_(LANGKAH_SESUDAH_TUKAR))
+    if produksi is not None and (salinan is None or produksi > salinan):
+        return StatusStaging.siap.value
+    return StatusStaging.gagal.value
+
+
+def catat_status_awal(sesi, job, staging) -> None:
+    """Sekali per job, sebelum pembungkus menimpa status dengan `mendorong` (percobaan ulang melihatnya)."""
+    if staging is not None and "status_staging_awal" not in umum.kemajuan(job):
+        umum.simpan_kemajuan(sesi, job, status_staging_awal=_status_staging_awal(sesi, job, staging),
+                             galat_staging_awal=staging.galat)
+
+
+def _gagal_milik_staging(job) -> bool:
     return umum.kemajuan(job).get("status_staging_awal") == StatusStaging.gagal.value
+
+
+def istirahat_r18(job):
+    """Status staging tanpa job berjalan menurut R18 (untuk pembungkus dan `tuntaskan_sukses`)."""
+    def istirahat(st) -> StatusStaging:
+        return StatusStaging.gagal if _gagal_milik_staging(job) else umum.status_istirahat(st)
+
+    return istirahat
+
+
+def galat_r18(job) -> str | None:
+    """Galat staging yang dipertahankan R18, atau None bila tidak ada yang dipertahankan."""
+    return umum.kemajuan(job).get("galat_staging_awal") if _gagal_milik_staging(job) else None
 
 
 def _staging_utuh(sesi, job, site_id, pesan: str) -> SiteError:
@@ -1227,12 +1277,9 @@ def _staging_utuh(sesi, job, site_id, pesan: str) -> SiteError:
     """
     st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
     if st is not None:
-        if _gagal_milik_staging(job):
-            st.status = StatusStaging.gagal
-            st.galat = umum.kemajuan(job).get("galat_staging_awal")
-        else:
-            st.status = umum.status_istirahat(st)
-            st.galat = pesan
+        st.status = istirahat_r18(job)(st)
+        dipertahankan = galat_r18(job)
+        st.galat = dipertahankan if dipertahankan is not None else pesan
         sesi.commit()
     return SiteError(STAGING_DITOLAK, pesan)
 
@@ -1336,9 +1383,11 @@ def tangani_staging_dorong(sesi, job, klien) -> dict:
 
     _periksa_awal(sesi, job)
     site_id = job.site_id
+    catat_status_awal(sesi, job, sesi.scalar(select(Staging).where(Staging.site_id == site_id)))
     try:
         return umum.jalankan_staging(sesi, job, inti, StatusStaging.mendorong, "Dorong ke produksi",
-                                     boleh_batal=boleh_batal)
+                                     boleh_batal=boleh_batal, istirahat=istirahat_r18(job), galat_sukses=galat_r18,
+                                     galat_istirahat=galat_r18)
     except umum.KlaimHilang:
         raise
     except Exception as exc:
@@ -1620,7 +1669,7 @@ class _Kembalikan:
                   "hapus": k["jumlah_hapus"], "db": bool(k["db"])}
         hasil = tuntaskan_sukses(self.sesi, self.job, self.site, self.staging, self.klien, k,
                                  f"Produksi dikembalikan dari snapshot #{k['snapshot_id']}", detail,
-                                 istirahat=_istirahat_balik(self.job))
+                                 istirahat=istirahat_r18(self.job))
         row = self.sesi.get(StagingSnapshot, k["snapshot_id"], populate_existing=True)
         if row is not None:
             row.status = "dipakai"
@@ -1656,42 +1705,6 @@ def _periksa_awal_kembalikan(sesi, job, site) -> None:
     _baca_meta(site, _baris_snapshot(sesi, job, site))
 
 
-def _istirahat_balik(job):
-    """Status staging sesudah kembalikan: staging yang semula gagal TETAP gagal.
-
-    Kembalikan menyangkut produksi, bukan salinan staging; ia tidak boleh
-    menyembunyikan staging yang rusak di balik status siap/dijeda.
-    """
-    def istirahat(st) -> StatusStaging:
-        return StatusStaging.gagal if _gagal_milik_staging(job) else umum.status_istirahat(st)
-
-    return istirahat
-
-
-def _status_staging_awal(sesi, job, staging) -> str:
-    """Status staging yang dipertahankan kembalikan.
-
-    `gagal` hanya dipertahankan bila kegagalannya milik salinan staging
-    (tarik/uji). Gagal akibat dorong/kembalikan sebelumnya adalah kabar
-    tentang PRODUKSI, yang justru dituntaskan kembalikan yang sukses ini;
-    mempertahankannya akan menampilkan galat produksi yang sudah basi.
-    """
-    if staging.status != StatusStaging.gagal:
-        return staging.status.value
-    terakhir = sesi.execute(
-        select(Job.tipe, Job.status).where(Job.site_id == job.site_id, Job.id != job.id, Job.tipe.in_(JOB_STAGING),
-                                           Job.status.in_((JobStatus.failed, JobStatus.success, JobStatus.unknown)))
-        .order_by(Job.id.desc()).limit(1)).first()
-    if terakhir is not None and terakhir.tipe in (JobType.staging_dorong, JobType.staging_kembalikan) \
-            and terakhir.status != JobStatus.success:
-        return StatusStaging.siap.value
-    return StatusStaging.gagal.value
-
-
-def _galat_sukses_balik(job) -> str | None:
-    return umum.kemajuan(job).get("galat_staging_awal") if _gagal_milik_staging(job) else None
-
-
 def tangani_staging_kembalikan(sesi, job, klien) -> dict:
     if not get_settings().staging_aktif:
         raise umum.galat_ditolak("Fitur staging tidak aktif (WPMGR_STAGING_DOMAIN kosong).")
@@ -1701,14 +1714,11 @@ def tangani_staging_kembalikan(sesi, job, klien) -> dict:
     site_id = job.site_id
     try:
         if staging is not None:
-            if "status_staging_awal" not in umum.kemajuan(job):
-                # Dicatat sebelum pembungkus menimpanya dengan `mendorong`;
-                # percobaan ulang melihat `mendorong`, jadi hanya sekali.
-                umum.simpan_kemajuan(sesi, job, status_staging_awal=_status_staging_awal(sesi, job, staging),
-                                     galat_staging_awal=staging.galat)
+            catat_status_awal(sesi, job, staging)
             return umum.jalankan_staging(sesi, job, lambda s, j, site_, st: kembalikan(s, j, site_, st, klien),
                                          StatusStaging.mendorong, "Kembalikan produksi", boleh_batal=boleh_batal,
-                                         istirahat=_istirahat_balik(job), galat_sukses=_galat_sukses_balik)
+                                         istirahat=istirahat_r18(job), galat_sukses=galat_r18,
+                                         galat_istirahat=galat_r18)
         # Staging sudah dihapus tetapi snapshot produksi masih ada: tetap bisa
         # dipulihkan, tanpa status staging dan tanpa batal.
         try:
