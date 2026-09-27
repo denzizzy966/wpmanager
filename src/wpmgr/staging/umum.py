@@ -381,7 +381,7 @@ def _batalkan(sesi: Session, job: Job, site_id, staging_id, nama: str,
 
 
 def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging, nama: str,
-                     boleh_batal=None, istirahat=_istirahat_bawaan) -> dict:
+                     boleh_batal=None, istirahat=_istirahat_bawaan, galat_sukses=None) -> dict:
     """Pembungkus bersama job staging: status, batal, dan pemetaan galat.
 
     `boleh_batal(job) -> bool` (opsional) dibaca dari kemajuan yang sudah
@@ -393,6 +393,9 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
     `istirahat(staging) -> StatusStaging` menentukan status sesudah batal
     atau penolakan tanpa ubah (bawaan: siap bila pernah ditarik); kembalikan
     memakai `status_istirahat` supaya staging yang dijeda tetap dijeda.
+    `galat_sukses(job) -> str | None` (opsional) menentukan `staging.galat`
+    sesudah sukses (bawaan: dikosongkan); kembalikan memakainya supaya galat
+    staging yang gagal tidak hilang oleh pengembalian produksi.
     """
     site, staging = muat_staging(sesi, job)
     staging_id, job_id, site_id = staging.id, job.id, site.id
@@ -452,7 +455,7 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
         _tandai(sesi, staging_id, StatusStaging.gagal, PESAN_TAK_TERDUGA)
         raise
     st = sesi.get(Staging, staging_id, populate_existing=True)
-    st.galat = None
+    st.galat = galat_sukses(job) if galat_sukses is not None else None
     st.batal_diminta_pada = None
     sesi.commit()
     return hasil

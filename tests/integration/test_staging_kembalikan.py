@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import uuid
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ from wpmgr.models import (
     JobStatus,
     JobType,
     Site,
+    SiteStatus,
     Staging,
     StagingSnapshot,
     StatusStaging,
@@ -726,3 +728,81 @@ def test_dorong_tidak_bisa_diantrekan_saat_kembalikan_tertunda(sesi, site_stagin
     with pytest.raises(IntegrityError):
         buat_job(sesi, site_staging.site_id, JobType.staging_dorong, {"mode": "hanya_kode"})
     sesi.rollback()
+
+
+# ---- fix putaran 1 ------------------------------------------------------------------
+
+
+def test_kembalikan_tidak_menyembunyikan_staging_gagal(sesi, site_staging, staging_aktif, prod, pb):
+    """Kembalikan menyangkut produksi: staging yang gagal tetap gagal dengan galatnya."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    st = _staging(sesi, site_staging)
+    st.status, st.galat = StatusStaging.gagal, "Tarik gagal: disk penuh."
+    sesi.commit()
+    hasil = _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    assert hasil["dorong_gagal"] is False
+    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    assert st.dorong_gagal_pada is None
+
+
+def test_batal_kembalikan_staging_gagal_tetap_gagal(sesi, site_staging, staging_aktif, prod, pb):
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    st = _staging(sesi, site_staging)
+    st.status, st.galat = StatusStaging.gagal, "Tarik gagal: disk penuh."
+    sesi.commit()
+    prod.sebelum["/staging/terapkan"] = lambda p, n, badan: _minta_batal(sesi, site_staging)
+    with pytest.raises(umum.GalatDibatalkan):
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    assert _staging(sesi, site_staging).status == StatusStaging.gagal
+
+
+@pytest.mark.parametrize("langkah,sah", [
+    # akhiri_gagal mati sebelum _buang_snapshot: snapshot dorongan yang tidak pernah menukar tertinggal.
+    ("siapkan", False), ("cek_ulang", False), (None, False),
+    # Tukar sudah dikirim (hasil tidak pasti, atau selesai belum terkonfirmasi): titik kembali sah.
+    ("tukar", True), ("selesai", True),
+])
+def test_snapshot_dorongan_yang_tidak_pernah_menukar_ditolak(sesi, site_staging, staging_aktif, prod, pb,
+                                                            langkah, sah):
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    job_dorong = sesi.get(Job, snap.job_id)
+    job_dorong.payload = {**job_dorong.payload,
+                          "kemajuan": {**job_dorong.payload["kemajuan"], "langkah_terapkan": langkah}}
+    job_dorong.status = JobStatus.failed
+    sesi.commit()
+    job = _job_balik(sesi, site, snap.id)
+    if sah:
+        assert _jalankan(sesi, site, prod, job)["dorong_gagal"] is False
+        return
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, job)
+    assert e.value.error_class == STAGING_DITOLAK and e.value.pesan == dorong.PESAN_SNAPSHOT_BUKAN_TITIK
+    assert prod.langkah == [] and prod.unggahan == {}
+    assert _staging(sesi, site_staging).status == StatusStaging.siap
+
+
+def test_snapshot_tanpa_job_pemilik_ditolak(sesi, site_staging, staging_aktif, prod, pb):
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    snap.job_id = None
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    assert e.value.pesan == dorong.PESAN_SNAPSHOT_BUKAN_TITIK
+
+
+def test_snapshot_milik_site_lain_ditolak(sesi, site_staging, staging_aktif, prod, pb):
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    lain = Site(id=uuid.uuid4(), nama="Contoh", url="https://lain.test", status=SiteStatus.active,
+                secret_terenkripsi=b"x")
+    sesi.add(lain)
+    sesi.commit()
+    snap_lain = StagingSnapshot(site_id=lain.id, job_id=snap.job_id, jenis="sebelum_dorong", status="tersedia",
+                                path=snap.path)
+    sesi.add(snap_lain)
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap_lain.id))
+    assert e.value.error_class == STAGING_DITOLAK and e.value.pesan == dorong.PESAN_SNAPSHOT_HILANG
+    assert prod.langkah == [] and prod.unggahan == {}
