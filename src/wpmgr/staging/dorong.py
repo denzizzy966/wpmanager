@@ -861,8 +861,13 @@ def hapus_dir_staging(relatif: str) -> None:
     shutil.rmtree(p, ignore_errors=True)
 
 
-def pangkas_snapshot(sesi, site_id, n: int) -> int:
-    """Pangkas snapshot sah melebihi `n` terbaru; snapshot job lama yang belum bersih dipertahankan."""
+def pangkas_snapshot(sesi, site_id, n: int, hapus=None) -> int:
+    """Pangkas snapshot sah melebihi `n` terbaru; snapshot job lama yang belum bersih dipertahankan.
+
+    `hapus(path)` menggantikan penghapusan langsung: cron memakainya untuk
+    memindahkan direktori ke nisan lalu menghapusnya sesudah kunci dilepas.
+    """
+    hapus = hapus or hapus_dir_staging
     ditahan = set(sesi.scalars(select(Job.id).where(*syarat_dorongan_lama_belum_bersih(site_id))).all())
     daftar = sesi.scalars(
         select(StagingSnapshot)
@@ -878,7 +883,7 @@ def pangkas_snapshot(sesi, site_id, n: int) -> int:
         # satunya titik kembali untuk dorongan yang keadaannya belum pasti.
         if s.job_id is not None and s.job_id in ditahan:
             continue
-        hapus_dir_staging(s.path)
+        hapus(s.path)
         s.status = "dipangkas"
         dipangkas += 1
     return dipangkas

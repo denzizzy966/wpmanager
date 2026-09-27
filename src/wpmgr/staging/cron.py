@@ -9,15 +9,21 @@ Karena itu setiap penghapusan lewat `dorong.hapus_dir_staging` dan helper
 `jalur_di_dalam`, target teratas harus direktori sungguhan (lstat), dan
 rmtree tidak pernah mengikuti symlink.
 
-Kunci baris (dipakai juga oleh route antre job staging):
-- jeda otomatis memegang `SELECT ... FOR UPDATE` atas baris `staging` itu
-  sejak pemeriksaan job sampai `jeda` selesai dan di-commit;
-- pemangkasan memegang `SELECT ... FOR UPDATE` atas baris `sites` (id =
-  nama direktori UUID) selama memeriksa ulang "tanpa Staging / tanpa job
-  staging aktif" dan memindahkan yang akan dihapus ke nisan `.hapus-*` di
-  akar yang sama (rename atomik). Penghapusan nisan yang lama berjalan
-  sesudah commit, di luar kunci; nisan sisa mati mendadak dihapus putaran
-  berikutnya.
+Kontrak kunci baris (route antre job staging wajib mengikuti urutan yang sama):
+1. `SELECT id FROM sites WHERE id = :site_id FOR NO KEY UPDATE`, lalu
+2. `SELECT ... FROM staging WHERE id = :id FOR UPDATE` (bila perlu).
+Urutan tetap sites -> staging mencegah siklus. NO KEY UPDATE (bukan FOR
+UPDATE) karena INSERT baris anak yang merujuk site itu (activity_log,
+jobs, staging_snapshot) mengambil FOR KEY SHARE atas baris sites untuk
+foreign key; FOR UPDATE memblokirnya, NO KEY UPDATE tidak.
+
+- Jeda otomatis: kunci 1 lalu 2 dipegang sejak pemeriksaan status/job
+  sampai `pb.jeda` selesai dan di-commit.
+- Pemangkasan: kunci 1 dipegang selama memeriksa ulang "tanpa Staging /
+  tanpa job staging aktif" dan memindahkan yang akan dihapus (termasuk
+  snapshot yang dipangkas `pangkas_snapshot`) ke nisan `.hapus-*` di akar
+  yang sama (rename atomik), lalu commit. Nisan dihapus sesudah commit, di
+  luar kunci; nisan sisa putaran yang mati dihapus putaran berikutnya.
 """
 
 import logging
@@ -106,14 +112,17 @@ def jeda_otomatis(sesi, pb, sekarang: datetime) -> int:
         return 0
     maks_akses = (sekarang + TOLERANSI_JAM).timestamp()
     n = 0
-    ids = sesi.scalars(select(Staging.id).where(Staging.aktif.is_(True), Staging.status == StatusStaging.siap)
-                       .order_by(Staging.nama)).all()
-    for sid in ids:
-        # Baris staging dikunci sejak pemeriksaan sampai jeda di-commit: job
-        # staging baru (yang mengunci baris yang sama saat diantrekan) tidak
-        # bisa menyelinap di antara pemeriksaan dan `pb.jeda`.
+    ids = sesi.execute(select(Staging.id, Staging.site_id).where(
+        Staging.aktif.is_(True), Staging.status == StatusStaging.siap).order_by(Staging.nama)).all()
+    sesi.commit()
+    for sid, site_id in ids:
+        # Kunci sites lalu staging (kontrak di docstring modul) dipegang sejak
+        # pemeriksaan sampai jeda di-commit: job staging baru (yang mengunci
+        # baris yang sama saat diantrekan) tidak bisa menyelinap di antara
+        # pemeriksaan dan `pb.jeda`.
+        _kunci_site(sesi, site_id)
         st = sesi.get(Staging, sid, populate_existing=True, with_for_update=True)
-        if st is None or not st.aktif or st.status != StatusStaging.siap:
+        if st is None or st.site_id != site_id or not st.aktif or st.status != StatusStaging.siap:
             sesi.commit()
             continue
         dibuka = _waktu_sah(st.dibuka_pada, sekarang)
@@ -200,14 +209,16 @@ def _tua(path: Path, sekarang: datetime) -> bool:
 
 
 def _kunci_site(sesi, site_id) -> None:
-    """`SELECT id FROM sites WHERE id = :site_id FOR UPDATE` sampai commit berikutnya.
+    """`SELECT id FROM sites WHERE id = :site_id FOR NO KEY UPDATE` sampai commit berikutnya.
 
     Route antre job staging mengunci baris yang sama, jadi pemeriksaan ulang
-    "tanpa Staging / tanpa job aktif" di bawah ini tetap benar sampai
-    pemindahan ke nisan di-commit. Site yang barisnya sudah hilang tidak
-    bisa mendapat job atau staging baru (foreign key).
+    "tanpa Staging / tanpa job aktif" tetap benar sampai commit. NO KEY
+    UPDATE tidak bentrok dengan FOR KEY SHARE yang diambil INSERT baris anak
+    (foreign key ke sites), sehingga mis. log aktivitas site ini tetap bisa
+    ditulis. Site yang barisnya sudah hilang tidak bisa mendapat job atau
+    staging baru (foreign key).
     """
-    sesi.execute(select(Site.id).where(Site.id == site_id).with_for_update())
+    sesi.execute(select(Site.id).where(Site.id == site_id).with_for_update(key_share=True))  # FOR NO KEY UPDATE
 
 
 def _ada_staging(sesi, site_id) -> bool:
@@ -354,8 +365,12 @@ def _pangkas_direktori(sesi, akar: Path, sekarang: datetime, hasil: dict) -> Non
             continue
         try:
             nisan = _pangkas_satu_site(sesi, akar, nama, sekarang, hasil)
-        finally:
             sesi.commit()
+        except Exception:
+            # Jangan meng-commit keadaan setengah jalan. Nisan yang sudah
+            # terbentuk tetap ada dan dihapus putaran berikutnya.
+            sesi.rollback()
+            raise
         for n in nisan:
             _hapus_nisan(akar, n)
 
@@ -398,11 +413,33 @@ def pangkas_staging(sesi, pb, sekarang: datetime) -> dict:
 
     site_snapshot = set(sesi.scalars(select(StagingSnapshot.site_id).where(
         StagingSnapshot.status.in_(STATUS_SNAPSHOT_SAH))).all())
+    sesi.commit()
     for site_id in sorted(site_snapshot, key=str):
-        _kunci_site(sesi, site_id)
-        if not _ada_job_staging(sesi, site_id):
-            hasil["snapshot"] += pangkas_snapshot(sesi, site_id, s.staging_snapshot)
-        sesi.commit()
+        # Di bawah kunci hanya rename ke nisan; rmtree snapshot (bisa berukuran
+        # GB) berjalan sesudah commit supaya route antre tidak menunggu.
+        nisan: list[str] = []
+
+        def ke_nisan(path: str, site_id=site_id, nisan=nisan) -> None:
+            try:
+                jalur_di_dalam(akar, path)
+            except PathTidakAman:
+                return
+            if _dir_nyata(akar / path):
+                n = _ke_nisan(akar, path, site_id)
+                if n is not None:
+                    nisan.append(n)
+
+        try:
+            _kunci_site(sesi, site_id)
+            if not _ada_job_staging(sesi, site_id):
+                hasil["snapshot"] += pangkas_snapshot(sesi, site_id, s.staging_snapshot, hapus=ke_nisan)
+            sesi.commit()
+        except Exception:
+            # Nisan yang sudah terbentuk dihapus putaran berikutnya.
+            sesi.rollback()
+            raise
+        for n in nisan:
+            _hapus_nisan(akar, n)
 
     if _dir_nyata(akar):
         _pangkas_direktori(sesi, akar, sekarang, hasil)

@@ -202,6 +202,7 @@ def test_pangkas_staging(sesi, staging_aktif, monkeypatch):
     assert not (akar / "router" / "hilang.rahasia").exists()
     assert (akar / "router" / "hidup.rahasia").exists()
     assert ("router_muat",) in pb.panggilan
+    assert not [n for n in os.listdir(akar) if n.startswith(".hapus-")]
 
 
 # ---- keamanan penghapusan -----------------------------------------------------
@@ -583,6 +584,122 @@ def test_jeda_otomatis_menunggu_kunci_baris_staging(sesi, engine, staging_aktif)
         sesi_cron.close()
     assert menunggu, "jeda otomatis tidak menunggu kunci baris staging"
     assert hasil == [0] and "jeda" not in pb.nama_panggilan()
+
+
+# ---- kontrak kunci sites -> staging (fix round 2) ---------------------------------
+
+
+def test_kunci_site_tidak_memblokir_insert_foreign_key(sesi, engine):
+    """FOR NO KEY UPDATE: INSERT baris anak (FOR KEY SHARE atas sites) tidak menunggu kunci pemangkasan.
+
+    Dengan FOR UPDATE, auto-pause (memegang staging, lalu INSERT activity_log)
+    dan route (memegang sites, lalu menunggu staging) membentuk siklus.
+    """
+    from sqlalchemy import text
+
+    s = Site(id=uuid.uuid4(), nama="ts", url="https://ts.test", status=SiteStatus.active, secret_terenkripsi=b"x")
+    sesi.add(s)
+    sesi.commit()
+    pemegang = sessionmaker(bind=engine, future=True)()
+    penulis = sessionmaker(bind=engine, future=True)()
+    try:
+        cron._kunci_site(pemegang, s.id)
+        penulis.execute(text("SET LOCAL lock_timeout = '2s'"))
+        penulis.add(ActivityLog(site_id=s.id, level="info", pesan="tidak menunggu"))
+        penulis.commit()
+    finally:
+        penulis.rollback()
+        penulis.close()
+        pemegang.rollback()
+        pemegang.close()
+    assert sesi.query(ActivityLog).filter(ActivityLog.site_id == s.id).count() == 1
+
+
+def test_jeda_otomatis_mengunci_site_sebelum_staging(sesi, engine, staging_aktif):
+    """Urutan kunci sama dengan route antre: sites dulu, lalu staging."""
+    import threading
+
+    from sqlalchemy import text
+
+    st = _staging(sesi, "a", aktif=True, status=StatusStaging.siap, ditarik_pada=SEKARANG - timedelta(days=9))
+    lain = sessionmaker(bind=engine, future=True)()
+    lain.execute(text("SELECT id FROM sites WHERE id = :id FOR NO KEY UPDATE"), {"id": st.site_id})
+    sesi_cron = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
+    pb = PembantuPalsu(staging_aktif)
+    hasil = []
+    t = threading.Thread(target=lambda: hasil.append(cron.jeda_otomatis(sesi_cron, pb, SEKARANG)))
+    t.start()
+    try:
+        t.join(1.0)
+        menunggu = t.is_alive()
+        buat_job(lain, st.site_id, JobType.staging_tarik)
+    finally:
+        lain.rollback()
+        lain.close()
+        t.join(10)
+        sesi_cron.close()
+    assert menunggu, "jeda otomatis tidak mengunci baris sites sebelum staging"
+    assert hasil == [0] and "jeda" not in pb.nama_panggilan()
+
+
+def test_pangkas_snapshot_dihapus_sesudah_kunci_dilepas(sesi, engine, staging_aktif, monkeypatch):
+    """rmtree snapshot yang dipangkas (bisa GB) berjalan sesudah commit, di luar kunci baris sites."""
+    from sqlalchemy import text
+
+    from wpmgr.config import get_settings
+
+    monkeypatch.setenv("WPMGR_STAGING_SNAPSHOT", "1")
+    get_settings.cache_clear()
+    akar = staging_aktif
+    hidup = _staging(sesi, "hidup")
+    for i in range(2):
+        (akar / str(hidup.site_id) / "snapshot" / f"j{i}").mkdir(parents=True)
+        sesi.add(StagingSnapshot(site_id=hidup.site_id, jenis="sebelum_dorong", status="tersedia", ukuran=1,
+                                 path=f"{hidup.site_id}/snapshot/j{i}", dibuat_pada=SEKARANG - timedelta(days=2 - i)))
+    sesi.commit()
+    asli = cron._hapus_nisan
+    saat_hapus = []
+
+    def hapus_nisan(akar_, nisan):
+        # Kunci baris sites harus sudah bebas: NOWAIT gagal seketika bila masih dipegang.
+        with sessionmaker(bind=engine, future=True)() as lain:
+            lain.execute(text("SELECT id FROM sites WHERE id = :id FOR UPDATE NOWAIT"), {"id": hidup.site_id})
+            lain.rollback()
+        saat_hapus.append(nisan)
+        asli(akar_, nisan)
+
+    monkeypatch.setattr(cron, "_hapus_nisan", hapus_nisan)
+    hasil = cron.pangkas_staging(sesi, PembantuPalsu(akar), SEKARANG)
+
+    assert hasil["snapshot"] == 1 and len(saat_hapus) == 1
+    assert not (akar / str(hidup.site_id) / "snapshot" / "j0").exists()
+    assert (akar / str(hidup.site_id) / "snapshot" / "j1").is_dir()
+    assert not [n for n in os.listdir(akar) if n.startswith(".hapus-")]
+
+
+def test_pangkas_galat_di_tengah_rollback_bukan_commit(sesi, staging_aktif, monkeypatch):
+    """Galat di tengah satu site: transaksi di-rollback, nisan yang sudah dibuat dihapus putaran berikutnya."""
+    akar = staging_aktif
+    s = Site(id=uuid.uuid4(), nama="ts", url="https://ts.test", status=SiteStatus.active, secret_terenkripsi=b"x")
+    sesi.add(s)
+    sesi.commit()
+    (akar / str(s.id) / "files").mkdir(parents=True)
+    asli = cron._pangkas_satu_site
+
+    def rusak(sesi_, akar_, nama, sekarang, hasil):
+        asli(sesi_, akar_, nama, sekarang, hasil)
+        sesi_.add(ActivityLog(site_id=s.id, level="info", pesan="setengah jalan"))
+        raise RuntimeError("galat di tengah")
+
+    monkeypatch.setattr(cron, "_pangkas_satu_site", rusak)
+    with pytest.raises(RuntimeError):
+        cron.pangkas_staging(sesi, PembantuPalsu(akar), SEKARANG)
+    assert sesi.query(ActivityLog).count() == 0
+    assert [n for n in os.listdir(akar) if n.startswith(".hapus-")]
+
+    monkeypatch.setattr(cron, "_pangkas_satu_site", asli)
+    cron.pangkas_staging(sesi, PembantuPalsu(akar), SEKARANG)
+    assert not [n for n in os.listdir(akar) if n.startswith(".hapus-")]
 
 
 # ---- CLI ----------------------------------------------------------------------
