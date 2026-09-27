@@ -760,10 +760,11 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
     return hasil
 
 
-def _bersihkan_bila_final(sesi, site_id) -> None:
+def bersihkan_bila_final(sesi, site_id, status_kerja: StatusStaging = StatusStaging.menyalin) -> None:
     """Hapus area kerja tarik/ bila kegagalan job ini final (M1).
 
-    Pembungkus sudah menandai staging: masih `menyalin` berarti job akan
+    Pembungkus sudah menandai staging: masih `status_kerja` (`menyalin`,
+    atau `berjalan_uji` untuk uji update yang diawali tarik) berarti job akan
     dilanjutkan (atau klaimnya direbut worker lain) dan area kerjanya
     dibutuhkan; status lain berarti tidak ada lagi yang melanjutkannya.
     """
@@ -772,7 +773,7 @@ def _bersihkan_bila_final(sesi, site_id) -> None:
         status = sesi.scalar(select(Staging.status).where(Staging.site_id == site_id))
     except Exception:  # noqa: BLE001 -- galat asli yang dilempar ulang lebih penting
         return
-    if status is not None and status != StatusStaging.menyalin:
+    if status is not None and status != status_kerja:
         shutil.rmtree(umum.dir_site(site_id) / "tarik", ignore_errors=True)
 
 
@@ -786,5 +787,5 @@ def tangani_staging_tarik(sesi, job, klien) -> dict:
     except umum.KlaimHilang:
         raise
     except Exception:
-        _bersihkan_bila_final(sesi, site_id)
+        bersihkan_bila_final(sesi, site_id)
         raise

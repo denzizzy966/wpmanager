@@ -98,8 +98,14 @@ def buat_pembantu() -> Pembantu:
 
 
 def buat_http() -> httpx.Client:
-    """Klien HTTP untuk probe staging dan cek halaman utama produksi."""
-    return httpx.Client(follow_redirects=False, timeout=30.0, headers={"User-Agent": UA})
+    """Klien HTTP untuk probe staging dan cek halaman utama produksi.
+
+    Tanpa keep-alive: tenggat total `site_client.minta_bertenggat` memutus
+    permintaan lewat soket yang dibuka untuknya, dan koneksi dari pool tidak
+    membuka soket baru yang bisa ditangkap.
+    """
+    return httpx.Client(follow_redirects=False, timeout=30.0, headers={"User-Agent": UA},
+                        limits=httpx.Limits(max_keepalive_connections=0))
 
 
 def sekarang() -> datetime:

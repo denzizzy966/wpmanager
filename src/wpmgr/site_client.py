@@ -49,6 +49,135 @@ def buat_klien_staging(**kwargs) -> httpx.Client:
     return httpx.Client(follow_redirects=False, limits=httpx.Limits(max_keepalive_connections=0), **kwargs)
 
 
+class TenggatHabis(Exception):
+    """Permintaan melewati tenggat total (`minta_bertenggat`)."""
+
+
+class MelebihiBatas(Exception):
+    """Body respons melebihi batas byte (`minta_bertenggat` tanpa `potong`)."""
+
+
+class TanpaHasil(Exception):
+    """Pekerja berhenti tanpa hasil maupun galat (mis. SystemExit di thread itu)."""
+
+
+def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict, content: bytes | None = None,
+                     timeout: float, tenggat: float, batas_byte: int, potong: bool = False,
+                     periksa=None) -> tuple[int, dict, bytes]:
+    """Satu permintaan HTTP dengan tenggat total dan batas byte (putusan F11).
+
+    Tenggat total mencakup SELURUH permintaan: koneksi, TLS, pengiriman body,
+    tunggu header, dan body. httpx tidak punya timeout total, dan panggilan
+    yang sedang terblokir di recv() tidak bisa dibatalkan dari thread yang
+    sama. Karena itu permintaan dijalankan di thread pekerja, dan thread
+    pemanggil menunggu paling lama sampai tenggat. Bila lewat, pemanggil
+    langsung mendapat TenggatHabis, dan soket yang dibuka untuk permintaan
+    ini (ditangkap lewat ekstensi `trace` httpcore) di-shutdown supaya recv()
+    pekerja yang terblokir ikut bangun, termasuk saat header atau body
+    diteteskan (yang terus mengulang timeout baca). Supaya soket itu selalu
+    tertangkap, klien sebaiknya tanpa keep-alive dan `headers` membawa
+    `Connection: close`: koneksi dari pool tidak membuka soket baru. Sebelum
+    jabat tangan TLS selesai belum ada soket TLS; tahap itu dibatasi
+    `timeout` (timeout per operasi httpx), yang pemanggil jepit ke tenggat.
+
+    Body dibaca mentah (iter_raw, tanpa dekompresi) sampai `batas_byte`:
+    lebih dari itu melempar MelebihiBatas, atau dengan `potong` dipotong di
+    batas dan pembacaan berhenti. `periksa(resp)` dipanggil sebelum body
+    dibaca dan boleh melempar untuk menolak respons. Galat httpx diteruskan
+    apa adanya supaya pemanggil yang memetakannya.
+    """
+    akhir = time.monotonic() + tenggat
+    batal = threading.Event()
+    soket: list = []
+    kunci = threading.Lock()
+    hasil: dict = {}
+
+    def putus(s) -> None:
+        # socket.socket.shutdown, bukan SSLSocket.shutdown: yang kedua
+        # melepas objek TLS lebih dulu, sehingga pekerja yang sedang
+        # berjalan sempat mengirim/menerima teks polos lewat soket itu.
+        try:
+            socket.socket.shutdown(s, socket.SHUT_RDWR)
+        except (OSError, TypeError):
+            pass
+
+    def trace(nama: str, info: dict) -> None:
+        # Soket TLS (dan TCP untuk jaga-jaga): soket TCP mentah terlepas
+        # (detach) saat dibungkus TLS, jadi yang bisa di-shutdown untuk
+        # membangunkan recv() yang terblokir adalah soket TLS-nya.
+        if nama not in ("connection.connect_tcp.complete", "connection.start_tls.complete"):
+            return
+        s = getattr(info.get("return_value"), "get_extra_info", lambda _: None)("socket")
+        if s is None:
+            return
+        with kunci:
+            soket.append(s)
+            sudah_batal = batal.is_set()
+        if sudah_batal:
+            # Koneksi baru selesai sesudah pemanggil menyerah.
+            putus(s)
+
+    def kerja() -> None:
+        try:
+            with http.stream(method, url, content=content, headers=headers, timeout=timeout,
+                             extensions={"trace": trace}) as resp:
+                try:
+                    if periksa is not None:
+                        periksa(resp)
+                    isi = bytearray()
+                    # Transport yang menyerahkan body sebagai bytes di memori
+                    # (MockTransport) membuat httpx membacanya lebih dulu;
+                    # tanpa content-encoding isinya sama dengan byte mentah.
+                    aliran = [resp.content] if resp.is_stream_consumed else resp.iter_raw()
+                    for bagian in aliran:
+                        if batal.is_set():
+                            return
+                        isi.extend(bagian)
+                        if len(isi) > batas_byte:
+                            if not potong:
+                                raise MelebihiBatas()
+                            del isi[batas_byte:]
+                            break
+                        if len(isi) == batas_byte and potong:
+                            break
+                        if time.monotonic() > akhir:
+                            raise TenggatHabis()
+                    with kunci:
+                        if not batal.is_set():
+                            hasil["ok"] = (resp.status_code, dict(resp.headers), bytes(isi))
+                finally:
+                    # Sebelum koneksi ditutup (keluar dari `with`): soket ini
+                    # tidak boleh lagi di-shutdown oleh pemanggil yang
+                    # kebetulan baru mencapai tenggat.
+                    with kunci:
+                        soket.clear()
+        except Exception as exc:  # noqa: BLE001 -- dilempar ulang di thread pemanggil
+            hasil["galat"] = exc
+
+    pekerja = threading.Thread(target=kerja, name="wpmgr-http-bertenggat", daemon=True)
+    pekerja.start()
+    pekerja.join(max(0.0, akhir - time.monotonic()))
+    if pekerja.is_alive():
+        with kunci:
+            # Hasil yang sudah lengkap tetap dipakai walau pekerja masih
+            # menutup koneksi saat tenggat lewat.
+            selesai = "ok" in hasil
+            if not selesai:
+                batal.set()
+                tertangkap = list(soket)
+        if not selesai:
+            for s in tertangkap:
+                putus(s)
+            raise TenggatHabis()
+        return hasil["ok"]
+    galat = hasil.get("galat")
+    if galat is not None:
+        raise galat
+    if "ok" not in hasil:
+        raise TanpaHasil()
+    return hasil["ok"]
+
+
 class SiteClient:
     def __init__(
         self, base_url: str, site_id: str, secret_hex: str, client: httpx.Client | None = None,
@@ -181,20 +310,9 @@ class SiteClient:
         batas byte atau tenggat total, alih-alih menampung seluruhnya di
         memori atau menunggu selamanya.
 
-        Tenggat total (putusan F11) mencakup SELURUH permintaan: koneksi, TLS,
-        pengiriman body, tunggu header, dan body. httpx tidak punya timeout
-        total, dan panggilan yang sedang terblokir di recv() tidak bisa
-        dibatalkan dari thread yang sama. Karena itu permintaan dijalankan di
-        thread pekerja, dan thread pemanggil menunggu paling lama sampai
-        tenggat. Bila lewat, pemanggil langsung mendapat SiteError, dan soket
-        TLS yang dibuka untuk permintaan ini (ditangkap lewat ekstensi
-        `trace` httpcore) di-shutdown supaya recv() pekerja yang terblokir
-        ikut bangun, termasuk saat header atau body diteteskan (yang terus
-        mengulang timeout baca). Supaya soket itu selalu tertangkap, klien
-        staging tidak memakai keep-alive (`buat_klien_staging`) dan mengirim
-        `Connection: close`: setiap permintaan membuka koneksi baru. Sebelum
-        jabat tangan TLS selesai belum ada soket TLS; tahap itu dibatasi
-        timeout koneksi yang dijepit ke tenggat.
+        Tenggat total, batas byte, dan pemutusan soket dikerjakan
+        `minta_bertenggat` (putusan F11); di sini hanya penandatanganan dan
+        pemetaan galatnya ke SiteError.
 
         Galat sesudah permintaan mungkin sudah sampai (baca/tulis putus,
         protokol rusak, timeout baca) pada panggilan `berefek` menjadi
@@ -219,113 +337,40 @@ class SiteClient:
         }
         if body:
             headers["Content-Type"] = content_type
-        akhir = time.monotonic() + tenggat
         kelas_waktu = UNKNOWN if berefek else TRANSIENT
-        pesan_tenggat = f"Respons connector melewati tenggat total {tenggat:g} detik"
-        batal = threading.Event()
-        soket: list = []
-        kunci = threading.Lock()
-        hasil: dict = {}
-
-        def putus(s) -> None:
-            # socket.socket.shutdown, bukan SSLSocket.shutdown: yang kedua
-            # melepas objek TLS lebih dulu, sehingga pekerja yang sedang
-            # berjalan sempat mengirim/menerima teks polos lewat soket itu.
-            try:
-                socket.socket.shutdown(s, socket.SHUT_RDWR)
-            except (OSError, TypeError):
-                pass
-
-        def trace(nama: str, info: dict) -> None:
-            # Soket TLS (dan TCP untuk jaga-jaga): soket TCP mentah terlepas
-            # (detach) saat dibungkus TLS, jadi yang bisa di-shutdown untuk
-            # membangunkan recv() yang terblokir adalah soket TLS-nya.
-            if nama not in ("connection.connect_tcp.complete", "connection.start_tls.complete"):
-                return
-            s = getattr(info.get("return_value"), "get_extra_info", lambda _: None)("socket")
-            if s is None:
-                return
-            with kunci:
-                soket.append(s)
-                sudah_batal = batal.is_set()
-            if sudah_batal:
-                # Koneksi baru selesai sesudah pemanggil menyerah.
-                putus(s)
-
-        # Setiap operasi yang terblokir (koneksi termasuk jabat tangan TLS,
-        # tulis, satu recv) juga tidak lebih lama dari tenggat total, supaya
-        # pekerja yang tidak bisa diputus lewat soket (jabat tangan TLS, koneksi
-        # pool) tetap berhenti dalam kurun yang sama.
+        # Setiap operasi yang terblokir juga tidak lebih lama dari tenggat
+        # total (lihat minta_bertenggat); nilai ini juga dipakai pesan galat.
         timeout = min(timeout, tenggat)
 
-        def kerja() -> None:
-            try:
-                with self._staging_http.stream(method, f"{self.base_url}{path}{query}", content=body or None,
-                                               headers=headers, timeout=timeout,
-                                               extensions={"trace": trace}) as resp:
-                    try:
-                        enkode = resp.headers.get("content-encoding", "").strip().lower()
-                        if enkode not in ("", "identity"):
-                            raise SiteError(BAD_RESPONSE,
-                                            "Respons connector dikompresi padahal diminta tanpa kompresi")
-                        isi = bytearray()
-                        # Transport yang menyerahkan body sebagai bytes di memori
-                        # (MockTransport) membuat httpx membacanya lebih dulu;
-                        # tanpa content-encoding isinya sama dengan byte mentah.
-                        aliran = [resp.content] if resp.is_stream_consumed else resp.iter_raw()
-                        for potong in aliran:
-                            if batal.is_set():
-                                return
-                            isi.extend(potong)
-                            if len(isi) > batas_byte:
-                                raise SiteError(BAD_RESPONSE, f"Respons connector melebihi batas {batas_byte} byte")
-                            if time.monotonic() > akhir:
-                                raise SiteError(kelas_waktu, pesan_tenggat)
-                        with kunci:
-                            if not batal.is_set():
-                                hasil["ok"] = (resp.status_code, dict(resp.headers), bytes(isi))
-                    finally:
-                        # Sebelum koneksi ditutup (keluar dari `with`): soket ini
-                        # tidak boleh lagi di-shutdown oleh pemanggil yang
-                        # kebetulan baru mencapai tenggat.
-                        with kunci:
-                            soket.clear()
-            except Exception as exc:  # noqa: BLE001 -- dilempar ulang di thread pemanggil
-                hasil["galat"] = exc
+        def tolak_kompresi(resp: httpx.Response) -> None:
+            enkode = resp.headers.get("content-encoding", "").strip().lower()
+            if enkode not in ("", "identity"):
+                raise SiteError(BAD_RESPONSE, "Respons connector dikompresi padahal diminta tanpa kompresi")
 
-        pekerja = threading.Thread(target=kerja, name="wpmgr-staging-http", daemon=True)
-        pekerja.start()
-        pekerja.join(max(0.0, akhir - time.monotonic()))
-        if pekerja.is_alive():
-            with kunci:
-                # Hasil yang sudah lengkap tetap dipakai walau pekerja masih
-                # menutup koneksi saat tenggat lewat.
-                selesai = "ok" in hasil
-                if not selesai:
-                    batal.set()
-                    tertangkap = list(soket)
-            if not selesai:
-                for s in tertangkap:
-                    putus(s)
-                raise SiteError(kelas_waktu, pesan_tenggat)
-            return hasil["ok"]
-        galat = hasil.get("galat")
-        if galat is None:
-            if "ok" not in hasil:
-                # Pekerja berhenti tanpa hasil (mis. SystemExit di thread itu).
-                raise SiteError(kelas_waktu, "Permintaan ke connector berhenti tanpa hasil")
-            return hasil["ok"]
+        try:
+            return minta_bertenggat(self._staging_http, method, f"{self.base_url}{path}{query}",
+                                    headers=headers, content=body or None, timeout=timeout, tenggat=tenggat,
+                                    batas_byte=batas_byte, periksa=tolak_kompresi)
+        except TenggatHabis:
+            raise SiteError(kelas_waktu, f"Respons connector melewati tenggat total {tenggat:g} detik") from None
+        except MelebihiBatas:
+            raise SiteError(BAD_RESPONSE, f"Respons connector melebihi batas {batas_byte} byte") from None
+        except TanpaHasil:
+            raise SiteError(kelas_waktu, "Permintaan ke connector berhenti tanpa hasil") from None
+        except httpx.HTTPError as galat:
+            raise self._galat_http(galat, kelas_waktu, timeout) from galat
+
+    @staticmethod
+    def _galat_http(galat: httpx.HTTPError, kelas_waktu: str, timeout: float) -> SiteError:
         if isinstance(galat, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
             # Koneksi tidak pernah terbentuk: tidak ada yang sampai ke site.
-            raise SiteError(TRANSIENT, f"koneksi gagal: {galat}") from galat
+            return SiteError(TRANSIENT, f"koneksi gagal: {galat}")
         if isinstance(galat, httpx.TimeoutException):
-            raise SiteError(kelas_waktu, f"timeout setelah {timeout} detik") from galat
-        if isinstance(galat, httpx.HTTPError):
-            # Putus sesudah permintaan mungkin sudah sampai (ReadError,
-            # WriteError, RemoteProtocolError): pada panggilan berefek
-            # hasilnya tidak diketahui, seperti timeout.
-            raise SiteError(kelas_waktu, f"kesalahan koneksi: {galat}") from galat
-        raise galat
+            return SiteError(kelas_waktu, f"timeout setelah {timeout} detik")
+        # Putus sesudah permintaan mungkin sudah sampai (ReadError,
+        # WriteError, RemoteProtocolError): pada panggilan berefek hasilnya
+        # tidak diketahui, seperti timeout.
+        return SiteError(kelas_waktu, f"kesalahan koneksi: {galat}")
 
     @staticmethod
     def _galat_dari(status: int, headers: dict, isi: bytes) -> SiteError | None:
