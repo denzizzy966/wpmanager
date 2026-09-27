@@ -47,26 +47,10 @@ class Indeks:
 
     def muat(self, maks: int | None = None) -> dict[str, Entri]:
         """Isi indeks. `maks` membatasi jumlah baris yang dibaca (IndeksTerlaluBesar bila lewat)."""
-        hasil: dict[str, Entri] = {}
         if not self.berkas.exists():
-            return hasil
+            return {}
         with open(self.berkas, encoding="utf-8", errors="replace") as f:
-            for nomor, baris in enumerate(f, 1):
-                if maks is not None and nomor > maks:
-                    raise IndeksTerlaluBesar(f"Indeks melebihi {maks} baris")
-                try:
-                    d = json.loads(baris)
-                except (ValueError, RecursionError):
-                    continue
-                if not isinstance(d, dict):
-                    continue
-                if d.get("hapus") == 1 and isinstance(d.get("p"), str):
-                    hasil.pop(d["p"], None)
-                    continue
-                e = entri_dari({"path": d.get("p"), "ukuran": d.get("u"), "mtime": d.get("m"), "hash": d.get("h")})
-                if e is not None:
-                    hasil[e.path] = e
-        return hasil
+            return urai_indeks(f, maks)
 
     def _awalan_baris_baru(self) -> str:
         """"\\n" bila berkas berakhir di tengah baris (crash saat menulis).
@@ -108,6 +92,31 @@ class Indeks:
             os.fsync(f.fileno())
         os.replace(sementara, self.berkas)
         self._ujung_diperiksa = True
+
+
+def urai_indeks(baris_teks, maks: int | None = None) -> dict[str, Entri]:
+    """Isi indeks dari baris-baris teks (berkas yang sudah dibuka pemanggil).
+
+    Dipisah dari `Indeks.muat` supaya snapshot Kembalikan bisa dibaca lewat
+    `aman.buka_baca` (tanpa mengikuti symlink) dengan penguraian yang sama.
+    """
+    hasil: dict[str, Entri] = {}
+    for nomor, baris in enumerate(baris_teks, 1):
+        if maks is not None and nomor > maks:
+            raise IndeksTerlaluBesar(f"Indeks melebihi {maks} baris")
+        try:
+            d = json.loads(baris)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        if d.get("hapus") == 1 and isinstance(d.get("p"), str):
+            hasil.pop(d["p"], None)
+            continue
+        e = entri_dari({"path": d.get("p"), "ukuran": d.get("u"), "mtime": d.get("m"), "hash": d.get("h")})
+        if e is not None:
+            hasil[e.path] = e
+    return hasil
 
 
 def _hash_dari(f: BinaryIO) -> str:

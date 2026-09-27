@@ -40,9 +40,11 @@ Aturan yang dijaga:
 """
 
 import hashlib
+import io
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -65,10 +67,12 @@ from wpmgr.errors import (
     UNKNOWN,
     SiteError,
 )
+from wpmgr.jobs.queue import akan_diulang
 from wpmgr.models import (
     Job,
     JobStatus,
     JobType,
+    Site,
     Staging,
     StagingSnapshot,
     StatusStaging,
@@ -76,15 +80,19 @@ from wpmgr.models import (
 from wpmgr.site_client import MelebihiBatas, TanpaHasil, TenggatHabis, minta_bertenggat
 from wpmgr.staging import umum
 from wpmgr.staging.aman import (
+    DILINDUNGI_STAGING,
     POLA_ID_DORONG,
     PathTidakAman,
     adalah_tautan,
     bersih_teks,
+    boleh_didorong,
     buka_baca,
+    daftar_direktori,
     hapus_berkas,
     jalur_di_dalam,
+    path_sah,
 )
-from wpmgr.staging.indeks import Indeks, pindai_lokal
+from wpmgr.staging.indeks import Indeks, IndeksTerlaluBesar, pindai_lokal, urai_indeks
 from wpmgr.staging.paket import susun
 from wpmgr.staging.rencana import (
     Entri,
@@ -98,7 +106,12 @@ from wpmgr.staging.rencana import (
 )
 from wpmgr.staging.sql_impor import periksa_berkas_terapkan, periksa_terapkan
 from wpmgr.staging.tarik import (
+    CHARSET_SAH,
+    MAKS_BATAS_UNGGAH,
+    MAKS_BYTE_MANIFEST,
+    MAKS_ENTRI_MANIFEST,
     MAKS_PERINGATAN,
+    POLA_PREFIX,
     Salin,
     _muat_manifest,
     ambil_manifest,
@@ -249,7 +262,7 @@ def rencana_unggah(sumber: SumberDorong, rencana_json: bytes, ukuran: int) -> li
     """
     daftar = [Unggahan("berkas" if p.jenis == "paket" else "rentang", p.berkas, p.dari, p.panjang)
               for p in bagi_potongan(sumber.ganti, ukuran_paket=ukuran)]
-    total_sql = sum(p.stat().st_size for p in sumber.sql)
+    total_sql = sum(os.lstat(p).st_size for p in sumber.sql)
     daftar += [Unggahan("sql", (), d, min(ukuran, total_sql - d)) for d in range(0, total_sql, ukuran)]
     daftar += [Unggahan("rencana", (), d, min(ukuran, len(rencana_json) - d))
                for d in range(0, len(rencana_json), ukuran)]
@@ -572,6 +585,48 @@ def terapkan(sesi, job, staging, klien, site_url: str, dorong_id: str, jumlah: i
                 langkah = _pindah(sesi, job, "beres")
             else:
                 raise umum.galat_gagal("Keadaan terapkan dorong tidak dikenal.")
+
+
+def terapkan_terunggah(sesi, job, staging, klien, site_url: str, k: dict, kunci_tahap: str,
+                       sebelum_tukar=None) -> dict:
+    """`terapkan` untuk dorongan yang terunggah menurut kemajuan (dorong dan kembalikan).
+
+    Area dorong di produksi yang kehilangan potongan (mis. dibersihkan cron
+    connector setelah 24 jam) diunggah ulang sekali: tahap `kunci_tahap`
+    kembali ke "unggah". Potongan yang masih ada dibalas connector sebagai
+    ulangan yang sama. Sukses memindahkan tahap ke "cek".
+    """
+    try:
+        terapkan(sesi, job, staging, klien, site_url, k["dorong_id"], k["jumlah_potongan"], k["sha256_rencana"],
+                 bool(k.get("ada_sql")), k["token"], sebelum_tukar=sebelum_tukar)
+    except PotonganKurang:
+        if k.get("unggah_ulang"):
+            raise umum.galat_gagal(PESAN_KURANG_BERULANG) from None
+        return umum.simpan_kemajuan(sesi, job, **{kunci_tahap: "unggah"}, unggah_nomor=0, unggah_ulang=True,
+                                    langkah_terapkan="siapkan")
+    return umum.simpan_kemajuan(sesi, job, **{kunci_tahap: "cek"})
+
+
+def tuntaskan_sukses(sesi, job, site, staging, klien, k: dict, judul: str, detail: dict) -> dict:
+    """Akhir dorong/kembalikan yang sukses: halaman utama, bersihkan, status staging, log aktivitas.
+
+    `dorong_gagal_pada` dikosongkan hanya bila halaman utama menjawab 2xx/3xx.
+    Tidak meng-commit: pemanggil menambahkan perubahannya sendiri (pangkas
+    snapshot, status snapshot) lalu meng-commit semuanya bersama.
+    """
+    status = cek_halaman(site.url)
+    if bersihkan(klien, k["dorong_id"], detak=lambda: umum.detak(sesi, job)):
+        umum.simpan_kemajuan(sesi, job, produksi_bersih=True)
+    ok = _hidup(status)
+    if staging is not None:
+        st = sesi.get(Staging, staging.id, populate_existing=True)
+        st.status = umum.status_istirahat(st)
+        st.dorong_gagal_pada = None if ok else umum.sekarang()
+    detail = {**detail, "halaman_utama": status}
+    if not ok:
+        judul += f": halaman utama membalas HTTP {status}" if status else ": halaman utama tidak dapat dihubungi"
+    umum.catat_aktivitas(sesi, site.id, job, judul, detail, level="info" if ok else "error")
+    return {**detail, "dorong_gagal": not ok}
 
 
 # ---- bersihkan, halaman utama, dan dorongan lama ------------------------------
@@ -1085,40 +1140,20 @@ class _Dorong:
                                    + "); dorong dibatalkan dan produksi tidak diubah.")
 
     def terapkan(self, k: dict) -> dict:
-        try:
-            terapkan(self.sesi, self.job, self.staging, self.klien, self.site.url, k["dorong_id"],
-                     k["jumlah_potongan"], k["sha256_rencana"], bool(k.get("ada_sql")), k["token"],
-                     sebelum_tukar=self._cek_ulang_tanda_air if self.mode == "timpa_penuh" else None)
-        except PotonganKurang:
-            # Area dorong di produksi kehilangan potongan (mis. dibersihkan
-            # cron setelah 24 jam): diunggah ulang sekali. Potongan yang masih
-            # ada dibalas connector sebagai ulangan yang sama.
-            if k.get("unggah_ulang"):
-                raise umum.galat_gagal(PESAN_KURANG_BERULANG) from None
-            return self.simpan(tahap_dorong="unggah", unggah_nomor=0, unggah_ulang=True,
-                               langkah_terapkan="siapkan")
-        return self.simpan(tahap_dorong="cek")
+        return terapkan_terunggah(self.sesi, self.job, self.staging, self.klien, self.site.url, k, "tahap_dorong",
+                                  sebelum_tukar=self._cek_ulang_tanda_air if self.mode == "timpa_penuh" else None)
 
     def cek(self, k: dict) -> dict:
-        status = cek_halaman(self.site.url)
-        if bersihkan(self.klien, k["dorong_id"], detak=lambda: umum.detak(self.sesi, self.job)):
-            k = self.simpan(produksi_bersih=True)
-        ok = _hidup(status)
-        st = self.sesi.get(Staging, self.staging.id, populate_existing=True)
-        st.status = StatusStaging.siap
-        st.dorong_gagal_pada = None if ok else umum.sekarang()
-        pangkas_snapshot(self.sesi, self.site.id, get_settings().staging_snapshot)
         detail = {"mode": self.mode, "berkas": k.get("jumlah_ganti", 0), "hapus": k.get("jumlah_hapus", 0),
                   "db": bool(k.get("db")), "ukuran": format_byte(k.get("byte_dorong", 0)),
                   "perubahan": k.get("perubahan", []), "snapshot_id": k.get("snapshot_id"),
-                  "halaman_utama": status, "peringatan": list(k.get("peringatan") or [])[:10]}
-        judul = f"Dorong ke produksi ({LABEL_MODE[self.mode]})"
-        if not ok:
-            judul += f": halaman utama membalas HTTP {status}" if status else ": halaman utama tidak dapat dihubungi"
-        umum.catat_aktivitas(self.sesi, self.site.id, self.job, judul, detail, level="info" if ok else "error")
+                  "peringatan": list(k.get("peringatan") or [])[:10]}
+        hasil = tuntaskan_sukses(self.sesi, self.job, self.site, self.staging, self.klien, k,
+                                 f"Dorong ke produksi ({LABEL_MODE[self.mode]})", detail)
+        pangkas_snapshot(self.sesi, self.site.id, get_settings().staging_snapshot)
         self.sesi.commit()
         shutil.rmtree(self.kerja, ignore_errors=True)
-        return {**detail, "dorong_gagal": not ok}
+        return hasil
 
     def tanpa_perubahan(self, k: dict) -> dict:
         st = self.sesi.get(Staging, self.staging.id, populate_existing=True)
@@ -1175,14 +1210,19 @@ def _staging_utuh(sesi, site_id, pesan: str) -> SiteError:
     """Kegagalan final yang tidak menyentuh produksi maupun staging: staging tidak dibiarkan gagal."""
     st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
     if st is not None:
-        st.status = StatusStaging.siap if st.ditarik_pada else StatusStaging.gagal
+        st.status = umum.status_istirahat(st)
         st.galat = pesan
         sesi.commit()
     return SiteError(STAGING_DITOLAK, pesan)
 
 
-def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None) -> SiteError | None:
+def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None, pesan_akhir: dict = PESAN_AKHIR,
+                 pesan_lama_akhir: str = PESAN_LAMA_AKHIR) -> SiteError | None:
     """Penanganan kegagalan FINAL dorong/kembalikan (putusan F9a). Tidak pernah melempar.
+
+    `pesan_akhir`/`pesan_lama_akhir`: pesan tetap per job (dorong atau kembalikan).
+    Snapshot yang dibuang hanya milik job ini (`job_id`); kembalikan tidak
+    pernah membuat snapshot, jadi snapshot dorongan yang dipakainya tetap.
 
     - Area dorong di produksi dibersihkan upaya-terbaik dengan tenggat pendek.
     - Belum pernah tukar, atau pemulihan terkonfirmasi: produksi tidak
@@ -1192,10 +1232,10 @@ def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None) -> S
       dikembalikan untuk dilempar pemanggil.
     """
     k = umum.kemajuan(job)
-    if isinstance(galat, GalatLamaSementara) and "tahap_dorong" not in k:
+    if isinstance(galat, GalatLamaSementara) and "dorong_id" not in k:
         # Percobaan habis saat menuntaskan dorongan lama: dorongan baru belum
         # dimulai (belum ada dorong_id, unggahan, atau snapshot).
-        return _staging_utuh(sesi, site_id, PESAN_LAMA_AKHIR)
+        return _staging_utuh(sesi, site_id, pesan_lama_akhir)
     langkah = k.get("langkah_terapkan")
     pulih = bool(k.get("pulih_terkonfirmasi"))
     dorong_id = k.get("dorong_id")
@@ -1212,7 +1252,7 @@ def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None) -> S
         # kunjung usai): produksi dan staging utuh, jadi staging tidak
         # dibiarkan berstatus gagal dan pesannya pesan final "coba lagi nanti".
         return _staging_utuh(sesi, site_id, pesan_tolak)
-    pesan = PESAN_AKHIR.get(langkah)
+    pesan = pesan_akhir.get(langkah)
     if pesan is None:
         return None
     st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
@@ -1223,7 +1263,14 @@ def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None) -> S
     return SiteError(STAGING_GAGAL, pesan)
 
 
-def _setelah_gagal(sesi, job, site_id, klien, galat: Exception) -> SiteError | None:
+def _akan_diulang(job, galat: Exception) -> bool:
+    """Keputusan yang sama dengan worker dan pembungkus staging (F26: UNKNOWN diulang sebagai TRANSIENT)."""
+    if not isinstance(galat, SiteError):
+        return False
+    return akan_diulang(job, TRANSIENT if galat.error_class == UNKNOWN else galat.error_class)
+
+
+def _setelah_gagal(sesi, job, site_id, klien, galat: Exception, **pesan) -> SiteError | None:
     try:
         sesi.rollback()
         status = sesi.scalar(select(Staging.status).where(Staging.site_id == site_id))
@@ -1232,7 +1279,11 @@ def _setelah_gagal(sesi, job, site_id, klien, galat: Exception) -> SiteError | N
             # produksi dan snapshot masih dibutuhkan putaran berikutnya.
             return None
         sesi.refresh(job)
-        return akhiri_gagal(sesi, job, site_id, klien, galat)
+        if status is None and _akan_diulang(job, galat):
+            # Kembalikan tanpa baris staging: tidak ada pembungkus yang
+            # menandai percobaan ulang, jadi diputuskan di sini.
+            return None
+        return akhiri_gagal(sesi, job, site_id, klien, galat, **pesan)
     except Exception:
         log.exception("Pembersihan sesudah dorong gagal (job %s) tidak tuntas", job.id)
         return None
@@ -1275,3 +1326,319 @@ def tangani_staging_dorong(sesi, job, klien) -> dict:
             raise pengganti from exc
         raise
 
+
+# ---- kembalikan (spec §8.3) ---------------------------------------------------
+#
+# Kembalikan mendorong ulang isi snapshot `<site_id>/snapshot/j<job>/` lewat
+# jalur dorong yang sama (unggah, terapkan, rekonsiliasi, F9a):
+# - `ganti` = berkas produksi lama di snapshot (indeks.jsonl + berkas/);
+# - `hapus` = meta.baru, berkas yang DITAMBAHKAN dorongan;
+# - database hanya untuk snapshot timpa penuh (Koreksi #13): prelude.sql +
+#   db/*.sql, SQL produksi MENTAH yang diimpor apa adanya (tanpa
+#   sesuaikan_mariadb) dan diperiksa R8 sebelum unggahan pertama.
+# Tanda air tidak dicek (spec §8.3); konfirmasinya nama site persis.
+#
+# Mesin keadaan (`tahap_balik`)::
+#
+#     (awal: validasi, dorongan lama, muat snapshot + R8)
+#       -> unggah -> terapkan (langkah_terapkan, sama dengan dorong) -> cek
+
+MAKS_META_SNAPSHOT = 64 * 1024 * 1024
+MAKS_DAFTAR_SNAPSHOT = MAKS_ENTRI_MANIFEST
+MAKS_INDEKS_SNAPSHOT = MAKS_BYTE_MANIFEST
+POLA_SQL_SNAPSHOT = re.compile(r"[0-9]{4}-[0-9]{6}\.sql")
+STATUS_SNAPSHOT_SAH = ("tersedia", "dipakai")
+
+PESAN_SNAPSHOT_HILANG = "Snapshot tidak ditemukan."
+PESAN_SNAPSHOT_DIPANGKAS = "Snapshot sudah dipangkas dan tidak bisa dipakai."
+PESAN_KONFIRMASI_BALIK = "Ketik nama site persis untuk mengembalikan produksi dari snapshot."
+PESAN_AKHIR_BALIK = {
+    "tukar": ("Hasil pengembalian snapshot di produksi tidak dapat dipastikan. Periksa site; dorong atau "
+              "kembalikan berikutnya menuntaskan langkah ini lebih dulu."),
+    "pulihkan": ("Pengembalian snapshot di produksi gagal dan pemulihannya belum terkonfirmasi. Connector "
+                 "melanjutkan pemulihan sendiri paling cepat 15 menit setelah aktivitas terakhir; periksa site."),
+    "selesai": ("Snapshot sudah dikembalikan di produksi, tetapi penyelesaiannya belum terkonfirmasi. Periksa "
+                "site; dorong atau kembalikan berikutnya menuntaskannya lebih dulu."),
+}
+PESAN_LAMA_AKHIR_BALIK = ("Dorongan sebelumnya di produksi belum dapat diperiksa atau dituntaskan (connector tidak "
+                          "menjawab); kembalikan tidak dimulai, produksi dan staging tidak diubah. Coba lagi nanti.")
+
+
+def _rusak(alasan: str) -> SiteError:
+    # Ditolak sebelum produksi disentuh: staging sendiri tidak rusak.
+    return umum.GalatDitolakTanpaUbah(f"Snapshot rusak: {alasan}")
+
+
+def _daftar_path(meta: dict, kunci: str) -> list[str]:
+    daftar = meta.get(kunci)
+    if not isinstance(daftar, list) or len(daftar) > MAKS_DAFTAR_SNAPSHOT:
+        raise _rusak(f"daftar {kunci} di meta.json tidak sah.")
+    for x in daftar:
+        try:
+            path_sah(x)
+        except PathTidakAman:
+            raise _rusak(f"daftar {kunci} di meta.json memuat path tidak sah.") from None
+    return daftar
+
+
+def urai_meta_snapshot(teks) -> dict:
+    """meta.json snapshot ditulis dashboard sendiri, tetapi tetap divalidasi ketat sebelum dipakai.
+
+    `baru` menjadi daftar HAPUS di produksi, jadi setiap path-nya harus
+    boleh didorong (Koreksi #14) dan tidak pernah berkas yang dilindungi.
+    """
+    try:
+        meta = json.loads(teks)
+    except (ValueError, RecursionError):
+        meta = None
+    if not isinstance(meta, dict) or meta.get("mode") not in MODE or meta.get("charset") not in CHARSET_SAH \
+            or not isinstance(meta.get("prefix"), str) or not POLA_PREFIX.fullmatch(meta["prefix"]):
+        raise _rusak("meta.json tidak sah.")
+    batas = meta.get("batas_unggah")
+    if isinstance(batas, bool) or not isinstance(batas, int) or not 1 <= batas <= MAKS_BATAS_UNGGAH:
+        raise _rusak("meta.json tidak sah.")
+    baru, diganti, dihapus = (_daftar_path(meta, k) for k in ("baru", "diganti", "dihapus"))
+    if any(not boleh_didorong(x) or x in DILINDUNGI_STAGING for x in baru):
+        raise _rusak("daftar berkas baru memuat path tidak sah.")
+    return {"mode": meta["mode"], "baru": baru, "diganti": diganti, "dihapus": dihapus,
+            "charset": meta["charset"], "prefix": meta["prefix"], "batas_unggah": batas}
+
+
+def _baris_snapshot(sesi, job, site, konfirmasi: bool = True) -> StagingSnapshot:
+    """Baris snapshot dari payload; ditolak sebelum apa pun disentuh bila tidak sah."""
+    p = job.payload or {}
+    snap_id = p.get("snapshot_id")
+    if isinstance(snap_id, bool) or not isinstance(snap_id, int) or not 1 <= snap_id <= 2**62:
+        raise umum.GalatDitolakTanpaUbah(PESAN_SNAPSHOT_HILANG)
+    row = sesi.get(StagingSnapshot, snap_id, populate_existing=True)
+    if row is None or row.site_id != site.id:
+        raise umum.GalatDitolakTanpaUbah(PESAN_SNAPSHOT_HILANG)
+    if row.status not in STATUS_SNAPSHOT_SAH:
+        raise umum.GalatDitolakTanpaUbah(PESAN_SNAPSHOT_DIPANGKAS)
+    if konfirmasi and p.get("konfirmasi_nama") != site.nama:
+        raise umum.GalatDitolakTanpaUbah(PESAN_KONFIRMASI_BALIK)
+    return row
+
+
+def _dir_snapshot(site, row) -> Path:
+    if not isinstance(row.path, str) or not row.path.startswith(f"{site.id}/snapshot/"):
+        raise _rusak("lokasi snapshot tidak sah.")
+    try:
+        snap = jalur_di_dalam(get_settings().jalur_staging, row.path)
+        st = os.lstat(snap)
+    except PathTidakAman:
+        raise _rusak("folder snapshot tidak aman.") from None
+    except OSError:
+        raise _rusak("berkas snapshot tidak ditemukan di server.") from None
+    if adalah_tautan(st) or not stat.S_ISDIR(st.st_mode):
+        raise _rusak("folder snapshot tidak aman.")
+    return snap
+
+
+def _baca_meta(site, row) -> tuple[Path, dict]:
+    snap = _dir_snapshot(site, row)
+    try:
+        with buka_baca(snap, "meta.json") as f:
+            if os.fstat(f.fileno()).st_size > MAKS_META_SNAPSHOT:
+                raise _rusak("meta.json terlalu besar.")
+            teks = f.read(MAKS_META_SNAPSHOT + 1)
+    except PathTidakAman:
+        raise _rusak("meta.json tidak aman (symlink atau bukan berkas biasa).") from None
+    except OSError:
+        raise _rusak("berkas snapshot tidak ditemukan di server.") from None
+    if len(teks) > MAKS_META_SNAPSHOT:
+        raise _rusak("meta.json terlalu besar.")
+    return snap, urai_meta_snapshot(teks)
+
+
+def _muat_indeks_snapshot(snap: Path) -> dict[str, Entri]:
+    try:
+        with buka_baca(snap, "indeks.jsonl") as f, io.TextIOWrapper(f, encoding="utf-8", errors="replace") as t:
+            if os.fstat(f.fileno()).st_size > MAKS_INDEKS_SNAPSHOT:
+                raise _rusak("indeks berkas terlalu besar.")
+            return urai_indeks(t, MAKS_DAFTAR_SNAPSHOT)
+    except FileNotFoundError:
+        # Dorongan yang hanya menambah berkas tidak menyalin apa pun.
+        return {}
+    except IndeksTerlaluBesar:
+        raise _rusak("indeks berkas terlalu besar.") from None
+    except PathTidakAman:
+        raise _rusak("indeks berkas tidak aman (symlink atau bukan berkas biasa).") from None
+    except OSError:
+        raise _rusak("indeks berkas tidak dapat dibaca.") from None
+
+
+def _periksa_berkas_snapshot(snap: Path, ganti: list[Entri]) -> None:
+    """Setiap berkas snapshot ada sebagai berkas biasa dengan ukuran yang tercatat.
+
+    Hash berkas kecil diperiksa lagi saat diunggah (`isi_unggahan`) dan
+    berkas besar oleh connector di langkah siapkan; di sini snapshot yang
+    tidak lengkap ditolak sebelum unggahan pertama.
+    """
+    for e in ganti:
+        try:
+            with buka_baca(snap, f"berkas/{e.path}") as f:
+                cocok = os.fstat(f.fileno()).st_size == e.ukuran
+        except (PathTidakAman, OSError):
+            cocok = False
+        if not cocok:
+            raise _rusak(f"berkas {bersih_teks(e.path, 300)} hilang atau berubah.")
+
+
+def _sql_snapshot(snap: Path) -> list[Path]:
+    """prelude.sql + db/NNNN-NNNNNN.sql berurutan, semuanya berkas biasa (bukan symlink)."""
+    try:
+        prelude = os.lstat(snap / "prelude.sql")
+        isi = daftar_direktori(snap, "db")
+    except (PathTidakAman, OSError):
+        raise _rusak("ekspor database snapshot tidak ada.") from None
+    if adalah_tautan(prelude) or not stat.S_ISREG(prelude.st_mode):
+        raise _rusak("ekspor database snapshot tidak aman.")
+    nama = []
+    for n, st in isi:
+        if not POLA_SQL_SNAPSHOT.fullmatch(n) or adalah_tautan(st) or not stat.S_ISREG(st.st_mode):
+            raise _rusak("folder database snapshot memuat berkas asing.")
+        nama.append(n)
+    if not nama:
+        raise _rusak("ekspor database snapshot tidak ada.")
+    return [snap / "prelude.sql", *(snap / "db" / n for n in sorted(nama))]
+
+
+def _sumber_snapshot(site, row, periksa_sql: bool) -> tuple[SumberDorong, dict]:
+    """Isi dorongan kembalikan dari snapshot, divalidasi utuh sebelum dipakai."""
+    snap, meta = _baca_meta(site, row)
+    indeks = _muat_indeks_snapshot(snap)
+    if set(indeks) != set(meta["diganti"]) | set(meta["dihapus"]):
+        raise _rusak("indeks berkas tidak cocok dengan meta.json.")
+    ganti = sorted(indeks.values(), key=lambda e: e.path)
+    if any(e.hash is None or not boleh_didorong(e.path) for e in ganti):
+        raise _rusak("indeks berkas memuat entri tidak sah.")
+    # Connector menolak rencana dengan path ganda (tanpa membedakan huruf).
+    semua = [e.path.lower() for e in ganti] + [x.lower() for x in meta["baru"]]
+    if len(set(semua)) != len(semua):
+        raise _rusak("daftar berkas memuat path ganda.")
+    try:
+        st = os.lstat(snap / "berkas")
+    except OSError:
+        st = None
+    if ganti and (st is None or adalah_tautan(st) or not stat.S_ISDIR(st.st_mode)):
+        raise _rusak("folder berkas snapshot tidak ada atau tidak aman.")
+    _periksa_berkas_snapshot(snap, ganti)
+    sql = _sql_snapshot(snap) if meta["mode"] == "timpa_penuh" else []
+    if sql and periksa_sql:
+        # R8: ubah() connector menolak komentar di tengah pernyataan dan
+        # PARTITION; SQL mentah snapshot diperiksa sebelum unggahan pertama.
+        alasan = periksa_berkas_terapkan(sql)
+        if alasan is not None:
+            raise umum.GalatDitolakTanpaUbah(
+                f"Database snapshot memuat {alasan}; connector produksi akan menolaknya saat impor. "
+                "Kembalikan dibatalkan sebelum apa pun diubah.")
+    return SumberDorong(ganti, snap / "berkas", list(meta["baru"]), sql, meta["charset"]), meta
+
+
+class _Kembalikan:
+    """Satu putaran job kembalikan: konteks bersama dan satu metode per tahap."""
+
+    def __init__(self, sesi, job, site, staging: Staging | None, klien) -> None:
+        self.sesi, self.job, self.site, self.staging, self.klien = sesi, job, site, staging, klien
+
+    def simpan(self, **perubahan) -> dict:
+        return umum.simpan_kemajuan(self.sesi, self.job, **perubahan)
+
+    def mulai(self, k: dict) -> dict:
+        _baris_snapshot(self.sesi, self.job, self.site)
+        # Dorongan lama yang belum dibersihkan menahan kunci dorong di
+        # produksi: dituntaskan dulu, seperti dorong.
+        if not k.get("lama_dituntaskan"):
+            selesaikan_dorongan_lama(self.sesi, self.job, self.site, self.klien)
+            k = self.simpan(lama_dituntaskan=True)
+        # Dibaca ulang: rekonsiliasi yang MEMULIHKAN dorongan pemilik snapshot
+        # ini membuang snapshotnya (produksi sudah kembali ke keadaan itu).
+        row = _baris_snapshot(self.sesi, self.job, self.site)
+        with umum.detak_latar(self.sesi, self.job):
+            sumber, meta = _sumber_snapshot(self.site, row, periksa_sql=True)
+        return self.simpan(tahap_balik="unggah", snapshot_id=row.id, mode=meta["mode"],
+                           batas_unggah=meta["batas_unggah"], jumlah_ganti=len(sumber.ganti),
+                           jumlah_hapus=len(sumber.hapus), db=bool(sumber.sql), dorong_id=uuid.uuid4().hex,
+                           token=secrets.token_hex(16), mulai=umum.sekarang().isoformat(), unggah_nomor=0,
+                           byte_selesai=0, byte_total=0)
+
+    def unggah(self, k: dict) -> dict:
+        row = self.sesi.get(StagingSnapshot, k["snapshot_id"], populate_existing=True)
+        if row is None:
+            raise umum.GalatDitolakTanpaUbah(PESAN_SNAPSHOT_HILANG)
+        with umum.detak_latar(self.sesi, self.job):
+            sumber, _ = _sumber_snapshot(self.site, row, periksa_sql=False)
+            k = unggah_semua(self.sesi, self.job, self.staging, self.klien, sumber, k["dorong_id"],
+                             min(UKURAN_UNGGAH, k["batas_unggah"]), k)
+        return self.simpan(tahap_balik="terapkan", langkah_terapkan="siapkan")
+
+    def terapkan(self, k: dict) -> dict:
+        return terapkan_terunggah(self.sesi, self.job, self.staging, self.klien, self.site.url, k, "tahap_balik")
+
+    def cek(self, k: dict) -> dict:
+        detail = {"snapshot_id": k["snapshot_id"], "mode": k["mode"], "berkas": k["jumlah_ganti"],
+                  "hapus": k["jumlah_hapus"], "db": bool(k["db"])}
+        hasil = tuntaskan_sukses(self.sesi, self.job, self.site, self.staging, self.klien, k,
+                                 f"Produksi dikembalikan dari snapshot #{k['snapshot_id']}", detail)
+        row = self.sesi.get(StagingSnapshot, k["snapshot_id"], populate_existing=True)
+        if row is not None:
+            row.status = "dipakai"
+        self.sesi.commit()
+        return hasil
+
+
+TAHAP_BALIK = ("unggah", "terapkan")
+
+
+def kembalikan(sesi, job, site, staging: Staging | None, klien) -> dict:
+    """Kembalikan produksi dari snapshot; `staging` None bila staging sudah dihapus."""
+    d = _Kembalikan(sesi, job, site, staging, klien)
+    k = umum.kemajuan(job)
+    if "tahap_balik" not in k:
+        k = d.mulai(k)
+    while k["tahap_balik"] != "cek":
+        if k["tahap_balik"] not in TAHAP_BALIK:
+            raise umum.galat_gagal("Keadaan kembalikan tidak dikenal.")
+        k = getattr(d, k["tahap_balik"])(k)
+    return d.cek(k)
+
+
+def _periksa_awal_kembalikan(sesi, job, site) -> None:
+    """Penolakan sebelum status staging disentuh pembungkus (bandingkan `_periksa_awal` dorong).
+
+    Kembalikan yang sudah dimulai tidak pernah ditolak di sini: ia harus
+    dituntaskan. meta.json dibaca juga (kecil), jadi snapshot rusak ditolak
+    tanpa menyentuh apa pun.
+    """
+    if "tahap_balik" in umum.kemajuan(job):
+        return
+    _baca_meta(site, _baris_snapshot(sesi, job, site))
+
+
+def tangani_staging_kembalikan(sesi, job, klien) -> dict:
+    if not get_settings().staging_aktif:
+        raise umum.galat_ditolak("Fitur staging tidak aktif (WPMGR_STAGING_DOMAIN kosong).")
+    site = sesi.get(Site, job.site_id)
+    _periksa_awal_kembalikan(sesi, job, site)
+    staging = sesi.scalar(select(Staging).where(Staging.site_id == job.site_id))
+    site_id = job.site_id
+    try:
+        if staging is not None:
+            return umum.jalankan_staging(sesi, job, lambda s, j, site_, st: kembalikan(s, j, site_, st, klien),
+                                         StatusStaging.mendorong, "Kembalikan produksi", boleh_batal=boleh_batal,
+                                         istirahat=umum.status_istirahat)
+        # Staging sudah dihapus tetapi snapshot produksi masih ada: tetap bisa
+        # dipulihkan, tanpa status staging dan tanpa batal.
+        try:
+            return kembalikan(sesi, job, site, None, klien)
+        except OSError as exc:
+            raise umum.galat_gagal(umum.pesan_os(exc)) from None
+    except umum.KlaimHilang:
+        raise
+    except Exception as exc:
+        pengganti = _setelah_gagal(sesi, job, site_id, klien, exc, pesan_akhir=PESAN_AKHIR_BALIK,
+                                   pesan_lama_akhir=PESAN_LAMA_AKHIR_BALIK)
+        if pengganti is not None:
+            raise pengganti from exc
+        raise

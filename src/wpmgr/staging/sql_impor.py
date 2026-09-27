@@ -15,6 +15,8 @@ berikutnya), sehingga tidak ada pemindaian ulang kuadratik (putusan C1).
 
 import re
 
+from wpmgr.staging.aman import buka_baca
+
 # ---- periksa ----------------------------------------------------------------
 
 # Bagian yang dilompati (diganti satu spasi): teks berkutip, identifier
@@ -350,11 +352,13 @@ def periksa_berkas_terapkan(berkas, blok: int = 1 << 20) -> str | None:
     """Seperti `periksa_terapkan` atas gabungan berkas berurutan, dibaca per blok.
 
     Hanya untuk berkas milik dashboard (area kerja dorong, snapshot); SQL dari
-    pohon yang di-bind mount dipindahkan lewat `aman` lebih dulu.
+    pohon yang di-bind mount dipindahkan lewat `aman` lebih dulu. Tetap
+    dibuka lewat `aman.buka_baca` (tanpa mengikuti symlink, hanya berkas
+    biasa), sama seperti `dorong.baca_gabungan` yang kelak mengunggahnya.
     """
     p = PemeriksaTerapkan()
     for b in berkas:
-        with open(b, "rb") as f:
+        with buka_baca(b.parent, b.name) as f:
             for bagian in iter(lambda f=f: f.read(blok), b""):
                 alasan = p.tambah(bagian)
                 if alasan is not None:
