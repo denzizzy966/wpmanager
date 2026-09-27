@@ -36,17 +36,24 @@ log = logging.getLogger(__name__)
 MAKS_PERINGATAN = 50
 
 
+class IndeksTerlaluBesar(ValueError):
+    """Berkas indeks/manifest memuat lebih banyak baris daripada batas pemanggil."""
+
+
 class Indeks:
     def __init__(self, berkas: Path) -> None:
         self.berkas = Path(berkas)
         self._ujung_diperiksa = False
 
-    def muat(self) -> dict[str, Entri]:
+    def muat(self, maks: int | None = None) -> dict[str, Entri]:
+        """Isi indeks. `maks` membatasi jumlah baris yang dibaca (IndeksTerlaluBesar bila lewat)."""
         hasil: dict[str, Entri] = {}
         if not self.berkas.exists():
             return hasil
         with open(self.berkas, encoding="utf-8", errors="replace") as f:
-            for baris in f:
+            for nomor, baris in enumerate(f, 1):
+                if maks is not None and nomor > maks:
+                    raise IndeksTerlaluBesar(f"Indeks melebihi {maks} baris")
                 try:
                     d = json.loads(baris)
                 except (ValueError, RecursionError):
@@ -143,12 +150,14 @@ class _Peringatan:
             self.tujuan.append(f"Dan {self.lebih} berkas staging lain dilewati.")
 
 
-def pindai_lokal(akar: Path, indeks: dict[str, Entri], peringatan: list[str] | None = None) -> dict[str, Entri]:
+def pindai_lokal(akar: Path, indeks: dict[str, Entri], peringatan: list[str] | None = None,
+                 tautan: list[str] | None = None) -> dict[str, Entri]:
     """Isi files/ staging saat ini. Hash diambil dari indeks bila ukuran dan mtime sama.
 
     Symlink (termasuk direktori symlink) dan yang bukan berkas biasa (FIFO,
     device) dilewati dengan peringatan, ditambahkan ke `peringatan` bila
-    diberikan. Ukuran dan mtime diambil dari deskriptor yang sama yang
+    diberikan. Path relatif setiap symlink yang ditemukan ditambahkan ke
+    `tautan` bila diberikan, supaya pemanggil bisa menghapusnya. Ukuran dan mtime diambil dari deskriptor yang sama yang
     di-hash, jadi berkas yang ditukar di sela langkah tidak tercampur.
     """
     hasil: dict[str, Entri] = {}
@@ -176,6 +185,8 @@ def pindai_lokal(akar: Path, indeks: dict[str, Entri], peringatan: list[str] | N
                 continue
             if adalah_tautan(st):
                 catat(relatif, "berupa symlink")
+                if tautan is not None:
+                    tautan.append(relatif)
                 continue
             if stat.S_ISDIR(st.st_mode):
                 # Akhiran "/" meniru manifest connector: aturan khusus berkas

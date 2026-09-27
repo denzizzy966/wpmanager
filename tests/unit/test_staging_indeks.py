@@ -4,7 +4,7 @@ import os
 import pytest
 
 from wpmgr.staging.aman import PathTidakAman
-from wpmgr.staging.indeks import Indeks, pindai_lokal, sha256_berkas
+from wpmgr.staging.indeks import Indeks, IndeksTerlaluBesar, pindai_lokal, sha256_berkas
 from wpmgr.staging.rencana import Entri
 
 
@@ -98,3 +98,25 @@ def test_sha256_berkas_lewat_akses_aman(tmp_path):
     _symlink(tmp_path / "luar.txt", akar / "tautan.txt")
     with pytest.raises(PathTidakAman):
         sha256_berkas(akar, "tautan.txt")
+
+
+def test_pindai_lokal_melaporkan_path_symlink(tmp_path):
+    akar = tmp_path / "files"
+    (akar / "wp-content").mkdir(parents=True)
+    luar = tmp_path / "luar"
+    luar.mkdir()
+    (luar / "a.txt").write_bytes(b"x")
+    _symlink(luar, akar / "wp-content" / "uploads", direktori=True)
+    _symlink(luar / "a.txt", akar / "index.php")
+    tautan = []
+    assert pindai_lokal(akar, {}, [], tautan) == {}
+    assert sorted(tautan) == ["index.php", "wp-content/uploads"]
+
+
+def test_muat_menolak_indeks_melebihi_batas(tmp_path):
+    ind = Indeks(tmp_path / "m.jsonl")
+    for i in range(3):
+        ind.catat(Entri(f"a{i}.txt", 1, 1, None))
+    assert len(ind.muat(maks=3)) == 3
+    with pytest.raises(IndeksTerlaluBesar):
+        ind.muat(maks=2)

@@ -506,6 +506,65 @@ def tulis_atomik(akar: Path, relatif: str, isi: bytes, mtime: int | None = None)
         w.selesai(mtime)
 
 
+def hapus_tautan(akar: Path, relatif: str) -> bool:
+    """Hapus `akar/relatif` hanya bila ia symlink/junction, tanpa mengikuti; True bila dihapus.
+
+    Container staging bisa menukar berkas atau direktori di files/ dengan
+    symlink. Tautan itu sendiri yang dihapus (target di luar tidak pernah
+    disentuh), supaya isi produksi bisa ditulis ulang di tempatnya.
+    """
+    induk, nama = _pecah(relatif)
+    try:
+        if _ADA_DIR_FD:
+            dfd = _fd_induk(akar, induk, buat=False)
+            try:
+                if not _tautan(os.stat(nama, dir_fd=dfd, follow_symlinks=False)):
+                    return False
+                # unlink pada symlink (juga symlink ke direktori) menghapus tautannya saja.
+                os.unlink(nama, dir_fd=dfd)
+            finally:
+                os.close(dfd)
+            return True
+        jalur = _periksa_jalur(akar, induk, buat=False) / nama
+        if not _tautan(os.lstat(jalur)):
+            return False
+        try:
+            os.unlink(jalur)
+        except (IsADirectoryError, PermissionError):
+            # Symlink direktori dan junction Windows dihapus dengan rmdir, yang
+            # juga tidak mengikuti tautannya.
+            os.rmdir(jalur)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def hapus_direktori_kosong(akar: Path, relatif: str) -> bool:
+    """Hapus direktori `akar/relatif` bila kosong (upaya terbaik); True bila terhapus.
+
+    Tidak pernah mengikuti symlink: rmdir pada symlink gagal (ENOTDIR), dan
+    setiap komponen induk dibuka tanpa mengikuti symlink.
+    """
+    induk, nama = _pecah(relatif)
+    try:
+        if _ADA_DIR_FD:
+            dfd = _fd_induk(akar, induk, buat=False)
+            try:
+                os.rmdir(nama, dir_fd=dfd)
+            finally:
+                os.close(dfd)
+            return True
+        jalur = _periksa_jalur(akar, induk, buat=False) / nama
+        st = os.lstat(jalur)
+        if _tautan(st) or not stat.S_ISDIR(st.st_mode):
+            return False
+        os.rmdir(jalur)
+        return True
+    except (OSError, PathTidakAman):
+        # Tidak kosong, tidak ada, atau bukan direktori.
+        return False
+
+
 def hapus_berkas(akar: Path, relatif: str) -> None:
     """Hapus `akar/relatif` (berkas atau symlink itu sendiri); diam bila tidak ada."""
     induk, nama = _pecah(relatif)

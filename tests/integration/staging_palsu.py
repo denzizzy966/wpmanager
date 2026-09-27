@@ -69,6 +69,11 @@ class ProduksiPalsu:
         # Paling banyak sekian entri per paket berkas (meniru berhenti dini
         # karena tenggat); None = tanpa batas selain maks_paket.
         self.maks_entri: int | None = None
+        # Paling banyak sekian byte per balasan rentang (connector yang
+        # meneteskan data); None = sebanyak `panjang` yang diminta.
+        self.maks_rentang: int | None = None
+        # Ukuran tabel yang dilaporkan di info, menimpa ukuran sebenarnya.
+        self.ukuran_tabel: dict[str, int] = {}
         # Path yang ada tetapi tidak terbaca: penanda `galat: 'baca'`.
         self.gagal_baca: set[str] = set()
         self.jadwal_gagal: dict[str, set[int]] = {}
@@ -116,7 +121,8 @@ class ProduksiPalsu:
         return getattr(self, "_" + route.removeprefix("/staging/").replace("-", "_"))(r, badan)
 
     def info_tabel(self) -> list[dict]:
-        return [{"nama": t, "baris": 1, "ukuran": sum(len(c) for c in isi), "mesin": "InnoDB",
+        return [{"nama": t, "baris": 1, "ukuran": self.ukuran_tabel.get(t, sum(len(c) for c in isi)),
+                 "mesin": "InnoDB",
                  "pk": self.pk.get(t, ["id"])} for t, isi in sorted(self.tabel.items())]
 
     def _manifest(self, r, badan):
@@ -149,7 +155,7 @@ class ProduksiPalsu:
             if x["path"] not in self.berkas:
                 return _biner(paket.susun({"berkas": [{"path": x["path"], "hilang": True, "total": 0}]}, [b""]))
             isi, mtime = self.berkas[x["path"]]
-            bagian = isi[x["dari"]:x["dari"] + x["panjang"]]
+            bagian = isi[x["dari"]:x["dari"] + min(x["panjang"], self.maks_rentang or x["panjang"])]
             return _biner(paket.susun({"berkas": [
                 {"path": x["path"], "dari": x["dari"], "total": len(isi), "mtime": mtime}]}, [bagian]))
         meta, isi, lengkap, pakai = [], [], True, 0

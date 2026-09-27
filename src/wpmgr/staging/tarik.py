@@ -16,6 +16,7 @@ container mana pun, jadi I/O biasa aman di sana.
 import errno
 import hashlib
 import json
+import math
 import re
 import shutil
 from pathlib import Path
@@ -36,11 +37,13 @@ from wpmgr.staging.aman import (
     angka,
     bersih_teks,
     hapus_berkas,
+    hapus_direktori_kosong,
+    hapus_tautan,
     tulis_atomik,
     tulis_bertahap,
     versi_php_staging,
 )
-from wpmgr.staging.indeks import Indeks, pindai_lokal
+from wpmgr.staging.indeks import Indeks, IndeksTerlaluBesar, pindai_lokal
 from wpmgr.staging.pembantu import GalatPembantu, tulis_akses_router
 from wpmgr.staging.rencana import (
     BERUBAH,
@@ -61,6 +64,7 @@ from wpmgr.staging.rencana import (
     selisih,
     urai_tanda_air,
 )
+from wpmgr.staging.sql_impor import periksa_sql, sesuaikan_mariadb
 
 MAKS_POTONGAN_TABEL = 200_000
 MAKS_PERINGATAN = 50
@@ -70,10 +74,21 @@ MAKS_BATAS_UNGGAH = 4 * 1024 * 1024
 # cocok) diulang dari awal paling banyak sekian kali, lalu dilewati dengan
 # peringatan; tidak pernah berputar tanpa batas.
 MAKS_ULANG_RENTANG = 3
-# Anggaran byte seluruh tarik = total manifest + 25% + toleransi ini. Connector
-# yang disusupi bisa terus mengirim "berkas yang tumbuh" untuk memenuhi disk
-# dashboard; berkas yang sungguh tumbuh sedikit tetap lolos.
+# Anggaran byte (lihat anggaran_berkas/anggaran_db). Connector yang disusupi
+# bisa terus mengirim "berkas yang tumbuh" atau SQL tanpa akhir untuk
+# memenuhi disk dashboard; pertumbuhan wajar tetap lolos.
 TOLERANSI_BYTE = 64 * 1024 * 1024
+# Rentang yang meneteskan sedikit byte per balasan: paling banyak sekian
+# permintaan per berkas = ceil(total_maks / KEMAJUAN_MINIMUM) + TAMBAHAN_PERMINTAAN
+# (untuk semua percobaan ulangnya), lalu berkas dilewati dengan peringatan.
+KEMAJUAN_MINIMUM = 1024 * 1024
+TAMBAHAN_PERMINTAAN = 16
+# Manifest: entri per halaman yang diminta, total entri, dan total byte
+# manifest.jsonl. Diperiksa SEBELUM ditulis, supaya berkas lokal dan
+# Indeks.muat() atasnya tidak pernah bisa digiring melewati batas ini.
+BATAS_HALAMAN_MANIFEST = 5000
+MAKS_ENTRI_MANIFEST = 2_000_000
+MAKS_BYTE_MANIFEST = 512 * 1024 * 1024
 # Penghapusan berkas lokal: titik potongan (batal, detak) setiap sekian berkas.
 HAPUS_PER_TITIK = 500
 CHARSET_SAH = ("utf8mb4", "utf8", "utf8mb3", "latin1")
@@ -84,6 +99,32 @@ POLA_URL = re.compile(r"https?://[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?(?:/[A-Za-z
 # bermasalah: job dihentikan, bukan berkasnya dilewati.
 ERRNO_FATAL = frozenset({errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC), errno.EROFS, errno.EIO})
 MU_PLUGIN = "wp-content/mu-plugins/wpmgr-staging.php"
+
+
+def anggaran_berkas(byte_total: int) -> int:
+    """Byte berkas yang boleh diterima satu tarik: total manifest + 25% + toleransi."""
+    return byte_total + byte_total // 4 + TOLERANSI_BYTE
+
+
+def anggaran_db(ukuran_db: int) -> int:
+    """Byte SQL ekspor yang boleh diterima: 3 x ukuran_db yang dilaporkan + toleransi.
+
+    ukuran_db (Data_length + Index_length) hanya perkiraan, dan SQL-nya bisa
+    lebih besar dari data mentah: nilai biner menjadi literal hex (2x), angka
+    kecil menjadi teks, ditambah sintaks INSERT.
+    """
+    return 3 * ukuran_db + TOLERANSI_BYTE
+
+
+def kebutuhan_disk(byte_berkas: int, ukuran_db: int) -> int:
+    """Ruang disk yang dicadangkan sebelum tarik (M4): anggaran maksimum, bukan perkiraan.
+
+    Berkas sampai anggaran_berkas, dump SQL sampai anggaran_db, ditambah
+    database hasil impor (~ukuran_db). Memakai anggaran yang sama dengan
+    batas saat menerima data, jadi tarik yang lolos cek disk tidak bisa
+    menghabiskan sisa 15% sebelum batasnya menghentikan tarik.
+    """
+    return anggaran_berkas(byte_berkas) + anggaran_db(ukuran_db) + ukuran_db
 
 
 def _tambah_peringatan(k: dict, teks: str) -> None:
@@ -184,55 +225,6 @@ def jumlah_aktif(sesi, staging: Staging) -> int:
         Staging.aktif.is_(True), Staging.id != staging.id)) or 0
 
 
-# ---- SQL untuk MariaDB (putusan R5) -----------------------------------------
-
-# Token yang tidak boleh diubah (teks berkutip, identifier) dan yang dicari
-# (komentar versi, akhir pernyataan). Teks berkutip dilompati utuh, jadi
-# COMMENT '...' dan nilai DEFAULT tidak pernah diubah.
-_TOKEN_SQL = re.compile(
-    rb"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`|/\*!(?P<versi>[0-9]{5,6})(?P<isi>.*?)\*/|/\*.*?\*/|;",
-    re.DOTALL,
-)
-_POLA_CREATE = re.compile(rb"\s*CREATE\s+TABLE\b", re.IGNORECASE)
-_KOLASI_MYSQL8 = re.compile(rb"\butf8mb4_[a-z0-9_]*0900_[a-z0-9_]+")
-
-
-def _ganti_kolasi(m: re.Match) -> bytes:
-    return b"utf8mb4_bin" if m.group(0).endswith(b"_bin") else b"utf8mb4_unicode_520_ci"
-
-
-def _sesuaikan_create(pernyataan: bytes) -> bytes:
-    hasil, posisi = [], 0
-    for m in _TOKEN_SQL.finditer(pernyataan):
-        hasil.append(_KOLASI_MYSQL8.sub(_ganti_kolasi, pernyataan[posisi:m.start()]))
-        versi = m.group("versi")
-        # /*!8xxxx ... */ hanya dimengerti MySQL 8/9, tetapi MariaDB 11
-        # (nomor versi 11xxxx) ikut mengeksekusinya lalu gagal: dibuang.
-        # Komentar versi lama (/*!50100 ...) sah di MariaDB dan dibiarkan.
-        hasil.append(b" " if versi is not None and 80000 <= int(versi) < 100000 else m.group(0))
-        posisi = m.end()
-    hasil.append(_KOLASI_MYSQL8.sub(_ganti_kolasi, pernyataan[posisi:]))
-    return b"".join(hasil)
-
-
-def sesuaikan_mariadb(sql: bytes) -> bytes:
-    """Potongan tabel pertama (DROP + CREATE + INSERT...) yang bisa diimpor MariaDB 11.4.
-
-    Hanya pernyataan CREATE TABLE yang diubah: kolasi khas MySQL 8
-    (`utf8mb4_0900_*`) diterjemahkan dan komentar versi MySQL 8 dibuang.
-    Baris data (INSERT) tidak pernah disentuh.
-    """
-    awal = 0
-    for m in _TOKEN_SQL.finditer(sql):
-        if m.group(0) != b";":
-            continue
-        pernyataan = sql[awal:m.end()]
-        if _POLA_CREATE.match(pernyataan):
-            return sql[:awal] + _sesuaikan_create(pernyataan) + sql[m.end():]
-        awal = m.end()
-    return sql
-
-
 # ---- penulisan berkas ---------------------------------------------------------
 
 
@@ -262,26 +254,42 @@ def ambil_manifest(sesi, job, staging, klien, dir_kerja: Path, k: dict) -> dict:
         # terakhir tanpa pindah tahap): mulai dari berkas kosong.
         berkas.unlink(missing_ok=True)
         halaman = 0
-        k = _simpan(sesi, job, k, berkas_dilewati=0)
+        k = _simpan(sesi, job, k, berkas_dilewati=0, manifest_entri=0, manifest_byte=0)
     while True:
         umum.titik_potongan(sesi, job, staging)
         halaman += 1
 
         def ambil(kursor=kursor, halaman=halaman):
-            mentah = klien.staging_manifest(kursor)
+            mentah = klien.staging_manifest(kursor, batas=BATAS_HALAMAN_MANIFEST)
+            if isinstance(mentah.get("berkas"), list) and len(mentah["berkas"]) > BATAS_HALAMAN_MANIFEST:
+                raise umum.galat_gagal("Halaman manifest produksi memuat lebih banyak entri daripada yang diminta.")
             return mentah, halaman_manifest(mentah, kursor, halaman=halaman)
 
         mentah, h = _ulangi(ambil)
         if kursor is None:
             k = _simpan(sesi, job, k, info=urai_info(mentah.get("info")))
-        if h.entri:
+        baris = [_baris_entri(e) for e in h.entri]
+        entri = (k.get("manifest_entri") or 0) + len(baris)
+        byte = (k.get("manifest_byte") or 0) + sum(len(b.encode("utf-8")) for b in baris)
+        if entri > MAKS_ENTRI_MANIFEST or byte > MAKS_BYTE_MANIFEST:
+            raise umum.galat_gagal(f"Manifest produksi melebihi batas {MAKS_ENTRI_MANIFEST} berkas "
+                                   f"atau {format_byte(MAKS_BYTE_MANIFEST)}; site ini terlalu besar untuk staging.")
+        if baris:
             with open(berkas, "a", encoding="utf-8", newline="\n") as f:
-                f.writelines(_baris_entri(e) for e in h.entri)
+                f.writelines(baris)
         k = _simpan(sesi, job, k, manifest_kursor=h.kursor, manifest_halaman=halaman,
+                    manifest_entri=entri, manifest_byte=byte,
                     berkas_dilewati=(k.get("berkas_dilewati") or 0) + h.dilewati)
         if not h.lagi:
             return k
         kursor = h.kursor
+
+
+def _muat_manifest(dir_kerja: Path) -> dict:
+    try:
+        return Indeks(dir_kerja / "manifest.jsonl").muat(maks=MAKS_ENTRI_MANIFEST)
+    except IndeksTerlaluBesar:
+        raise umum.galat_gagal(f"Manifest produksi melebihi batas {MAKS_ENTRI_MANIFEST} berkas.") from None
 
 
 # ---- penyalinan berkas --------------------------------------------------------
@@ -317,6 +325,8 @@ class Salin:
     def __init__(self, sesi, job, staging, klien, files: Path, indeks: Indeks, lokal: dict, k: dict) -> None:
         self.sesi, self.job, self.staging, self.klien = sesi, job, staging, klien
         self.files, self.indeks, self.lokal, self.k = files, indeks, lokal, k
+        # Direktori induk berkas yang dihapus; dirapikan bila jadi kosong.
+        self.induk_dihapus: set[str] = set()
 
     def _simpan(self, **perubahan) -> None:
         self.k = _simpan(self.sesi, self.job, self.k, byte_selesai=self.k.get("byte_selesai") or 0,
@@ -328,7 +338,7 @@ class Salin:
 
     def _terima(self, byte: int) -> None:
         total = self.k.get("byte_total") or 0
-        anggaran = total + total // 4 + TOLERANSI_BYTE
+        anggaran = anggaran_berkas(total)
         diterima = (self.k.get("byte_diterima") or 0) + byte
         if diterima > anggaran:
             raise umum.galat_gagal(
@@ -354,6 +364,19 @@ class Salin:
             return
         self.indeks.catat_hapus(path)
         self.lokal.pop(path, None)
+        if "/" in path:
+            self.induk_dihapus.add(path.rsplit("/", 1)[0])
+
+    def rapikan(self) -> None:
+        """Hapus direktori yang menjadi kosong setelah penghapusan (upaya terbaik, lewat aman)."""
+        calon = set()
+        for d in self.induk_dihapus:
+            bagian = d.split("/")
+            calon.update("/".join(bagian[:i]) for i in range(1, len(bagian) + 1))
+        # Terdalam lebih dulu, supaya induk yang ikut kosong juga terhapus.
+        for d in sorted(calon, key=lambda x: (-x.count("/"), x)):
+            hapus_direktori_kosong(self.files, d)
+        self.induk_dihapus.clear()
 
     def _tulis(self, path: str, isi: bytes, mtime: int) -> bool:
         try:
@@ -399,12 +422,24 @@ class Salin:
 
     def besar(self, e: Entri) -> None:
         """Satu berkas lewat rentang, ditulis bertahap ke berkas sementara (tidak ditampung di memori)."""
+        sisa_permintaan = None
         for _ in range(MAKS_ULANG_RENTANG):
             r = RakitRentang(e, UKURAN_PAKET)
+            if sisa_permintaan is None:
+                sisa_permintaan = math.ceil(r.total_maks() / KEMAJUAN_MINIMUM) + TAMBAHAN_PERMINTAAN
             ditulis = 0
             try:
                 with tulis_bertahap(self.files, e.path) as w:
                     while True:
+                        if sisa_permintaan <= 0:
+                            # Balasan meneteskan terlalu sedikit byte: tulisan
+                            # sementara dibuang saat keluar dari blok.
+                            self._maju(-ditulis)
+                            _tambah_peringatan(self.k, f"Berkas {e.path} dikirim produksi terlalu lambat "
+                                                       "(terlalu banyak potongan kecil); dilewati.")
+                            self._simpan()
+                            return
+                        sisa_permintaan -= 1
                         umum.titik_potongan(self.sesi, self.job, self.staging)
                         try:
                             hasil, isi = _ambil_rentang(self.klien, r)
@@ -462,6 +497,7 @@ def _sinkron_berkas(sesi, job, staging, klien, akar: Path, produksi: dict, k: di
                 salin.besar(pot.berkas[0])
         else:
             salin.paket(pot.berkas)
+    salin.rapikan()
     return _simpan(sesi, job, salin.k, tahap="tanda_air")
 
 
@@ -479,6 +515,7 @@ def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tah
     (dir_sql / "prelude.sql").write_bytes(
         f"SET NAMES {info['charset']};\nSET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\n"
         f"SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n".encode("ascii"))
+    anggaran = anggaran_db(info["ukuran_db"])
     for idx, t in enumerate(info["tabel"]):
         nama = t["nama"]
         if nama in (k.get("tabel_selesai") or []):
@@ -497,6 +534,16 @@ def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tah
             except SiteError as exc:
                 raise SiteError(exc.error_class, f"{exc.pesan} (tabel {nama})") from exc
             sql = pot.sql
+            # Dihitung lintas potongan dan tercatat bersama kursornya, jadi
+            # tetap berlaku setelah job dilanjutkan.
+            diterima = (k.get("db_diterima") or 0) + len(sql)
+            if diterima > anggaran:
+                raise umum.galat_gagal(
+                    f"SQL dari produksi ({format_byte(diterima)}) melebihi ukuran database yang dilaporkan "
+                    f"({format_byte(info['ukuran_db'])}) jauh di atas toleransi; tarik dihentikan.")
+            alasan = periksa_sql(sql)
+            if alasan is not None:
+                raise umum.galat_gagal(f"Potongan SQL tabel {nama} dari produksi ditolak: {alasan}.")
             if kursor is None:
                 sql = sesuaikan_mariadb(sql)
                 if pot.mode == "offset":
@@ -509,6 +556,7 @@ def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tah
                 tabel={**(k.get("tabel") or {}), nama: pot.kursor or ""},
                 tabel_seq={**(k.get("tabel_seq") or {}), nama: seq},
                 tabel_selesai=list(k.get("tabel_selesai") or []) + ([nama] if pot.selesai else []),
+                db_diterima=diterima,
             )
             if pot.selesai:
                 break
@@ -523,7 +571,11 @@ def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tah
 
 def _siapkan_runtime(sesi, job, staging: Staging, site, pb, akar: Path, info: dict) -> None:
     s = get_settings()
-    tulis_atomik(akar / "files", MU_PLUGIN, isi_mu_plugin_staging(staging.nama).encode("utf-8"))
+    try:
+        tulis_atomik(akar / "files", MU_PLUGIN, isi_mu_plugin_staging(staging.nama).encode("utf-8"))
+    except PathTidakAman:
+        raise umum.galat_gagal("Folder mu-plugins staging tidak aman (berupa symlink); "
+                               "jalankan tarik lagi untuk memulihkannya.") from None
     tulis_akses_router(s.jalur_staging, staging.nama, staging.sandi_hash,
                        dekripsi_secret(staging.rahasia_router_terenkripsi))
     url = umum.url_staging(staging)
@@ -547,8 +599,17 @@ def _bangun_ulang_indeks(sesi, job, akar: Path, peringatan: list[str]) -> None:
     yang ukuran dan mtime-nya sama, jadi pemindaian ini murah.
     """
     indeks = Indeks(akar / "indeks.jsonl")
+    tautan: list[str] = []
     with umum.detak_latar(sesi, job):
-        lokal = pindai_lokal(akar / "files", indeks.muat(), peringatan)
+        lokal = pindai_lokal(akar / "files", indeks.muat(), peringatan, tautan)
+    # Symlink di files/ (dibuat kode di container staging) dihapus tautannya
+    # saja, tanpa diikuti; path itu lalu tidak ada di indeks, sehingga isi
+    # produksi ditulis ulang di tempatnya.
+    for p in tautan:
+        try:
+            hapus_tautan(akar / "files", p)
+        except (PathTidakAman, OSError):
+            peringatan.append(bersih_teks(f"Symlink staging {p} tidak dapat dihapus.", 300))
     # Berkas milik staging sendiri tidak pernah menjadi bagian salinan.
     indeks.padatkan({p: e for p, e in lokal.items() if p not in DILINDUNGI_STAGING})
 
@@ -590,10 +651,10 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
 
         if k["tahap"] == "manifest":
             k = ambil_manifest(sesi, job, staging, klien, tarik_dir, k)
-            produksi = Indeks(tarik_dir / "manifest.jsonl").muat()
+            produksi = _muat_manifest(tarik_dir)
             lokal = Indeks(akar / "indeks.jsonl").muat()
             beda = selisih(produksi, lokal)
-            pesan = cek_disk(status, beda.byte + 2 * k["info"]["ukuran_db"])
+            pesan = cek_disk(status, kebutuhan_disk(beda.byte, k["info"]["ukuran_db"]))
             if pesan:
                 raise umum.galat_ditolak(pesan)
             info = k["info"]
@@ -610,7 +671,7 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
 
         info = k["info"]
         if k["tahap"] == "berkas":
-            produksi = Indeks(tarik_dir / "manifest.jsonl").muat()
+            produksi = _muat_manifest(tarik_dir)
             k = _sinkron_berkas(sesi, job, staging, klien, akar, produksi, k)
 
         if k["tahap"] == "tanda_air":
@@ -620,7 +681,8 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
             ta = urai_tanda_air(umum.ulangi(klien.staging_tanda_air))
             if ta is None:
                 raise umum.galat_gagal("Tanda air produksi tidak dapat dibaca.")
-            k = _simpan(sesi, job, k, tahap="db", tanda_air=ta, tabel={}, tabel_seq={}, tabel_selesai=[])
+            k = _simpan(sesi, job, k, tahap="db", tanda_air=ta, tabel={}, tabel_seq={}, tabel_selesai=[],
+                        db_diterima=0)
 
         if k["tahap"] == "db":
             k = ekspor_db(sesi, job, staging, klien, tarik_dir, info, k, "impor")
@@ -645,6 +707,12 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
     except umum.Dibatalkan:
         shutil.rmtree(tarik_dir, ignore_errors=True)
         raise
+    except PathTidakAman:
+        # Container staging menukar direktori di files/ dengan symlink di sela
+        # pemeriksaan; pesan tetap, tanpa path VPS. Tarik berikutnya menghapus
+        # symlink itu (_bangun_ulang_indeks).
+        raise umum.galat_gagal("Struktur folder staging tidak aman (ada symlink yang ditukar selama tarik); "
+                               "jalankan tarik lagi.") from None
 
     sertifikat_ok = True
     try:
@@ -692,8 +760,31 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
     return hasil
 
 
+def _bersihkan_bila_final(sesi, site_id) -> None:
+    """Hapus area kerja tarik/ bila kegagalan job ini final (M1).
+
+    Pembungkus sudah menandai staging: masih `menyalin` berarti job akan
+    dilanjutkan (atau klaimnya direbut worker lain) dan area kerjanya
+    dibutuhkan; status lain berarti tidak ada lagi yang melanjutkannya.
+    """
+    try:
+        sesi.rollback()
+        status = sesi.scalar(select(Staging.status).where(Staging.site_id == site_id))
+    except Exception:  # noqa: BLE001 -- galat asli yang dilempar ulang lebih penting
+        return
+    if status is not None and status != StatusStaging.menyalin:
+        shutil.rmtree(umum.dir_site(site_id) / "tarik", ignore_errors=True)
+
+
 def tangani_staging_tarik(sesi, job, klien) -> dict:
     def inti(sesi, job, site, staging):
         return tarik(sesi, job, site, staging, klien, umum.buat_pembantu())
 
-    return umum.jalankan_staging(sesi, job, inti, StatusStaging.menyalin, "Tarik staging")
+    site_id = job.site_id
+    try:
+        return umum.jalankan_staging(sesi, job, inti, StatusStaging.menyalin, "Tarik staging")
+    except umum.KlaimHilang:
+        raise
+    except Exception:
+        _bersihkan_bila_final(sesi, site_id)
+        raise

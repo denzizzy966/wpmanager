@@ -1,6 +1,7 @@
 import errno
 import hashlib
 import os
+import shutil
 import uuid
 from datetime import datetime, timezone
 
@@ -21,6 +22,7 @@ from wpmgr.models import (
     StatusStaging,
 )
 from wpmgr.staging import rencana, tarik, umum
+from wpmgr.staging.aman import PathTidakAman
 from wpmgr.staging.pembantu import GalatPembantu, StatusPembantu
 
 pytestmark = pytest.mark.integration
@@ -196,7 +198,10 @@ def test_lanjut_setelah_putus_di_tengah(sesi, site_staging, staging_aktif, prod,
     assert job.payload["kemajuan"]["tahap"] == "berkas"
     assert job.payload["kemajuan"]["byte_selesai"] > 0
     sesi.refresh(site_staging)
-    assert site_staging.status == StatusStaging.gagal or "dilanjutkan" in (site_staging.galat or "")
+    # attempts 0 < max_attempts: kegagalan TRANSIENT diulang, staging tetap menyalin.
+    assert site_staging.status == StatusStaging.menyalin
+    assert site_staging.galat.startswith("Terputus, dilanjutkan otomatis: ")
+    assert (staging_aktif / str(site_staging.site_id) / "tarik" / "manifest.jsonl").exists()
     _jalankan(sesi, site_staging, prod, job=job)
     diminta = _paths_diminta(prod)
     assert len(diminta) == len(set(diminta))
@@ -359,6 +364,8 @@ def test_tarik_disk_habis_gagal_jelas_dan_bisa_dilanjutkan(sesi, site_staging, s
     assert site_staging.status == StatusStaging.gagal
     assert "Disk VPS penuh" in site_staging.galat
     assert str(staging_aktif) not in site_staging.galat
+    # Kegagalan final: area kerja tarik/ dibersihkan (M1).
+    assert not (staging_aktif / str(site_staging.site_id) / "tarik").exists()
     pertama = tulisan[0]
     monkeypatch.setattr(tarik, "tulis_berkas", asli)
     _gagalkan_job_tertunda(sesi)
@@ -466,8 +473,9 @@ def test_potongan_tertulis_tanpa_tercatat_dibuang_saat_lanjut(sesi, site_staging
 
 
 def test_impor_diulang_selalu_dari_database_bersih(sesi, site_staging, prod, pb):
-    """Impor yang gagal/terputus tidak dilanjutkan di tengah: db-buat + db-impor diulang utuh."""
-    pb.gagal["db_impor"] = GalatPembantu("waktu", "Skrip pembantu tidak selesai dalam 10800 detik.")
+    """Impor yang terputus tidak dilanjutkan di tengah: db-buat + db-impor diulang utuh."""
+    # Worker dihentikan di tengah impor (deploy): job dilanjutkan otomatis.
+    pb.gagal["db_impor"] = umum.GalatBerhenti()
     with pytest.raises(SiteError):
         _jalankan(sesi, site_staging, prod)
     job = sesi.query(Job).one()
@@ -573,3 +581,125 @@ def test_urai_info_membersihkan_dan_menjepit():
     assert info["tabel_dilewati"] == 3
     assert tarik.urls_produksi(info) == ["https://contoh.test/wp", "http://contoh.test/wp",
                                          "https://contoh.test", "http://contoh.test"]
+
+
+def test_sql_baca_berkas_ditolak_sebelum_impor(sesi, site_staging, prod, pb):
+    prod.tabel["wp_posts"].append(b"LOAD DATA LOCAL INFILE '/etc/shadow' INTO TABLE `wp_posts`;\n")
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_GAGAL
+    assert "Potongan SQL tabel wp_posts dari produksi ditolak" in e.value.pesan
+    assert "db_impor" not in pb.nama_panggilan()
+
+
+def test_anggaran_db_dihitung_lintas_potongan_dan_setelah_lanjut(sesi, site_staging, prod, pb, monkeypatch):
+    prod.tabel["wp_posts"].append(b"INSERT INTO `wp_posts` (`id`) VALUES ('2');\n")
+    total = sum(len(c) for isi in prod.tabel.values() for c in isi)
+    # Setiap putaran sendiri di bawah batas; hanya jumlah keduanya yang melebihi.
+    monkeypatch.setattr(tarik, "anggaran_db", lambda ukuran: total - 1)
+    prod.jadwal_gagal["/staging/tabel"] = {3, 4, 5}
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod)
+    assert e.value.error_class == TRANSIENT
+    job = sesi.query(Job).one()
+    assert job.payload["kemajuan"]["db_diterima"] > 0
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job=job)
+    assert e.value.error_class == STAGING_GAGAL
+    assert "melebihi ukuran database" in e.value.pesan
+
+
+def test_anggaran_db_dari_ukuran_yang_dilaporkan(sesi, site_staging, prod, pb, monkeypatch):
+    monkeypatch.setattr(tarik, "TOLERANSI_BYTE", 0)
+    prod.ukuran_tabel = {"wp_posts": 1, "wp_options": 1}
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod)
+    assert "melebihi ukuran database" in e.value.pesan
+
+
+def test_halaman_manifest_melebihi_batas_ditolak(sesi, site_staging, prod, pb, monkeypatch):
+    monkeypatch.setattr(tarik, "BATAS_HALAMAN_MANIFEST", 2)
+    prod.halaman = 3
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_GAGAL
+    assert "lebih banyak entri" in e.value.pesan
+    assert next(b.get("batas") for route, b in prod.diminta if route == "/staging/manifest") == "2"
+
+
+@pytest.mark.parametrize("batas", [("MAKS_ENTRI_MANIFEST", 2), ("MAKS_BYTE_MANIFEST", 100)])
+def test_manifest_total_dibatasi(sesi, site_staging, prod, pb, monkeypatch, batas):
+    monkeypatch.setattr(tarik, *batas)
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_GAGAL
+    assert "Manifest produksi melebihi batas" in e.value.pesan
+    assert _paths_diminta(prod) == []
+
+
+def test_cadangan_disk_memakai_anggaran(sesi, site_staging, prod, pb):
+    # Cukup untuk ukuran manifest mentah, tetapi tidak untuk anggaran
+    # maksimum (toleransi 64 MiB berkas + 64 MiB SQL).
+    pb.status_palsu = StatusPembantu(8 * GB, 100 * GB, 15 * GB + 100 * 1024 * 1024, {}, {})
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_DITOLAK
+    assert "minimal 15%" in e.value.pesan
+
+
+def test_symlink_di_staging_dihapus_dan_isi_produksi_dipulihkan(sesi, site_staging, staging_aktif, prod, pb,
+                                                               tmp_path):
+    _jalankan(sesi, site_staging, prod)
+    files = _files(staging_aktif, site_staging)
+    luar = tmp_path / "luar"
+    (luar / "d").mkdir(parents=True)
+    (luar / "rahasia.txt").write_bytes(b"rahasia")
+    (luar / "d" / "besar.bin").write_bytes(b"bukan milik staging")
+    (files / "index.php").unlink()
+    shutil.rmtree(files / "wp-content/uploads")
+    try:
+        os.symlink(luar / "rahasia.txt", files / "index.php")
+        os.symlink(luar / "d", files / "wp-content/uploads", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink tidak diizinkan di sistem ini")
+    _jalankan(sesi, site_staging, prod)
+    assert not os.path.islink(files / "index.php")
+    assert (files / "index.php").read_bytes() == b"<?php // indeks"
+    assert not os.path.islink(files / "wp-content/uploads")
+    assert (files / "wp-content/uploads/besar.bin").read_bytes() == bytes(range(256)) * 10
+    assert (luar / "rahasia.txt").read_bytes() == b"rahasia"
+    assert (luar / "d" / "besar.bin").read_bytes() == b"bukan milik staging"
+
+
+def test_path_tidak_aman_saat_penyiapan_pesan_tetap(sesi, site_staging, staging_aktif, prod, pb, monkeypatch):
+    def tolak(*a, **kw):
+        raise PathTidakAman("Path melewati symlink atau bukan direktori")
+
+    monkeypatch.setattr(tarik, "tulis_atomik", tolak)
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_GAGAL
+    sesi.refresh(site_staging)
+    assert site_staging.status == StatusStaging.gagal
+    assert "mu-plugins" in site_staging.galat and str(staging_aktif) not in site_staging.galat
+
+
+def test_rentang_yang_menetes_dilewati(sesi, site_staging, staging_aktif, prod, pb):
+    prod.maks_rentang = 10
+    _, hasil = _jalankan(sesi, site_staging, prod)
+    diminta = _rentang_diminta(prod, "wp-content/uploads/besar.bin")
+    # ceil(total_maks / 1 MiB) + 16 permintaan untuk seluruh percobaan berkas ini.
+    assert len(diminta) == 1 + tarik.TAMBAHAN_PERMINTAAN
+    assert not (_files(staging_aktif, site_staging) / "wp-content/uploads/besar.bin").exists()
+    assert any("besar.bin" in p and "terlalu lambat" in p for p in hasil["peringatan"])
+    assert not list(_files(staging_aktif, site_staging).rglob(".wpmgr-*"))
+
+
+def test_direktori_kosong_setelah_hapus_dirapikan(sesi, site_staging, staging_aktif, prod, pb):
+    _jalankan(sesi, site_staging, prod)
+    files = _files(staging_aktif, site_staging)
+    assert (files / "wp-content/themes/t").is_dir()
+    del prod.berkas["wp-content/themes/t/style.css"]
+    _jalankan(sesi, site_staging, prod)
+    assert not (files / "wp-content/themes").exists()
+    assert (files / "wp-content/uploads/besar.bin").exists()

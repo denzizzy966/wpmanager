@@ -17,6 +17,8 @@ from wpmgr.staging.aman import (
     daftar_direktori,
     dikecualikan,
     hapus_berkas,
+    hapus_direktori_kosong,
+    hapus_tautan,
     jalur_di_dalam,
     nama_dari_url,
     nama_sah,
@@ -361,3 +363,39 @@ def test_waktu_penanda_sah(mentah, harapan):
 ])
 def test_waktu_penanda_ditolak(mentah):
     assert waktu_penanda(mentah, KINI) is None
+
+
+def test_hapus_tautan_berkas_dan_direktori_tanpa_mengikuti(pohon):
+    akar, luar = pohon
+    (luar / "d").mkdir()
+    (luar / "d" / "isi.txt").write_bytes(b"isi")
+    _symlink(luar / "rahasia.env", akar / "wp-content" / "x.php", False)
+    _symlink(luar / "d", akar / "wp-content" / "uploads", True)
+    (akar / "wp-content" / "biasa.txt").write_bytes(b"b")
+    assert hapus_tautan(akar, "wp-content/x.php") is True
+    assert hapus_tautan(akar, "wp-content/uploads") is True
+    assert not os.path.lexists(akar / "wp-content" / "x.php")
+    assert not os.path.lexists(akar / "wp-content" / "uploads")
+    assert (luar / "rahasia.env").read_bytes() == b"WPMGR_SECRET_KEY=bocor"
+    assert (luar / "d" / "isi.txt").read_bytes() == b"isi"
+    # Berkas/direktori biasa dan path yang tidak ada tidak disentuh.
+    assert hapus_tautan(akar, "wp-content/biasa.txt") is False
+    assert hapus_tautan(akar, "wp-content") is False
+    assert hapus_tautan(akar, "tidak/ada.txt") is False
+    assert (akar / "wp-content" / "biasa.txt").exists()
+
+
+def test_hapus_direktori_kosong(pohon):
+    akar, luar = pohon
+    (akar / "wp-content" / "a" / "b").mkdir(parents=True)
+    (akar / "wp-content" / "c").mkdir()
+    (akar / "wp-content" / "c" / "isi.txt").write_bytes(b"x")
+    assert hapus_direktori_kosong(akar, "wp-content/a/b") is True
+    assert hapus_direktori_kosong(akar, "wp-content/a") is True
+    assert hapus_direktori_kosong(akar, "wp-content/c") is False
+    assert hapus_direktori_kosong(akar, "wp-content/tidak-ada") is False
+    assert (akar / "wp-content" / "c" / "isi.txt").exists()
+    (luar / "kosong").mkdir()
+    _symlink(luar / "kosong", akar / "wp-content" / "t", True)
+    assert hapus_direktori_kosong(akar, "wp-content/t") is False
+    assert (luar / "kosong").is_dir()
