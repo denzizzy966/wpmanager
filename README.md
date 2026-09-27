@@ -470,10 +470,13 @@ systemctl restart 'wpmgr-worker@*' wpmgr-web
 tidak boleh ditulisi `wpmgr` — pada Ubuntu 24.04 baku ini sudah begitu; jangan mengubah pemiliknya.
 Sudoers hanya memberi `wpmgr` hak menjalankan skrip itu (`env_reset` aktif, tanpa baris `env_keep`),
 jadi variabel lingkungan yang dikirim `wpmgr` (termasuk dua kait test skrip pembantu,
-`WPMGR_STG_PATH`/`WPMGR_STG_KONF`) tidak pernah ikut lewat ke proses root. `/var/lib/wpmgr` dan semua
-turunannya (`certs/`, `acme/`, `letsencrypt/`, `staging/` termasuk) harus tetap root-owned dan tidak
-bisa ditulisi `wpmgr` — direktori itu memuat kunci privat TLS dan konfigurasi router yang tidak boleh
-bisa diubah proses dashboard (F2, cek_mount_root di skrip pembantu menolak start bila ini dilanggar).
+`WPMGR_STG_PATH`/`WPMGR_STG_KONF`) tidak pernah ikut lewat ke proses root. `/var/lib/wpmgr`, `certs/`,
+`acme/`, dan `letsencrypt/` harus tetap root-owned dan tidak bisa ditulisi `wpmgr`. **Pengecualiannya
+`staging/`** (`STAGING_DIR`, dibuat di langkah 2 di atas): itu justru milik `wpmgr`, `0700` — direktori
+kerja dashboard sendiri untuk berkas staging dan snapshot. Syarat root-owned pada `CERT_DIR`/`ACME_DIR`/
+`LE_DIR` **ditegakkan**, bukan cuma konvensi: `wpmgr-staging sertifikat` memeriksa setiap komponen path
+ketiganya (direktori itu sendiri dan induk langsungnya) lewat `cek_mount_root` — bukan symlink, milik
+root — sebelum menulis apa pun, dan menolak (`GALAT ditolak`) bila dilanggar.
 
 Lalu aktifkan **Izinkan staging** di **Pengaturan → WP Manager** di wp-admin setiap site yang akan
 distaging. Tanpa setelan itu connector membalas 403 untuk semua endpoint staging.
@@ -516,11 +519,34 @@ Catatan:
   `/etc/wpmgr-staging/staging.conf` defaultnya `www-data` (Debian/Ubuntu); ganti kalau paket nginx
   di VPS memakai grup lain (mis. `nginx`) -- skrip pembantu menolak jalan (`GALAT konfigurasi`)
   bila grup itu tidak ada di sistem.
+  **Siapa saja yang bisa membaca kunci ini:** SETIAP proses yang berjalan sebagai grup
+  `NGINX_GROUP`, tidak cuma nginx. Di Ubuntu baku itu termasuk pool php-fpm site lain, kalau
+  semuanya juga dijalankan sebagai `www-data` (pola umum di shared hosting) — proses itu ikut bisa
+  membaca `privkey.pem` staging manapun. Dampaknya terbatas pada bisa MENYAMAR sebagai host staging
+  itu lewat TLS (mis. terminasi TLS palsu di tempat lain); staging tidak menyimpan rahasia produksi
+  apa pun, dan kunci ini bukan kunci SSH/kredensial database. Skrip pembantu menolak start
+  (`GALAT konfigurasi`) bila `NGINX_GROUP` adalah grup `root`, grup utama pengguna dashboard, atau
+  salah satu grup tambahan pengguna dashboard — tapi **`wpmgr` sendiri tidak boleh pernah dijadikan
+  anggota `NGINX_GROUP`** lewat cara lain (mis. `usermod -aG www-data wpmgr`): pengecekan itu hanya
+  berjalan sekali saat skrip pembantu start, bukan terus-menerus, jadi keanggotaan yang ditambahkan
+  belakangan tidak terdeteksi otomatis dan akan membuat proses dashboard sendiri ikut bisa membaca
+  kunci privat staging manapun.
 - **Image dipin lewat digest** di `/etc/wpmgr-staging/digest.lock`, yang diisi pada pemakaian pertama
   setiap image. Untuk memperbarui image (mis. rilis keamanan PHP), hapus barisnya lalu jalankan
   `wpmgr-staging siapkan`. Container staging memakai image baru pada tarik berikutnya.
 - **Isolasi:** container staging boleh ke internet (update plugin), tetapi tidak ke host atau jaringan
   privat. Aturan itu ada di rantai `INPUT` dan `DOCKER-USER` untuk jembatan `br-wpmgrstg`.
+- **Aturan iptables isolasi itu bertahan lebih dari yang terlihat, tapi tidak tanpa batas.** Unit
+  `wpmgr-staging-siapkan.service` memakai `Requires=docker.service` DITAMBAH `PartOf=docker.service`,
+  jadi `siapkan` (idempoten) ikut jalan ulang setiap kali `docker.service` distop/direstart, baik
+  manual (`systemctl restart docker`) maupun otomatis (dockerd crash lalu di-restart systemd
+  sendiri) — walau sebenarnya restart Docker SENDIRI tidak menghapus aturan itu (dockerd tidak
+  pernah membersihkan rantai `DOCKER-USER`/`INPUT`). Yang benar-benar MENGHAPUS aturan ini hanya
+  **reboot host**, atau **firewall di-reload/ditulis ulang total** (`ufw reload`, `firewalld
+  reload`, `iptables-restore` dari berkas yang tidak menyertakan rantai kustom ini) — keduanya
+  menimpa seluruh tabel netfilter, bukan cuma milik Docker. Sesudah salah satu dari itu, jalankan
+  `systemctl restart wpmgr-staging-siapkan` secara manual untuk memasang ulang isolasi jaringan
+  staging.
 - **`listen [::]:80`/`listen [::]:443`** di `nginx-wpmgr-staging.conf` menjadikan berkas ini
   *default* untuk IPv6 bila belum ada site lain di `sites-enabled` yang mendengarkan IPv6 di port
   itu (nginx menandai `listen` IPv6 pertama sebagai default secara implisit). Ini tidak berbahaya

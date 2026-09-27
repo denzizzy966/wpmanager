@@ -242,6 +242,36 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
   (( 10#$UID_W != 0 && 10#$GID_W != 0 )) || galat konfigurasi "pemilik STAGING_DIR tidak boleh root"
   UID_W=$(( 10#$UID_W ))
   GID_W=$(( 10#$GID_W ))
+
+  # Lanjutan validasi NGINX_GROUP di atas (baru bisa dilakukan sesudah
+  # GID_W ada). privkey.pem staging dipasang 0640 root:$NGINX_GROUP (lihat
+  # cmd_sertifikat), jadi SETIAP proses yang berjalan sebagai grup itu bisa
+  # membacanya -- termasuk proses dashboard sendiri bila user dashboard
+  # kebetulan anggota grup itu. NGINX_GROUP tidak boleh: grup root (gid 0,
+  # dibaca terlalu banyak proses privileged), grup UTAMA user dashboard
+  # (GID_W), atau grup TAMBAHAN mana pun yang sudah dimiliki user dashboard
+  # (`id -G`) -- ketiganya membuat proses dashboard ikut bisa membaca kunci
+  # privat staging mana pun (putusan review Task 21, putaran 2).
+  local gid_nginx nama_dashboard g
+  gid_nginx="$(getent group "$NGINX_GROUP" | cut -d: -f3)"
+  [[ "$gid_nginx" =~ ^[0-9]+$ ]] || galat konfigurasi "grup NGINX_GROUP tidak terbaca"
+  (( gid_nginx != 0 )) || galat konfigurasi "NGINX_GROUP tidak boleh grup root"
+  (( gid_nginx != GID_W )) \
+    || galat konfigurasi "NGINX_GROUP tidak boleh sama dengan grup utama pengguna dashboard"
+  # UID_W diterjemahkan ke nama dulu: `id -G <uid>` tidak selalu diterima
+  # (implementasi id sebagian menerima nama saja); tanpa entri passwd untuk
+  # UID itu pengecekan grup tambahan ini dilewati (tidak ada apa pun untuk
+  # dicek), tetapi dua pengecekan di atas tetap berlaku.
+  # `|| true` pada keduanya: getent/id yang tidak menemukan apa pun keluar
+  # tidak nol, dan di bawah `set -e` itu akan menghentikan skrip lewat
+  # jebakan ERR walau hasil "tidak ketemu" ini sah dan disengaja (variabel
+  # tetap kosong, blok if di bawah melewatinya).
+  nama_dashboard="$(getent passwd "$UID_W" 2>/dev/null | cut -d: -f1 || true)"
+  if [[ -n "$nama_dashboard" ]]; then
+    for g in $(id -G "$nama_dashboard" 2>/dev/null || true); do
+      (( g != gid_nginx )) || galat konfigurasi "pengguna dashboard tidak boleh anggota NGINX_GROUP"
+    done
+  fi
 }
 
 # ---- validasi ------------------------------------------------------------
@@ -907,6 +937,17 @@ cmd_router_muat() {
 cmd_sertifikat() {
   cek_nama "${1-}"
   local host="$1.$DOMAIN"
+  # Putusan review Task 21 (putaran 2): sebelum menulis apa pun, pastikan
+  # CERT_DIR/ACME_DIR/LE_DIR dan induk langsungnya (basisnya, mis.
+  # /var/lib/wpmgr) benar-benar milik root dan bukan symlink. Ketiganya
+  # bersebelahan dengan STAGING_DIR (milik user dashboard) di bawah induk
+  # yang sama; tanpa cek ini user dashboard bisa menukar salah satunya
+  # dengan symlink sebelum skrip root ini menulis sertifikat/kunci privat
+  # ke dalamnya (mis. symlink ke /etc, atau ke direktori staging site lain).
+  local d
+  for d in "$CERT_DIR" "$ACME_DIR" "$LE_DIR"; do
+    cek_mount_root "$d" d "$(dirname -- "$d")"
+  done
   if [[ "$TANPA_SERTIFIKAT" == 1 ]]; then
     echo "sertifikat dilewati (TANPA_SERTIFIKAT=1)"
     return 0

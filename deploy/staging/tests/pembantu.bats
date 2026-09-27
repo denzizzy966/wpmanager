@@ -12,7 +12,10 @@ setup() {
   export WPMGR_STG_PATH="$BATS_TEST_DIRNAME/palsu:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   export WPMGR_STG_KONF="$BATS_TEST_TMPDIR/staging.conf"
   S="$BATS_TEST_TMPDIR/srv"
-  mkdir -p "$S/staging/router" "$S/etc/router/conf.d" "$S/etc/router/htpasswd" "$S/etc/db" "$S/log"
+  # certs/acme/le meniru direktori yang sudah dibuat root oleh `siapkan`
+  # (install -d) sebelum `sertifikat` pernah dipanggil di VPS sungguhan.
+  mkdir -p "$S/staging/router" "$S/etc/router/conf.d" "$S/etc/router/htpasswd" "$S/etc/db" "$S/log" \
+    "$S/certs" "$S/acme" "$S/le"
   cat > "$WPMGR_STG_KONF" <<KONF
 DOMAIN=staging.contoh.id
 STAGING_DIR=$S/staging
@@ -475,12 +478,13 @@ tulis_mounts() {
 }
 
 @test "NGINX_GROUP menentukan grup kunci privat dan divalidasi ketat" {
-  # Nilai kustom yang sah (grup "root" pasti ada di semua sistem) dipakai
-  # apa adanya, bukan default www-data yang diam-diam di-hardcode.
-  printf 'NGINX_GROUP=root\n' >> "$WPMGR_STG_KONF"
+  # Nilai kustom yang sah ("bin", gid 1, bukan gid 0/GID_W) dipakai apa
+  # adanya, bukan default www-data yang diam-diam di-hardcode. "root" TIDAK
+  # dipakai di sini karena gid-nya (0) sekarang ditolak (lihat test lain).
+  printf 'NGINX_GROUP=bin\n' >> "$WPMGR_STG_KONF"
   run "$SKRIP" sertifikat toko
   [ "$status" -eq 0 ]
-  [ "$(stat -c '%a %U:%G' "$S/certs/toko.staging.contoh.id/privkey.pem")" = "640 root:root" ]
+  [ "$(stat -c '%a %U:%G' "$S/certs/toko.staging.contoh.id/privkey.pem")" = "640 root:bin" ]
 
   # Pola tidak sah (spasi) ditolak sebelum sampai ke pengecekan grup sistem.
   sed -i 's/^NGINX_GROUP=.*/NGINX_GROUP=grup tidak sah/' "$WPMGR_STG_KONF"
@@ -492,6 +496,61 @@ tulis_mounts() {
   sed -i 's/^NGINX_GROUP=.*/NGINX_GROUP=grup-yang-tidak-ada/' "$WPMGR_STG_KONF"
   run "$SKRIP" status
   [ "$status" -eq 7 ]
+}
+
+@test "NGINX_GROUP ditolak bila grup root, grup dashboard, atau grup tambahan pengguna dashboard" {
+  # Kasus 1: NGINX_GROUP adalah grup root (gid 0) -- privkey bisa dibaca
+  # terlalu banyak proses sistem.
+  printf 'NGINX_GROUP=root\n' >> "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"NGINX_GROUP"* ]]
+
+  # Kasus 2: gid NGINX_GROUP sama dengan grup UTAMA user dashboard
+  # (GID_W=1000 dari PENGGUNA_GID di setup()) -- proses dashboard sendiri
+  # akan bisa membaca kunci privat staging manapun.
+  echo "grupsama:x:1000:" >> /etc/group
+  sed -i 's/^NGINX_GROUP=.*/NGINX_GROUP=grupsama/' "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"NGINX_GROUP"* ]]
+
+  # Kasus 3: NGINX_GROUP bukan grup utama pengguna dashboard, tapi pengguna
+  # itu (UID_W) adalah anggota TAMBAHANnya (id -G). Butuh entri /etc/passwd
+  # sungguhan untuk UID 1000 supaya UID itu bisa diterjemahkan ke nama dulu.
+  echo "cobapengguna:x:1000:1000::/nonexistent:/bin/false" >> /etc/passwd
+  echo "grupekstra:x:1234:cobapengguna" >> /etc/group
+  sed -i 's/^NGINX_GROUP=.*/NGINX_GROUP=grupekstra/' "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"NGINX_GROUP"* ]]
+}
+
+@test "sertifikat menolak CERT_DIR/ACME_DIR/LE_DIR yang bukan milik root atau berupa symlink" {
+  # CERT_DIR sebagai symlink: cek_mount_root menolak sebelum menulis apa
+  # pun (sertifikat/kunci belum pernah diminta ke certbot tiruan).
+  rm -rf "$S/certs"
+  ln -s /tmp "$S/certs"
+  run "$SKRIP" sertifikat toko
+  [ "$status" -eq 3 ]
+  [ ! -e "$PALSU/certbot.log" ]
+  rm -f "$S/certs"
+  mkdir -p "$S/certs"
+
+  # ACME_DIR milik user lain (bukan root): user dashboard tidak boleh bisa
+  # menukar direktori ini di bawah skrip root.
+  chown 1000:1000 "$S/acme"
+  run "$SKRIP" sertifikat toko
+  [ "$status" -eq 3 ]
+  [ ! -e "$PALSU/certbot.log" ]
+  chown 0:0 "$S/acme"
+
+  # LE_DIR sebagai symlink.
+  rm -rf "$S/le"
+  ln -s /tmp "$S/le"
+  run "$SKRIP" sertifikat toko
+  [ "$status" -eq 3 ]
+  [ ! -e "$PALSU/certbot.log" ]
 }
 
 @test "status mencetak JSON dengan memori, disk, container, dan akses" {

@@ -3,14 +3,38 @@
 [Unit]
 Description=Siapkan jaringan, isolasi, dan layanan staging WP Manager
 After=docker.service network-online.target
-# Requires= hanya menjamin docker.service AKTIF sebelum unit oneshot ini
-# dijalankan sekali saat boot; ia TIDAK membuat unit ini otomatis berjalan
-# ulang bila Docker di-restart belakangan (mis. `systemctl restart docker`
-# setelah upgrade paket) tanpa reboot host penuh. Aturan iptables yang
-# dipasang `pasang_iptables` TIDAK ikut bertahan otomatis pada kasus itu --
-# restart Docker manual harus diikuti `systemctl restart
-# wpmgr-staging-siapkan` supaya isolasi jaringan staging terpasang lagi.
+# Requires=docker.service (pull-in saat start + nonaktifkan unit ini bila
+# docker.service gagal aktif/dinonaktifkan) DITAMBAH PartOf=docker.service:
+# stop atau restart EKSPLISIT pada docker.service (`systemctl stop/restart
+# docker`), maupun restart OTOMATIS oleh Restart= milik unit docker.service
+# sendiri (dockerd crash lalu systemd me-restart-nya), sama-sama ikut
+# menghentikan/me-restart unit oneshot ini -- keduanya sama-sama lewat job
+# "restart" systemd pada docker.service, dan PartOf= khusus mempropagasi
+# stop+restart target ke unit ini. Hasilnya ExecStart= (siapkan, idempoten)
+# ikut dijalankan ulang pada kedua kasus. BindsTo= (alternatif yang lebih
+# ketat) tidak dipakai: ia hanya memperkuat arah "berhenti bersama docker",
+# sedangkan yang sebenarnya dibutuhkan di sini -- unit ini START LAGI
+# setelah docker restart -- datang dari PartOf=; menambahkan PartOf= saja
+# sudah cukup tanpa kerumitan/risiko flapping tambahan dari BindsTo=.
+#
+# CATATAN: restart docker.service (manual maupun otomatis) SENDIRI TIDAK
+# menghapus aturan pasang_iptables -- dockerd dijamin tidak pernah
+# membersihkan rantai DOCKER-USER (khusus untuk aturan pihak ketiga) atau
+# INPUT (rantai dasar host, di luar kendali dockerd) saat dia sendiri
+# start/restart. Jalannya siapkan ulang di atas karena itu lebih untuk
+# menjaga state siapkan LAIN tetap konsisten (jaringan wpmgr-staging,
+# wp-cli.phar, kontainer db/mail/router), bukan memulihkan iptables yang
+# sebenarnya sudah aman dari sekadar restart Docker.
+#
+# Aturan iptables itu betul-betul HILANG hanya pada dua kasus: REBOOT host
+# (kernel mengosongkan semua tabel netfilter), atau firewall DI-RELOAD/
+# DITULIS ULANG TOTAL (`ufw reload`, `firewalld reload`, `iptables-restore`
+# dari berkas yang tidak menyertakan rantai DOCKER-USER/INPUT kustom ini) --
+# keduanya menimpa seluruh tabel, bukan cuma milik Docker. Sesudah salah
+# satu dari itu, jalankan `systemctl restart wpmgr-staging-siapkan` secara
+# manual untuk memasang ulang isolasi jaringan staging.
 Requires=docker.service
+PartOf=docker.service
 Wants=network-online.target
 
 [Service]
