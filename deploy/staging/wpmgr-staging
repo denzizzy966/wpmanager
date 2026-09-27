@@ -497,7 +497,7 @@ cmd_siapkan() {
   SEMENTARA+=("$env_db")
   printf 'MARIADB_ROOT_PASSWORD=%s\n' "$sandi" > "$env_db"
   jalankan_layanan wpmgr-stg-db db --memory 1g --env-file "$env_db" -v wpmgr-stg-db:/var/lib/mysql \
-    "$img_db" --innodb-buffer-pool-size=256M --max-allowed-packet=64M
+    "$img_db" --innodb-buffer-pool-size=256M --max-allowed-packet=64M --local-infile=0
   rm -f "$env_db"
   jalankan_layanan wpmgr-stg-mail mail --memory 128m -p "$MAIL_PORT:8025" "$img_mail"
   # Layanan bersama berjalan sebagai root di container, jadi tidak satu pun
@@ -724,11 +724,17 @@ cmd_db_impor() {
   db="$(nama_db "$nama")"
   [[ -s "$KONF_DIR/db/$nama" ]] || galat ditolak "database staging belum dibuat (db-buat)"
   sandi="$(cat "$KONF_DIR/db/$nama")"
-  sql_root "DROP DATABASE IF EXISTS \`$db\`; CREATE DATABASE \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  # SET GLOBAL local_infile: container db yang dibuat sebelum argumen server
+  # --local-infile=0 ditambahkan (siapkan hanya menjalankan ulang container
+  # yang sudah ada) ikut tertutup.
+  sql_root "SET GLOBAL local_infile=0; DROP DATABASE IF EXISTS \`$db\`; CREATE DATABASE \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
   # SQL berasal dari site produksi yang bisa saja disusupi: diimpor sebagai
   # user staging ini, yang hanya berhak atas database-nya sendiri (Koreksi #8).
+  # --local-infile=0: tanpa ini LOAD DATA LOCAL INFILE di SQL itu membuat
+  # klien mengirim berkas apa pun di container db (mis. /etc/shadow,
+  # /var/lib/mysql/...) ke server; --binary-mode tidak mencegahnya.
   opsi_klien "$db" "$sandi"
-  dk exec -i wpmgr-stg-db mariadb --defaults-extra-file="$OPSI_KLIEN" --binary-mode \
+  dk exec -i wpmgr-stg-db mariadb --defaults-extra-file="$OPSI_KLIEN" --binary-mode --local-infile=0 \
     --max-allowed-packet=64M "$db" || galat impor "impor database staging gagal"
 }
 

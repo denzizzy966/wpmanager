@@ -374,10 +374,10 @@ tulis_mounts() {
   run bash -c "printf 'INSERT INTO t VALUES (1);' | '$SKRIP' db-impor toko"
   [ "$status" -eq 0 ]
   [[ "$(cat "$PALSU/stdin-1")" == *"password=rootrahasia"* ]]
-  [[ "$(cat "$PALSU/stdin-2")" == *'DROP DATABASE IF EXISTS `stg_toko`; CREATE DATABASE `stg_toko`'* ]]
+  [[ "$(cat "$PALSU/stdin-2")" == *'SET GLOBAL local_infile=0; DROP DATABASE IF EXISTS `stg_toko`; CREATE DATABASE `stg_toko`'* ]]
   [[ "$(cat "$PALSU/stdin-3")" == *"user=stg_toko"* && "$(cat "$PALSU/stdin-3")" == *"password=sandi-user"* ]]
   [ "$(cat "$PALSU/stdin-4")" = "INSERT INTO t VALUES (1);" ]
-  grep -q '^\[exec\]\[-i\]\[wpmgr-stg-db\]\[mariadb\]\[--defaults-extra-file=/run/wpmgr-klien-[0-9-]*\.cnf\]\[--binary-mode\]\[--max-allowed-packet=64M\]\[stg_toko\]$' "$PALSU/docker.log"
+  grep -q '^\[exec\]\[-i\]\[wpmgr-stg-db\]\[mariadb\]\[--defaults-extra-file=/run/wpmgr-klien-[0-9-]*\.cnf\]\[--binary-mode\]\[--local-infile=0\]\[--max-allowed-packet=64M\]\[stg_toko\]$' "$PALSU/docker.log"
   # Kata sandi tidak pernah muncul di argumen proses.
   ! grep -q 'sandi-user\|rootrahasia' "$PALSU/docker.log" || false
 }
@@ -495,6 +495,8 @@ tulis_mounts() {
   grep -q '^wpcli=[0-9a-f]\{128\}$' "$S/etc/digest.lock"
   grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-router\]' "$PALSU/docker.log"
   grep -q '\[-p\]\[127.0.0.1:8090:80\]' "$PALSU/docker.log"
+  # Server db bersama menolak LOAD DATA LOCAL INFILE (local_infile OFF).
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-db\].*\[--max-allowed-packet=64M\]\[--local-infile=0\]$' "$PALSU/docker.log"
   ! grep -q 'MARIADB_ROOT_PASSWORD=' "$PALSU/docker.log" || false
   # Router (root di container) hanya memasang berkas yang dirender skrip ini,
   # read-only; tidak ada path yang bisa ditulis user dashboard.
