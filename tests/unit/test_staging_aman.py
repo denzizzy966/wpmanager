@@ -1,6 +1,7 @@
 import os
 import stat
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from wpmgr.staging.aman import (
     path_sah,
     tulis_atomik,
     versi_php_staging,
+    waktu_penanda,
 )
 
 
@@ -280,3 +282,30 @@ def test_daftar_direktori_memakai_lstat_dan_menolak_induk_symlink(pohon):
     assert stat.S_ISLNK(isi["uploads"].st_mode)
     with pytest.raises(PathTidakAman):
         daftar_direktori(akar, "wp-content/uploads")
+
+
+# ---- penanda `log/diubah` (fix round 1 Task 13) ----------------------------
+
+KINI = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("mentah,harapan", [
+    (b"1790000000", datetime.fromtimestamp(1790000000, tz=timezone.utc)),
+    (b"  1790000000\n", datetime.fromtimestamp(1790000000, tz=timezone.utc)),
+    (b"0", datetime(1970, 1, 1, tzinfo=timezone.utc)),
+    # Tepat di batas toleransi jam (5 menit ke depan) masih diterima.
+    (str(int(KINI.timestamp()) + 300).encode(), KINI + timedelta(minutes=5)),
+])
+def test_waktu_penanda_sah(mentah, harapan):
+    assert waktu_penanda(mentah, KINI) == harapan
+
+
+@pytest.mark.parametrize("mentah", [
+    b"", b"bukan angka", b"-5", b"1.5", b"\xff\xfe", b"17900000001790000000",
+    # Masa depan (lebih dari 5 menit): di Linux fromtimestamp menerimanya
+    # sampai tahun 9999, jadi harus ditolak eksplisit, bukan dijepit.
+    str(int(KINI.timestamp()) + 301).encode(),
+    b"253402300799", b"99999999999999999999", b"9" * 400,
+])
+def test_waktu_penanda_ditolak(mentah):
+    assert waktu_penanda(mentah, KINI) is None

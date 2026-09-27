@@ -27,10 +27,12 @@ from wpmgr.jobs.queue import akan_diulang
 from wpmgr.models import ActivityLog, Job, JobStatus, Site, Staging, StatusStaging, User
 from wpmgr.staging.aman import (
     BATAS_DIUBAH,
+    TOLERANSI_JAM,
     PathTidakAman,
-    angka,
     baca_terbatas,
+    bersih_json,
     bersih_teks,
+    waktu_penanda,
 )
 from wpmgr.staging.pembantu import GalatPembantu, Pembantu
 
@@ -48,8 +50,7 @@ JEDA_DETAK = 60.0
 BATAS_KUNCI_DETAK = "5s"
 TUNGGU_UTAS_DETAK = 10.0
 PESAN_TAK_TERDUGA = "Galat tak terduga; lihat log server"
-# Stempel waktu Unix terbesar yang masih bisa menjadi datetime (9999-12-31).
-_DETIK_MAKS = 253402300799
+PESAN_DIBATALKAN = "Dibatalkan oleh pengguna."
 
 
 class KlaimHilang(Exception):
@@ -58,6 +59,30 @@ class KlaimHilang(Exception):
 
 class Dibatalkan(Exception):
     """Pengguna meminta pembatalan (staging.batal_diminta_pada)."""
+
+
+class GalatDibatalkan(SiteError):
+    """Job berakhir karena pengguna membatalkannya: final, tetapi bukan kegagalan.
+
+    Pembungkus sudah mencatat aktivitasnya (dengan nama pengguna), jadi worker
+    tidak menambah baris "gagal" level error.
+    """
+
+    sudah_dicatat = True
+
+    def __init__(self) -> None:
+        super().__init__(STAGING_GAGAL, PESAN_DIBATALKAN)
+
+
+class GalatBerhenti(SiteError):
+    """Worker dihentikan (deploy/restart) di tengah job; job dilanjutkan otomatis."""
+
+    level_aktivitas = "info"
+    ringkasan_aktivitas = "dihentikan bersama worker; dilanjutkan otomatis"
+    sudah_dicatat = False
+
+    def __init__(self) -> None:
+        super().__init__(TRANSIENT, "Worker dihentikan; job staging dilanjutkan otomatis.")
 
 
 def galat_ditolak(pesan: str) -> SiteError:
@@ -104,20 +129,17 @@ def baca_diubah(site_id) -> datetime | None:
         mentah = baca_terbatas(dir_site(site_id), "log/diubah", BATAS_DIUBAH)
     except (PathTidakAman, OSError):
         return None
-    teks = mentah.decode("ascii", errors="replace").strip()[:20]
-    detik = angka(teks, 0, _DETIK_MAKS)
-    if detik is None:
-        return None
-    try:
-        return datetime.fromtimestamp(detik, tz=timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        # Windows menolak stempel waktu di atas tahun 3000 dengan OSError.
-        return None
+    return waktu_penanda(mentah, sekarang())
 
 
 def perbarui_diubah(staging: Staging) -> None:
     d = baca_diubah(staging.site_id)
-    if d is not None and (staging.diubah_pada is None or d > staging.diubah_pada):
+    lama = staging.diubah_pada
+    if lama is not None and lama > sekarang() + TOLERANSI_JAM:
+        # Nilai masa depan yang sempat tersimpan tidak boleh menahan setiap
+        # pembaruan sesudahnya.
+        lama = None
+    if d is not None and (lama is None or d > lama):
         staging.diubah_pada = d
 
 
@@ -167,6 +189,10 @@ def detak_latar(sesi: Session, job: Job, jeda: float = JEDA_DETAK) -> Iterator[D
         yield keadaan
         return
     job_id, pemegang = job.id, job.locked_by
+    # Transaksi utas utama yang masih terbuka bisa memegang kunci baris job
+    # (mis. kemajuan yang sudah di-flush); detak latar akan tertahan olehnya
+    # sepanjang blok. Di-commit di sini supaya blok selalu dimulai bersih.
+    sesi.commit()
     bind = sesi.get_bind()
     # Sesi utama mungkin terikat ke Connection; utas butuh koneksinya sendiri.
     buat_sesi = sessionmaker(bind=getattr(bind, "engine", bind), future=True)
@@ -204,9 +230,12 @@ def harus_berhenti() -> bool:
     return worker._berhenti
 
 
+def _batal_diminta(sesi: Session, staging_id) -> bool:
+    return sesi.scalar(select(Staging.batal_diminta_pada).where(Staging.id == staging_id)) is not None
+
+
 def periksa_batal(sesi: Session, staging: Staging) -> None:
-    diminta = sesi.scalar(select(Staging.batal_diminta_pada).where(Staging.id == staging.id))
-    if diminta is not None:
+    if _batal_diminta(sesi, staging.id):
         raise Dibatalkan()
 
 
@@ -223,7 +252,7 @@ def titik_potongan(sesi: Session, job: Job, staging: Staging | None) -> None:
         # tidak dihabiskan, dan progres di payload membuat job melanjutkan.
         job.attempts = max(0, job.attempts - 1)
         sesi.commit()
-        raise SiteError(TRANSIENT, "Worker dihentikan; job staging dilanjutkan otomatis.")
+        raise GalatBerhenti()
     detak(sesi, job)
 
 
@@ -271,7 +300,8 @@ def catat_aktivitas(sesi: Session, site_id, job: Job | None, pesan: str, detail:
         email = u.email if u is not None else None
     teks = f"{pesan} oleh {email}" if email else pesan
     sesi.add(ActivityLog(site_id=site_id, job_id=job.id if job is not None else None, user_id=uid,
-                         level=level, pesan=bersih_teks(teks, 500), detail=detail))
+                         level=level, pesan=bersih_teks(teks, 500),
+                         detail=None if detail is None else bersih_json(detail)))
 
 
 def pesan_os(exc: OSError) -> str:
@@ -294,18 +324,30 @@ def muat_staging(sesi: Session, job: Job) -> tuple[Site, Staging]:
     return site, staging
 
 
-def _tandai(sesi: Session, staging_id, status: StatusStaging, galat: str | None) -> None:
+def _tandai(sesi: Session, staging_id, status: StatusStaging, galat: str | None,
+            bersihkan_batal: bool = True) -> None:
     sesi.rollback()
     st = sesi.get(Staging, staging_id, populate_existing=True)
     st.status = status
     st.galat = bersih_teks(galat, 1000)
-    st.batal_diminta_pada = None
+    if bersihkan_batal:
+        st.batal_diminta_pada = None
     sesi.commit()
+
+
+def _batalkan(sesi: Session, job: Job, site_id, staging_id, nama: str) -> GalatDibatalkan:
+    sesi.rollback()
+    st = sesi.get(Staging, staging_id, populate_existing=True)
+    status = StatusStaging.siap if st.ditarik_pada else StatusStaging.gagal
+    _tandai(sesi, staging_id, status, PESAN_DIBATALKAN)
+    catat_aktivitas(sesi, site_id, job, f"{nama} dibatalkan", level="warning")
+    sesi.commit()
+    return GalatDibatalkan()
 
 
 def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging, nama: str) -> dict:
     site, staging = muat_staging(sesi, job)
-    staging_id, job_id = staging.id, job.id
+    staging_id, job_id, site_id = staging.id, job.id, site.id
     staging.status = status_kerja
     staging.galat = None
     sesi.commit()
@@ -313,25 +355,29 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
         periksa_batal(sesi, staging)
         hasil = inti(sesi, job, site, staging)
     except Dibatalkan:
-        sesi.rollback()
-        st = sesi.get(Staging, staging_id, populate_existing=True)
-        status = StatusStaging.siap if st.ditarik_pada else StatusStaging.gagal
-        _tandai(sesi, staging_id, status, "Dibatalkan oleh pengguna.")
-        catat_aktivitas(sesi, site.id, job, f"{nama} dibatalkan", level="warning")
-        sesi.commit()
-        raise galat_gagal("Dibatalkan oleh pengguna.") from None
+        raise _batalkan(sesi, job, site_id, staging_id, nama) from None
     except KlaimHilang:
         raise
     except GalatPembantu as exc:
         _tandai(sesi, staging_id, StatusStaging.gagal, exc.pesan)
         raise galat_gagal(exc.pesan) from None
     except SiteError as exc:
+        # Perubahan setengah jadi dari inti (termasuk pada objek job) dibuang
+        # dulu: keputusan di bawah harus memakai keadaan yang ter-commit.
+        sesi.rollback()
+        if _batal_diminta(sesi, staging_id):
+            # Pembatalan menang atas percobaan ulang: tanpa ini dorong yang
+            # dibatalkan tetap berlanjut pada putaran berikutnya.
+            raise _batalkan(sesi, job, site_id, staging_id, nama) from None
         # Keputusan "final atau diulang" harus sama persis dengan worker
         # (queue.akan_diulang), termasuk batas bad_response dan UNKNOWN yang
         # oleh worker diulang sebagai TRANSIENT untuk job staging (F26).
         kelas = TRANSIENT if exc.error_class == UNKNOWN else exc.error_class
         if akan_diulang(job, kelas):
-            _tandai(sesi, staging_id, status_kerja, f"Terputus, dilanjutkan otomatis: {exc.pesan}")
+            # Permintaan batal yang tiba sesudah pemeriksaan di atas tidak
+            # dihapus; putaran berikutnya berhenti di pemeriksaan awalnya.
+            _tandai(sesi, staging_id, status_kerja, f"Terputus, dilanjutkan otomatis: {exc.pesan}",
+                    bersihkan_batal=False)
         else:
             _tandai(sesi, staging_id, StatusStaging.gagal, exc.pesan)
         raise

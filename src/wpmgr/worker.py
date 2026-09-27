@@ -35,6 +35,8 @@ from wpmgr.models import (
     Site,
     SiteStatus,
 )
+from wpmgr.staging.aman import bersih_teks
+from wpmgr.staging.umum import PESAN_TAK_TERDUGA
 
 log = logging.getLogger("wpmgr.worker")
 JEDA_ANTREAN_KOSONG = 5.0
@@ -138,7 +140,13 @@ def _catat_kesalahan_internal(sesi: Session, job_id: int, worker: str, exc: Exce
         return
 
     job = sesi.get(Job, job_id)
-    pesan = f"{type(exc).__name__}: {exc}"
+    if job.tipe in JOB_STAGING:
+        # Teks pengecualian job staging bisa memuat path VPS atau isi payload,
+        # dan job.error tampil di UI (putusan F12): traceback-nya sudah di log
+        # server, yang disimpan hanya pesan tetap.
+        pesan = PESAN_TAK_TERDUGA
+    else:
+        pesan = f"{type(exc).__name__}: {exc}"
     # Status site sengaja tidak disentuh: kesalahan ini milik dashboard.
     sesi.add(
         ActivityLog(
@@ -152,6 +160,9 @@ def _catat_kesalahan_internal(sesi: Session, job_id: int, worker: str, exc: Exce
 
 def _catat_kegagalan(sesi, job, site, exc: SiteError, worker: str, buat_klien_fn) -> None:
     kelas = exc.error_class
+    # Pesan bisa membawa teks connector; NUL atau surrogate tunggal di sana
+    # membuat commit job.error dan detail log gagal seluruhnya.
+    pesan = bersih_teks(exc.pesan, 2000)
     if kelas == UNKNOWN and job.tipe != JobType.update_package:
         # Sejak R55 ping dan inventory tidak pernah menghasilkan unknown. Bila
         # tetap terjadi, keduanya read-only dan aman diulang; menandainya
@@ -163,7 +174,7 @@ def _catat_kegagalan(sesi, job, site, exc: SiteError, worker: str, buat_klien_fn
         kelas = TRANSIENT
 
     if kelas == UNKNOWN:
-        tandai_unknown(sesi, job, exc.pesan)
+        tandai_unknown(sesi, job, pesan)
         try:
             hasil = resolusi_unknown(sesi, job, buat_klien_fn(site))
             log.info("Job %s diselesaikan lewat scan ulang: %s", job.id, hasil)
@@ -178,7 +189,7 @@ def _catat_kegagalan(sesi, job, site, exc: SiteError, worker: str, buat_klien_fn
             sesi.commit()
             return
     else:
-        selesai_gagal(sesi, job, kelas, exc.pesan)
+        selesai_gagal(sesi, job, kelas, pesan)
 
     if kelas == PACKAGE_MISSING:
         # Inventaris dashboard menyimpang dari kenyataan; scan ulang yang
@@ -199,14 +210,19 @@ def _catat_kegagalan(sesi, job, site, exc: SiteError, worker: str, buat_klien_fn
     if status_baru is not None and site.status != SiteStatus.disabled:
         site.status = status_baru
     if sentuh_site:
-        site.last_error = exc.pesan[:2000]
-    sesi.add(
-        ActivityLog(
-            site_id=site.id, job_id=job.id, level="error",
-            pesan=f"{job.tipe.value} gagal: {kelas}",
-            detail={"pesan": exc.pesan[:500], "worker": worker},
+        site.last_error = pesan[:2000]
+    # Batal oleh pengguna sudah dicatat pembungkus staging (dengan nama
+    # pengguna), dan worker yang dihentikan saat deploy bukan kegagalan:
+    # keduanya tidak boleh muncul sebagai baris "gagal" level error.
+    if not getattr(exc, "sudah_dicatat", False):
+        ringkasan = getattr(exc, "ringkasan_aktivitas", None)
+        sesi.add(
+            ActivityLog(
+                site_id=site.id, job_id=job.id, level=getattr(exc, "level_aktivitas", "error"),
+                pesan=f"{job.tipe.value} {ringkasan}" if ringkasan else f"{job.tipe.value} gagal: {kelas}",
+                detail={"pesan": pesan[:500], "worker": worker},
+            )
         )
-    )
     sesi.commit()
 
 

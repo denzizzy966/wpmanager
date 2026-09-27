@@ -1,7 +1,9 @@
-# Unit template: satu instans per worker, mis. wpmgr-worker@1 dan
-# wpmgr-worker@2. Worker yang berbeda memproses site yang berbeda secara
-# paralel; aturan satu-job-per-site ditegakkan oleh query klaim di database,
-# bukan oleh jumlah proses (spec §7.1).
+# Unit template: satu instans per worker. Umum: wpmgr-worker@1 dan
+# wpmgr-worker@2, yang memproses job non-staging untuk site berbeda secara
+# paralel. Staging: wpmgr-worker@staging, satu-satunya yang mengambil job
+# staging (Koreksi #1). Aturan job per site (termasuk tarik/uji yang boleh
+# berjalan bersama job non-staging) ditegakkan oleh klaim di database, bukan
+# oleh jumlah proses (spec §7.1, §11).
 [Unit]
 Description=WP Manager worker %i
 After=network.target postgresql.service
@@ -12,6 +14,9 @@ WorkingDirectory=/opt/wpmgr
 EnvironmentFile=/opt/wpmgr/.env
 # Instans `staging` (wpmgr-worker@staging) hanya memproses job staging, yang
 # bisa berjalan berjam-jam; instans lain tidak pernah mengambilnya.
+# Variabel dari EnvironmentFile= MENIMPA Environment= (systemd.exec), jadi
+# WPMGR_WORKER_INSTANS tidak boleh ditulis di /opt/wpmgr/.env: semua instans
+# akan mendapat jenis yang sama dan job staging bisa tidak pernah diambil.
 Environment=WPMGR_WORKER_INSTANS=%i
 ExecStart=/opt/wpmgr/.venv/bin/python -m wpmgr.worker
 Restart=always

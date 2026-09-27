@@ -20,6 +20,7 @@ import re
 import stat
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urlsplit
@@ -131,6 +132,21 @@ def bersih_teks(nilai, panjang: int) -> str | None:
     return teks[:panjang]
 
 
+def bersih_json(nilai, panjang: int = 2000):
+    """Salinan nilai JSON dengan setiap teks (termasuk kunci) lewat `bersih_teks`.
+
+    JSONB menolak \\u0000 sama seperti kolom text, jadi detail log yang memuat
+    teks dari connector dibersihkan dengan cara yang sama.
+    """
+    if isinstance(nilai, str):
+        return bersih_teks(nilai, panjang)
+    if isinstance(nilai, dict):
+        return {bersih_teks(k, panjang): bersih_json(v, panjang) for k, v in nilai.items()}
+    if isinstance(nilai, (list, tuple)):
+        return [bersih_json(v, panjang) for v in nilai]
+    return nilai
+
+
 def angka(nilai, bawah: int, atas: int) -> int | None:
     if isinstance(nilai, bool):
         return None
@@ -141,6 +157,30 @@ def angka(nilai, bawah: int, atas: int) -> int | None:
     else:
         return None
     return max(bawah, min(atas, n))
+
+
+_POLA_DETIK = re.compile(r"[0-9]{1,12}")
+# Jam VPS dan jam container staging sama (satu mesin); lima menit hanya
+# menampung penulisan yang berlangsung tepat saat dibaca.
+TOLERANSI_JAM = timedelta(minutes=5)
+
+
+def waktu_penanda(mentah: bytes, kini: datetime) -> datetime | None:
+    """Stempel waktu Unix dari penanda `log/diubah`, atau None bila tidak masuk akal.
+
+    Penanda ditulis kode di container staging, jadi nilainya tidak
+    dipercaya. Nilai di luar [epoch, kini + 5 menit] ditolak, bukan dijepit:
+    penanda masa depan yang tersimpan akan mengalahkan setiap perubahan asli
+    sesudahnya. Batasnya dihitung dari `kini`, bukan dari rentang datetime,
+    yang berbeda antara Linux (sampai tahun 9999) dan Windows (sampai 3000).
+    """
+    teks = mentah.decode("ascii", errors="replace").strip()
+    if not _POLA_DETIK.fullmatch(teks):
+        return None
+    detik = int(teks)
+    if detik > (kini + TOLERANSI_JAM).timestamp():
+        return None
+    return datetime.fromtimestamp(detik, tz=timezone.utc)
 
 
 def path_sah(p) -> str:

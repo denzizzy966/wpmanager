@@ -34,6 +34,7 @@ from wpmgr.models import (
     JobType,
     Site,
     SiteStatus,
+    Staging,
     StatusStaging,
 )
 from wpmgr.staging import umum
@@ -530,3 +531,311 @@ def test_penanda_diubah_symlink_ditolak(site_staging, staging_aktif, tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("symlink tidak dapat dibuat di platform ini")
     assert umum.baca_diubah(site_staging.site_id) is None
+
+
+# ---- fix round 1 -------------------------------------------------------------
+
+
+def test_penanda_diubah_masa_depan_tidak_pernah_menempel(site_staging, staging_aktif):
+    log = staging_aktif / str(site_staging.site_id) / "log"
+    log.mkdir(parents=True)
+    masa_depan = int((datetime.now(timezone.utc) + timedelta(days=365)).timestamp())
+    (log / "diubah").write_text(str(masa_depan), encoding="ascii")
+    assert umum.baca_diubah(site_staging.site_id) is None
+    umum.perbarui_diubah(site_staging)
+    assert site_staging.diubah_pada is None
+
+    # Nilai masa depan yang sudah tersimpan (mis. dari versi lama) digantikan
+    # penanda sah berikutnya, bukan menahan semua pembaruan selamanya.
+    site_staging.diubah_pada = datetime(9999, 1, 1, tzinfo=timezone.utc)
+    (log / "diubah").write_text("1790000000", encoding="ascii")
+    umum.perbarui_diubah(site_staging)
+    assert site_staging.diubah_pada == datetime.fromtimestamp(1790000000, tz=timezone.utc)
+
+
+def _jalankan_lewat_worker(sesi, monkeypatch, tipe, inti, status_kerja=StatusStaging.mendorong, nama="Dorong"):
+    def handler(sesi, job, klien):
+        return umum.jalankan_staging(sesi, job, inti, status_kerja, nama)
+
+    monkeypatch.setitem(handlers.HANDLER, tipe, handler)
+    return proses_satu(sesi, "w1", buat_klien_fn=lambda s: None, jenis="staging")
+
+
+@pytest.mark.parametrize("kelas", [TRANSIENT, UNKNOWN])
+def test_batal_lalu_potongan_gagal_sementara_tetap_batal(sesi, site_staging, monkeypatch, kelas):
+    """Batal yang diminta sebelum potongan gagal sementara tidak hilang; dorong tidak berlanjut."""
+    site_staging.ditarik_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    panggilan = []
+
+    def inti(sesi, job, site, staging):
+        panggilan.append(1)
+        staging.batal_diminta_pada = datetime.now(timezone.utc)
+        sesi.commit()
+        raise SiteError(kelas, "koneksi putus")
+
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_dorong)
+    assert _jalankan_lewat_worker(sesi, monkeypatch, JobType.staging_dorong, inti)
+    sesi.expire_all()
+    job = sesi.get(Job, job.id)
+    assert job.status == JobStatus.failed
+    st = sesi.get(Staging, site_staging.id)
+    assert st.status == StatusStaging.siap
+    assert st.galat == "Dibatalkan oleh pengguna."
+    assert st.batal_diminta_pada is None
+    # Tidak ada putaran berikutnya yang menjalankan dorong lagi.
+    assert not proses_satu(sesi, "w1", buat_klien_fn=lambda s: None, jenis="staging")
+    assert len(panggilan) == 1
+
+
+def test_batal_yang_tiba_saat_percobaan_ulang_tidak_dihapus(sesi, site_staging, monkeypatch):
+    """Batal yang masuk sesudah pemeriksaan tetapi sebelum status ulang ditulis tetap berlaku."""
+    panggilan = []
+
+    def inti(sesi, job, site, staging):
+        panggilan.append(1)
+        raise SiteError(TRANSIENT, "koneksi putus")
+
+    asli = umum._batal_diminta
+
+    def batal_tiba_sesudah_diperiksa(sesi, staging_id):
+        hasil = asli(sesi, staging_id)
+        if panggilan:
+            sesi.execute(text("UPDATE staging SET batal_diminta_pada = now() WHERE id = :i"), {"i": staging_id})
+            sesi.commit()
+        return hasil
+
+    monkeypatch.setattr(umum, "_batal_diminta", batal_tiba_sesudah_diperiksa)
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_dorong)
+    assert _jalankan_lewat_worker(sesi, monkeypatch, JobType.staging_dorong, inti)
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.pending
+    assert sesi.get(Staging, site_staging.id).batal_diminta_pada is not None
+
+    # Putaran berikutnya berhenti sebagai batal sebelum inti dipanggil.
+    monkeypatch.setattr(umum, "_batal_diminta", asli)
+    sesi.execute(text("UPDATE jobs SET scheduled_for = now() WHERE id = :i"), {"i": job.id})
+    sesi.commit()
+    assert _jalankan_lewat_worker(sesi, monkeypatch, JobType.staging_dorong, inti)
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.failed
+    st = sesi.get(Staging, site_staging.id)
+    assert st.galat == "Dibatalkan oleh pengguna."
+    assert st.batal_diminta_pada is None
+    assert len(panggilan) == 1
+
+
+def test_keputusan_ulang_memakai_keadaan_yang_sudah_di_rollback(sesi, site_staging):
+    def inti(sesi, job, site, staging):
+        job.attempts = 99  # perubahan yang belum di-commit tidak boleh memengaruhi keputusan
+        raise SiteError(TRANSIENT, "koneksi putus")
+
+    job, jalan = _jalankan(sesi, site_staging, inti)
+    job.attempts = 1
+    sesi.commit()
+    with pytest.raises(SiteError):
+        jalan()
+    sesi.refresh(site_staging)
+    assert site_staging.status == StatusStaging.menyalin
+    assert sesi.get(Job, job.id).attempts == 1
+
+
+def test_batal_pengguna_dicatat_netral(sesi, site_staging, monkeypatch):
+    def inti(sesi, job, site, staging):
+        staging.batal_diminta_pada = datetime.now(timezone.utc)
+        sesi.commit()
+        umum.titik_potongan(sesi, job, staging)
+
+    buat_job(sesi, site_staging.site_id, JobType.staging_dorong)
+    _jalankan_lewat_worker(sesi, monkeypatch, JobType.staging_dorong, inti)
+    log = sesi.query(ActivityLog).all()
+    assert [(x.level, x.pesan) for x in log] == [("warning", "Dorong dibatalkan")]
+
+
+def test_worker_dihentikan_dicatat_netral(sesi, site_staging, monkeypatch):
+    monkeypatch.setattr(umum, "harus_berhenti", lambda: True)
+
+    def inti(sesi, job, site, staging):
+        umum.titik_potongan(sesi, job, staging)
+
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
+    _jalankan_lewat_worker(sesi, monkeypatch, JobType.staging_tarik, inti, StatusStaging.menyalin, "Tarik")
+    sesi.expire_all()
+    job = sesi.get(Job, job.id)
+    assert job.status == JobStatus.pending
+    assert job.attempts == 0
+    log = sesi.query(ActivityLog).one()
+    assert log.level == "info"
+    assert "gagal" not in log.pesan
+    assert log.pesan == "staging_tarik dihentikan bersama worker; dilanjutkan otomatis"
+
+
+def test_reaper_menandai_staging_gagal_saat_jatah_habis(sesi, site_staging):
+    from wpmgr.jobs.reaper import pulihkan_job_yatim
+
+    site_staging.status = StatusStaging.mendorong
+    site_staging.batal_diminta_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    buat_job(sesi, site_staging.site_id, JobType.staging_dorong)
+    job = ambil_job(sesi, "w1", "staging")
+    job.attempts = job.max_attempts
+    job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    sesi.commit()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.unknown
+    st = sesi.get(Staging, site_staging.id)
+    assert st.status == StatusStaging.gagal
+    assert st.galat == "Proses terhenti tak terduga; coba lagi."
+    assert st.batal_diminta_pada is None
+
+
+def test_reaper_yang_menjadwalkan_ulang_tidak_mengubah_staging(sesi, site_staging):
+    from wpmgr.jobs.reaper import pulihkan_job_yatim
+
+    buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
+    job = ambil_job(sesi, "w1", "staging")
+    job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    sesi.commit()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.pending
+    assert sesi.get(Staging, site_staging.id).status == StatusStaging.menyalin
+
+
+def test_reaper_job_non_staging_tidak_menyentuh_staging(sesi, site_staging):
+    from wpmgr.jobs.reaper import pulihkan_job_yatim
+
+    buat_job(sesi, site_staging.site_id, JobType.scan_site)
+    job = ambil_job(sesi, "w1", "umum")
+    job.attempts = job.max_attempts
+    job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    sesi.commit()
+    pulihkan_job_yatim(sesi)
+    sesi.expire_all()
+    assert sesi.get(Staging, site_staging.id).status == StatusStaging.menyalin
+
+
+def test_galat_tak_terduga_tidak_bocor_ke_job_error(sesi, site_staging, monkeypatch):
+    def inti(sesi, job, site, staging):
+        raise KeyError("/var/lib/wpmgr/staging/rahasia")
+
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
+    _jalankan_lewat_worker(sesi, monkeypatch, JobType.staging_tarik, inti, StatusStaging.menyalin, "Tarik")
+    sesi.expire_all()
+    job = sesi.get(Job, job.id)
+    assert job.error == "Galat tak terduga; lihat log server"
+    assert "KeyError" not in job.error and "/var/lib" not in job.error
+    for baris in sesi.query(ActivityLog).all():
+        teks = f"{baris.pesan} {baris.detail}"
+        assert "KeyError" not in teks and "/var/lib" not in teks
+
+
+def _gagal_dengan_pesan(pesan):
+    def handler(sesi, job, klien):
+        raise SiteError(STAGING_GAGAL, pesan)
+
+    return handler
+
+
+def test_detail_aktivitas_dibersihkan(sesi, site, monkeypatch):
+    job = buat_job(sesi, site.id, JobType.staging_tarik)
+    umum.catat_aktivitas(sesi, site.id, job, "Tarik\x00 selesai", {"daftar": ["a\x00b", {"k\x00": "\ud800x"}]})
+    sesi.commit()
+    log = sesi.query(ActivityLog).one()
+    assert log.pesan == "Tarik selesai"
+    assert log.detail == {"daftar": ["ab", {"k": "?x"}]}
+
+    sesi.query(ActivityLog).delete()
+    sesi.commit()
+    monkeypatch.setitem(handlers.HANDLER, JobType.staging_tarik, _gagal_dengan_pesan("rusak\x00 dari connector"))
+    assert proses_satu(sesi, "w1", buat_klien_fn=lambda s: None, jenis="staging")
+    log = sesi.query(ActivityLog).one()
+    assert log.detail["pesan"] == "rusak dari connector"
+
+
+def _locked_at_lain(sesi, job_id):
+    """Baca locked_at lewat koneksi lain, supaya tidak membuka transaksi di sesi utama."""
+    with sesi.get_bind().connect() as c:
+        return c.execute(text("SELECT locked_at FROM jobs WHERE id = :i"), {"i": job_id}).scalar()
+
+
+def test_detak_latar_meng_commit_sesi_utama_saat_masuk(sesi, site):
+    """Transaksi utas utama yang memegang baris job tidak boleh menahan detak latar."""
+    buat_job(sesi, site.id, JobType.staging_tarik)
+    job = ambil_job(sesi, "w1", "staging")
+    sesi.execute(text("UPDATE jobs SET locked_at = now() - interval '20 minutes' WHERE id = :i"), {"i": job.id})
+    sesi.commit()
+    basi = datetime.now(timezone.utc) - timedelta(minutes=10)
+    job.payload = {"kemajuan": {"tahap": "db"}}
+    sesi.flush()  # baris job kini terkunci oleh transaksi utas utama
+    with umum.detak_latar(sesi, job, jeda=0.05):
+        assert _tunggu(lambda: _locked_at_lain(sesi, job.id) > basi, batas=2.0)
+
+
+@pytest.mark.parametrize("berjalan,diklaim,jenis,boleh", [
+    (JobType.scan_site, JobType.staging_uji_update, "staging", True),
+    (JobType.staging_uji_update, JobType.scan_site, "umum", True),
+    (JobType.scan_site, JobType.staging_kembalikan, "staging", False),
+    (JobType.staging_kembalikan, JobType.scan_site, "umum", False),
+    (JobType.update_package, JobType.staging_kembalikan, "staging", False),
+    (JobType.staging_dorong, JobType.update_package, "umum", False),
+])
+def test_matriks_klaim(sesi, site, berjalan, diklaim, jenis, boleh):
+    _berjalan(sesi, site, berjalan)
+    kandidat = buat_job(sesi, site.id, diklaim)
+    hasil = ambil_job(sesi, "w1", jenis)
+    assert (hasil is not None and hasil.id == kandidat.id) is boleh
+
+
+def test_klaim_bentrok_diperiksa_ulang_sesudah_snapshot_basi(sesi, site, monkeypatch):
+    """M1: klaim yang lolos NOT EXISTS berdasarkan snapshot basi dibatalkan oleh pemeriksaan ulang."""
+    from wpmgr.jobs import queue
+
+    _berjalan(sesi, site, JobType.staging_dorong)
+    scan = buat_job(sesi, site.id, JobType.scan_site)
+    # Tiru snapshot basi: pernyataan klaim tanpa penyaring NOT EXISTS.
+    teks = queue.SQL_AMBIL.text
+    basi = teks[:teks.index("AND NOT EXISTS")] + teks[teks.index("ORDER BY j.scheduled_for"):]
+    monkeypatch.setattr(queue, "SQL_AMBIL", text(basi).bindparams(queue.SQL_AMBIL._bindparams["jenis"]))
+    assert ambil_job(sesi, "w2", "umum") is None
+    sesi.expire_all()
+    scan = sesi.get(Job, scan.id)
+    assert scan.status == JobStatus.pending
+    assert scan.attempts == 0
+    assert scan.locked_by is None
+
+
+def test_klaim_diserialkan_per_site_lintas_sesi(engine, sesi, site):
+    """M1, dua sesi: B memeriksa ulang baru setelah klaim A di-commit, dan melihatnya."""
+    from sqlalchemy.orm import sessionmaker
+
+    from wpmgr.jobs import queue
+
+    dorong = buat_job(sesi, site.id, JobType.staging_dorong)
+    scan = buat_job(sesi, site.id, JobType.scan_site)
+    buat = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    a, b = buat(), buat()
+    hasil = {}
+    try:
+        # A: klaim dorong, lolos pemeriksaan, belum commit (lock site dipegang).
+        a.execute(text("UPDATE jobs SET status = 'running', locked_by = 'A' WHERE id = :i"), {"i": dorong.id})
+        assert queue._masih_eksklusif(a, dorong.id, site.id)
+
+        # B: klaim scan dengan snapshot yang belum melihat A, lalu memeriksa ulang.
+        def klaim_b():
+            b.execute(text("UPDATE jobs SET status = 'running', locked_by = 'B' WHERE id = :i"), {"i": scan.id})
+            hasil["b"] = queue._masih_eksklusif(b, scan.id, site.id)
+
+        utas = threading.Thread(target=klaim_b)
+        utas.start()
+        time.sleep(0.5)
+        assert utas.is_alive(), "B harus menunggu lock site yang dipegang A"
+        a.commit()
+        utas.join(5)
+        assert hasil["b"] is False
+    finally:
+        b.rollback()
+        a.rollback()
+        a.close()
+        b.close()

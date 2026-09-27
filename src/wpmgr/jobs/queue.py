@@ -1,3 +1,4 @@
+import logging
 import os
 import socket
 import uuid
@@ -10,17 +11,29 @@ from sqlalchemy.orm import Session
 from wpmgr.errors import BAD_RESPONSE, DAPAT_DIULANG, UNKNOWN
 from wpmgr.models import Job, JobStatus, JobType
 
+log = logging.getLogger("wpmgr.jobs.queue")
+
 # Percobaan pertama ditambah satu ulangan.
 BATAS_PERCOBAAN_BAD_RESPONSE = 2
 
 _STAGING = "('staging_tarik', 'staging_uji_update', 'staging_dorong', 'staging_kembalikan')"
 _STAGING_BACA = "('staging_tarik', 'staging_uji_update')"
+# Pasangan (j, j2) yang TIDAK boleh berjalan bersamaan di satu site.
+_BENTROK = (
+    f"NOT (j.tipe IN {_STAGING_BACA} AND j2.tipe NOT IN {_STAGING})"
+    f" AND NOT (j2.tipe IN {_STAGING_BACA} AND j.tipe NOT IN {_STAGING})"
+)
 
 # Satu job berjalan per site, dengan dua pengecualian (Koreksi #1): tarik
 # dan uji staging hanya membaca produksi, jadi tidak menahan dan tidak
 # ditahan job non-staging. Dorong/kembalikan menulis ke produksi dan tetap
 # eksklusif terhadap semuanya. `:jenis` memisahkan worker staging (job
 # berjam-jam) dari worker umum.
+#
+# NOT EXISTS di sini hanya penyaring cepat: di READ COMMITTED ia membaca
+# snapshot awal pernyataan, jadi job yang baru di-commit worker lain sesudah
+# snapshot itu tidak terlihat. Penjaga yang sebenarnya adalah
+# `_masih_eksklusif` sesudahnya.
 SQL_AMBIL = text(
     f"""
     UPDATE jobs
@@ -42,16 +55,33 @@ SQL_AMBIL = text(
                     SELECT 1 FROM jobs j2
                      WHERE j2.site_id = j.site_id
                        AND j2.status = 'running'
-                       AND NOT (j.tipe IN {_STAGING_BACA} AND j2.tipe NOT IN {_STAGING})
-                       AND NOT (j2.tipe IN {_STAGING_BACA} AND j.tipe NOT IN {_STAGING}))
+                       AND {_BENTROK})
             ORDER BY j.scheduled_for
               FOR UPDATE OF j, s SKIP LOCKED
             LIMIT 1)
-    RETURNING id
+    RETURNING id, site_id
     """
 # Nilai bawaan None: pemanggil lama (dan test antrean Lapis 1) yang hanya
 # mengirim :worker tetap mendapat perilaku "klaim apa saja".
 ).bindparams(bindparam("jenis", value=None, type_=String))
+
+# Klaim per site diserialkan dengan advisory lock transaksi (bentuk dua
+# int4, ruang kunci terpisah dari kunci cron bigint di wpmgr.kunci). Lock
+# dilepas saat commit, jadi pemegang berikutnya pasti melihat klaim yang
+# sudah di-commit ketika memeriksa ulang.
+SQL_KUNCI_SITE = text("SELECT pg_advisory_xact_lock(:ruang, hashtext(CAST(:site AS text)))")
+RUANG_KUNCI_KLAIM = 72_140_100
+SQL_BENTROK = text(
+    f"""
+    SELECT 1
+      FROM jobs j
+      JOIN jobs j2 ON j2.site_id = j.site_id AND j2.id <> j.id
+     WHERE j.id = :id
+       AND j2.status = 'running'
+       AND {_BENTROK}
+     LIMIT 1
+    """
+)
 
 
 def worker_id() -> str:
@@ -104,12 +134,34 @@ def antrekan_scan(sesi: Session, site_id: uuid.UUID) -> Job | None:
     return antrekan_jika_belum(sesi, site_id, JobType.scan_site)
 
 
+def _masih_eksklusif(sesi: Session, job_id: int, site_id) -> bool:
+    """Periksa ulang, di transaksi klaim, bahwa tidak ada job bentrok yang berjalan.
+
+    Celah yang ditutup: worker A meng-commit klaim dorong tepat sesudah
+    snapshot pernyataan klaim worker B diambil tetapi sebelum B mengunci
+    baris site. NOT EXISTS milik B tidak melihat klaim A, sehingga dorong
+    (menulis ke produksi) bisa berjalan bersama job lain. Dengan lock per
+    site, B baru memeriksa setelah A commit, dan pernyataan baru di READ
+    COMMITTED memakai snapshot baru yang melihat klaim A.
+    """
+    sesi.execute(SQL_KUNCI_SITE, {"ruang": RUANG_KUNCI_KLAIM, "site": str(site_id)})
+    return sesi.execute(SQL_BENTROK, {"id": job_id}).first() is None
+
+
 def ambil_job(sesi: Session, worker: str, jenis: str | None = None) -> Job | None:
     baris = sesi.execute(SQL_AMBIL, {"worker": worker, "jenis": jenis}).first()
-    sesi.commit()
     if baris is None:
+        sesi.commit()
         return None
-    return sesi.get(Job, baris[0], populate_existing=True)
+    job_id, site_id = baris
+    if not _masih_eksklusif(sesi, job_id, site_id):
+        # Klaim dibatalkan utuh (status, attempts); job tetap pending dan
+        # diambil lagi setelah job yang bentrok selesai.
+        sesi.rollback()
+        log.info("Klaim job %s dibatalkan: job lain di site yang sama baru saja berjalan", job_id)
+        return None
+    sesi.commit()
+    return sesi.get(Job, job_id, populate_existing=True)
 
 
 def jeda_menit(attempts: int) -> int:
