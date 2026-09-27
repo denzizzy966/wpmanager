@@ -310,6 +310,8 @@ def test_pangkas_melewati_site_dengan_job_staging(sesi, staging_aktif, monkeypat
         (akar / str(hidup.site_id) / "snapshot" / f"j{i}").mkdir(parents=True)
         sesi.add(StagingSnapshot(site_id=hidup.site_id, jenis="sebelum_dorong", status="tersedia", ukuran=1,
                                  path=f"{hidup.site_id}/snapshot/j{i}", dibuat_pada=SEKARANG - timedelta(days=2 - i)))
+    (akar / str(hidup.site_id) / "snapshot" / "j77").mkdir()
+    os.utime(akar / str(hidup.site_id) / "snapshot" / "j77", (tua, tua))
     sesi.commit()
     buat_job(sesi, hidup.site_id, JobType.staging_dorong)
     # Kembalikan berjalan tanpa baris Staging (staging sudah dihapus).
@@ -328,7 +330,7 @@ def test_pangkas_melewati_site_dengan_job_staging(sesi, staging_aktif, monkeypat
     hasil = cron.pangkas_staging(sesi, PembantuPalsu(akar), SEKARANG)
 
     assert hasil == {"snapshot": 0, "direktori": 0, "sementara": 0, "router": 0}
-    for nama in ("tarik", "dorong", "snapshot/j0", "snapshot/j1"):
+    for nama in ("tarik", "dorong", "snapshot/j0", "snapshot/j1", "snapshot/j77"):
         assert (akar / str(hidup.site_id) / nama).is_dir(), nama
     assert (akar / str(s.id) / "dorong").is_dir()
     assert sesi.query(StagingSnapshot).filter(StagingSnapshot.status == "tersedia").count() == 3
@@ -369,6 +371,218 @@ def test_pangkas_mempertahankan_snapshot_dorongan_lama_belum_bersih(sesi, stagin
     assert (akar / str(hidup.site_id) / "snapshot" / "j0").is_dir()
     assert not (akar / str(hidup.site_id) / "snapshot" / "j1").exists()
     assert sesi.get(Job, lama.id).status == JobStatus.failed
+
+
+# ---- snapshot yatim, nisan, kunci baris (fix round 1) -----------------------------
+
+
+def _dir_tua(p):
+    p.mkdir(parents=True)
+    tua = (SEKARANG - timedelta(days=2)).timestamp()
+    os.utime(p, (tua, tua))
+    return p
+
+
+def test_pangkas_snapshot_yatim(sesi, staging_aktif):
+    """`snapshot/j<id>` tanpa baris sah, bukan kandidat rekonsiliasi, dan > 24 jam dihapus."""
+    akar = staging_aktif
+    hidup = _staging(sesi, "hidup")
+    snap = akar / str(hidup.site_id) / "snapshot"
+    kandidat = buat_job(sesi, hidup.site_id, JobType.staging_dorong,
+                        payload={"kemajuan": {"unggah_mulai": True, "dorong_id": "a" * 32}})
+    kandidat.status = JobStatus.failed
+    sesi.commit()
+    # Nama direktori lain tidak boleh kebetulan sama dengan id job kandidat.
+    dasar = kandidat.id + 1000
+    yatim = _dir_tua(snap / f"j{dasar}")
+    (yatim / "meta.json").write_bytes(b"{}")
+    tua = (SEKARANG - timedelta(days=2)).timestamp()
+    os.utime(yatim, (tua, tua))
+    dipangkas = _dir_tua(snap / f"j{dasar + 1}")
+    sah = _dir_tua(snap / f"j{dasar + 2}")
+    ditahan = _dir_tua(snap / f"j{kandidat.id}")
+    muda = snap / f"j{dasar + 3}"
+    muda.mkdir()
+    lain = _dir_tua(snap / "bukan-j")
+    for nama, status in ((f"j{dasar + 1}", "dipangkas"), (f"j{dasar + 2}", "tersedia")):
+        sesi.add(StagingSnapshot(site_id=hidup.site_id, jenis="sebelum_dorong", status=status, ukuran=1,
+                                 path=f"{hidup.site_id}/snapshot/{nama}"))
+    # Site tanpa staging dengan snapshot sah: yatimnya juga dihapus, yang sah bertahan.
+    s = Site(id=uuid.uuid4(), nama="ts", url="https://ts.test", status=SiteStatus.active, secret_terenkripsi=b"x")
+    sesi.add(s)
+    sesi.flush()
+    sah2 = _dir_tua(akar / str(s.id) / "snapshot" / "j1")
+    yatim2 = _dir_tua(akar / str(s.id) / "snapshot" / "j2")
+    sesi.add(StagingSnapshot(site_id=s.id, jenis="sebelum_dorong", status="dipakai", ukuran=1,
+                             path=f"{s.id}/snapshot/j1"))
+    sesi.commit()
+
+    hasil = cron.pangkas_staging(sesi, PembantuPalsu(akar), SEKARANG)
+
+    assert hasil == {"snapshot": 3, "direktori": 0, "sementara": 0, "router": 0}
+    assert not yatim.exists() and not dipangkas.exists() and not yatim2.exists()
+    for tetap in (sah, ditahan, muda, lain, sah2):
+        assert tetap.is_dir(), tetap.name
+    assert not [n for n in os.listdir(akar) if n.startswith(".hapus-")]
+
+
+def test_pangkas_snapshot_yatim_symlink_tidak_diikuti(sesi, staging_aktif, luar):
+    akar = staging_aktif
+    hidup = _staging(sesi, "hidup")
+    snap = akar / str(hidup.site_id) / "snapshot"
+    snap.mkdir(parents=True)
+    tua = (SEKARANG - timedelta(days=2)).timestamp()
+    os.utime(luar, (tua, tua))
+    os.symlink(luar, snap / "j5", target_is_directory=True)
+
+    hasil = cron.pangkas_staging(sesi, PembantuPalsu(akar), SEKARANG)
+
+    assert hasil["snapshot"] == 0
+    assert _utuh(luar)
+    assert os.path.islink(snap / "j5")
+
+
+def test_pangkas_nisan_sisa_putaran_mati_dihapus(sesi, staging_aktif, luar):
+    akar = staging_aktif
+    nisan = akar / f".hapus-{uuid.uuid4()}-{'0' * 12}"
+    (nisan / "files").mkdir(parents=True)
+    os.symlink(luar, nisan / "files" / "tautan", target_is_directory=True)
+    nisan_tautan = akar / f".hapus-{uuid.uuid4()}-{'1' * 12}"
+    os.symlink(luar, nisan_tautan, target_is_directory=True)
+    bukan = akar / ".hapus-lain"
+    bukan.mkdir()
+
+    cron.pangkas_staging(sesi, PembantuPalsu(akar), SEKARANG)
+
+    assert not nisan.exists() and not os.path.lexists(nisan_tautan)
+    assert bukan.is_dir()
+    assert _utuh(luar)
+
+
+def test_pangkas_menunggu_kunci_baris_site(sesi, engine, staging_aktif):
+    """Route antre job staging mengunci baris sites yang sama: pemangkasan menunggu, lalu memeriksa ulang."""
+    import threading
+
+    from sqlalchemy import text
+
+    akar = staging_aktif
+    s = Site(id=uuid.uuid4(), nama="ts", url="https://ts.test", status=SiteStatus.active, secret_terenkripsi=b"x")
+    sesi.add(s)
+    sesi.commit()
+    (akar / str(s.id) / "files").mkdir(parents=True)
+    lain = sessionmaker(bind=engine, future=True)()
+    lain.execute(text("SELECT id FROM sites WHERE id = :id FOR UPDATE"), {"id": s.id})
+    sesi_cron = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
+    hasil = {}
+    t = threading.Thread(target=lambda: hasil.update(cron.pangkas_staging(sesi_cron, PembantuPalsu(akar), SEKARANG)))
+    t.start()
+    try:
+        t.join(1.0)
+        menunggu = t.is_alive()
+        # Pemegang kunci mengantrekan job staging sebelum melepas kunci.
+        buat_job(lain, s.id, JobType.staging_kembalikan)
+    finally:
+        lain.rollback()
+        lain.close()
+        t.join(10)
+        sesi_cron.close()
+    assert menunggu, "pemangkasan tidak menunggu kunci baris sites"
+    assert not t.is_alive()
+    assert hasil["direktori"] == 0
+    assert (akar / str(s.id) / "files").is_dir()
+
+
+def test_pangkas_router_galat_hapus_tidak_menghentikan_putaran(sesi, staging_aktif, monkeypatch):
+    from pathlib import Path
+
+    akar = staging_aktif
+    (akar / "router").mkdir(parents=True)
+    for nama in ("a.rahasia", "b.rahasia"):
+        (akar / "router" / nama).write_bytes(b"e" * 64)
+    asli = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self.name == "a.rahasia":
+            raise PermissionError(13, "ditolak")
+        asli(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    pb = PembantuPalsu(akar)
+
+    hasil = cron.pangkas_staging(sesi, pb, SEKARANG)
+
+    assert hasil["router"] == 1
+    assert (akar / "router" / "a.rahasia").exists() and not (akar / "router" / "b.rahasia").exists()
+    assert ("router_muat",) in pb.panggilan
+
+
+def test_pangkas_akar_symlink_diperingatkan_dan_dilewati(sesi, staging_aktif, luar, monkeypatch, caplog):
+    from wpmgr.config import get_settings
+
+    nyata = luar / "stg"
+    yatim = nyata / str(uuid.uuid4())
+    (yatim / "files").mkdir(parents=True)
+    tautan = staging_aktif.parent / "stg-tautan"
+    os.symlink(nyata, tautan, target_is_directory=True)
+    monkeypatch.setenv("WPMGR_STAGING_DIR", str(tautan))
+    get_settings.cache_clear()
+
+    with caplog.at_level("WARNING", logger="wpmgr.staging.cron"):
+        hasil = cron.pangkas_staging(sesi, PembantuPalsu(tautan), SEKARANG)
+
+    assert hasil == {"snapshot": 0, "direktori": 0, "sementara": 0, "router": 0}
+    assert yatim.is_dir()
+    assert any("symlink" in r.getMessage() for r in caplog.records)
+
+
+def test_jeda_otomatis_memeriksa_ulang_status_di_bawah_kunci(sesi, engine, staging_aktif):
+    """Status yang berubah sesudah daftar diambil (mis. tarik dimulai) dibaca ulang dengan FOR UPDATE."""
+    lama = SEKARANG - timedelta(days=9)
+    a = _staging(sesi, "a", aktif=True, status=StatusStaging.siap, ditarik_pada=lama)
+    b = _staging(sesi, "b", aktif=True, status=StatusStaging.siap, ditarik_pada=lama)
+    pb = PembantuPalsu(staging_aktif)
+    asli = pb.jeda
+
+    def jeda(nama):
+        asli(nama)
+        if nama == "a":
+            with sessionmaker(bind=engine, future=True)() as lain:
+                lain.get(Staging, b.id).status = StatusStaging.menyalin
+                lain.commit()
+
+    pb.jeda = jeda
+    assert cron.jeda_otomatis(sesi, pb, SEKARANG) == 1
+    assert ("jeda", "b") not in pb.panggilan
+    sesi.refresh(a)
+    sesi.refresh(b)
+    assert (a.aktif, a.status) == (False, StatusStaging.dijeda)
+    assert (b.aktif, b.status) == (True, StatusStaging.menyalin)
+
+
+def test_jeda_otomatis_menunggu_kunci_baris_staging(sesi, engine, staging_aktif):
+    import threading
+
+    from sqlalchemy import text
+
+    st = _staging(sesi, "a", aktif=True, status=StatusStaging.siap, ditarik_pada=SEKARANG - timedelta(days=9))
+    lain = sessionmaker(bind=engine, future=True)()
+    lain.execute(text("SELECT id FROM staging WHERE id = :id FOR UPDATE"), {"id": st.id})
+    sesi_cron = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
+    pb = PembantuPalsu(staging_aktif)
+    hasil = []
+    t = threading.Thread(target=lambda: hasil.append(cron.jeda_otomatis(sesi_cron, pb, SEKARANG)))
+    t.start()
+    try:
+        t.join(1.0)
+        menunggu = t.is_alive()
+        buat_job(lain, st.site_id, JobType.staging_tarik)
+    finally:
+        lain.rollback()
+        lain.close()
+        t.join(10)
+        sesi_cron.close()
+    assert menunggu, "jeda otomatis tidak menunggu kunci baris staging"
+    assert hasil == [0] and "jeda" not in pb.nama_panggilan()
 
 
 # ---- CLI ----------------------------------------------------------------------

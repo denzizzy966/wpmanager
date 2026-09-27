@@ -817,7 +817,8 @@ def selesaikan_dorongan_lama(sesi, job, site, klien) -> None:
                              {"job_lama": j.id, "hasil": hasil})
         _tandai_bersih(sesi, j)
         if hasil == "dipulihkan":
-            # Sesudah commit: direktori yatim bila mati di sini dibersihkan prune-staging.
+            # Sesudah commit: bila mati di sini, direktori snapshot tanpa baris ini
+            # dibersihkan prune-staging setelah berumur 24 jam (cron._nisan_snapshot_yatim).
             hapus_dir_staging(f"{site.id}/snapshot/j{j.id}")
 
 
@@ -870,6 +871,11 @@ def pangkas_snapshot(sesi, site_id, n: int) -> int:
     ).all()
     dipangkas = 0
     for s in daftar[n:]:
+        # Snapshot kandidat rekonsiliasi dipertahankan walau melebihi `n`.
+        # Kandidat yang tidak pernah bisa dituntaskan (connector terus menolak
+        # tanpa kode yang menahan dorongan baru, atau kemajuan tanpa dorong_id
+        # sah) tertahan permanen: disk lebih murah daripada membuang satu-
+        # satunya titik kembali untuk dorongan yang keadaannya belum pasti.
         if s.job_id is not None and s.job_id in ditahan:
             continue
         hapus_dir_staging(s.path)

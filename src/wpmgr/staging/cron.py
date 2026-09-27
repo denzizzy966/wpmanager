@@ -8,10 +8,22 @@ Karena itu setiap penghapusan lewat `dorong.hapus_dir_staging` dan helper
 `aman`: path disusun dari nama direktori berbentuk UUID, diperiksa dengan
 `jalur_di_dalam`, target teratas harus direktori sungguhan (lstat), dan
 rmtree tidak pernah mengikuti symlink.
+
+Kunci baris (dipakai juga oleh route antre job staging):
+- jeda otomatis memegang `SELECT ... FOR UPDATE` atas baris `staging` itu
+  sejak pemeriksaan job sampai `jeda` selesai dan di-commit;
+- pemangkasan memegang `SELECT ... FOR UPDATE` atas baris `sites` (id =
+  nama direktori UUID) selama memeriksa ulang "tanpa Staging / tanpa job
+  staging aktif" dan memindahkan yang akan dihapus ke nisan `.hapus-*` di
+  akar yang sama (rename atomik). Penghapusan nisan yang lama berjalan
+  sesudah commit, di luar kunci; nisan sisa mati mendadak dihapus putaran
+  berikutnya.
 """
 
 import logging
 import os
+import re
+import secrets
 import stat
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -24,6 +36,7 @@ from wpmgr.models import (
     JOB_STAGING,
     Job,
     JobStatus,
+    Site,
     Staging,
     StagingSnapshot,
     StatusStaging,
@@ -42,6 +55,7 @@ from wpmgr.staging.dorong import (
     STATUS_SNAPSHOT_SAH,
     hapus_dir_staging,
     pangkas_snapshot,
+    syarat_dorongan_lama_belum_bersih,
 )
 from wpmgr.staging.pembantu import GalatPembantu
 
@@ -49,6 +63,10 @@ log = logging.getLogger("wpmgr.staging.cron")
 UMUR_SEMENTARA = timedelta(hours=24)
 PESAN_SERTIFIKAT_GAGAL = "Sertifikat staging belum dapat diperpanjang; lihat log server."
 AKHIRAN_ROUTER = ("rahasia", "htpasswd")
+# Direktori snapshot ditulis dorong sebagai `snapshot/j<job_id>` (Koreksi #24).
+POLA_SNAPSHOT = re.compile(r"j[0-9]{1,19}")
+# Nisan: bukan UUID, jadi tidak pernah tertukar dengan direktori site.
+POLA_NISAN = re.compile(r"\.hapus-[0-9a-f-]{36}-[0-9a-f]{12}")
 
 
 def _ada_job_staging(sesi, site_id) -> bool:
@@ -91,7 +109,10 @@ def jeda_otomatis(sesi, pb, sekarang: datetime) -> int:
     ids = sesi.scalars(select(Staging.id).where(Staging.aktif.is_(True), Staging.status == StatusStaging.siap)
                        .order_by(Staging.nama)).all()
     for sid in ids:
-        st = sesi.get(Staging, sid, populate_existing=True)
+        # Baris staging dikunci sejak pemeriksaan sampai jeda di-commit: job
+        # staging baru (yang mengunci baris yang sama saat diantrekan) tidak
+        # bisa menyelinap di antara pemeriksaan dan `pb.jeda`.
+        st = sesi.get(Staging, sid, populate_existing=True, with_for_update=True)
         if st is None or not st.aktif or st.status != StatusStaging.siap:
             sesi.commit()
             continue
@@ -105,23 +126,15 @@ def jeda_otomatis(sesi, pb, sekarang: datetime) -> int:
         if (terakhir is not None and terakhir >= batas) or _ada_job_staging(sesi, st.site_id):
             sesi.commit()
             continue
-        nama, site_id = st.nama, st.site_id
-        sesi.commit()
         try:
-            pb.jeda(nama)
+            pb.jeda(st.nama)
         except (GalatPembantu, ValueError) as exc:
-            log.warning("Staging %s tidak dapat dijeda otomatis: %s", nama, getattr(exc, "pesan", "nama tidak sah"))
-            continue
-        st = sesi.get(Staging, sid, populate_existing=True, with_for_update=True)
-        if st is None:
+            log.warning("Staging %s tidak dapat dijeda otomatis: %s", st.nama, getattr(exc, "pesan", "nama tidak sah"))
             sesi.commit()
             continue
-        # Container sudah berhenti: `aktif` mengikuti kenyataan. Status hanya
-        # siap -> dijeda; bila job staging sempat dimulai, statusnya milik job itu.
         st.aktif = False
-        if st.status == StatusStaging.siap:
-            st.status = StatusStaging.dijeda
-        umum.catat_aktivitas(sesi, site_id, None, f"Staging dijeda otomatis setelah {hari} hari tanpa akses")
+        st.status = StatusStaging.dijeda
+        umum.catat_aktivitas(sesi, st.site_id, None, f"Staging dijeda otomatis setelah {hari} hari tanpa akses")
         sesi.commit()
         n += 1
     return n
@@ -186,9 +199,18 @@ def _tua(path: Path, sekarang: datetime) -> bool:
     return datetime.fromtimestamp(mtime, tz=timezone.utc) < sekarang - UMUR_SEMENTARA
 
 
+def _kunci_site(sesi, site_id) -> None:
+    """`SELECT id FROM sites WHERE id = :site_id FOR UPDATE` sampai commit berikutnya.
+
+    Route antre job staging mengunci baris yang sama, jadi pemeriksaan ulang
+    "tanpa Staging / tanpa job aktif" di bawah ini tetap benar sampai
+    pemindahan ke nisan di-commit. Site yang barisnya sudah hilang tidak
+    bisa mendapat job atau staging baru (foreign key).
+    """
+    sesi.execute(select(Site.id).where(Site.id == site_id).with_for_update())
+
+
 def _ada_staging(sesi, site_id) -> bool:
-    # Dibaca ulang tepat sebelum menghapus: staging yang baru dibuat sesudah
-    # putaran dimulai tidak boleh dianggap yatim.
     return sesi.scalar(select(Staging.id).where(Staging.site_id == site_id)) is not None
 
 
@@ -197,35 +219,124 @@ def _ada_snapshot(sesi, site_id) -> bool:
         StagingSnapshot.site_id == site_id, StagingSnapshot.status.in_(STATUS_SNAPSHOT_SAH)).limit(1)) is not None
 
 
-def _kosongkan_kecuali_snapshot(akar: Path, nama: str) -> bool:
-    """Hapus isi `<nama>/` selain `snapshot/`; True bila ada yang dihapus.
+def _ke_nisan(akar: Path, relatif: str, site_id) -> str | None:
+    """Pindahkan `akar/relatif` (tanpa mengikuti symlink) ke nisan di akar; nama nisan atau None."""
+    nisan = f".hapus-{site_id}-{secrets.token_hex(6)}"
+    try:
+        os.rename(akar / relatif, akar / nisan)
+    except OSError as exc:
+        log.warning("Sisa staging %s tidak dapat dipindahkan untuk dihapus: %s", relatif, type(exc).__name__)
+        return None
+    return nisan
+
+
+def _hapus_nisan(akar: Path, nisan: str) -> None:
+    try:
+        st = os.lstat(akar / nisan)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning("Nisan staging %s tidak terbaca: %s", nisan, type(exc).__name__)
+        return
+    try:
+        if adalah_tautan(st):
+            # Tautannya saja yang dihapus; targetnya tidak pernah disentuh.
+            hapus_tautan(akar, nisan)
+        elif stat.S_ISDIR(st.st_mode):
+            hapus_dir_staging(nisan)
+        else:
+            hapus_berkas(akar, nisan)
+    except (OSError, PathTidakAman) as exc:
+        log.warning("Nisan staging %s tidak dapat dihapus: %s", nisan, type(exc).__name__)
+
+
+def _nisan_selain_snapshot(akar: Path, nama: str, site_id) -> list[str]:
+    """Isi `<nama>/` selain `snapshot/` dipindah ke nisan.
 
     Kembalikan (staging_kembalikan) tetap berjalan tanpa baris Staging, jadi
     snapshot yang masih sah harus bertahan.
     """
-    dihapus = False
     try:
         anak = sorted(os.listdir(akar / nama))
     except OSError:
-        return False
+        return []
+    nisan = []
     for a in anak:
-        if a == "snapshot":
+        if a != "snapshot":
+            n = _ke_nisan(akar, f"{nama}/{a}", site_id)
+            if n is not None:
+                nisan.append(n)
+    return nisan
+
+
+def _nisan_snapshot_yatim(sesi, akar: Path, nama: str, site_id, sekarang: datetime) -> list[str]:
+    """`snapshot/j<id>` tanpa baris sah, bukan milik kandidat rekonsiliasi, dan lebih tua dari 24 jam.
+
+    Mis. sisa `selesaikan_dorongan_lama` yang mati sesudah commit, atau baris
+    `dipangkas` yang direktorinya gagal dihapus. Umur 24 jam menjaga snapshot
+    yang direktorinya sudah ditulis tetapi barisnya belum di-commit.
+    """
+    snap = f"{nama}/snapshot"
+    try:
+        jalur_di_dalam(akar, snap)
+    except PathTidakAman:
+        return []
+    if not _dir_nyata(akar / snap):
+        return []
+    sah = set(sesi.scalars(select(StagingSnapshot.path).where(
+        StagingSnapshot.site_id == site_id, StagingSnapshot.status.in_(STATUS_SNAPSHOT_SAH))).all())
+    ditahan = set(sesi.scalars(select(Job.id).where(*syarat_dorongan_lama_belum_bersih(site_id))).all())
+    try:
+        anak = sorted(os.listdir(akar / snap))
+    except OSError:
+        return []
+    nisan = []
+    for a in anak:
+        rel = f"{snap}/{a}"
+        if not POLA_SNAPSHOT.fullmatch(a) or rel in sah or int(a[1:]) in ditahan:
             continue
-        rel = f"{nama}/{a}"
-        try:
-            st = os.lstat(akar / rel)
-            if adalah_tautan(st):
-                # Tautannya saja yang dihapus; targetnya tidak pernah disentuh.
-                hapus_tautan(akar, rel)
-            elif stat.S_ISDIR(st.st_mode):
-                hapus_dir_staging(rel)
-            else:
-                hapus_berkas(akar, rel)
-        except (OSError, PathTidakAman) as exc:
-            log.warning("Sisa staging %s tidak dapat dihapus: %s", rel, type(exc).__name__)
+        if not _dir_nyata(akar / rel) or not _tua(akar / rel, sekarang):
             continue
-        dihapus = True
-    return dihapus
+        n = _ke_nisan(akar, rel, site_id)
+        if n is not None:
+            nisan.append(n)
+    return nisan
+
+
+def _pangkas_satu_site(sesi, akar: Path, nama: str, sekarang: datetime, hasil: dict) -> list[str]:
+    """Pemeriksaan dan pemindahan ke nisan untuk satu `<uuid>/`, di bawah kunci baris site."""
+    site_id = uuid.UUID(nama)
+    _kunci_site(sesi, site_id)
+    # Job staging (termasuk kembalikan tanpa baris Staging) masih memakai
+    # tarik/, dorong/, dan snapshot-nya.
+    if _ada_job_staging(sesi, site_id):
+        return []
+    if not _ada_staging(sesi, site_id):
+        if not _ada_snapshot(sesi, site_id):
+            n = _ke_nisan(akar, nama, site_id)
+            if n is None:
+                return []
+            hasil["direktori"] += 1
+            return [n]
+        nisan = _nisan_selain_snapshot(akar, nama, site_id)
+        if nisan:
+            hasil["direktori"] += 1
+    else:
+        nisan = []
+        for sub in ("tarik", "dorong"):
+            rel = f"{nama}/{sub}"
+            try:
+                sementara = jalur_di_dalam(akar, rel)
+            except PathTidakAman:
+                continue
+            if _dir_nyata(sementara) and _tua(sementara, sekarang):
+                n = _ke_nisan(akar, rel, site_id)
+                if n is not None:
+                    nisan.append(n)
+                    hasil["sementara"] += 1
+    yatim = _nisan_snapshot_yatim(sesi, akar, nama, site_id, sekarang)
+    hasil["snapshot"] += len(yatim)
+    return nisan + yatim
 
 
 def _pangkas_direktori(sesi, akar: Path, sekarang: datetime, hasil: dict) -> None:
@@ -234,31 +345,19 @@ def _pangkas_direktori(sesi, akar: Path, sekarang: datetime, hasil: dict) -> Non
     except OSError:
         return
     for nama in daftar:
+        if POLA_NISAN.fullmatch(nama):
+            # Sisa putaran yang mati sesudah commit pemindahan.
+            _hapus_nisan(akar, nama)
+    for nama in daftar:
         # Hanya nama UUID kanonis: `router/` dan apa pun yang lain tidak pernah disentuh.
         if not _uuid(nama) or not _dir_nyata(akar / nama):
             continue
-        site_id = uuid.UUID(nama)
-        # Job staging (termasuk kembalikan tanpa baris Staging) masih memakai
-        # tarik/, dorong/, dan snapshot-nya.
-        if _ada_job_staging(sesi, site_id):
-            continue
-        if not _ada_staging(sesi, site_id):
-            if _ada_snapshot(sesi, site_id):
-                if _kosongkan_kecuali_snapshot(akar, nama):
-                    hasil["direktori"] += 1
-            else:
-                hapus_dir_staging(nama)
-                hasil["direktori"] += 1
-            continue
-        for sub in ("tarik", "dorong"):
-            rel = f"{nama}/{sub}"
-            try:
-                sementara = jalur_di_dalam(akar, rel)
-            except PathTidakAman:
-                continue
-            if _dir_nyata(sementara) and _tua(sementara, sekarang):
-                hapus_dir_staging(rel)
-                hasil["sementara"] += 1
+        try:
+            nisan = _pangkas_satu_site(sesi, akar, nama, sekarang, hasil)
+        finally:
+            sesi.commit()
+        for n in nisan:
+            _hapus_nisan(akar, n)
 
 
 def _pangkas_router(sesi, pb, akar: Path, hasil: dict) -> None:
@@ -278,11 +377,12 @@ def _pangkas_router(sesi, pb, akar: Path, hasil: dict) -> None:
         f = router / berkas
         try:
             st = os.lstat(f)
-        except OSError:
+            if adalah_tautan(st) or not stat.S_ISREG(st.st_mode):
+                continue
+            f.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Berkas router %s tidak dapat dihapus: %s", berkas, type(exc).__name__)
             continue
-        if adalah_tautan(st) or not stat.S_ISREG(st.st_mode):
-            continue
-        f.unlink(missing_ok=True)
         hasil["router"] += 1
     if hasil["router"]:
         try:
@@ -299,12 +399,14 @@ def pangkas_staging(sesi, pb, sekarang: datetime) -> dict:
     site_snapshot = set(sesi.scalars(select(StagingSnapshot.site_id).where(
         StagingSnapshot.status.in_(STATUS_SNAPSHOT_SAH))).all())
     for site_id in sorted(site_snapshot, key=str):
-        if _ada_job_staging(sesi, site_id):
-            continue
-        hasil["snapshot"] += pangkas_snapshot(sesi, site_id, s.staging_snapshot)
+        _kunci_site(sesi, site_id)
+        if not _ada_job_staging(sesi, site_id):
+            hasil["snapshot"] += pangkas_snapshot(sesi, site_id, s.staging_snapshot)
         sesi.commit()
 
     if _dir_nyata(akar):
         _pangkas_direktori(sesi, akar, sekarang, hasil)
         _pangkas_router(sesi, pb, akar, hasil)
+    elif os.path.islink(akar) or (os.path.lexists(akar) and adalah_tautan(os.lstat(akar))):
+        log.warning("WPMGR_STAGING_DIR berupa symlink atau junction; pemangkasan direktori dan router dilewati")
     return hasil

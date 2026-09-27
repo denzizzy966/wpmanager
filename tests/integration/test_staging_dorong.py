@@ -296,6 +296,37 @@ def test_snapshot_dipangkas_ke_n(sesi, site_staging, staging_aktif, prod, pb, mo
     assert (staging_aktif / snap[2].path).exists()
 
 
+def test_snapshot_kandidat_rekonsiliasi_tidak_dipangkas_di_cek(sesi, site_staging, staging_aktif, prod, pb,
+                                                               monkeypatch):
+    """Dorongan lama yang belum terbukti bersih menahan snapshotnya walau melebihi WPMGR_STAGING_SNAPSHOT."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from wpmgr.config import get_settings
+
+    monkeypatch.setenv("WPMGR_STAGING_SNAPSHOT", "1")
+    get_settings.cache_clear()
+    _tarik(sesi, site_staging, prod)
+    files = _files(staging_aktif, site_staging)
+    (files / "wp-content/themes/t/style.css").write_bytes(b"body{z-index:0}")
+    _dorong(sesi, site_staging, prod, "hanya_kode")
+    lama = sesi.query(Job).filter(Job.tipe == JobType.staging_dorong).one()
+    # Pembersihan area dorong job lama tidak pernah terbukti di connector.
+    lama.payload = {**lama.payload, "kemajuan": {**lama.payload["kemajuan"], "produksi_bersih": False}}
+    flag_modified(lama, "payload")
+    sesi.commit()
+    # Rekonsiliasi di awal dorongan baru ditolak tanpa kode yang menahan dorongan: job lama tetap kandidat.
+    prod.kejadian["bersihkan"] = [_galat(400, "wpmgr_staging_permintaan", "Permintaan tidak sah.")]
+    (files / "wp-content/themes/t/style.css").write_bytes(b"body{z-index:1}")
+
+    _dorong(sesi, site_staging, prod, "hanya_kode")
+
+    assert _kemajuan(sesi, lama).get("produksi_bersih") is not True
+    snap = sesi.query(StagingSnapshot).order_by(StagingSnapshot.id).all()
+    assert snap[0].job_id == lama.id
+    assert [s.status for s in snap] == ["tersedia", "tersedia"]
+    assert all((staging_aktif / s.path).is_dir() for s in snap)
+
+
 def test_unggah_dilanjutkan_setelah_putus(sesi, site_staging, staging_aktif, prod, pb):
     _siap(sesi, site_staging, staging_aktif, prod)
     prod.jadwal_gagal["/staging/unggah"] = {2, 3, 4}
