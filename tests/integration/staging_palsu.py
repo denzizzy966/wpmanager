@@ -32,8 +32,27 @@ def _json(kode: int, data) -> httpx.Response:
     return httpx.Response(kode, json=data)
 
 
-def _galat(kode: int, kode_wp: str, pesan: str) -> httpx.Response:
-    return _json(kode, {"code": kode_wp, "message": pesan, "data": {"status": kode}})
+def _galat(kode: int, kode_wp: str, pesan: str, **data) -> httpx.Response:
+    return _json(kode, {"code": kode_wp, "message": pesan, "data": {"status": kode, **data}})
+
+
+# Kosakata status dorong WPMGR_Staging_Dorong (Task 7-8), disalin apa adanya.
+STATUS_BOLEH_BERSIHKAN = {"baru", "mengunggah", "menyiapkan", "siap", "mengimpor", "terimpor",
+                          "selesai", "gagal", "direbut", "dipulihkan"}
+STATUS_PRA_TUKAR = {"baru", "mengunggah", "menyiapkan", "siap", "mengimpor", "terimpor"}
+STATUS_MENYENTUH_PRODUKSI = {"menukar", "ditukar", "memulihkan"}
+STATUS_LANGKAH_SELESAI = {
+    "siapkan": {"siap", "mengimpor", "terimpor", "menukar", "ditukar", "selesai"},
+    "impor": {"terimpor", "menukar", "ditukar", "selesai"},
+    "tukar": {"ditukar", "selesai"},
+    "selesai": {"selesai"},
+    "pulihkan": {"dipulihkan"},
+}
+
+
+def respons_putus(r: httpx.Request):
+    """Koneksi putus sesudah permintaan terkirim: dashboard mendapat UNKNOWN."""
+    raise httpx.ReadError("koneksi putus", request=r)
 
 
 def _biner(isi: bytes) -> httpx.Response:
@@ -80,16 +99,36 @@ class ProduksiPalsu:
         self.sebelum: dict = {}
         self.ekstra_manifest: list = []
         self.jumlah_dilewati = 0
+        # Langkah yang gagal di connector. "tukar": gagal_tukar() connector
+        # (pemulihan otomatis di request yang sama, lalu 500
+        # wpmgr_staging_tukar dengan data.pemulihan); langkah lain: galat
+        # khas langkah itu.
         self.gagal_langkah: str | None = None
+        # Pemulihan otomatis di gagal_tukar() tidak tuntas: status tetap
+        # "memulihkan" dan dashboard harus melanjutkan dengan langkah pulihkan.
+        self.pulih_otomatis_macet = False
+        # Kejadian sekali pakai per langkah terapkan ("siapkan", "tukar", ...)
+        # atau per route ("unggah", "bersihkan"), diambil berurutan:
+        #   "putus"        langkah dijalankan, lalu respons hilang (ReadError);
+        #   "putus_awal"   koneksi putus sebelum apa pun dijalankan;
+        #   "gagal_putus"  tukar gagal di connector (seperti gagal_langkah),
+        #                  lalu respons hilang;
+        #   "lagi"         langkah maju tetapi belum selesai (selesai:false);
+        #   httpx.Response dikembalikan apa adanya tanpa menjalankan langkah.
+        self.kejadian: dict[str, list] = {}
+        self.impor_ditahan = False
         self.halaman_utama = 200
         self.hitung: dict[str, int] = {}
         self.diminta: list[tuple[str, object]] = []
+        # Potongan dorongan TERAKHIR yang mulai diunggah (nomor -> paket).
         self.unggahan: dict[int, bytes] = {}
         self.langkah: list[str] = []
+        # (dorong_id, langkah) setiap panggilan terapkan.
+        self.langkah_id: list[tuple[str, str]] = []
         self.sql_diterapkan = b""
-        self._rencana: dict | None = None
-        self._isi_baru: dict[str, bytes] = {}
-        self._sql = b""
+        # Keadaan per dorongan (keadaan.php connector) dan kunci dorong site.
+        self.dorongan: dict[str, dict] = {}
+        self.kunci: str | None = None
         self._ekstra_terkirim = False
 
     def klien(self, site) -> SiteClient:
@@ -211,46 +250,184 @@ class ProduksiPalsu:
             hasil["tanda_air"] = {**self.tanda_air, "diambil": 1790000000}
         return _json(200, hasil)
 
+    # ---- sisi dorong (WPMGR_Staging_Dorong, Task 7-8) ------------------------
+
+    def _kejadian(self, kunci: str):
+        antre = self.kejadian.get(kunci)
+        return antre.pop(0) if antre else None
+
+    def _jalankan(self, r, kejadian, fungsi) -> httpx.Response:
+        """Jalankan `fungsi` sesuai kejadian yang dijadwalkan untuk permintaan ini."""
+        if isinstance(kejadian, httpx.Response):
+            return kejadian
+        if kejadian == "putus_awal":
+            respons_putus(r)
+        hasil = fungsi()
+        if kejadian == "putus":
+            respons_putus(r)
+        return hasil
+
     def _unggah(self, r, badan):
         meta, _ = paket.urai(r.content)
-        self.unggahan[meta["nomor"]] = r.content
-        return _json(200, {"ok": True, "nomor": meta["nomor"], "sha256": hashlib.sha256(r.content).hexdigest()})
+        return self._jalankan(r, self._kejadian("unggah"), lambda: self._unggah_inti(r.content, meta))
 
-    def _rakit(self, badan) -> None:
-        rencana, self._sql, self._isi_baru = b"", b"", {}
-        for nomor in sorted(self.unggahan):
-            meta, bagian = paket.urai(self.unggahan[nomor])
+    def _unggah_inti(self, data: bytes, meta: dict) -> httpx.Response:
+        id_, nomor = meta["dorong_id"], meta["nomor"]
+        d = self.dorongan.get(id_)
+        if d is not None and d["status"] == "direbut":
+            return _galat(409, "wpmgr_staging_direbut", "Dorongan ini sudah direbut dorongan lain.")
+        if d is not None and d["status"] != "mengunggah":
+            return _galat(409, "wpmgr_staging_urutan", "Dorongan ini sudah melewati tahap unggah.")
+        if self.kunci not in (None, id_):
+            return _galat(409, "wpmgr_staging_sibuk", "Dorongan lain sedang berlangsung di site ini.")
+        self.kunci = id_
+        if d is None:
+            d = self.dorongan[id_] = {"status": "mengunggah", "potongan": {}, "hasil": {}}
+            self.unggahan = d["potongan"]
+        lama = d["potongan"].get(nomor)
+        if lama is not None and lama != data:
+            return _galat(409, "wpmgr_staging_nomor_bentrok", "Nomor potongan ini sudah dipakai dengan isi berbeda.")
+        d["potongan"][nomor] = data
+        return _json(200, {"ok": True, "nomor": nomor, "sha256": hashlib.sha256(data).hexdigest()})
+
+    @staticmethod
+    def _rakit(d: dict, badan) -> httpx.Response | None:
+        rencana, sql, isi_baru = b"", b"", {}
+        for nomor in range(badan["jumlah_potongan"]):
+            if nomor not in d["potongan"]:
+                return _galat(409, "wpmgr_staging_kurang", f"Potongan {nomor} belum diunggah.")
+        for nomor in sorted(d["potongan"]):
+            meta, bagian = paket.urai(d["potongan"][nomor])
             if meta["jenis"] == "rencana":
                 rencana += bagian[0]
             elif meta["jenis"] == "sql":
-                self._sql += bagian[0]
+                sql += bagian[0]
             else:
                 for m, isi in zip(meta["berkas"], bagian):
-                    self._isi_baru[m["path"]] = self._isi_baru.get(m["path"], b"") + isi
-        assert hashlib.sha256(rencana).hexdigest() == badan["sha256_rencana"]
-        self._rencana = json.loads(rencana)
+                    isi_baru[m["path"]] = isi_baru.get(m["path"], b"") + isi
+        if hashlib.sha256(rencana).hexdigest() != badan["sha256_rencana"]:
+            return _galat(422, "wpmgr_staging_rencana", "Rencana dorong rusak atau tidak cocok.")
+        d.update(rencana=json.loads(rencana), sql=sql, isi_baru=isi_baru)
+        for b in d["rencana"]["berkas"]:
+            if hashlib.sha256(isi_baru.get(b["path"], b"")).hexdigest() != b["sha256"]:
+                return _galat(422, "wpmgr_staging_verifikasi", "Berkas tidak lengkap atau berbeda dari rencana: "
+                              + b["path"])
+        return None
+
+    def _selesaikan_langkah(self, d: dict, langkah: str, status: str) -> httpx.Response:
+        d["status"] = status
+        d["hasil"][langkah] = {"selesai": True, "status": status}
+        return _json(200, d["hasil"][langkah])
+
+    def _lepas_kunci(self, id_: str) -> None:
+        if self.kunci == id_:
+            self.kunci = None
+
+    def _pulihkan_produksi(self, id_: str, d: dict) -> None:
+        if "cadangan" in d:
+            self.berkas = dict(d["cadangan"])
+            self.sql_diterapkan = d["sql_lama"]
+        d["status"] = "dipulihkan"
+        d["hasil"]["pulihkan"] = {"selesai": True, "status": "dipulihkan"}
+        self._lepas_kunci(id_)
+
+    def _gagal_tukar(self, id_: str, d: dict) -> httpx.Response:
+        """WPMGR_Staging_Dorong::gagal_tukar(): pulihkan otomatis lalu 500 wpmgr_staging_tukar."""
+        d["status"] = "menukar"
+        if self.pulih_otomatis_macet:
+            d["status"] = "memulihkan"
+            return _galat(500, "wpmgr_staging_tukar", "Penukaran gagal; pemulihan belum selesai, lanjutkan "
+                          "dengan langkah pulihkan: Berkas baru tidak dapat dipasang: wp-content/x",
+                          pemulihan="memulihkan")
+        self._pulihkan_produksi(id_, d)
+        return _galat(500, "wpmgr_staging_tukar", "Penukaran gagal dan sudah dipulihkan otomatis: "
+                      "Berkas baru tidak dapat dipasang: wp-content/x", pemulihan="dipulihkan")
 
     def _terapkan(self, r, badan):
         langkah = badan["langkah"]
         self.langkah.append(langkah)
+        self.langkah_id.append((badan["dorong_id"], langkah))
+        kejadian = self._kejadian(langkah)
+        if kejadian == "gagal_putus":
+            self._gagal_tukar(badan["dorong_id"], self.dorongan[badan["dorong_id"]])
+            respons_putus(r)
+        return self._jalankan(r, kejadian, lambda: self._terapkan_inti(badan, langkah))
+
+    def _terapkan_inti(self, badan, langkah) -> httpx.Response:
+        id_, token = badan["dorong_id"], badan.get("token")
+        d = self.dorongan.get(id_)
+        if d is None:
+            return _galat(404, "wpmgr_staging_tidak_ada", "Dorongan tidak ditemukan.")
+        if d["status"] == "direbut":
+            return _galat(409, "wpmgr_staging_direbut", "Dorongan ini sudah direbut dorongan lain.")
+        # Ruling F4: ulangan langkah yang sudah selesai dibalas hasil tersimpan.
+        if langkah in d["hasil"] and d["status"] in STATUS_LANGKAH_SELESAI[langkah]:
+            if langkah in ("tukar", "pulihkan") and d.get("token_hash") and \
+                    hashlib.sha256((token or "").encode()).hexdigest() != d["token_hash"]:
+                return _galat(403, "wpmgr_staging_token", "Token tidak cocok.")
+            return _json(200, d["hasil"][langkah])
         if self.gagal_langkah == langkah:
-            return _galat(500, "wpmgr_staging_tukar", "Berkas baru tidak dapat dipasang: wp-content/x")
+            if langkah == "tukar" and d["status"] in ("siap", "terimpor"):
+                d["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
+                return self._gagal_tukar(id_, d)
+            if langkah == "siapkan":
+                return _galat(422, "wpmgr_staging_verifikasi", "Berkas tidak lengkap atau berbeda dari rencana: x")
+            if langkah == "impor":
+                return _galat(422, "wpmgr_staging_impor", "Pernyataan SQL memuat komentar; tidak diizinkan.")
+            if langkah == "pulihkan" and d["status"] in STATUS_MENYENTUH_PRODUKSI:
+                d["status"] = "memulihkan"
+                return _galat(500, "wpmgr_staging_pulihkan",
+                              "Sebagian berkas atau tabel belum dapat dikembalikan; ulangi langkah pulihkan.")
         if langkah == "siapkan":
-            self._rakit(badan)
-            return _json(200, {"selesai": True, "status": "siap"})
+            if d["status"] not in ("mengunggah", "menyiapkan"):
+                return _galat(409, "wpmgr_staging_urutan", "Dorongan ini tidak sedang menunggu disiapkan.")
+            galat = self._rakit(d, badan)
+            if galat is not None:
+                return galat
+            return self._selesaikan_langkah(d, "siapkan", "siap")
         if langkah == "impor":
-            return _json(200, {"selesai": True, "status": "terimpor"})
+            if not d["rencana"]["sql"] or d["status"] not in ("siap", "mengimpor"):
+                return _galat(409, "wpmgr_staging_urutan", "Dorongan ini tidak menunggu impor database.")
+            if self.impor_ditahan:
+                d["status"] = "mengimpor"
+                return _galat(409, "wpmgr_staging_ditahan", "Tabel sementara ini masih ditahan pemulihan "
+                              "dorongan lain (24 jam); coba lagi nanti.")
+            return self._selesaikan_langkah(d, "impor", "terimpor")
         if langkah == "tukar":
-            for b in self._rencana["berkas"]:
-                self.berkas[b["path"]] = (self._isi_baru[b["path"]], b["mtime"])
-            for p in self._rencana["hapus"]:
-                self.berkas.pop(p, None)
-            if self._rencana["sql"]:
-                self.sql_diterapkan = self._sql
-            return _json(200, {"selesai": True, "status": "ditukar"})
-        return _json(200, {"selesai": True, "status": {"pulihkan": "dipulihkan", "selesai": "selesai"}[langkah]})
+            if d["status"] == "menukar":
+                if hashlib.sha256((token or "").encode()).hexdigest() != d["token_hash"]:
+                    return _galat(403, "wpmgr_staging_token", "Token tukar tidak cocok.")
+            elif d["status"] != ("terimpor" if d["rencana"]["sql"] else "siap"):
+                return _galat(409, "wpmgr_staging_urutan", "Dorongan belum siap ditukar.")
+            d.update(status="menukar", token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                     cadangan=dict(self.berkas), sql_lama=self.sql_diterapkan)
+            for b in d["rencana"]["berkas"]:
+                self.berkas[b["path"]] = (d["isi_baru"][b["path"]], b["mtime"])
+            for p in d["rencana"]["hapus"]:
+                if not p.startswith("wp-content/uploads/"):
+                    self.berkas.pop(p, None)
+            if d["rencana"]["sql"]:
+                self.sql_diterapkan = d["sql"]
+            return self._selesaikan_langkah(d, "tukar", "ditukar")
+        if langkah == "pulihkan":
+            if d["status"] in STATUS_PRA_TUKAR or d["status"] in STATUS_MENYENTUH_PRODUKSI:
+                self._pulihkan_produksi(id_, d)
+                return _json(200, d["hasil"]["pulihkan"])
+            return _galat(409, "wpmgr_staging_urutan", "Dorongan ini tidak dapat dipulihkan lewat langkah ini.")
+        if d["status"] != "ditukar":
+            return _galat(409, "wpmgr_staging_urutan", "Dorongan belum ditukar.")
+        return self._selesaikan_langkah(d, "selesai", "selesai")
 
     def _bersihkan(self, r, badan):
+        return self._jalankan(r, self._kejadian("bersihkan"), lambda: self._bersihkan_inti(badan["dorong_id"]))
+
+    def _bersihkan_inti(self, id_: str) -> httpx.Response:
+        d = self.dorongan.get(id_)
+        if d is not None and d["status"] not in STATUS_BOLEH_BERSIHKAN:
+            return _galat(409, "wpmgr_staging_sibuk", "Dorongan sedang atau sudah diterapkan; selesaikan atau "
+                          "pulihkan dulu.")
+        self.dorongan.pop(id_, None)
+        self._lepas_kunci(id_)
         return _json(200, {"lagi": False})
 
 

@@ -26,6 +26,7 @@ from wpmgr.models import (
     User,
 )
 from wpmgr.site_client import SiteClient
+from wpmgr.staging.dorong import tangani_staging_dorong
 from wpmgr.staging.tarik import tangani_staging_tarik
 from wpmgr.staging.uji import tangani_staging_uji_update
 
@@ -332,4 +333,5 @@ HANDLER = {
     JobType.collect_traffic: tangani_collect_traffic,
     JobType.staging_tarik: tangani_staging_tarik,
     JobType.staging_uji_update: tangani_staging_uji_update,
+    JobType.staging_dorong: tangani_staging_dorong,
 }

@@ -205,6 +205,9 @@ def urai_info(info) -> dict:
         "php": php, "versi_php": versi, "php_peringatan": peringatan,
         # Connector mengirim 1 byte..4 MiB (bisa < 256 KB bila post_max_size kecil).
         "batas_unggah": angka(info.get("batas_unggah"), 1, MAKS_BATAS_UNGGAH) or MAKS_BATAS_UNGGAH,
+        # post_max_size produksi terlalu kecil untuk potongan unggah yang
+        # wajar (< 256 KB); dorong menolak lebih awal (Task 16).
+        "unggah_terlalu_kecil": info.get("unggah_terlalu_kecil") is True,
         "tabel": tabel, "ukuran_db": min(sum(t["ukuran"] for t in tabel), 2**62),
         "tabel_dilewati": (angka(info.get("tabel_dilewati"), 0, 10**6) or 0) + max(0, ditolak),
     }
@@ -508,8 +511,14 @@ def _ambil_tabel(klien, nama: str, kursor: str | None):
     return _ulangi(lambda: potongan_tabel(nama, kursor, *klien.staging_tabel(nama, kursor)))
 
 
-def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tahap_berikut: str) -> dict:
-    """Ekspor tabel per potongan ke dir_sql/db/ (dipakai tarik dan snapshot dorong)."""
+def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tahap_berikut: str,
+              periksa_awal=None) -> dict:
+    """Ekspor tabel per potongan ke dir_sql/db/ (dipakai tarik dan snapshot dorong).
+
+    `periksa_awal(nama, sql)` (opsional) dipanggil untuk potongan pertama
+    setiap tabel -- yang memuat DROP + CREATE TABLE -- sebelum ditulis, dan
+    boleh melempar untuk menghentikan ekspor sedini mungkin (R8 dorong).
+    """
     db_dir = dir_sql / "db"
     db_dir.mkdir(parents=True, exist_ok=True)
     (dir_sql / "prelude.sql").write_bytes(
@@ -546,6 +555,8 @@ def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tah
                 raise umum.galat_gagal(f"Potongan SQL tabel {nama} dari produksi ditolak: {alasan}.")
             if kursor is None:
                 sql = sesuaikan_mariadb(sql)
+                if periksa_awal is not None:
+                    periksa_awal(nama, sql)
                 if pot.mode == "offset":
                     _tambah_peringatan(k, f"Tabel {nama} tanpa primary key disalin dengan LIMIT/OFFSET; "
                                           "baris yang berubah selama tarik bisa terlewat atau ganda.")
