@@ -95,31 +95,44 @@ proses harus berjalan bersamaan; tanpa worker, job hanya menumpuk sebagai
 Proyek ini punya tiga lapis test Python plus satu suite PHP, masing-masing
 butuh prasyarat berbeda. **Jangan jalankan `pytest -m "not integration"` saja**
 — marker itu hanya menyingkirkan test integrasi, bukan test e2e, sehingga ia
-tetap mengumpulkan 245 dari 608 test, termasuk 34 test e2e yang butuh
+tetap mengumpulkan 637 dari 1495 test, termasuk 35 test e2e yang butuh
 kontainer WordPress menyala. Di clone segar tanpa Docker jalan, ini gagal
 dengan cara yang tidak ada hubungannya dengan perubahan yang sedang diuji.
 Gunakan tiga perintah berikut, sesuai apa yang tersedia:
 
 ```bash
-# Unit — tidak butuh service apa pun (211 test)
+# Unit — tidak butuh service apa pun (602 test)
 .venv/Scripts/python -m pytest -m "not integration and not e2e"
 
-# Integrasi — butuh PostgreSQL (363 test)
+# Integrasi — butuh PostgreSQL (858 test)
 docker compose up -d db
 .venv/Scripts/python -m pytest tests/integration -m integration
 
-# End-to-end — butuh kontainer WordPress + MariaDB (34 test)
+# End-to-end — butuh kontainer WordPress + MariaDB (35 test, termasuk e2e
+# staging yang juga menjalankan container `pembantu`; lihat "Staging (Lapis 3)")
 docker compose up -d db wp wpdb wpcli
 .venv/Scripts/python -m pytest tests/e2e -m e2e
 ```
 
-Dan untuk plugin connector PHP (206 test):
+Integrasi dan e2e memakai database test yang sama (`wpmgr_test`) dan membuangnya di awal sesi:
+jangan jalankan keduanya bersamaan, atau beri salah satunya `TEST_DATABASE_URL` lain.
+
+Dan untuk plugin connector PHP (511 test), di PHP 8.3 lokal dan di PHP 7.4 (versi terendah yang
+didukung connector):
 
 ```bash
 cd connector && php vendor/bin/phpunit
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/app" -w /app/connector php:7.4-cli php vendor/bin/phpunit
 ```
 
-(`composer install` sekali di `connector/` dulu jika `vendor/` belum ada.)
+(`composer install` sekali di `connector/` dulu jika `vendor/` belum ada; perintah PHP 7.4 dijalankan
+dari akar repo.)
+
+Skrip pembantu staging (bats, dengan `docker` tiruan):
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/code" -w /code bats/bats:1.11.0 deploy/staging/tests
+```
 
 ## Menambahkan site dan memasang plugin connector
 
@@ -572,6 +585,28 @@ Catatan:
 
 Cron baru (`deploy/crontab`): `staging-jeda-otomatis` tiap jam, `renew-staging-certs` dan
 `prune-staging` harian.
+
+E2E staging (`tests/e2e/test_staging.py`) menjalankan skrip pembantu sungguhan di container
+`pembantu` (profil compose `staging`, image `docker:27-cli` + bash/coreutils/setpriv) dengan socket
+Docker Desktop; dashboard di pytest memanggilnya lewat `WPMGR_STAGING_PEMBANTU_AWALAN`, tanpa sudo.
+Akar staging adalah bind mount `./var/e2e-stg` (di-`.gitignore`). Bind mount Windows di Docker
+Desktop menyimpan pemilik Unix (`chown` bertahan), jadi cek pemilik skrip tetap berlaku; test hanya
+menyerahkan direktori site ke UID 33 seperti yang terjadi di VPS, setelah lebih dulu membuktikan
+skrip menolak direktori milik root. Router staging di `localhost:8090`, Mailpit di `localhost:8025`.
+
+```bash
+docker compose up -d wp wpdb wpcli     # plus `db` bila PostgreSQL test belum jalan
+.venv/Scripts/python -m pytest -m e2e tests/e2e/test_staging.py -q
+```
+
+Bila port 8081 sudah dipakai stack lain, jalankan WordPress e2e di port lain dengan
+`WPMGR_E2E_WP_PORT=8082` pada kedua perintah di atas. Tarik menolak bila sisa disk sesudahnya di bawah
+15%; bila drive repo sesempit itu, pindahkan akar staging e2e ke drive lain dengan
+`WPMGR_E2E_STG_AKAR=C:/Users/<anda>/AppData/Local/Temp/wpmgr-e2e-stg`. Pilih path pendek: skrip
+pembantu hanya menerima path sumber mount (sebagai `/run/desktop/mnt/host/<drive>/...`) sampai 200
+karakter. Jalan pertama menarik image
+`wordpress:php8.1-apache`, `mariadb:11.4`, `nginx:1.27-alpine`, dan `axllent/mailpit` (beberapa
+menit). Skenario uji update butuh wordpress.org; tanpa internet keduanya dilewati dengan pesan.
 
 Test skrip pembantu berjalan di container bats dengan `docker` tiruan:
 

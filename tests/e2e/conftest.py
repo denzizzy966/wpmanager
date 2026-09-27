@@ -16,7 +16,8 @@ from wpmgr.signing import new_nonce, sign
 from wpmgr.site_client import SiteClient
 from wpmgr.worker import proses_satu
 
-WP_URL = "http://localhost:8081"
+# Sama dengan port di docker-compose.yml (`WPMGR_E2E_WP_PORT`, bawaan 8081).
+WP_URL = f"http://localhost:{os.environ.get('WPMGR_E2E_WP_PORT', '8081')}"
 pytestmark = pytest.mark.e2e
 
 DB_URL = os.environ.get(
@@ -45,7 +46,7 @@ def sinkronkan_connector() -> None:
     subprocess.run(
         ["docker", "compose", "exec", "-T", "wpcli", "sh", "-c",
          f"rm -rf '{PLUGIN_DI_KONTAINER}' && cp -r '{SUMBER_DI_KONTAINER}' '{PLUGIN_DI_KONTAINER}'"],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, timeout=300,
     )
 
 
@@ -53,14 +54,14 @@ def tulis_di_kontainer(path: str, isi: str) -> None:
     subprocess.run(
         ["docker", "compose", "exec", "-T", "wpcli", "sh", "-c",
          f"mkdir -p \"$(dirname '{path}')\" && cat > '{path}'"],
-        input=isi, text=True, capture_output=True, check=True,
+        input=isi, text=True, capture_output=True, check=True, timeout=300,
     )
 
 
 def hapus_di_kontainer(path: str) -> None:
     subprocess.run(
         ["docker", "compose", "exec", "-T", "wpcli", "rm", "-rf", path],
-        capture_output=True, check=False,
+        capture_output=True, check=False, timeout=300,
     )
 
 
@@ -101,7 +102,7 @@ def wpcli(*args: str) -> str:
     hasil = subprocess.run(
         ["docker", "compose", "exec", "-T", "wpcli", "wp", "--path=/var/www/html",
          "--allow-root", *args],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=300,
     )
     if hasil.returncode != 0:
         raise RuntimeError(f"wp {' '.join(args)} gagal: {hasil.stderr}")
@@ -117,7 +118,7 @@ def _wpcli_status(*args: str) -> int:
     return subprocess.run(
         ["docker", "compose", "exec", "-T", "wpcli", "wp", "--path=/var/www/html",
          "--allow-root", *args],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=300,
     ).returncode
 
 

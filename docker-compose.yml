@@ -33,7 +33,9 @@ services:
       WORDPRESS_DB_USER: wp
       WORDPRESS_DB_PASSWORD: wp
       WORDPRESS_DB_NAME: wp
-    ports: ["8081:80"]
+    # WPMGR_E2E_WP_PORT: jalankan WordPress e2e di port lain bila 8081 sudah
+    # dipakai stack lain (conftest e2e membaca variabel yang sama).
+    ports: ["${WPMGR_E2E_WP_PORT:-8081}:80"]
     volumes:
       # Sumber connector dipasang read-only di luar direktori plugin, lalu
       # disalin ke direktori plugin oleh fixture e2e. Bind mount langsung ke
@@ -52,6 +54,22 @@ services:
       WORDPRESS_DB_PASSWORD: wp
       WORDPRESS_DB_NAME: wp
     volumes_from: [wp]
+
+  # E2E staging (Task 22): skrip pembantu dijalankan di Linux dengan socket
+  # Docker Desktop. Profil `staging` supaya `docker compose up -d` biasa
+  # tidak membangunnya.
+  pembantu:
+    profiles: ["staging"]
+    build: ./tests/e2e/pembantu
+    entrypoint: ["sh", "-c", "sleep infinity"]
+    environment:
+      WPMGR_STG_KONF: /srv/wpmgr/staging.conf
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./deploy/staging/wpmgr-staging:/usr/local/sbin/wpmgr-staging:ro
+      # WPMGR_E2E_STG_AKAR: pindahkan akar staging e2e ke drive lain bila sisa
+      # disk drive repo di bawah 15% (tarik menolaknya, spec §2).
+      - ${WPMGR_E2E_STG_AKAR:-./var/e2e-stg}:/srv/wpmgr
 
 volumes:
   pgdata:
