@@ -38,9 +38,21 @@ BATAS_JSON_STAGING = 32 * 1024 * 1024
 BATAS_BINER_STAGING = paket.BATAS_PAKET
 
 
+def buat_klien_staging(**kwargs) -> httpx.Client:
+    """Klien httpx untuk endpoint staging: tanpa koneksi keep-alive.
+
+    Tenggat total memutus permintaan dengan shutdown soket yang ditangkap
+    saat koneksi dibuka (lihat SiteClient._kirim). Koneksi dari pool tidak
+    pernah membuka soket baru, jadi tidak bisa diputus; tanpa keep-alive
+    setiap permintaan staging selalu memakai koneksi baru.
+    """
+    return httpx.Client(follow_redirects=False, limits=httpx.Limits(max_keepalive_connections=0), **kwargs)
+
+
 class SiteClient:
     def __init__(
-        self, base_url: str, site_id: str, secret_hex: str, client: httpx.Client | None = None
+        self, base_url: str, site_id: str, secret_hex: str, client: httpx.Client | None = None,
+        klien_staging: httpx.Client | None = None,
     ) -> None:
         if not base_url.startswith("https://"):
             raise ValueError("URL site wajib berskema https://")
@@ -48,6 +60,15 @@ class SiteClient:
         self.site_id = site_id
         self.secret_hex = secret_hex
         self._client = client or httpx.Client(follow_redirects=False)
+        # Klien yang disuntikkan (test dengan MockTransport) dipakai juga
+        # untuk staging bila klien staging tidak diberikan tersendiri.
+        self._klien_staging = klien_staging or client
+
+    @property
+    def _staging_http(self) -> httpx.Client:
+        if self._klien_staging is None:
+            self._klien_staging = buat_klien_staging()
+        return self._klien_staging
 
     def _panggil(
         self, method: str, path: str, body: bytes, timeout: float, berefek: bool = False,
@@ -166,12 +187,18 @@ class SiteClient:
         dibatalkan dari thread yang sama. Karena itu permintaan dijalankan di
         thread pekerja, dan thread pemanggil menunggu paling lama sampai
         tenggat. Bila lewat, pemanggil langsung mendapat SiteError, dan soket
-        TCP yang dibuka untuk permintaan ini (ditangkap lewat ekstensi
-        `trace` httpcore) di-shutdown supaya pekerja ikut berhenti. Bila
-        permintaan memakai koneksi pool yang sudah ada, soketnya tidak
-        tertangkap; pekerja lalu berhenti oleh timeout baca httpx atau di
-        potongan body berikutnya (bendera `batal`), tetapi pemanggil tetap
-        kembali tepat waktu.
+        TLS yang dibuka untuk permintaan ini (ditangkap lewat ekstensi
+        `trace` httpcore) di-shutdown supaya recv() pekerja yang terblokir
+        ikut bangun, termasuk saat header atau body diteteskan (yang terus
+        mengulang timeout baca). Supaya soket itu selalu tertangkap, klien
+        staging tidak memakai keep-alive (`buat_klien_staging`) dan mengirim
+        `Connection: close`: setiap permintaan membuka koneksi baru. Sebelum
+        jabat tangan TLS selesai belum ada soket TLS; tahap itu dibatasi
+        timeout koneksi yang dijepit ke tenggat.
+
+        Galat sesudah permintaan mungkin sudah sampai (baca/tulis putus,
+        protokol rusak, timeout baca) pada panggilan `berefek` menjadi
+        UNKNOWN; hanya kegagalan membuka koneksi yang pasti TRANSIENT.
         """
         timestamp = int(time.time())
         nonce = new_nonce()
@@ -185,6 +212,9 @@ class SiteClient:
             # yang tetap dikompresi ditolak, sehingga batas byte berlaku pada
             # byte di kabel dan tidak ada dekompresi atas masukan penyerang.
             "Accept-Encoding": "identity",
+            # Koneksi tidak dipakai ulang (lihat buat_klien_staging), juga bila
+            # klien yang disuntikkan masih memakai keep-alive.
+            "Connection": "close",
             **(header_tambahan or {}),
         }
         if body:
@@ -198,9 +228,12 @@ class SiteClient:
         hasil: dict = {}
 
         def putus(s) -> None:
+            # socket.socket.shutdown, bukan SSLSocket.shutdown: yang kedua
+            # melepas objek TLS lebih dulu, sehingga pekerja yang sedang
+            # berjalan sempat mengirim/menerima teks polos lewat soket itu.
             try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
+                socket.socket.shutdown(s, socket.SHUT_RDWR)
+            except (OSError, TypeError):
                 pass
 
         def trace(nama: str, info: dict) -> None:
@@ -227,26 +260,36 @@ class SiteClient:
 
         def kerja() -> None:
             try:
-                with self._client.stream(method, f"{self.base_url}{path}{query}", content=body or None,
-                                         headers=headers, timeout=timeout,
-                                         extensions={"trace": trace}) as resp:
-                    enkode = resp.headers.get("content-encoding", "").strip().lower()
-                    if enkode not in ("", "identity"):
-                        raise SiteError(BAD_RESPONSE, "Respons connector dikompresi padahal diminta tanpa kompresi")
-                    isi = bytearray()
-                    # Transport yang menyerahkan body sebagai bytes di memori
-                    # (MockTransport) membuat httpx membacanya lebih dulu;
-                    # tanpa content-encoding isinya sama dengan byte mentah.
-                    aliran = [resp.content] if resp.is_stream_consumed else resp.iter_raw()
-                    for potong in aliran:
-                        if batal.is_set():
-                            return
-                        isi.extend(potong)
-                        if len(isi) > batas_byte:
-                            raise SiteError(BAD_RESPONSE, f"Respons connector melebihi batas {batas_byte} byte")
-                        if time.monotonic() > akhir:
-                            raise SiteError(kelas_waktu, pesan_tenggat)
-                    hasil["ok"] = (resp.status_code, dict(resp.headers), bytes(isi))
+                with self._staging_http.stream(method, f"{self.base_url}{path}{query}", content=body or None,
+                                               headers=headers, timeout=timeout,
+                                               extensions={"trace": trace}) as resp:
+                    try:
+                        enkode = resp.headers.get("content-encoding", "").strip().lower()
+                        if enkode not in ("", "identity"):
+                            raise SiteError(BAD_RESPONSE,
+                                            "Respons connector dikompresi padahal diminta tanpa kompresi")
+                        isi = bytearray()
+                        # Transport yang menyerahkan body sebagai bytes di memori
+                        # (MockTransport) membuat httpx membacanya lebih dulu;
+                        # tanpa content-encoding isinya sama dengan byte mentah.
+                        aliran = [resp.content] if resp.is_stream_consumed else resp.iter_raw()
+                        for potong in aliran:
+                            if batal.is_set():
+                                return
+                            isi.extend(potong)
+                            if len(isi) > batas_byte:
+                                raise SiteError(BAD_RESPONSE, f"Respons connector melebihi batas {batas_byte} byte")
+                            if time.monotonic() > akhir:
+                                raise SiteError(kelas_waktu, pesan_tenggat)
+                        with kunci:
+                            if not batal.is_set():
+                                hasil["ok"] = (resp.status_code, dict(resp.headers), bytes(isi))
+                    finally:
+                        # Sebelum koneksi ditutup (keluar dari `with`): soket ini
+                        # tidak boleh lagi di-shutdown oleh pemanggil yang
+                        # kebetulan baru mencapai tenggat.
+                        with kunci:
+                            soket.clear()
             except Exception as exc:  # noqa: BLE001 -- dilempar ulang di thread pemanggil
                 hasil["galat"] = exc
 
@@ -255,23 +298,33 @@ class SiteClient:
         pekerja.join(max(0.0, akhir - time.monotonic()))
         if pekerja.is_alive():
             with kunci:
-                batal.set()
-                tertangkap = list(soket)
-            for s in tertangkap:
-                putus(s)
-            raise SiteError(kelas_waktu, pesan_tenggat)
+                # Hasil yang sudah lengkap tetap dipakai walau pekerja masih
+                # menutup koneksi saat tenggat lewat.
+                selesai = "ok" in hasil
+                if not selesai:
+                    batal.set()
+                    tertangkap = list(soket)
+            if not selesai:
+                for s in tertangkap:
+                    putus(s)
+                raise SiteError(kelas_waktu, pesan_tenggat)
+            return hasil["ok"]
         galat = hasil.get("galat")
         if galat is None:
             if "ok" not in hasil:
                 # Pekerja berhenti tanpa hasil (mis. SystemExit di thread itu).
                 raise SiteError(kelas_waktu, "Permintaan ke connector berhenti tanpa hasil")
             return hasil["ok"]
-        if isinstance(galat, (httpx.ConnectTimeout, httpx.PoolTimeout)):
-            raise SiteError(TRANSIENT, f"timeout koneksi setelah {timeout} detik") from galat
+        if isinstance(galat, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            # Koneksi tidak pernah terbentuk: tidak ada yang sampai ke site.
+            raise SiteError(TRANSIENT, f"koneksi gagal: {galat}") from galat
         if isinstance(galat, httpx.TimeoutException):
             raise SiteError(kelas_waktu, f"timeout setelah {timeout} detik") from galat
         if isinstance(galat, httpx.HTTPError):
-            raise SiteError(TRANSIENT, f"kesalahan koneksi: {galat}") from galat
+            # Putus sesudah permintaan mungkin sudah sampai (ReadError,
+            # WriteError, RemoteProtocolError): pada panggilan berefek
+            # hasilnya tidak diketahui, seperti timeout.
+            raise SiteError(kelas_waktu, f"kesalahan koneksi: {galat}") from galat
         raise galat
 
     @staticmethod
@@ -340,6 +393,10 @@ class SiteClient:
         return self._staging_json("GET", "/staging/tanda-air", query="?" + urlencode(param) if param else "")
 
     def staging_snapshot(self, paths: list[str], awal: bool = False) -> dict:
+        # POST hanya karena daftar path bisa panjang. Connector
+        # (WPMGR_Staging::snapshot, WPMGR_Staging_Dorong::snapshot_berkas)
+        # hanya membaca: ada/ukuran/mtime berkas, daftar tabel, tanda air;
+        # tidak menulis apa pun di produksi, jadi aman diulang (bukan berefek).
         return self._staging_json("POST", "/staging/snapshot", {"paths": list(paths), "awal": awal})
 
     def staging_unggah(self, isi: bytes) -> dict:

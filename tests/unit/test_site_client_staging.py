@@ -228,8 +228,9 @@ def test_tenggat_total_mencakup_tunggu_sebelum_header(monkeypatch, panggil, kela
 
 def test_tenggat_total_memutus_soket_yang_macet(monkeypatch):
     """Server TCP sungguhan yang menerima koneksi lalu tidak pernah menjawab
-    (jabat tangan TLS macet). Sesudah tenggat, soketnya diputus dari sisi
-    dashboard, bukan dibiarkan menggantung sampai timeout httpx 45 detik."""
+    (jabat tangan TLS macet). Soket TLS belum ada di tahap ini, jadi yang
+    memutusnya adalah timeout koneksi yang dijepit ke tenggat, bukan
+    shutdown; jalur shutdown diuji di test_header_menetes_diputus_lewat_shutdown."""
     monkeypatch.setattr(site_client, "TENGGAT_STAGING", 0.3)
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
@@ -269,26 +270,220 @@ def test_soket_tls_yang_tertangkap_di_shutdown_saat_tenggat(monkeypatch):
     # Sesudah jabat tangan TLS, recv() yang terblokir (header yang diteteskan)
     # hanya bisa dibangunkan dengan shutdown soket TLS dari thread lain.
     monkeypatch.setattr(site_client, "TENGGAT_STAGING", 0.3)
-    diputus = threading.Event()
 
-    class SoketPalsu:
+    class SoketTls(socket.socket):
+        """Meniru SSLSocket: shutdown() miliknya melepas objek TLS lebih dulu
+        dan tidak boleh dipakai; socket.socket.shutdown yang dipanggil."""
+
+        dipanggil = False
+
         def shutdown(self, how):
-            assert how == socket.SHUT_RDWR
-            diputus.set()
+            SoketTls.dipanggil = True
+            super().shutdown(how)
+
+    a, b = socket.socketpair()
+    s = SoketTls(fileno=a.detach())
+    b.settimeout(5)
 
     class AliranPalsu:
         def get_extra_info(self, nama):
-            return SoketPalsu() if nama == "socket" else None
+            return s if nama == "socket" else None
 
     def h(r):
         r.extensions["trace"]("connection.start_tls.complete", {"return_value": AliranPalsu()})
-        diputus.wait(5)
+        time.sleep(2)
         raise httpx.ReadError("soket diputus", request=r)
 
+    try:
+        with pytest.raises(SiteError) as e:
+            klien(h).staging_manifest()
+        assert "tenggat" in e.value.pesan
+        assert b.recv(1) == b"", "soket tidak di-shutdown"
+        assert SoketTls.dipanggil is False
+    finally:
+        s.close()
+        b.close()
+
+
+# ---- server TLS sungguhan (fix putaran 2) -----------------------------------
+
+
+@pytest.fixture
+def server_tls(tmp_path):
+    """Server HTTPS kecil di 127.0.0.1 dengan sertifikat buatan sendiri.
+
+    `perilaku(conn)` dijalankan per koneksi sesudah jabat tangan TLS.
+    Mengembalikan (buat_server, konteks_klien).
+    """
+    import datetime
+    import ipaddress
+    import ssl
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    kunci = ec.generate_private_key(ec.SECP256R1())
+    nama = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    sekarang = datetime.datetime.now(datetime.timezone.utc)
+    sert = (x509.CertificateBuilder().subject_name(nama).issuer_name(nama).public_key(kunci.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(sekarang - datetime.timedelta(days=1))
+            .not_valid_after(sekarang + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+                           critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(kunci, hashes.SHA256()))
+    (tmp_path / "sert.pem").write_bytes(sert.public_bytes(serialization.Encoding.PEM))
+    (tmp_path / "kunci.pem").write_bytes(kunci.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    ctx_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx_server.load_cert_chain(tmp_path / "sert.pem", tmp_path / "kunci.pem")
+    ctx_klien = ssl.create_default_context(cafile=str(tmp_path / "sert.pem"))
+    daftar = []
+
+    def buat(perilaku):
+        dengar = socket.socket()
+        dengar.bind(("127.0.0.1", 0))
+        dengar.listen(8)
+        daftar.append(dengar)
+
+        def terima():
+            while True:
+                try:
+                    conn, _ = dengar.accept()
+                except OSError:
+                    return
+                try:
+                    tls = ctx_server.wrap_socket(conn, server_side=True)
+                except (OSError, ssl.SSLError):
+                    conn.close()
+                    continue
+                threading.Thread(target=perilaku, args=(tls,), daemon=True).start()
+
+        threading.Thread(target=terima, daemon=True).start()
+        return dengar.getsockname()[1]
+
+    yield buat, ctx_klien
+    for d in daftar:
+        d.close()
+
+
+def _baca_permintaan(conn) -> bytes:
+    data = b""
+    while b"\r\n\r\n" not in data:
+        potong = conn.recv(4096)
+        if not potong:
+            break
+        data += potong
+    return data
+
+
+def test_setiap_panggilan_staging_membuka_koneksi_baru(server_tls):
+    buat, ctx = server_tls
+    permintaan = []
+
+    def jawab(conn):
+        with conn:
+            permintaan.append(_baca_permintaan(conn))
+            badan = b'{"berkas":[],"lagi":false}'
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                         + str(len(badan)).encode() + b"\r\n\r\n" + badan)
+            # Tidak menutup lebih dulu: klien yang memakai ulang koneksi
+            # (keep-alive) akan mengirim permintaan kedua lewat soket ini.
+            conn.settimeout(3)
+            try:
+                while conn.recv(4096):
+                    pass
+            except OSError:
+                pass
+
+    port = buat(jawab)
+    k = SiteClient(f"https://127.0.0.1:{port}", "s1", SECRET,
+                   klien_staging=site_client.buat_klien_staging(verify=ctx))
+    assert k.staging_manifest() == {"berkas": [], "lagi": False}
+    assert k.staging_manifest() == {"berkas": [], "lagi": False}
+    # Dua permintaan, dua koneksi (setiap koneksi hanya melihat satu
+    # permintaan), masing-masing meminta ditutup.
+    assert len(permintaan) == 2
+    assert all(p.count(b"GET ") == 1 and b"connection: close" in p.lower() for p in permintaan)
+
+
+def test_header_menetes_diputus_lewat_shutdown(monkeypatch, server_tls):
+    """Server meneteskan satu baris header tiap 0,1 detik: setiap recv()
+    berhasil sebelum timeout baca (yang dijepit ke 0,3 detik), jadi hanya
+    shutdown soket TLS dari thread pemanggil yang bisa menghentikan pekerja."""
+    monkeypatch.setattr(site_client, "TENGGAT_STAGING", 0.3)
+    buat, ctx = server_tls
+    diputus = threading.Event()
+
+    def menetes(conn):
+        _baca_permintaan(conn)
+        try:
+            conn.sendall(b"HTTP/1.1 200 OK\r\n")
+            for _ in range(600):
+                conn.sendall(b"X-A: b\r\n")
+                time.sleep(0.1)
+        except OSError:
+            diputus.set()
+        finally:
+            conn.close()
+
+    port = buat(menetes)
+    k = SiteClient(f"https://127.0.0.1:{port}", "s1", SECRET,
+                   klien_staging=site_client.buat_klien_staging(verify=ctx))
+    mulai = time.monotonic()
+    with pytest.raises(SiteError) as e:
+        k.staging_manifest()
+    assert time.monotonic() - mulai < 1.5
+    assert "tenggat" in e.value.pesan
+    assert diputus.wait(5), "pekerja tetap membaca header sesudah tenggat"
+
+
+@pytest.mark.parametrize("pengecualian,kelas_tulis", [
+    (httpx.ReadError, UNKNOWN),
+    (httpx.RemoteProtocolError, UNKNOWN),
+    (httpx.WriteError, UNKNOWN),
+    (httpx.ConnectError, TRANSIENT),
+    (httpx.ConnectTimeout, TRANSIENT),
+])
+def test_galat_sesudah_terkirim_pada_panggilan_berefek_adalah_unknown(pengecualian, kelas_tulis):
+    def h(r):
+        raise pengecualian("putus", request=r)
+
+    with pytest.raises(SiteError) as e:
+        klien(h).staging_unggah(b"x")
+    assert e.value.error_class == kelas_tulis
+    with pytest.raises(SiteError) as e:
+        klien(h).staging_terapkan({"langkah": "tukar"})
+    assert e.value.error_class == kelas_tulis
+    # Panggilan baca tetap sementara apa pun galatnya.
     with pytest.raises(SiteError) as e:
         klien(h).staging_manifest()
+    assert e.value.error_class == TRANSIENT
+
+
+def test_hasil_yang_sudah_ada_tidak_dilaporkan_timeout(monkeypatch):
+    # Pekerja sudah menyimpan hasil tetapi masih menutup koneksi saat
+    # tenggat lewat: hasilnya dipakai, bukan dilaporkan timeout.
+    class MasihMenutup(threading.Thread):
+        """Pekerja yang sudah menyimpan hasil tetapi (menurut is_alive) belum
+        keluar ketika join() pemanggil habis."""
+
+        def join(self, timeout=None):
+            super().join()
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(site_client.threading, "Thread", MasihMenutup)
+    k = klien(lambda r: httpx.Response(200, json={"ok": True}))
+    assert k.staging_manifest() == {"ok": True}
+    # Tanpa hasil, pekerja yang masih hidup tetap dilaporkan melewati tenggat.
+    with pytest.raises(SiteError) as e:
+        klien(lambda r: (_ for _ in ()).throw(httpx.ReadError("x", request=r))).staging_manifest()
     assert "tenggat" in e.value.pesan
-    assert diputus.wait(1)
 
 
 def test_content_encoding_selain_identity_ditolak():
