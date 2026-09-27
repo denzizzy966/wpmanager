@@ -722,14 +722,14 @@ def test_jalan_memeriksa_ulang_di_bawah_kunci(klien_web, engine, sesi, siap, pb)
 
 
 @pytest.mark.parametrize("metode,path", [
-    ("GET", "/api/sites/{id}/staging"),
     ("GET", "/api/sites/{id}/staging/sso"),
     ("POST", "/api/sites/{id}/staging/batal"),
 ])
 def test_tulis_lain_menunggu_kunci_staging(klien_web, engine, sesi, siap, metode, path):
+    """Kunci baris sites (bukan hanya staging): tanpa `_kunci`, UPDATE staging tidak tertahan kunci ini."""
     buat_job(sesi, siap.site_id, JobType.staging_tarik)
     lain = sessionmaker(bind=engine, future=True)()
-    lain.execute(text("SELECT id FROM staging WHERE site_id = :site FOR UPDATE"), {"site": siap.site_id})
+    lain.execute(text("SELECT id FROM sites WHERE id = :site FOR NO KEY UPDATE"), {"site": siap.site_id})
     hasil = []
     t = threading.Thread(target=lambda: hasil.append(klien_web.request(metode, path.format(id=siap.site_id))))
     t.start()
@@ -742,3 +742,90 @@ def test_tulis_lain_menunggu_kunci_staging(klien_web, engine, sesi, siap, metode
         t.join(10)
     assert menunggu, "route tidak menunggu kunci baris staging"
     assert hasil[0].status_code == 200, hasil[0].text
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM sites WHERE id = :site FOR NO KEY UPDATE",
+    "SELECT id FROM staging WHERE site_id = :site FOR UPDATE",
+])
+def test_get_staging_tidak_menunggu_kunci(klien_web, engine, sesi, siap, staging_aktif, sql):
+    """GET status tidak pernah tertahan (mis. cron memegang kunci selama `pb.jeda`); penanda diubah dilewati."""
+    penanda = staging_aktif / str(siap.site_id) / "log" / "diubah"
+    penanda.parent.mkdir(parents=True)
+    penanda.write_bytes(str(int(time.time())).encode())
+    lain = sessionmaker(bind=engine, future=True)()
+    lain.execute(text(sql), {"site": siap.site_id})
+    hasil = []
+    # Di utas terpisah: bila route menunggu kunci, test gagal alih-alih macet.
+    t = threading.Thread(target=lambda: hasil.append(klien_web.get(f"/api/sites/{siap.site_id}/staging")))
+    t.start()
+    try:
+        t.join(5.0)
+        tertahan = t.is_alive()
+    finally:
+        lain.rollback()
+        lain.close()
+        t.join(10)
+    assert not tertahan, "GET staging menunggu kunci baris"
+    r = hasil[0]
+    assert r.status_code == 200 and r.json()["staging"]["nama"] == "contoh-test"
+    sesi.expire_all()
+    assert sesi.get(Staging, siap.id).diubah_pada is None
+    # Tanpa kunci lain, penanda ditulis seperti biasa.
+    klien_web.get(f"/api/sites/{siap.site_id}/staging")
+    sesi.expire_all()
+    assert sesi.get(Staging, siap.id).diubah_pada is not None
+
+
+def _sisip_di_transaksi_kedua(monkeypatch, engine, siap, aksi):
+    """Jalankan `aksi(sesi_lain)` tepat sebelum hapus mengambil kunci sites untuk kedua kalinya."""
+    from wpmgr.web import routes_staging
+
+    asli = routes_staging._kunci_site
+    panggilan = []
+
+    def kunci(sesi, site_id):
+        panggilan.append(site_id)
+        if len(panggilan) == 2:
+            with sessionmaker(bind=engine, future=True)() as s:
+                aksi(s)
+        return asli(sesi, site_id)
+
+    monkeypatch.setattr(routes_staging, "_kunci_site", kunci)
+
+
+@pytest.mark.parametrize("muncul", ["staging", "job"])
+def test_hapus_staging_berkas_dilewati_bila_staging_atau_job_baru_muncul(
+        klien_web, sesi, engine, siap, staging_aktif, pb, monkeypatch, muncul):
+    files = staging_aktif / str(siap.site_id) / "files"
+    files.mkdir(parents=True)
+
+    def aksi(s):
+        if muncul == "staging":
+            s.add(Staging(site_id=siap.site_id, nama="contoh-baru"))
+            s.commit()
+        else:
+            buat_job(s, siap.site_id, JobType.staging_kembalikan, {"snapshot_id": 1})
+
+    _sisip_di_transaksi_kedua(monkeypatch, engine, siap, aksi)
+    assert klien_web.delete(f"/api/sites/{siap.site_id}/staging").status_code == 200
+    assert files.exists()
+    assert not [p.name for p in staging_aktif.iterdir() if p.name.startswith(".hapus-")]
+
+
+def test_hapus_staging_galat_transaksi_kedua_tetap_sukses(klien_web, sesi, siap, staging_aktif, pb, monkeypatch,
+                                                           caplog):
+    from wpmgr.web import routes_staging
+
+    files = staging_aktif / str(siap.site_id) / "files"
+    files.mkdir(parents=True)
+
+    def gagal(*a):
+        raise OSError("disk")
+
+    monkeypatch.setattr(routes_staging, "_nisan_selain_snapshot", gagal)
+    r = klien_web.delete(f"/api/sites/{siap.site_id}/staging")
+    assert r.status_code == 200
+    sesi.expire_all()
+    assert sesi.query(Staging).count() == 0 and files.exists()
+    assert any("cron" in c.getMessage() for c in caplog.records if c.levelname == "ERROR")

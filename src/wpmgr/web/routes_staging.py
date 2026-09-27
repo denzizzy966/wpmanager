@@ -15,6 +15,7 @@ pesan yang menyebut sebabnya.
 """
 
 import json
+import logging
 import re
 import secrets
 import time
@@ -81,6 +82,7 @@ from wpmgr.staging.rencana import (
 )
 from wpmgr.web.auth import pengguna_api
 
+log = logging.getLogger("wpmgr.web.routes_staging")
 router = APIRouter()
 PenggunaApi = Annotated[User, Depends(pengguna_api)]
 
@@ -207,6 +209,24 @@ def _kunci(sesi, site_id: uuid.UUID) -> Staging | None:
     return _kunci_staging(sesi, site_id)
 
 
+def _kunci_tanpa_tunggu(sesi, site_id: uuid.UUID) -> tuple[Staging | None, bool]:
+    """(staging, terkunci): kontrak kunci yang sama dengan `_kunci`, tetapi SKIP LOCKED.
+
+    Baris yang sedang dikunci pihak lain dilewati alih-alih ditunggu; staging
+    lalu dibaca tanpa kunci (MVCC tidak menahan baca biasa) dan `terkunci`
+    False memberi tahu pemanggil untuk tidak menulis.
+    """
+    site_terkunci = sesi.scalar(select(Site.id).where(Site.id == site_id)
+                                .with_for_update(key_share=True, skip_locked=True))  # FOR NO KEY UPDATE SKIP LOCKED
+    if site_terkunci is not None:
+        st = sesi.scalar(select(Staging).where(Staging.site_id == site_id).with_for_update(skip_locked=True)
+                         .execution_options(populate_existing=True))
+        if st is not None:
+            return st, True
+    return sesi.scalar(select(Staging).where(Staging.site_id == site_id)
+                       .execution_options(populate_existing=True)), False
+
+
 def _job_aktif(sesi, site_id) -> Job | None:
     return sesi.scalar(select(Job).where(
         Job.site_id == site_id, Job.tipe.in_(JOB_STAGING),
@@ -302,10 +322,12 @@ def status_staging(site_id: uuid.UUID, pengguna: PenggunaApi):
         return {"aktif_fitur": False}
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
-        # `perbarui_diubah` bisa menulis: lewat kontrak kunci yang sama, lalu
-        # commit segera supaya GET tidak memegang kunci selama membaca daftar.
-        st = _kunci(sesi, site_id)
-        if st is not None:
+        # `perbarui_diubah` bisa menulis, jadi lewat kontrak kunci yang sama --
+        # tetapi GET tidak pernah menunggu (cron memegang kunci selama
+        # `pb.jeda`): bila kunci sedang dipegang, baca tanpa kunci dan
+        # penanda diubah dilewati sampai GET berikutnya.
+        st, terkunci = _kunci_tanpa_tunggu(sesi, site_id)
+        if st is not None and terkunci:
             umum.perbarui_diubah(st)
         sesi.commit()
         job = _job_aktif(sesi, site_id)
@@ -464,12 +486,20 @@ def hapus(site_id: uuid.UUID, pengguna: PenggunaApi):
         # kembalikan tetap bisa berjalan tanpa baris Staging; cron memangkas
         # sisanya. Selain itu dipindah ke nisan (rename atomik, tanpa
         # mengikuti symlink), lalu dihapus sesudah kunci dilepas.
-        _kunci_site(sesi, site_id)
-        nama_dir = str(site_id)
+        # Penghapusan sudah ter-commit; galat di sini tidak membatalkannya.
+        # Berkas yang tertinggal dipangkas cron (tanpa baris Staging).
         nisan = []
-        if not _ada_staging(sesi, site_id) and not _ada_job_staging(sesi, site_id) and _dir_nyata(akar / nama_dir):
-            nisan = _nisan_selain_snapshot(akar, nama_dir, site_id)
-        sesi.commit()
+        try:
+            _kunci_site(sesi, site_id)
+            nama_dir = str(site_id)
+            if not _ada_staging(sesi, site_id) and not _ada_job_staging(sesi, site_id) \
+                    and _dir_nyata(akar / nama_dir):
+                nisan = _nisan_selain_snapshot(akar, nama_dir, site_id)
+            sesi.commit()
+        except Exception:
+            sesi.rollback()
+            log.exception("Berkas staging site %s tidak dapat dipindah sesudah penghapusan; "
+                          "diserahkan ke pemangkasan cron", site_id)
     for n in nisan:
         _hapus_nisan(akar, n)
     return {"ok": True}
