@@ -2,7 +2,17 @@ import time
 
 import pytest
 
-from wpmgr.staging.sql_impor import BATAS_CREATE, periksa_sql, sesuaikan_mariadb
+from wpmgr.staging.sql_impor import (
+    ALASAN_KOMENTAR,
+    ALASAN_PARTISI,
+    ALASAN_TERBUKA,
+    BATAS_CREATE,
+    PemeriksaTerapkan,
+    periksa_berkas_terapkan,
+    periksa_sql,
+    periksa_terapkan,
+    sesuaikan_mariadb,
+)
 
 AWAL = b"DROP TABLE IF EXISTS `t`;\nCREATE TABLE `t` (`id` int);\n"
 DELAPAN_MB = 8 * 1024 * 1024
@@ -81,3 +91,78 @@ def test_dump_sah_8mb_cepat():
     assert periksa_sql(sql) is None
     sesuaikan_mariadb(sql)
     assert time.perf_counter() - mulai < BATAS_DETIK
+
+
+# ---- R8: pra-pemeriksaan dorong (Task 16) ------------------------------------
+
+
+def _bertahap(sql: bytes, ukuran: int) -> str | None:
+    p = PemeriksaTerapkan()
+    for i in range(0, len(sql), ukuran):
+        alasan = p.tambah(sql[i:i + ukuran])
+        if alasan is not None:
+            return alasan
+    return p.akhir()
+
+
+@pytest.mark.parametrize("sql", [
+    AWAL + b"INSERT INTO `t` VALUES (1,'a -- b # c /* d */ ; PARTITION'),(2,\"x\\\"; -- y\");\n",
+    # Komentar di AWAL pernyataan dibuang connector (tanpa_komentar_awal).
+    b"/*!40101 SET NAMES utf8mb4 */;\n-- kepala\n# lagi\n" + AWAL,
+    b"-- a\n/* b */ CREATE TABLE `partition` (`subpartition` int);\n",
+    # Kutip ganda dua kali di dalam teks dan escape backslash.
+    b"INSERT INTO `t` VALUES ('it''s','a\\'b','c\\\\');\n",
+    # "--" tanpa spasi sesudahnya bukan komentar (pengurai connector).
+    b"INSERT INTO `t` VALUES (1--1),(2---1),(3/2);\n",
+    b"",
+])
+def test_terapkan_menerima(sql):
+    assert periksa_terapkan(sql) is None
+    for ukuran in (1, 2, 3, 7):
+        assert _bertahap(sql, ukuran) is None
+
+
+@pytest.mark.parametrize("sql,alasan", [
+    (b"CREATE TABLE `t` (`id` int) /*!50100 PARTITION BY HASH (`id`) */;\n", ALASAN_KOMENTAR),
+    (b"CREATE TABLE `t` (`id` int /* x */);\n", ALASAN_KOMENTAR),
+    (b"INSERT INTO `t` VALUES (1); INSERT INTO `t` VALUES (2) # x\n;", ALASAN_KOMENTAR),
+    (b"INSERT INTO `t` VALUES (1) -- x\n;", ALASAN_KOMENTAR),
+    (b"INSERT INTO `t` VALUES (1)--\t\n;", ALASAN_KOMENTAR),
+    # Sama seperti ada_komentar() connector: "--- " memuat "-- " di posisi kedua.
+    (b"INSERT INTO `t` VALUES (1)--- x\n;", ALASAN_KOMENTAR),
+    (b"CREATE TABLE `t` (`id` int) PARTITION BY HASH (`id`) PARTITIONS 4;\n", ALASAN_PARTISI),
+    (b"CREATE TABLE `t` (`id` int) partition by key () subpartition by hash(id);\n", ALASAN_PARTISI),
+    (b"CREATE TABLE `t` (`id` int) PARTITION BY KEY ()", ALASAN_PARTISI),
+    (b"INSERT INTO `t` VALUES ('tidak ditutup);\n", ALASAN_TERBUKA),
+    (b"CREATE TABLE `t (`id` int);\n", ALASAN_TERBUKA),
+    (b"/* kepala tanpa penutup", ALASAN_TERBUKA),
+])
+def test_terapkan_menolak(sql, alasan):
+    assert periksa_terapkan(sql) == alasan
+    for ukuran in (1, 2, 3, 7):
+        assert _bertahap(sql, ukuran) == alasan
+
+
+def test_terapkan_kata_partisi_terpotong_antar_bagian_tidak_salah_tangkap():
+    # "PARTITIONED_X" terpotong tepat setelah "PARTITION": bukan kata PARTITION.
+    p = PemeriksaTerapkan()
+    assert p.tambah(b"CREATE TABLE `t` (`id` int) COMMENT='x' PARTITION") is None
+    assert p.tambah(b"ED_X=1;\n") is None
+    assert p.akhir() is None
+
+
+def test_berkas_terapkan_digabung_berurutan(tmp_path):
+    a, b = tmp_path / "a.sql", tmp_path / "b.sql"
+    a.write_bytes(b"INSERT INTO `t` VALUES ('a;")
+    b.write_bytes(b"b');\nCREATE TABLE `t` (`id` int) /* x */;\n")
+    assert periksa_berkas_terapkan([a, b]) == ALASAN_KOMENTAR
+    b.write_bytes(b"b');\n")
+    assert periksa_berkas_terapkan([a, b]) is None
+
+
+@pytest.mark.parametrize("unit", [b"'a',", b"`a` ", b"1,", b"\\", b"/", b"-", b"--", b"/*x*/;", b"'\\"])
+def test_terapkan_8mb_linear(unit):
+    sql = b"INSERT INTO `t` VALUES (" + unit * (DELAPAN_MB // len(unit))
+    mulai = time.perf_counter()
+    periksa_terapkan(sql)
+    assert time.perf_counter() - mulai < BATAS_DETIK * 2

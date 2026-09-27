@@ -133,3 +133,230 @@ def sesuaikan_mariadb(sql: bytes) -> bytes:
             return sql[:awal] + _sesuaikan_create(pernyataan) + sql[m.end():]
         awal = m.end()
     return sql
+
+
+# ---- pra-pemeriksaan dorong (R8, Task 16) --------------------------------------
+#
+# Connector menerapkan SQL dorong (dan kelak SQL snapshot saat Kembalikan)
+# lewat WPMGR_Staging_Sql::ubah(), yang menolak SELURUH pernyataan bila memuat
+# komentar di luar literal (kecuali komentar di awal pernyataan, yang dibuang
+# tanpa_komentar_awal()) dan menolak CREATE TABLE ber-PARTITION. Bila baru
+# ketahuan di tengah impor, dorongan gagal sesudah snapshot dan unggahan
+# selesai; bila ada di struktur tabel produksi, snapshot database tidak akan
+# pernah bisa dipulihkan. Karena itu keduanya diperiksa di dashboard sebelum
+# apa pun diunggah.
+#
+# Pemindaian linear dan bertahap (berkas SQL bisa bergigabyte): `_RUNTUN`
+# menelan teks biasa dan literal utuh dalam satu pencocokan di mesin regex,
+# jadi loop Python hanya berputar per pernyataan, per komentar awal, dan per
+# literal yang terpotong di batas bagian. Byte yang belum bisa diputuskan
+# ("/" atau "-" di ujung bagian, backslash di ujung literal, "*" di ujung
+# komentar) ditahan paling banyak dua byte untuk bagian berikutnya.
+
+ALASAN_KOMENTAR = "komentar SQL di tengah pernyataan"
+ALASAN_PARTISI = "klausa PARTITION pada CREATE TABLE"
+ALASAN_TERBUKA = "teks, identifier, atau komentar yang tidak ditutup"
+ALASAN_CREATE_BESAR = "CREATE TABLE yang terlalu besar untuk diperiksa"
+
+_SPASI = b" \t\r\n\v\f"
+# Satu atau lebih token yang pasti bukan awal komentar dan bukan akhir
+# pernyataan: teks biasa, literal/identifier yang sudah ditutup, "/" yang
+# tidak diikuti "*", dan "-" yang tidak memulai "-- " (aturan ada_komentar()
+# connector: "--" hanya komentar bila diikuti spasi). Lookahead mewajibkan
+# byte berikutnya ada, sehingga "/" dan "-" di ujung bagian tidak pernah
+# diputuskan terlalu dini. Setiap alternatif maju paling sedikit satu byte
+# dan pencocokan tidak pernah bisa gagal (nol pengulangan sah), jadi tidak
+# ada pemindaian ulang.
+_RUNTUN = re.compile(
+    rb"(?:[^'\"`#;/\-]+"
+    rb"|'[^'\\]*(?:\\.[^'\\]*)*'"
+    rb'|"[^"\\]*(?:\\.[^"\\]*)*"'
+    rb"|`[^`]*`"
+    rb"|/(?=[^*])"
+    rb"|-(?=[^-]|-[^ \t\r\n\v\f])"
+    rb")*",
+    re.DOTALL,
+)
+_LANJUT_LITERAL = {
+    ord("'"): re.compile(rb"[^'\\]*(?:\\.[^'\\]*)*"),
+    ord('"'): re.compile(rb'[^"\\]*(?:\\.[^"\\]*)*'),
+    ord("`"): re.compile(rb"[^`]*"),
+}
+_BUKAN_SPASI = re.compile(rb"[^ \t\r\n\v\f]")
+_AWAL_CREATE = re.compile(rb"CREATE\b", re.IGNORECASE)
+_PARTISI = re.compile(rb"(?<![A-Za-z0-9_$])(?:SUB)?PARTITION(?![A-Za-z0-9_$])", re.IGNORECASE)
+# CREATE TABLE hasil SHOW CREATE TABLE hanya beberapa KB; yang lebih besar
+# dari ini bukan struktur tabel yang wajar.
+MAKS_CREATE = 4 * 1024 * 1024
+# Cukup untuk memastikan kata pertama pernyataan ("CREATE" + pemisah).
+_PANJANG_KEPALA = 7
+
+_NORMAL, _LITERAL, _BLOK, _BARIS = range(4)
+
+
+class PemeriksaTerapkan:
+    """Pemindai bertahap R8: `tambah()` per bagian, lalu `akhir()`.
+
+    Keduanya mengembalikan alasan penolakan (teks tetap) begitu ditemukan,
+    atau None. Sesudah ada alasan, pemanggil berhenti memakai objek ini.
+    Hanya teks CREATE TABLE yang ditampung (untuk mencari PARTITION di luar
+    literal saat pernyataannya berakhir); isi INSERT tidak pernah ditampung.
+    """
+
+    def __init__(self) -> None:
+        self._keadaan = _NORMAL
+        self._kutip = 0
+        self._tahan = b""
+        self._awal = True
+        self._jenis: str | None = None
+        self._kepala = b""
+        self._create = bytearray()
+
+    def _isi(self, teks: bytes) -> str | None:
+        """Isi pernyataan (bukan komentar awal) yang baru dikonsumsi."""
+        if self._awal:
+            m = _BUKAN_SPASI.search(teks)
+            if m is None:
+                return None
+            self._awal = False
+            teks = teks[m.start():]
+        if self._jenis is None:
+            self._kepala += teks
+            if len(self._kepala) < _PANJANG_KEPALA:
+                return None
+            self._jenis = "create" if _AWAL_CREATE.match(self._kepala) else "lain"
+            teks, self._kepala = self._kepala, b""
+        if self._jenis == "create":
+            if len(self._create) + len(teks) > MAKS_CREATE:
+                return ALASAN_CREATE_BESAR
+            self._create.extend(teks)
+        return None
+
+    def _akhir_pernyataan(self) -> str | None:
+        if self._jenis is None and _AWAL_CREATE.match(self._kepala):
+            teks = self._kepala
+        else:
+            teks = bytes(self._create) if self._jenis == "create" else None
+        self._awal, self._jenis, self._kepala, self._create = True, None, b"", bytearray()
+        if teks is not None and _PARTISI.search(_LEWATI.sub(b" ", teks)):
+            return ALASAN_PARTISI
+        return None
+
+    def _pindai(self, buf: bytes, akhir: bool) -> str | None:
+        pos, n = 0, len(buf)
+        while pos < n:
+            if self._keadaan == _LITERAL:
+                m = _LANJUT_LITERAL[self._kutip].match(buf, pos)
+                if m.end() >= n:
+                    return None
+                if buf[m.end()] == self._kutip:
+                    self._keadaan, pos = _NORMAL, m.end() + 1
+                    continue
+                # Backslash tunggal di ujung bagian: yang di-escape ada di bagian berikutnya.
+                if not akhir:
+                    self._tahan = buf[m.end():]
+                return None
+            if self._keadaan == _BLOK:
+                i = buf.find(b"*/", pos)
+                if i < 0:
+                    if not akhir and buf.endswith(b"*"):
+                        self._tahan = b"*"
+                    return None
+                self._keadaan, pos = _NORMAL, i + 2
+                continue
+            if self._keadaan == _BARIS:
+                i = buf.find(b"\n", pos)
+                if i < 0:
+                    return None
+                self._keadaan, pos = _NORMAL, i + 1
+                continue
+
+            m = _RUNTUN.match(buf, pos)
+            if m.end() > pos:
+                alasan = self._isi(buf[pos:m.end()])
+                if alasan is not None:
+                    return alasan
+                pos = m.end()
+                if pos >= n:
+                    return None
+            c = buf[pos]
+            if c == ord(";"):
+                alasan = self._akhir_pernyataan()
+                if alasan is not None:
+                    return alasan
+                pos += 1
+            elif c in _LANJUT_LITERAL:
+                # Literal yang belum ditutup di bagian ini (yang utuh sudah
+                # ditelan _RUNTUN). Diwakili literal kosong utuh supaya teks
+                # CREATE yang ditampung tetap bisa ditopengi dengan benar.
+                alasan = self._isi(b"''")
+                if alasan is not None:
+                    return alasan
+                self._keadaan, self._kutip, pos = _LITERAL, c, pos + 1
+            elif c == ord("#"):
+                if not self._awal:
+                    return ALASAN_KOMENTAR
+                self._keadaan, pos = _BARIS, pos + 1
+            elif c == ord("/"):
+                if pos + 1 < n:
+                    # Pasti "/*": "/" lain sudah ditelan _RUNTUN.
+                    if not self._awal:
+                        return ALASAN_KOMENTAR
+                    self._keadaan, pos = _BLOK, pos + 2
+                elif akhir:
+                    self._isi(b"/")
+                    pos += 1
+                else:
+                    self._tahan = buf[pos:]
+                    return None
+            else:
+                # "-" yang tidak ditelan _RUNTUN: "-- " (komentar), atau "-"/"--"
+                # di ujung bagian yang belum bisa diputuskan.
+                if pos + 2 < n:
+                    if not self._awal:
+                        return ALASAN_KOMENTAR
+                    self._keadaan, pos = _BARIS, pos + 3
+                elif akhir:
+                    alasan = self._isi(buf[pos:])
+                    if alasan is not None:
+                        return alasan
+                    pos = n
+                else:
+                    self._tahan = buf[pos:]
+                    return None
+        return None
+
+    def tambah(self, data: bytes) -> str | None:
+        buf, self._tahan = self._tahan + data, b""
+        return self._pindai(buf, akhir=False)
+
+    def akhir(self) -> str | None:
+        buf, self._tahan = self._tahan, b""
+        alasan = self._pindai(buf, akhir=True)
+        if alasan is not None:
+            return alasan
+        if self._keadaan in (_LITERAL, _BLOK):
+            return ALASAN_TERBUKA
+        return self._akhir_pernyataan()
+
+
+def periksa_terapkan(sql: bytes) -> str | None:
+    """Alasan (teks tetap) bila SQL ini akan ditolak ubah() connector, atau None."""
+    p = PemeriksaTerapkan()
+    return p.tambah(sql) or p.akhir()
+
+
+def periksa_berkas_terapkan(berkas, blok: int = 1 << 20) -> str | None:
+    """Seperti `periksa_terapkan` atas gabungan berkas berurutan, dibaca per blok.
+
+    Hanya untuk berkas milik dashboard (area kerja dorong, snapshot); SQL dari
+    pohon yang di-bind mount dipindahkan lewat `aman` lebih dulu.
+    """
+    p = PemeriksaTerapkan()
+    for b in berkas:
+        with open(b, "rb") as f:
+            for bagian in iter(lambda f=f: f.read(blok), b""):
+                alasan = p.tambah(bagian)
+                if alasan is not None:
+                    return alasan
+    return p.akhir()

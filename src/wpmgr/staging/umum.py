@@ -363,14 +363,28 @@ def _batalkan(sesi: Session, job: Job, site_id, staging_id, nama: str) -> GalatD
     return GalatDibatalkan()
 
 
-def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging, nama: str) -> dict:
+def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging, nama: str,
+                     boleh_batal=None) -> dict:
+    """Pembungkus bersama job staging: status, batal, dan pemetaan galat.
+
+    `boleh_batal(job) -> bool` (opsional) dibaca dari kemajuan yang sudah
+    ter-commit. False berarti permintaan batal tidak lagi mengakhiri job --
+    dipakai dorong sesudah tukar dikirim ke produksi: berhenti di sana
+    meninggalkan produksi setengah jadi, jadi job diulang sampai tuntas dan
+    permintaan batalnya dibiarkan tercatat (dihapus saat job selesai).
+    """
     site, staging = muat_staging(sesi, job)
     staging_id, job_id, site_id = staging.id, job.id, site.id
     staging.status = status_kerja
     staging.galat = None
     sesi.commit()
+
+    def batal_berlaku() -> bool:
+        return boleh_batal is None or boleh_batal(job)
+
     try:
-        periksa_batal(sesi, staging)
+        if batal_berlaku():
+            periksa_batal(sesi, staging)
         hasil = inti(sesi, job, site, staging)
     except Dibatalkan:
         raise _batalkan(sesi, job, site_id, staging_id, nama) from None
@@ -388,7 +402,7 @@ def jalankan_staging(sesi: Session, job: Job, inti, status_kerja: StatusStaging,
         # Perubahan setengah jadi dari inti (termasuk pada objek job) dibuang
         # dulu: keputusan di bawah harus memakai keadaan yang ter-commit.
         sesi.rollback()
-        if _batal_diminta(sesi, staging_id):
+        if batal_berlaku() and _batal_diminta(sesi, staging_id):
             # Pembatalan menang atas percobaan ulang: tanpa ini dorong yang
             # dibatalkan tetap berlanjut pada putaran berikutnya.
             raise _batalkan(sesi, job, site_id, staging_id, nama) from None

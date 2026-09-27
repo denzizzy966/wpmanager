@@ -839,3 +839,40 @@ def test_klaim_diserialkan_per_site_lintas_sesi(engine, sesi, site):
         a.rollback()
         a.close()
         b.close()
+
+
+# ---- Task 16: batal tidak berlaku lagi sesudah dorong menyentuh produksi ------
+
+
+@pytest.mark.parametrize("kelas", [TRANSIENT, UNKNOWN])
+def test_batal_diabaikan_bila_pembungkus_melarang(sesi, site_staging, monkeypatch, kelas):
+    """Sesudah tukar dikirim, batal tidak boleh mengakhiri job: job diulang dan menuntaskan dorongnya."""
+    site_staging.ditarik_pada = datetime.now(timezone.utc)
+    site_staging.batal_diminta_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    panggilan = []
+
+    def inti(sesi, job, site, staging):
+        panggilan.append(1)
+        raise SiteError(kelas, "koneksi putus")
+
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_dorong)
+    with pytest.raises(SiteError) as e:
+        umum.jalankan_staging(sesi, job, inti, StatusStaging.mendorong, "Dorong", boleh_batal=lambda j: False)
+    # Batal yang sudah diminta sebelum job mulai pun tidak menghentikan inti.
+    assert panggilan == [1]
+    assert not isinstance(e.value, umum.GalatDibatalkan)
+    st = sesi.get(Staging, site_staging.id, populate_existing=True)
+    assert st.status == StatusStaging.mendorong
+    # Permintaan batal tetap tercatat, bukan dihapus diam-diam.
+    assert st.batal_diminta_pada is not None
+
+
+def test_batal_tetap_berlaku_bila_pembungkus_mengizinkan(sesi, site_staging):
+    site_staging.ditarik_pada = datetime.now(timezone.utc)
+    site_staging.batal_diminta_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_dorong)
+    with pytest.raises(umum.GalatDibatalkan):
+        umum.jalankan_staging(sesi, job, lambda *a: {}, StatusStaging.mendorong, "Dorong",
+                              boleh_batal=lambda j: True)
