@@ -512,8 +512,12 @@ def _ambil_tabel(klien, nama: str, kursor: str | None):
 
 
 def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tahap_berikut: str,
-              periksa_awal=None) -> dict:
+              periksa_awal=None, untuk_mariadb: bool = True) -> dict:
     """Ekspor tabel per potongan ke dir_sql/db/ (dipakai tarik dan snapshot dorong).
+
+    `untuk_mariadb` False (snapshot dorong) menyimpan SQL produksi mentah:
+    snapshot dipulihkan ke produksi (bisa MySQL 8) lewat connector, bukan ke
+    MariaDB staging, jadi kolasi `0900` dan komentar versi tidak diubah.
 
     `periksa_awal(nama, sql)` (opsional) dipanggil untuk potongan pertama
     setiap tabel -- yang memuat DROP + CREATE TABLE -- sebelum ditulis, dan
@@ -554,7 +558,8 @@ def ekspor_db(sesi, job, staging, klien, dir_sql: Path, info: dict, k: dict, tah
             if alasan is not None:
                 raise umum.galat_gagal(f"Potongan SQL tabel {nama} dari produksi ditolak: {alasan}.")
             if kursor is None:
-                sql = sesuaikan_mariadb(sql)
+                if untuk_mariadb:
+                    sql = sesuaikan_mariadb(sql)
                 if periksa_awal is not None:
                     periksa_awal(nama, sql)
                 if pot.mode == "offset":

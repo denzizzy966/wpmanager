@@ -637,7 +637,7 @@ def test_gagal_final_membersihkan_produksi_dengan_tenggat_pendek(sesi, site_stag
         _dorong(sesi, site_staging, prod, "hanya_kode", klien=klien)
     assert e.value.error_class == STAGING_GAGAL
     assert "tidak cocok dengan rencana" in e.value.pesan
-    assert tenggat_dipakai == [dorong.TENGGAT_BERSIHKAN_AKHIR]
+    assert len(tenggat_dipakai) == 1 and 0 < tenggat_dipakai[0] <= dorong.TENGGAT_BERSIHKAN_AKHIR
     assert prod.dorongan == {} and prod.kunci is None
     assert sesi.query(StagingSnapshot).count() == 0
     assert list((staging_aktif / str(site_staging.site_id)).glob("snapshot/j*")) == []
@@ -854,3 +854,230 @@ def test_handler_terdaftar():
     from wpmgr.jobs.handlers import HANDLER
 
     assert HANDLER[JobType.staging_dorong] is dorong.tangani_staging_dorong
+
+
+# ---- fix putaran 1: fidelitas snapshot ------------------------------------------
+
+CREATE_MYSQL8 = (b"DROP TABLE IF EXISTS `wp_posts`;\n"
+                 b"CREATE TABLE `wp_posts` (`id` int, `t` text COLLATE utf8mb4_0900_ai_ci) "
+                 b"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n")
+
+
+def test_tarik_tetap_menyesuaikan_mariadb_untuk_staging(sesi, site_staging, prod, pb):
+    prod.tabel["wp_posts"] = [CREATE_MYSQL8]
+    _tarik(sesi, site_staging, prod)
+    assert b"utf8mb4_0900_ai_ci" not in pb.sql and b"utf8mb4_unicode_520_ci" in pb.sql
+
+
+def test_snapshot_menyimpan_sql_produksi_mentah(sesi, site_staging, staging_aktif, prod, pb):
+    """Snapshot dipulihkan ke produksi (MySQL 8), bukan ke MariaDB staging: SQL-nya tidak diubah."""
+    prod.tabel["wp_posts"] = [CREATE_MYSQL8]
+    _siap(sesi, site_staging, staging_aktif, prod)
+    _dorong(sesi, site_staging, prod, "timpa_penuh", konfirmasi="Contoh")
+    snap = sesi.query(StagingSnapshot).one()
+    isi = b"".join(p.read_bytes() for p in sorted((staging_aktif / snap.path / "db").glob("*.sql")))
+    assert isi == CREATE_MYSQL8
+
+
+def test_r8_memeriksa_create_produksi_mentah(sesi, site_staging, staging_aktif, prod, pb):
+    """Komentar versi MySQL 8 di tengah CREATE ikut diimpor saat Kembalikan dan ditolak ubah() connector."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.tabel["wp_posts"] = [b"CREATE TABLE `wp_posts` (`id` int /*!80023 INVISIBLE */);\n"]
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "timpa_penuh")
+    assert e.value.error_class == STAGING_DITOLAK
+    assert "wp_posts" in e.value.pesan and "komentar SQL" in e.value.pesan
+    assert prod.unggahan == {} and sesi.query(StagingSnapshot).count() == 0
+
+
+# ---- fix putaran 1: penolakan pra-tukar (M1) ------------------------------------
+
+
+def test_tukar_ditunda_maintenance_diulang_tanpa_pulihkan(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.tolak_tukar = {"wpmgr_staging_maintenance": 1}
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.error_class == TRANSIENT and "pemeliharaan" in e.value.pesan
+    assert "dipulihkan" not in e.value.pesan
+    k = _kemajuan(sesi, job)
+    # Produksi belum tersentuh: kembali ke titik sebelum tukar (batal berlaku lagi).
+    assert k["langkah_terapkan"] == "cek_ulang"
+    assert prod.dorongan[k["dorong_id"]]["status"] == "siap"
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.mendorong and st.galat.count("dilanjutkan otomatis") == 1
+    hasil = _jalankan(sesi, site_staging, prod, job)
+    assert hasil["dorong_gagal"] is False
+    assert prod.langkah == ["siapkan", "tukar", "tukar", "selesai"]
+
+
+def test_tukar_ditunda_maintenance_final_ditolak_tanpa_gagal(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.tolak_tukar = {"wpmgr_staging_maintenance": 1}
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.error_class == STAGING_DITOLAK and "coba lagi nanti" in e.value.pesan.lower()
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.dorong_gagal_pada is None
+    assert "dilanjutkan otomatis" not in st.galat
+    assert "pulihkan" not in prod.langkah and prod.dorongan == {}
+    assert sesi.query(StagingSnapshot).count() == 0
+
+
+def test_tukar_ditolak_tabel_lama_tanpa_pulihkan(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert e.value.error_class == STAGING_DITOLAK
+    assert "Tabel produksi lama" in e.value.pesan and "dipulihkan" not in e.value.pesan
+    assert "pulihkan" not in prod.langkah
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.dorong_gagal_pada is None
+    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
+    assert prod.dorongan == {} and sesi.query(StagingSnapshot).count() == 0
+
+
+# ---- fix putaran 1: rekonsiliasi dorongan lama (M2, M3, M9) --------------------
+
+
+def _dorongan_lama(prod, status, token="b" * 32, **lain):
+    lama_id = "a" * 32
+    prod.dorongan[lama_id] = {"status": status, "potongan": {}, "rencana": {"sql": False}, "hasil": {},
+                              "token_hash": hashlib.sha256(token.encode()).hexdigest(), **lain}
+    prod.kunci = lama_id
+    return lama_id
+
+
+def test_dorongan_lama_gangguan_jaringan_menghentikan_dorongan_baru(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    lama_id = _dorongan_lama(prod, "ditukar", hasil={"tukar": {"selesai": True, "status": "ditukar"}})
+    job_lama = _job_lama(sesi, site_staging, lama_id, "b" * 32)
+    # Job lain yang sudah bersih dan lebih baru dari batas pencarian tidak menutupinya.
+    for _ in range(dorong.MAKS_JOB_LAMA + 2):
+        j = buat_job(sesi, site_staging.site_id, JobType.staging_dorong, {"mode": "hanya_kode", "kemajuan": {
+            "dorong_id": "c" * 32, "unggah_mulai": True, "produksi_bersih": True}})
+        j.status = JobStatus.success
+        sesi.commit()
+    prod.kejadian["bersihkan"] = ["putus_awal"]
+    mulai = len(prod.diminta)
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.error_class == TRANSIENT
+    assert [r for r, _ in prod.diminta[mulai:]] == ["/staging/bersihkan"]
+    k = _kemajuan(sesi, job)
+    assert "tahap_dorong" not in k and not k.get("lama_dituntaskan")
+    assert _staging(sesi, site_staging).status == StatusStaging.mendorong
+    hasil = _jalankan(sesi, site_staging, prod, job)
+    assert hasil["dorong_gagal"] is False
+    assert (lama_id, "selesai") in prod.langkah_id and lama_id not in prod.dorongan
+    assert _kemajuan(sesi, job)["lama_dituntaskan"] is True
+    assert _kemajuan(sesi, job_lama)["produksi_bersih"] is True
+    log = sesi.query(ActivityLog).filter(ActivityLog.pesan.like("Dorongan sebelumnya%diselesaikan%")).one()
+    assert log.job_id == job.id
+
+
+def test_dorongan_lama_dipulihkan_membuang_snapshotnya_dan_mencatat(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    lama_id = _dorongan_lama(prod, "memulihkan")
+    job_lama = _job_lama(sesi, site_staging, lama_id, "b" * 32, langkah="pulihkan")
+    sesi.add(StagingSnapshot(site_id=site_staging.site_id, job_id=job_lama.id, jenis="sebelum_dorong",
+                             status="tersedia", path=f"{site_staging.site_id}/snapshot/j{job_lama.id}"))
+    st = _staging(sesi, site_staging)
+    st.dorong_gagal_pada = umum.sekarang()
+    sesi.commit()
+    # Dorongan baru ditolak (butuh konfirmasi) SESUDAH dorongan lama dituntaskan.
+    prod.tanda_air["sumber"]["comments"] = {"maks_id": 5, "jumlah": 4}
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "timpa_penuh")
+    assert "Ketik nama site" in e.value.pesan
+    assert (lama_id, "pulihkan") in prod.langkah_id and lama_id not in prod.dorongan
+    # Produksi sudah kembali ke keadaan sebelum dorongan lama: snapshotnya dibuang
+    # dan chip merah dimatikan karena halaman utama hidup.
+    assert sesi.query(StagingSnapshot).filter(StagingSnapshot.job_id == job_lama.id).count() == 0
+    assert _staging(sesi, site_staging).dorong_gagal_pada is None
+    assert sesi.query(ActivityLog).filter(ActivityLog.pesan.like("Dorongan sebelumnya%dipulihkan%")).count() == 1
+
+
+def test_dorongan_lama_perlu_pemulihan_dipulihkan(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    lama_id = _dorongan_lama(prod, "terimpor", tabel_old=True)
+    _job_lama(sesi, site_staging, lama_id, "b" * 32)
+    _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert [lk for i, lk in prod.langkah_id if i == lama_id] == ["selesai", "pulihkan"]
+    assert lama_id not in prod.dorongan
+
+
+def test_dorongan_lama_tahan_batal_dianggap_bersih(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    lama_id = _dorongan_lama(prod, "dipulihkan", tahan_batal=True)
+    job_lama = _job_lama(sesi, site_staging, lama_id, "b" * 32)
+    hasil = _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert hasil["dorong_gagal"] is False
+    # Area ditahan 24 jam oleh connector, tetapi kuncinya dilepas.
+    assert lama_id in prod.dorongan and prod.kunci is None
+    assert _kemajuan(sesi, job_lama)["produksi_bersih"] is True
+
+
+def test_bersihkan_mengulang_selama_lagi(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.bersihkan_lagi = 2
+    _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert _jumlah(prod, "/staging/bersihkan") == 3
+    assert prod.dorongan == {}
+
+
+# ---- fix putaran 1: gagal final sesudah tukar (M8) -----------------------------
+
+
+def test_gagal_final_di_selesai(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.kejadian["selesai"] = [httpx.Response(500, text="galat")] * 10
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.error_class == STAGING_GAGAL and e.value.pesan == dorong.PESAN_AKHIR["selesai"]
+    st = _staging(sesi, site_staging)
+    assert st.dorong_gagal_pada is not None and st.galat == dorong.PESAN_AKHIR["selesai"]
+    assert sesi.query(StagingSnapshot).one().status == "tersedia"
+    assert prod.dorongan[_kemajuan(sesi, job)["dorong_id"]]["status"] == "ditukar"
+
+
+def test_gagal_final_di_pulihkan(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.gagal_langkah = "tukar"
+    prod.pulih_otomatis_macet = True
+    prod.kejadian["pulihkan"] = [_galat(500, "wpmgr_staging_pulihkan", "belum")] * 20
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.pesan == dorong.PESAN_AKHIR["pulihkan"] and "paling cepat 15 menit" in e.value.pesan
+    assert _staging(sesi, site_staging).dorong_gagal_pada is not None
+    assert sesi.query(StagingSnapshot).one().status == "tersedia"
+
+
+def test_galat_tak_terduga_sesudah_tukar(sesi, site_staging, staging_aktif, prod, pb, monkeypatch):
+    _siap(sesi, site_staging, staging_aktif, prod)
+
+    def rusak(*a, **kw):
+        raise RuntimeError("bug dashboard")
+
+    monkeypatch.setattr(dorong, "_selesai", rusak)
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.pesan == dorong.PESAN_AKHIR["selesai"]
+    assert isinstance(e.value.__cause__, RuntimeError)
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.dorong_gagal_pada is not None
+    assert sesi.query(StagingSnapshot).one().status == "tersedia"
+    assert prod.dorongan[_kemajuan(sesi, job)["dorong_id"]]["status"] == "ditukar"

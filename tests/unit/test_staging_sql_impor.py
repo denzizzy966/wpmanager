@@ -162,9 +162,17 @@ def test_berkas_terapkan_digabung_berurutan(tmp_path):
 
 @pytest.mark.parametrize("unit", [b"'a',", b"`a` ", b"1,", b"\\", b"/", b"-", b"--", b"/*x*/;", b"'\\"])
 def test_terapkan_linear(unit):
-    # 2 MB: versi kuadratik butuh menit, versi linear di bawah satu detik;
-    # cukup jauh dari batas walau mesin sedang sibuk.
-    sql = b"INSERT INTO `t` VALUES (" + unit * (2 * 1024 * 1024 // len(unit))
-    mulai = time.perf_counter()
-    periksa_terapkan(sql)
-    assert time.perf_counter() - mulai < BATAS_DETIK
+    # Rasio waktu, bukan waktu mutlak, supaya tahan beban mesin: masukan 4x
+    # lebih besar harus ~4x lebih lama (kuadratik: ~16x). Diambil waktu
+    # terbaik dari beberapa ulangan untuk meredam gangguan sesaat.
+    def waktu(ukuran: int) -> float:
+        sql = b"INSERT INTO `t` VALUES (" + unit * (ukuran // len(unit))
+        terbaik = float("inf")
+        for _ in range(3):
+            mulai = time.perf_counter()
+            periksa_terapkan(sql)
+            terbaik = min(terbaik, time.perf_counter() - mulai)
+        return terbaik
+
+    kecil, besar = waktu(256 * 1024), waktu(1024 * 1024)
+    assert besar < 8 * kecil + 0.05

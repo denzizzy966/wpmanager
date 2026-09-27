@@ -41,6 +41,7 @@ STATUS_BOLEH_BERSIHKAN = {"baru", "mengunggah", "menyiapkan", "siap", "mengimpor
                           "selesai", "gagal", "direbut", "dipulihkan"}
 STATUS_PRA_TUKAR = {"baru", "mengunggah", "menyiapkan", "siap", "mengimpor", "terimpor"}
 STATUS_MENYENTUH_PRODUKSI = {"menukar", "ditukar", "memulihkan"}
+STATUS_AMAN_TERMINAL = {"selesai", "gagal", "direbut", "dipulihkan"}
 STATUS_LANGKAH_SELESAI = {
     "siapkan": {"siap", "mengimpor", "terimpor", "menukar", "ditukar", "selesai"},
     "impor": {"terimpor", "menukar", "ditukar", "selesai"},
@@ -117,6 +118,12 @@ class ProduksiPalsu:
         #   httpx.Response dikembalikan apa adanya tanpa menjalankan langkah.
         self.kejadian: dict[str, list] = {}
         self.impor_ditahan = False
+        # Pra-pemeriksaan tukar connector (sebelum status 'menukar'): kode
+        # galat yang dikembalikan sebanyak hitungannya, mis.
+        # {"wpmgr_staging_maintenance": 2}.
+        self.tolak_tukar: dict[str, int] = {}
+        # Sekian panggilan bersihkan pertama menjawab lagi:true (waktu habis).
+        self.bersihkan_lagi = 0
         self.halaman_utama = 200
         self.hitung: dict[str, int] = {}
         self.diminta: list[tuple[str, object]] = []
@@ -399,6 +406,12 @@ class ProduksiPalsu:
                     return _galat(403, "wpmgr_staging_token", "Token tukar tidak cocok.")
             elif d["status"] != ("terimpor" if d["rencana"]["sql"] else "siap"):
                 return _galat(409, "wpmgr_staging_urutan", "Dorongan belum siap ditukar.")
+            else:
+                for kode, sisa in self.tolak_tukar.items():
+                    if sisa > 0:
+                        # prapemeriksaan_tukar(): ditolak SEBELUM status berubah.
+                        self.tolak_tukar[kode] = sisa - 1
+                        return _galat(409, kode, "Tukar ditunda oleh pra-pemeriksaan connector.")
             d.update(status="menukar", token_hash=hashlib.sha256(token.encode()).hexdigest(),
                      cadangan=dict(self.berkas), sql_lama=self.sql_diterapkan)
             for b in d["rencana"]["berkas"]:
@@ -410,6 +423,9 @@ class ProduksiPalsu:
                 self.sql_diterapkan = d["sql"]
             return self._selesaikan_langkah(d, "tukar", "ditukar")
         if langkah == "pulihkan":
+            token_cocok = hashlib.sha256((token or "").encode()).hexdigest() == d.get("token_hash")
+            if d["status"] in STATUS_MENYENTUH_PRODUKSI and not token_cocok:
+                return _galat(403, "wpmgr_staging_token", "Token pemulihan tidak cocok.")
             if d["status"] in STATUS_PRA_TUKAR or d["status"] in STATUS_MENYENTUH_PRODUKSI:
                 self._pulihkan_produksi(id_, d)
                 return _json(200, d["hasil"]["pulihkan"])
@@ -426,6 +442,17 @@ class ProduksiPalsu:
         if d is not None and d["status"] not in STATUS_BOLEH_BERSIHKAN:
             return _galat(409, "wpmgr_staging_sibuk", "Dorongan sedang atau sudah diterapkan; selesaikan atau "
                           "pulihkan dulu.")
+        if d is not None and d.get("tabel_old") and d["status"] not in STATUS_AMAN_TERMINAL:
+            return _galat(409, "wpmgr_staging_perlu_pemulihan", "Dorongan ini memiliki tabel produksi lama yang "
+                          "belum aman dihapus; pulihkan atau selesaikan dulu.")
+        if self.bersihkan_lagi > 0:
+            # Waktu habis di tengah (jurnal sisa tersimpan): dashboard mengulang.
+            self.bersihkan_lagi -= 1
+            return _json(200, {"lagi": True})
+        if d is not None and d.get("tahan_batal"):
+            # Tabel batal ditahan 24 jam: area tetap, kunci dilepas.
+            self._lepas_kunci(id_)
+            return _json(200, {"lagi": False, "tahan_batal": True, "sampai": 1790086400})
         self.dorongan.pop(id_, None)
         self._lepas_kunci(id_)
         return _json(200, {"lagi": False})
