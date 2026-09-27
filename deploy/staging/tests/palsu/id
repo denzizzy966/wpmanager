@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# id tiruan: diteruskan ke id asli, kecuali diminta gagal lewat penanda
+# $PALSU/id-gagal (putusan review Task 21, putaran 3: user dashboard
+# ditemukan tapi grupnya tidak bisa diperiksa).
+if [[ -f "${PALSU-}/id-gagal" ]]; then
+  exit 1
+fi
+for asli in /usr/bin/id /bin/id; do
+  [[ -x "$asli" ]] && exec "$asli" "$@"
+done
+exit 127

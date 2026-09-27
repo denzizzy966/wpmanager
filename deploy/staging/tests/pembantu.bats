@@ -526,6 +526,32 @@ tulis_mounts() {
   [[ "$output" == *"NGINX_GROUP"* ]]
 }
 
+@test "guard NGINX_GROUP gagal TERTUTUP bila getent/id gagal, bukan 'tidak ditemukan'" {
+  # getent passwd gagal karena NSS (kode 1, bukan "tidak ditemukan" = 2):
+  # ditolak, bukan diam-diam dilewati (putusan review Task 21, putaran 3).
+  printf '1' > "$PALSU/getent-passwd-gagal"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"pengguna dashboard tidak dapat diperiksa"* ]]
+  rm -f "$PALSU/getent-passwd-gagal"
+
+  # getent passwd "tidak ditemukan" (kode 2) TETAP diterima: hanya GID
+  # utama yang berlaku di kasus itu, dan sudah dicek di tempat lain.
+  printf '2' > "$PALSU/getent-passwd-gagal"
+  run "$SKRIP" status
+  [ "$status" -eq 0 ]
+  rm -f "$PALSU/getent-passwd-gagal"
+
+  # User dashboard DITEMUKAN (getent passwd sungguhan, bukan tiruan gagal),
+  # tapi grupnya tidak bisa diperiksa (id -G gagal): ditolak, bukan
+  # dianggap "tidak ada anggota tambahan".
+  echo "cobapengguna:x:1000:1000::/nonexistent:/bin/false" >> /etc/passwd
+  touch "$PALSU/id-gagal"
+  run "$SKRIP" status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"pengguna dashboard tidak dapat diperiksa"* ]]
+}
+
 @test "sertifikat menolak CERT_DIR/ACME_DIR/LE_DIR yang bukan milik root atau berupa symlink" {
   # CERT_DIR sebagai symlink: cek_mount_root menolak sebelum menulis apa
   # pun (sertifikat/kunci belum pernah diminta ke certbot tiruan).

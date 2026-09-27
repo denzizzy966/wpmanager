@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# getent tiruan: diteruskan ke getent asli, kecuali diminta gagal lewat
+# penanda $PALSU/getent-passwd-gagal (putusan review Task 21, putaran 3) --
+# supaya "gagal NSS" (kode keluar bukan 0/2) bisa dibedakan dari "tidak
+# ditemukan" (kode 2) tanpa mengubah perilaku getent group yang dipakai
+# test lain.
+if [[ "${1-}" == passwd && -f "${PALSU-}/getent-passwd-gagal" ]]; then
+  exit "$(cat "$PALSU/getent-passwd-gagal")"
+fi
+for asli in /usr/bin/getent /bin/getent; do
+  [[ -x "$asli" ]] && exec "$asli" "$@"
+done
+exit 127
