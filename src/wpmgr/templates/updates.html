@@ -11,7 +11,7 @@
       <span x-text="berjalan ? 'Sedang berjalan…' : `Update ${terpilih.length} item terpilih`"></span>
     </button>
     {% if staging_aktif %}
-    <button @click="ujiStaging()" :disabled="terpilih.length === 0 || berjalan">Uji di staging dulu</button>
+    <button @click="ujiStaging()" :disabled="terpilih.length === 0 || mengirimUji">Uji di staging dulu</button>
     {% endif %}
     <button @click="muat()" :disabled="berjalan">Muat ulang</button>
   </div>

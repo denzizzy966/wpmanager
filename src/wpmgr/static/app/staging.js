@@ -8,6 +8,10 @@ const TEKS_MODE_SNAPSHOT = {
 // Cermin STATUS_SNAPSHOT_SAH di wpmgr.staging.dorong: hanya snapshot ini yang bisa dikembalikan.
 const SNAPSHOT_SAH = ['tersedia', 'dipakai'];
 const JEDA_POLLING = 3000;
+// Galat yang tidak akan sembuh sendiri (sesi habis, site dicabut): polling berhenti.
+const STATUS_BERHENTI = [401, 404];
+// Galat lain (server sibuk, jaringan putus) dicoba ulang, tetapi tidak selamanya.
+const MAKS_GAGAL_BERUNTUN = 5;
 
 // Cermin pra-pemeriksaan 409 `_periksa_dorong` di routes_staging.py (R19),
 // supaya tombol nonaktif dengan alasan yang terbaca. Server tetap memeriksa
@@ -39,9 +43,14 @@ function tabStaging(siteId) {
     konfirmasiNama: '',
     email: null,
     emailTerbuka: null,
+    urlSso: '',
     _timer: null,
     _memuat: false,
     _muatLagi: false,
+    _gagalBeruntun: 0,
+    // Galat yang dipasang muat() sendiri; hanya itu yang dihapus saat muat()
+    // berikutnya berhasil (galat aksi pengguna tetap tampil).
+    _galatMuat: '',
 
     mulai(dataset, tab) {
       // Nama site dan pesan server datang lewat data-* (autoescape Jinja),
@@ -83,22 +92,34 @@ function tabStaging(siteId) {
       clearTimeout(this._timer);
       this._timer = null;
       let adaJob = !!(this.data && this.data.job);
+      let lanjut = true;
       try {
         const r = await fetch(this.dasar());
-        if (!r.ok) throw new Error(await pesanGalat(r));
+        if (!r.ok) {
+          lanjut = !STATUS_BERHENTI.includes(r.status);
+          throw new Error(await pesanGalat(r));
+        }
         this.data = await r.json();
         adaJob = !!this.data.job;
+        this._gagalBeruntun = 0;
+        if (this._galatMuat && this.galat === this._galatMuat) this.galat = '';
+        this._galatMuat = '';
       } catch (e) {
-        this.galat = `Data staging tidak dapat dimuat. ${e.message}`;
+        this._gagalBeruntun += 1;
+        if (this._gagalBeruntun >= MAKS_GAGAL_BERUNTUN) lanjut = false;
+        this.galat = `Data staging tidak dapat dimuat. ${e.message}`
+          + (lanjut ? '' : ' Pembaruan otomatis dihentikan; muat ulang halaman untuk mencoba lagi.');
+        this._galatMuat = this.galat;
       } finally {
         this._memuat = false;
       }
-      if (this._muatLagi) {
+      if (this._muatLagi && lanjut) {
         this._muatLagi = false;
         this.muat();
         return;
       }
-      if (adaJob && this.terlihat()) this._timer = setTimeout(() => this.muat(), JEDA_POLLING);
+      this._muatLagi = false;
+      if (lanjut && adaJob && this.terlihat()) this._timer = setTimeout(() => this.muat(), JEDA_POLLING);
     },
 
     async kirim(method, url, body) {
@@ -154,6 +175,8 @@ function tabStaging(siteId) {
       this.mulaiAksi();
       try {
         const d = await this.kirim('GET', `${this.dasar()}/sso`);
+        // Tautan cadangan: window.open sesudah await bisa diblokir popup blocker.
+        this.urlSso = d.url;
         window.open(d.url, '_blank', 'noopener');
       } catch (e) {
         this.galat = `SSO staging gagal. ${e.message}`;
@@ -179,6 +202,7 @@ function tabStaging(siteId) {
         await this.kirim('DELETE', this.dasar());
         this.info = 'Staging dihapus.';
         this.sandi = '';
+        this.urlSso = '';
         this.email = null;
         this.emailTerbuka = null;
         this.dialogDorong = false;

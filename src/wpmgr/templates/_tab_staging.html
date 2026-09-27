@@ -72,6 +72,8 @@
           <button type="button" @click="sandiBaru()" :disabled="!!data.job">Buat ulang kata sandi</button>
           <button type="button" @click="hapus()" :disabled="!!data.job">Hapus staging</button>
         </div>
+        <p x-show="urlSso">Tautan masuk admin staging (bila jendela baru tidak terbuka):
+           <a :href="aman(urlSso)" target="_blank" rel="noopener noreferrer" @click="urlSso = ''">buka admin staging</a></p>
         <p class="redup" x-show="alasanDorong()" x-text="'Dorong ke produksi belum bisa: ' + alasanDorong()"></p>
 
         <div class="panel" x-show="dialogDorong">

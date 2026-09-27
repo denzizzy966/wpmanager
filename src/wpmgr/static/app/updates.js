@@ -7,6 +7,11 @@ function layarUpdate() {
     galat: '',
     info: '',
     stagingAktif: false,
+    // Hanya selama POST uji berjalan (cegah klik ganda). Uji di staging bisa
+    // berjam-jam, jadi ia tidak memakai `berjalan` yang mengunci tombol
+    // Update produksi dan Muat ulang.
+    mengirimUji: false,
+    _memantau: false,
     pesanKonfirmasiUji: '',
     _timer: null,
 
@@ -106,6 +111,7 @@ function layarUpdate() {
         site_id: b.site_id, tipe: b.tipe, slug: b.slug, ke_versi: b.versi_tersedia,
       }));
       let respons;
+      this.mengirimUji = true;
       try {
         respons = await fetch('/api/staging/uji', {
           method: 'POST',
@@ -115,6 +121,8 @@ function layarUpdate() {
       } catch (e) {
         this.galat = `Gagal menghubungi server: ${e.message}`;
         return;
+      } finally {
+        this.mengirimUji = false;
       }
       if (!respons.ok) {
         const pesan = await pesanGalat(respons);
@@ -130,15 +138,27 @@ function layarUpdate() {
         this.galat = `Uji tidak dijalankan. ${pesan}`;
         return;
       }
-      this.info = 'Uji di staging diantrekan. Hasilnya tampil di kolom Uji staging setelah selesai.';
-      this.berjalan = true;
+      this.info = 'Uji di staging diantrekan. Hasilnya tampil di kolom Uji staging setelah selesai; '
+        + 'update produksi tetap bisa dijalankan sementara itu.';
       this.pantau();
     },
 
     pantau() {
       clearInterval(this._timer);
       this._timer = setInterval(async () => {
-        this.progres = await (await fetch('/api/jobs/active')).json();
+        // Satu permintaan dalam perjalanan: tick berikutnya dilewati bila
+        // server lebih lambat dari interval, bukan ditumpuk.
+        if (this._memantau) return;
+        this._memantau = true;
+        try {
+          const r = await fetch('/api/jobs/active');
+          if (!r.ok) return;
+          this.progres = await r.json();
+        } catch (e) {
+          return;
+        } finally {
+          this._memantau = false;
+        }
         if (this.progres.length === 0) {
           clearInterval(this._timer);
           this.berjalan = false;

@@ -295,12 +295,23 @@ def _dict_snapshot(s: StagingSnapshot) -> dict:
             "perubahan": detail.get("perubahan") or [], "dibuat_pada": _iso(s.dibuat_pada)}
 
 
+def _daftar_json(nilai, batas: int, hanya_teks: bool = False) -> list:
+    """Daftar dari JSONB, atau [] bila bukan daftar; dipotong supaya satu baris uji tidak membengkakkan respons."""
+    if not isinstance(nilai, list):
+        return []
+    if hanya_teks:
+        nilai = [v for v in nilai if isinstance(v, str)]
+    return nilai[:batas]
+
+
 def _dict_uji(u: StagingUji) -> dict:
     periksa = u.pemeriksaan if isinstance(u.pemeriksaan, dict) else {}
     # `catatan` (R17): halaman yang sudah gagal sebelum update, ditampilkan
     # terpisah dari alasan kegagalan.
-    return {"id": u.id, "hasil": u.hasil, "paket": u.paket, "alasan": periksa.get("alasan") or [],
-            "catatan": periksa.get("catatan") or [], "halaman": periksa.get("halaman") or [],
+    return {"id": u.id, "hasil": u.hasil, "paket": _daftar_json(u.paket, BATAS_DAFTAR),
+            "alasan": _daftar_json(periksa.get("alasan"), BATAS_DAFTAR, hanya_teks=True),
+            "catatan": _daftar_json(periksa.get("catatan"), BATAS_DAFTAR, hanya_teks=True),
+            "halaman": _daftar_json(periksa.get("halaman"), BATAS_DAFTAR),
             "dibuat_pada": _iso(u.dibuat_pada)}
 
 

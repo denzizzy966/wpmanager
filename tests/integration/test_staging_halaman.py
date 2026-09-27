@@ -181,3 +181,50 @@ def test_updates_js_lencana_uji_lewat_esc():
 def test_alasan_dorong_nonaktif_untuk_salinan_gagal():
     js = (AKAR / "static" / "app" / "staging.js").read_text(encoding="utf-8")
     assert "Salinan staging belum utuh (penyegaran terakhir gagal); segarkan ulang sebelum mendorong." in js
+
+
+def _badan_metode(js: str, awal: str, akhir: str) -> str:
+    i = js.index(awal)
+    return js[i:js.index(akhir, i + len(awal))]
+
+
+def test_uji_staging_tidak_mengunci_tombol_update_produksi():
+    """Uji bisa berjam-jam: ia tidak boleh memakai flag `berjalan` yang menonaktifkan Update dan Muat ulang."""
+    js = (AKAR / "static" / "app" / "updates.js").read_text(encoding="utf-8")
+    uji = _badan_metode(js, "async ujiStaging(", "\n    },\n")
+    assert "berjalan" not in uji
+    assert "this.pantau()" in uji
+    assert "Uji di staging diantrekan" in uji
+    template = (AKAR / "templates" / "updates.html").read_text(encoding="utf-8")
+    tombol_uji = next(b for b in template.splitlines() if "Uji di staging dulu" in b)
+    assert "berjalan" not in tombol_uji
+
+
+def test_pantau_update_tanpa_permintaan_bertumpuk():
+    js = (AKAR / "static" / "app" / "updates.js").read_text(encoding="utf-8")
+    pantau = _badan_metode(js, "pantau() {", "\n    },\n")
+    assert "_memantau" in pantau
+
+
+def test_polling_staging_berhenti_pada_galat_menetap():
+    js = (AKAR / "static" / "app" / "staging.js").read_text(encoding="utf-8")
+    assert "MAKS_GAGAL_BERUNTUN = 5" in js
+    assert "STATUS_BERHENTI = [401, 404]" in js
+    # Galat dari muat() sendiri dihapus saat muat() berikutnya berhasil.
+    assert "_galatMuat" in js
+
+
+def test_sso_staging_punya_tautan_cadangan():
+    template = (AKAR / "templates" / "_tab_staging.html").read_text(encoding="utf-8")
+    assert ':href="aman(urlSso)"' in template
+    assert 'rel="noopener' in template
+
+
+def test_api_uji_menormalkan_daftar(klien_web, sesi, site_staging):
+    sesi.add(StagingUji(site_id=site_staging.site_id, paket=[], hasil="gagal",
+                        pemeriksaan={"alasan": "bukan daftar", "catatan": [f"c{i}" for i in range(500)],
+                                     "halaman": {"bukan": "daftar"}}))
+    sesi.commit()
+    u, = klien_web.get(f"/api/sites/{site_staging.site_id}/staging").json()["uji"]
+    assert u["alasan"] == [] and u["halaman"] == []
+    assert len(u["catatan"]) == 50 and u["catatan"][0] == "c0"
