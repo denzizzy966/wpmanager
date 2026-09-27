@@ -747,6 +747,61 @@ def test_kembalikan_tidak_menyembunyikan_staging_gagal(sesi, site_staging, stagi
     assert st.dorong_gagal_pada is None
 
 
+def _staging_gagal(sesi, site_staging) -> None:
+    st = _staging(sesi, site_staging)
+    st.status, st.galat = StatusStaging.gagal, "Tarik gagal: disk penuh."
+    sesi.commit()
+
+
+def test_tolak_pra_tukar_final_staging_gagal_tetap_gagal(sesi, site_staging, staging_aktif, prod, pb):
+    """R18 pada _staging_utuh: penolakan pra-pemeriksaan tukar tidak mengangkat staging yang gagal."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    _staging_gagal(sesi, site_staging)
+    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    assert e.value.error_class == STAGING_DITOLAK
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{color:red}"
+
+
+def test_rekonsiliasi_lama_gagal_final_staging_gagal_tetap_gagal(sesi, site_staging, staging_aktif, prod, pb):
+    """R18 pada _staging_utuh: rekonsiliasi dorongan lama yang gagal final tidak mengangkat staging yang gagal."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    lama_id, token = "a" * 32, "b" * 32
+    prod.dorongan[lama_id] = {"status": "ditukar", "potongan": {}, "rencana": {"sql": False},
+                              "hasil": {"tukar": {"selesai": True, "status": "ditukar"}},
+                              "token_hash": hashlib.sha256(token.encode()).hexdigest()}
+    prod.kunci = lama_id
+    # Job lama yang sukses (bukan dorong gagal): gagal staging tetap milik salinan staging.
+    lama = buat_job(sesi, site.id, JobType.staging_dorong, {"mode": "hanya_kode", "kemajuan": {
+        "dorong_id": lama_id, "token": token, "unggah_mulai": True, "langkah_terapkan": "selesai"}})
+    lama.status = JobStatus.success
+    sesi.commit()
+    _staging_gagal(sesi, site_staging)
+    prod.kejadian["bersihkan"] = ["putus_awal"] * 5
+    job = _job_balik(sesi, site, snap.id)
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, job)
+    assert e.value.error_class == STAGING_DITOLAK and e.value.pesan == dorong.PESAN_LAMA_AKHIR_BALIK
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == "Tarik gagal: disk penuh."
+    assert prod.unggahan == {}
+
+
+def test_tolak_pra_tukar_final_gagal_produksi_dibersihkan(sesi, site_staging, staging_aktif, prod, pb):
+    """Tanpa gagal milik staging, perilaku lama tetap: staging siap dengan pesan penolakan."""
+    site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
+    prod.tolak_tukar = {"wpmgr_staging_tabel_lama": 1}
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site, prod, _job_balik(sesi, site, snap.id))
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.galat == e.value.pesan
+
+
 def test_batal_kembalikan_staging_gagal_tetap_gagal(sesi, site_staging, staging_aktif, prod, pb):
     site, snap = _siap_balik(sesi, site_staging, staging_aktif, prod)
     st = _staging(sesi, site_staging)

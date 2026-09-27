@@ -1208,12 +1208,31 @@ def boleh_batal(job) -> bool:
     return umum.kemajuan(job).get("langkah_terapkan") not in LANGKAH_SESUDAH_TUKAR
 
 
-def _staging_utuh(sesi, site_id, pesan: str) -> SiteError:
-    """Kegagalan final yang tidak menyentuh produksi maupun staging: staging tidak dibiarkan gagal."""
+def _gagal_milik_staging(job) -> bool:
+    """Putusan R18: staging sudah `gagal` karena salinannya sendiri (tarik/uji) sebelum job ini.
+
+    Dicatat kembalikan di kemajuan (`status_staging_awal`, lihat
+    `_status_staging_awal`); gagal akibat dorong/kembalikan sebelumnya adalah
+    kabar produksi dan tidak dicatat sebagai `gagal`. Staging seperti itu
+    tetap `gagal` dengan galat aslinya apa pun hasil job ini.
+    """
+    return umum.kemajuan(job).get("status_staging_awal") == StatusStaging.gagal.value
+
+
+def _staging_utuh(sesi, job, site_id, pesan: str) -> SiteError:
+    """Kegagalan final yang tidak menyentuh produksi maupun staging: staging tidak dibiarkan gagal.
+
+    Kecuali staging memang sudah gagal karena salinannya sendiri (R18):
+    status dan galat aslinya dipertahankan; pesan ini tetap tampil di job.
+    """
     st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
     if st is not None:
-        st.status = umum.status_istirahat(st)
-        st.galat = pesan
+        if _gagal_milik_staging(job):
+            st.status = StatusStaging.gagal
+            st.galat = umum.kemajuan(job).get("galat_staging_awal")
+        else:
+            st.status = umum.status_istirahat(st)
+            st.galat = pesan
         sesi.commit()
     return SiteError(STAGING_DITOLAK, pesan)
 
@@ -1237,7 +1256,7 @@ def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None, pesa
     if isinstance(galat, GalatLamaSementara) and "dorong_id" not in k:
         # Percobaan habis saat menuntaskan dorongan lama: dorongan baru belum
         # dimulai (belum ada dorong_id, unggahan, atau snapshot).
-        return _staging_utuh(sesi, site_id, pesan_lama_akhir)
+        return _staging_utuh(sesi, job, site_id, pesan_lama_akhir)
     langkah = k.get("langkah_terapkan")
     pulih = bool(k.get("pulih_terkonfirmasi"))
     dorong_id = k.get("dorong_id")
@@ -1253,7 +1272,7 @@ def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None, pesa
         # Penolakan pra-pemeriksaan tukar (mis. pemeliharaan lain yang tidak
         # kunjung usai): produksi dan staging utuh, jadi staging tidak
         # dibiarkan berstatus gagal dan pesannya pesan final "coba lagi nanti".
-        return _staging_utuh(sesi, site_id, pesan_tolak)
+        return _staging_utuh(sesi, job, site_id, pesan_tolak)
     pesan = pesan_akhir.get(langkah)
     if pesan is None:
         return None
@@ -1644,9 +1663,7 @@ def _istirahat_balik(job):
     menyembunyikan staging yang rusak di balik status siap/dijeda.
     """
     def istirahat(st) -> StatusStaging:
-        if umum.kemajuan(job).get("status_staging_awal") == StatusStaging.gagal.value:
-            return StatusStaging.gagal
-        return umum.status_istirahat(st)
+        return StatusStaging.gagal if _gagal_milik_staging(job) else umum.status_istirahat(st)
 
     return istirahat
 
@@ -1672,8 +1689,7 @@ def _status_staging_awal(sesi, job, staging) -> str:
 
 
 def _galat_sukses_balik(job) -> str | None:
-    k = umum.kemajuan(job)
-    return k.get("galat_staging_awal") if k.get("status_staging_awal") == StatusStaging.gagal.value else None
+    return umum.kemajuan(job).get("galat_staging_awal") if _gagal_milik_staging(job) else None
 
 
 def tangani_staging_kembalikan(sesi, job, klien) -> dict:
