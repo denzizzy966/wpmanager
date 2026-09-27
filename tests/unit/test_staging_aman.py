@@ -22,6 +22,7 @@ from wpmgr.staging.aman import (
     nama_sah,
     path_sah,
     tulis_atomik,
+    tulis_bertahap,
     versi_php_staging,
     waktu_penanda,
 )
@@ -238,6 +239,57 @@ def test_tulis_menolak_path_tidak_sah(pohon):
     with pytest.raises(PathTidakAman):
         tulis_atomik(akar, "../luar/x.php", b"x")
     assert sorted(p.name for p in luar.iterdir()) == ["rahasia.env"]
+
+
+def _sisa_sementara(d: Path) -> list[str]:
+    return [p.name for p in d.iterdir() if p.name.startswith(".wpmgr-")]
+
+
+def test_tulis_bertahap_menulis_potongan_lalu_memasang(pohon):
+    akar, _ = pohon
+    with tulis_bertahap(akar, "wp-content/uploads/2026/besar.bin") as w:
+        w.tulis(b"abc")
+        w.tulis(b"def")
+        # Belum dipasang: tujuan belum terlihat selama penulisan.
+        assert not (akar / "wp-content/uploads/2026/besar.bin").exists()
+        w.selesai(mtime=1_700_000_000)
+    tujuan = akar / "wp-content/uploads/2026/besar.bin"
+    assert tujuan.read_bytes() == b"abcdef"
+    assert int(tujuan.stat().st_mtime) == 1_700_000_000
+    assert _sisa_sementara(tujuan.parent) == []
+
+
+def test_tulis_bertahap_tanpa_selesai_tidak_memasang(pohon):
+    akar, _ = pohon
+    tulis_atomik(akar, "wp-content/a.bin", b"lama")
+    with tulis_bertahap(akar, "wp-content/a.bin") as w:
+        w.tulis(b"setengah")
+    assert (akar / "wp-content/a.bin").read_bytes() == b"lama"
+    assert _sisa_sementara(akar / "wp-content") == []
+
+
+def test_tulis_bertahap_galat_membuang_sementara(pohon):
+    akar, _ = pohon
+    tulis_atomik(akar, "wp-content/a.bin", b"lama")
+    with pytest.raises(RuntimeError), tulis_bertahap(akar, "wp-content/a.bin") as w:
+        w.tulis(b"setengah")
+        raise RuntimeError("putus")
+    assert (akar / "wp-content/a.bin").read_bytes() == b"lama"
+    assert _sisa_sementara(akar / "wp-content") == []
+
+
+def test_tulis_bertahap_menolak_symlink(pohon):
+    akar, luar = pohon
+    with pytest.raises(PathTidakAman), tulis_bertahap(akar, "../luar/x.bin"):
+        pass
+    _symlink(luar / "rahasia.env", akar / "wp-content" / "x.bin", False)
+    with pytest.raises(PathTidakAman), tulis_bertahap(akar, "wp-content/x.bin"):
+        pass
+    _symlink(luar, akar / "wp-content" / "uploads", True)
+    with pytest.raises(PathTidakAman), tulis_bertahap(akar, "wp-content/uploads/baru/x.bin"):
+        pass
+    assert sorted(p.name for p in luar.iterdir()) == ["rahasia.env"]
+    assert (luar / "rahasia.env").read_bytes() == b"WPMGR_SECRET_KEY=bocor"
 
 
 def test_hapus_berkas(pohon):

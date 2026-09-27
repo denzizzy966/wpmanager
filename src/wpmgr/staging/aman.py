@@ -9,7 +9,7 @@ Direktori `files/`, `ekspor/`, dan `log/` staging di-bind mount ke container
 yang menjalankan kode salinan produksi sebagai UID dashboard (putusan R13).
 Proses PHP di sana bisa menukar path apa pun di pohon itu dengan symlink kapan
 saja, termasuk di sela pemeriksaan dan pemakaian. Karena itu dashboard hanya
-membaca/menulis di pohon itu lewat `buka_baca`, `baca_terbatas`,
+membaca/menulis di pohon itu lewat `buka_baca`, `baca_terbatas`, `tulis_bertahap`,
 `tulis_atomik`, dan `hapus_berkas` (putusan F1): setiap komponen dibuka
 tanpa mengikuti symlink, dan hanya berkas biasa yang dibaca.
 """
@@ -20,6 +20,8 @@ import re
 import stat
 import sys
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -394,12 +396,46 @@ def baca_terbatas(akar: Path, relatif: str, maks: int, dari: int = 0) -> bytes:
         return f.read(maks)
 
 
-def tulis_atomik(akar: Path, relatif: str, isi: bytes, mtime: int | None = None) -> None:
-    """Tulis `akar/relatif` lewat berkas sementara lalu rename, membuat direktori induk.
+class PenulisBertahap:
+    """Berkas sementara yang ditulis per potongan, dipasang hanya lewat `selesai()`."""
 
-    Tujuan yang berupa symlink ditolak. Rename sendiri tidak pernah mengikuti
-    symlink, jadi symlink yang muncul sesudah pemeriksaan hanya tertimpa,
-    bukan diikuti.
+    def __init__(self, f: BinaryIO, pasang) -> None:
+        self._f = f
+        self._pasang = pasang
+        self.terpasang = False
+
+    def tulis(self, data: bytes) -> None:
+        if self.terpasang:
+            raise ValueError("Berkas sudah dipasang")
+        self._f.write(data)
+
+    def selesai(self, mtime: int | None = None) -> None:
+        """Pasang berkas sementara di tujuan (rename atomik), dengan mtime bila diberikan."""
+        if self.terpasang:
+            raise ValueError("Berkas sudah dipasang")
+        self._pasang(mtime)
+        self.terpasang = True
+
+
+def _tolak_tujuan_tautan(st_fungsi) -> None:
+    try:
+        if _tautan(st_fungsi()):
+            raise PathTidakAman("Tujuan tulis berupa symlink")
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def tulis_bertahap(akar: Path, relatif: str) -> Iterator[PenulisBertahap]:
+    """Tulis `akar/relatif` per potongan lewat berkas sementara, lalu rename.
+
+    Untuk berkas besar yang tidak boleh ditampung utuh di memori (rentang
+    tarik): jaminannya sama dengan `tulis_atomik` -- setiap komponen induk
+    dibuka tanpa mengikuti symlink, berkas sementara dibuat O_EXCL|O_NOFOLLOW
+    di direktori yang sama, dan tujuan yang berupa symlink ditolak. Tujuan
+    baru berubah saat `selesai()` dipanggil; keluar dari blok tanpa itu
+    (termasuk karena galat) membuang berkas sementara dan membiarkan tujuan
+    apa adanya.
     """
     induk, nama = _pecah(relatif)
     # Nama sementara pendek: akhiran pada nama asli yang sudah 250 byte
@@ -408,46 +444,66 @@ def tulis_atomik(akar: Path, relatif: str, isi: bytes, mtime: int | None = None)
     if _ADA_DIR_FD:
         dfd = _fd_induk(akar, induk, buat=True)
         try:
-            try:
-                if _tautan(os.stat(nama, dir_fd=dfd, follow_symlinks=False)):
-                    raise PathTidakAman("Tujuan tulis berupa symlink")
-            except FileNotFoundError:
-                pass
+            _tolak_tujuan_tautan(lambda: os.stat(nama, dir_fd=dfd, follow_symlinks=False))
             fd = os.open(sementara, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o644,
                          dir_fd=dfd)
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(isi)
-                    f.flush()
-                    if mtime is not None:
-                        os.utime(f.fileno(), (mtime, mtime))
+            f = os.fdopen(fd, "wb")
+
+            def pasang(mtime: int | None) -> None:
+                f.flush()
+                if mtime is not None:
+                    os.utime(f.fileno(), (mtime, mtime))
+                f.close()
                 os.rename(sementara, nama, src_dir_fd=dfd, dst_dir_fd=dfd)
-            except BaseException:
+
+            def buang() -> None:
+                f.close()
                 try:
                     os.unlink(sementara, dir_fd=dfd)
                 except OSError:
                     pass
-                raise
+
+            penulis = PenulisBertahap(f, pasang)
+            try:
+                yield penulis
+            finally:
+                if not penulis.terpasang:
+                    buang()
         finally:
             os.close(dfd)
         return
     d = _periksa_jalur(akar, induk, buat=True)
     tujuan = d / nama
-    try:
-        if _tautan(os.lstat(tujuan)):
-            raise PathTidakAman("Tujuan tulis berupa symlink")
-    except FileNotFoundError:
-        pass
+    _tolak_tujuan_tautan(lambda: os.lstat(tujuan))
     jalur_sementara = d / sementara
-    try:
-        with open(jalur_sementara, "xb") as f:
-            f.write(isi)
-        if mtime is not None:
-            os.utime(jalur_sementara, (mtime, mtime))
-        os.replace(jalur_sementara, tujuan)
-    except BaseException:
-        jalur_sementara.unlink(missing_ok=True)
-        raise
+    with open(jalur_sementara, "xb") as f:
+
+        def pasang(mtime: int | None) -> None:
+            f.close()
+            if mtime is not None:
+                os.utime(jalur_sementara, (mtime, mtime))
+            os.replace(jalur_sementara, tujuan)
+
+        penulis = PenulisBertahap(f, pasang)
+        try:
+            yield penulis
+        finally:
+            if not penulis.terpasang:
+                # Ditutup dulu: Windows tidak bisa menghapus berkas yang masih terbuka.
+                f.close()
+                jalur_sementara.unlink(missing_ok=True)
+
+
+def tulis_atomik(akar: Path, relatif: str, isi: bytes, mtime: int | None = None) -> None:
+    """Tulis `akar/relatif` lewat berkas sementara lalu rename, membuat direktori induk.
+
+    Tujuan yang berupa symlink ditolak. Rename sendiri tidak pernah mengikuti
+    symlink, jadi symlink yang muncul sesudah pemeriksaan hanya tertimpa,
+    bukan diikuti.
+    """
+    with tulis_bertahap(akar, relatif) as w:
+        w.tulis(isi)
+        w.selesai(mtime)
 
 
 def hapus_berkas(akar: Path, relatif: str) -> None:
