@@ -474,6 +474,19 @@ tulis_mounts() {
   grep -qF 'set $wpmgr_e $cookie_wpmgr_stg_e;' "$konf"
 }
 
+@test "router-muat: redirect router relatif supaya tidak turun ke http di balik TLS" {
+  # Router hanya bicara http di belakang nginx host (TLS). Tanpa
+  # absolute_redirect off, `return 302 /?wpmgr_sso=...` menjadi
+  # Location: http://<host>/..., dan proxy_redirect bawaan host tidak
+  # menulis ulangnya (ditemukan e2e Task 22).
+  printf 'layanan:router' > "$PALSU/wadah/wpmgr-stg-router"
+  printf '%s' "$(printf 'e%.0s' $(seq 1 64))" > "$S/staging/router/toko.rahasia"
+  printf 'staging:%s\n' '$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ01234' > "$S/staging/router/toko.htpasswd"
+  run "$SKRIP" router-muat
+  [ "$status" -eq 0 ]
+  grep -qxF '    absolute_redirect off;' "$S/etc/router/conf.d/stg-toko.conf"
+}
+
 @test "router-muat memulihkan konfigurasi lama bila nginx -t gagal" {
   printf 'layanan:router' > "$PALSU/wadah/wpmgr-stg-router"
   printf 'lama' > "$S/etc/router/conf.d/stg-lama.conf"

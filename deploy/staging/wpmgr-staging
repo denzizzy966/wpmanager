@@ -855,6 +855,9 @@ server {
     client_max_body_size 64m;
     access_log /var/log/wpmgr-akses/$n.log wpmgr_akses;
     add_header X-Robots-Tag "noindex, nofollow" always;
+    # Router hanya bicara http di belakang nginx host (TLS): redirect
+    # absolut buatan nginx akan berskema http dan tidak ditulis ulang host.
+    absolute_redirect off;
 
     # Cookie bertanda tangan dari /__wpmgr_masuk mematikan Basic Auth
     # sampai kedaluwarsa (SSO dan probe dashboard, Koreksi #5).
