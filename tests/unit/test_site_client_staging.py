@@ -1,4 +1,6 @@
 import json
+import socket
+import threading
 import time
 
 import httpx
@@ -195,3 +197,108 @@ def test_timeout_unggah_unknown_manifest_transient():
     with pytest.raises(SiteError) as e:
         klien(h).staging_manifest()
     assert e.value.error_class == TRANSIENT
+
+
+# ---- fix putaran 1 -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("panggil,kelas", [
+    (lambda k: k.staging_file(["a"]), TRANSIENT),
+    (lambda k: k.staging_manifest(), TRANSIENT),
+    (lambda k: k.staging_unggah(b"x"), UNKNOWN),
+    (lambda k: k.staging_terapkan({"langkah": "tukar"}), UNKNOWN),
+])
+def test_tenggat_total_mencakup_tunggu_sebelum_header(monkeypatch, panggil, kelas):
+    # Connector yang diam sebelum mengirim header: loop body belum pernah
+    # berjalan, jadi tenggat harus berlaku atas seluruh permintaan.
+    monkeypatch.setattr(site_client, "TENGGAT_STAGING", 0.3)
+    monkeypatch.setattr(site_client, "TENGGAT_STAGING_TERAPKAN", 0.3)
+
+    def diam(r):
+        time.sleep(2)
+        return httpx.Response(200, json={"ok": True})
+
+    mulai = time.monotonic()
+    with pytest.raises(SiteError) as e:
+        panggil(klien(diam))
+    assert time.monotonic() - mulai < 1.5
+    assert e.value.error_class == kelas
+    assert "tenggat" in e.value.pesan
+
+
+def test_tenggat_total_memutus_soket_yang_macet(monkeypatch):
+    """Server TCP sungguhan yang menerima koneksi lalu tidak pernah menjawab
+    (jabat tangan TLS macet). Sesudah tenggat, soketnya diputus dari sisi
+    dashboard, bukan dibiarkan menggantung sampai timeout httpx 45 detik."""
+    monkeypatch.setattr(site_client, "TENGGAT_STAGING", 0.3)
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    tertutup = threading.Event()
+
+    def layani():
+        conn, _ = server.accept()
+        conn.settimeout(30)
+        try:
+            while conn.recv(4096):
+                pass
+            tertutup.set()
+        except OSError:
+            tertutup.set()
+        finally:
+            conn.close()
+
+    t = threading.Thread(target=layani, daemon=True)
+    t.start()
+    try:
+        k = SiteClient(f"https://127.0.0.1:{port}", "s1", SECRET)
+        mulai = time.monotonic()
+        with pytest.raises(SiteError) as e:
+            k.staging_manifest()
+        assert time.monotonic() - mulai < 1.5
+        # Tenggat total atau timeout koneksi yang dijepit ke tenggat, mana
+        # yang lebih dulu; keduanya sementara karena belum ada yang terkirim.
+        assert e.value.error_class == TRANSIENT
+        assert tertutup.wait(3), "soket ke connector tidak diputus sesudah tenggat"
+    finally:
+        server.close()
+
+
+def test_soket_tls_yang_tertangkap_di_shutdown_saat_tenggat(monkeypatch):
+    # Sesudah jabat tangan TLS, recv() yang terblokir (header yang diteteskan)
+    # hanya bisa dibangunkan dengan shutdown soket TLS dari thread lain.
+    monkeypatch.setattr(site_client, "TENGGAT_STAGING", 0.3)
+    diputus = threading.Event()
+
+    class SoketPalsu:
+        def shutdown(self, how):
+            assert how == socket.SHUT_RDWR
+            diputus.set()
+
+    class AliranPalsu:
+        def get_extra_info(self, nama):
+            return SoketPalsu() if nama == "socket" else None
+
+    def h(r):
+        r.extensions["trace"]("connection.start_tls.complete", {"return_value": AliranPalsu()})
+        diputus.wait(5)
+        raise httpx.ReadError("soket diputus", request=r)
+
+    with pytest.raises(SiteError) as e:
+        klien(h).staging_manifest()
+    assert "tenggat" in e.value.pesan
+    assert diputus.wait(1)
+
+
+def test_content_encoding_selain_identity_ditolak():
+    data = susun({"berkas": [{"path": "a"}]}, [b"isi"])
+    with pytest.raises(SiteError) as e:
+        # Body sebagai stream (seperti transport sungguhan), supaya httpx
+        # tidak mendekodenya lebih dulu.
+        klien(lambda r: httpx.Response(200, content=iter([data]),
+                                       headers={"Content-Encoding": "gzip"})).staging_file(["a"])
+    assert e.value.error_class == BAD_RESPONSE
+    meta, _ = klien(lambda r: httpx.Response(200, content=data,
+                                             headers={"Content-Encoding": "identity"})).staging_file(["a"])
+    assert meta["berkas"][0]["path"] == "a"

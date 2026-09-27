@@ -348,3 +348,61 @@ def test_potongan_tabel_dengan_mode():
 def test_potongan_tabel_tidak_sah(meta):
     with pytest.raises(BalasanTidakSah):
         potongan_tabel("wp_x", "K", meta, [b""])
+
+
+# ---- fix putaran 1 -----------------------------------------------------------
+
+
+def test_entri_dari_menjepit_mtime_negatif_ke_nol():
+    assert entri_dari({"path": "a.php", "ukuran": 1, "mtime": -5, "hash": None}) == Entri("a.php", 1, 0, None)
+    assert entri_dari({"path": "a.php", "ukuran": 1, "mtime": True, "hash": None}) is None
+
+
+def test_diubah_tanda_air_hanya_format_waktu_sah():
+    ta = urai_tanda_air({"sumber": {"posts": {**POSTS, "diubah": "2026-09-20 00:00:00<script>"}}})
+    assert ta["sumber"]["posts"]["diubah"] == ""
+    ta = urai_tanda_air({"sumber": {"posts": {**POSTS, "diubah": "2026-09-20T00:00:00"}}})
+    assert ta["sumber"]["posts"]["diubah"] == ""
+    ta = urai_tanda_air({"sumber": {"posts": {**POSTS, "diubah": "2026-09-20 00:00:00"}}})
+    assert ta["sumber"]["posts"]["diubah"] == "2026-09-20 00:00:00"
+
+
+def test_bandingkan_tanda_air_baru_tidak_ada():
+    lama = _ta(posts=POSTS)
+    for baru in (None, {}, {"sumber": "x"}):
+        hasil = bandingkan_tanda_air(lama, baru)
+        assert len(hasil) == 1 and "tidak bisa dipastikan" in hasil[0]
+
+
+def test_info_manifest_hanya_bendera_yang_dikenal():
+    h = halaman_manifest({"berkas": [], "lagi": False, "kursor": None, "info": {
+        "multisite": 1, "konten_di_luar": "", "unggah_terlalu_kecil": True, "batas_unggah": 99 * 1024 * 1024,
+        "home": "<b>x</b>", "lain": [1]}}, None)
+    assert h.info == {"multisite": True, "konten_di_luar": False, "unggah_terlalu_kecil": True,
+                      "batas_unggah": 4 * 1024 * 1024}
+    h = halaman_manifest({"berkas": [], "lagi": False, "kursor": None, "info": {"batas_unggah": "x"}}, None)
+    assert h.info == {"multisite": False, "konten_di_luar": False, "unggah_terlalu_kecil": False,
+                      "batas_unggah": None}
+
+
+def test_halaman_manifest_menegakkan_batas_halaman():
+    from wpmgr.staging.rencana import MAKS_HALAMAN_MANIFEST
+
+    data = {"berkas": [], "lagi": True, "kursor": "b"}
+    assert halaman_manifest(data, "a", halaman=MAKS_HALAMAN_MANIFEST - 1).lagi is True
+    with pytest.raises(BalasanTidakSah):
+        halaman_manifest(data, "a", halaman=MAKS_HALAMAN_MANIFEST)
+    # Halaman terakhir (lagi:false) di batas tetap diterima.
+    assert halaman_manifest({"berkas": [], "lagi": False}, "a", halaman=MAKS_HALAMAN_MANIFEST).lagi is False
+
+
+def test_rakit_rentang_total_jauh_melebihi_manifest_berarti_berubah():
+    mib = 1024 * 1024
+    r = RakitRentang(Entri("x", 100 * mib, 5, None), panjang=4)
+    # Pertumbuhan kecil sejak manifest masih diterima...
+    assert r.terima({"path": "x", "dari": 0, "total": 100 * mib + 5, "mtime": 6}, b"abcd") == "lanjut"
+    # ...tetapi total yang jauh melebihi manifest tidak diikuti (bisa jadi
+    # connector yang disusupi mencoba memenuhi disk).
+    r = RakitRentang(Entri("x", 100 * mib, 5, None), panjang=4)
+    assert r.terima({"path": "x", "dari": 0, "total": 200 * mib, "mtime": 6}, b"abcd") == "berubah"
+    assert r.dari == 0

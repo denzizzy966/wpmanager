@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from wpmgr.errors import (
     AUTH_ERROR,
     BAD_RESPONSE,
@@ -224,6 +226,39 @@ def test_json_bersarang_dalam_tidak_meledak_saat_klasifikasi():
     assert klasifikasi_respons(200, {}, dalam) is None
     assert klasifikasi_respons(400, {}, dalam) == BAD_RESPONSE
     assert pesan_plugin(dalam) is None
+
+
+@pytest.mark.parametrize("status,kode,kelas", [
+    (403, "wpmgr_staging_mati", "staging_mati"),
+    (413, "wpmgr_staging_terlalu_besar", "terlalu_besar"),
+    (404, "wpmgr_staging_tidak_ada", "berkas_hilang"),
+    (413, "wpmgr_staging_baris_terlalu_besar", "staging_gagal"),
+    (409, "wpmgr_staging_ditahan", "staging_ditolak"),
+    (409, "wpmgr_staging_sibuk", TRANSIENT),
+    (409, "wpmgr_staging_direbut", "staging_gagal"),
+    (400, "wpmgr_staging_path", "staging_gagal"),
+    (400, "wpmgr_staging_permintaan", "staging_gagal"),
+    (400, "wpmgr_staging_kursor", "staging_gagal"),
+    (400, "wpmgr_staging_paket", "staging_gagal"),
+    (400, "wpmgr_staging_sql", "staging_gagal"),
+    (422, "wpmgr_staging_impor", "staging_gagal"),
+    (422, "wpmgr_staging_rencana", "staging_gagal"),
+    (422, "wpmgr_staging_verifikasi", "staging_gagal"),
+    (422, "wpmgr_staging_hash", BAD_RESPONSE),
+    (507, "wpmgr_staging_disk_penuh", "staging_gagal"),
+    # Kode yang sama dengan status lain tidak ikut: 500 impor tetap sementara.
+    (500, "wpmgr_staging_impor", TRANSIENT),
+    (409, "wpmgr_staging_urutan", BAD_RESPONSE),
+])
+def test_tabel_kode_staging(status, kode, kelas):
+    body = json.dumps({"code": kode, "message": "x", "data": {"status": status}})
+    assert klasifikasi_respons(status, {}, body) == kelas
+
+
+def test_kelas_staging_permanen_tidak_diulang():
+    from wpmgr.errors import STAGING_DITOLAK, STAGING_GAGAL
+
+    assert STAGING_GAGAL not in DAPAT_DIULANG and STAGING_DITOLAK not in DAPAT_DIULANG
 
 
 def test_kode_staging_dipetakan_sebelum_cabang_status():

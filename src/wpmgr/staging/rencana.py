@@ -66,7 +66,12 @@ def entri_dari(item) -> Entri | None:
     if dikecualikan(path):
         return None
     ukuran = _bulat(item.get("ukuran"), MAKS_UKURAN)
-    mtime = _bulat(item.get("mtime"), MAKS_MTIME)
+    mtime = item.get("mtime")
+    if isinstance(mtime, int) and not isinstance(mtime, bool) and mtime < 0:
+        # Berkas bermtime sebelum 1970 (arsip lama, jam server salah) sah di
+        # produksi; dijepit ke 0 alih-alih dibuang dari manifest.
+        mtime = 0
+    mtime = _bulat(mtime, MAKS_MTIME)
     h = item.get("hash")
     if ukuran is None or mtime is None:
         return None
@@ -126,6 +131,16 @@ class Potongan:
 
 def bagi_potongan(entri: list[Entri], ukuran_paket: int = UKURAN_PAKET,
                   maks_berkas: int = MAKS_BERKAS_PAKET) -> list[Potongan]:
+    """Kelompokkan berkas kecil ke paket; berkas besar menjadi potongan "rentang".
+
+    Rentang di sini hanya RENCANA menurut ukuran manifest, untuk menghitung
+    jumlah potongan dan byte. Pengambilan berkas besar yang sebenarnya
+    memakai `RakitRentang` (rentang dinamis: maju sebesar bagian yang benar-
+    benar dikembalikan, ukuran berkas bisa berubah sejak manifest), mulai
+    dari potongan rentang pertama (`dari == 0`); potongan rentang lain untuk
+    berkas yang sama dilewati pemanggil. Untuk mengemas berkas kecil,
+    potongan "paket" dipakai apa adanya.
+    """
     hasil: list[Potongan] = []
     kumpulan: list[Entri] = []
     total = 0
@@ -186,12 +201,40 @@ class HalamanManifest:
     info: dict | None
 
 
-def halaman_manifest(data, kursor_masuk: str | None) -> HalamanManifest:
+MAKS_BATAS_UNGGAH = 4 * 1024 * 1024
+
+
+def _info_manifest(info) -> dict | None:
+    """Hanya bendera yang dipakai dashboard, dengan tipe yang dijamin.
+
+    Teks lain dari connector (home, siteurl, versi, dst.) sengaja tidak
+    diteruskan dari sini supaya tidak ada teks penyerang yang sampai ke
+    penyimpanan tanpa dibersihkan.
+    """
+    if not isinstance(info, dict):
+        return None
+    return {
+        "multisite": bool(info.get("multisite")),
+        "konten_di_luar": bool(info.get("konten_di_luar")),
+        "unggah_terlalu_kecil": bool(info.get("unggah_terlalu_kecil")),
+        # None bila tidak ada/rusak; connector selalu mengirim 1..4 MiB.
+        "batas_unggah": angka(info.get("batas_unggah"), 1, MAKS_BATAS_UNGGAH),
+    }
+
+
+def halaman_manifest(data, kursor_masuk: str | None, halaman: int | None = None) -> HalamanManifest:
     """Satu halaman /staging/manifest yang sudah diperiksa.
 
     Halaman boleh kosong dengan `lagi: true` (connector berhenti di tenggat
     sesudah hanya melewati entri anomali); yang tidak boleh adalah kursor
-    yang tidak maju. `info` hanya dibaca dari halaman pertama.
+    yang tidak maju. `info` hanya dibaca dari halaman pertama, dan hanya
+    bendera `multisite`, `konten_di_luar`, `unggah_terlalu_kecil`, dan
+    `batas_unggah`.
+
+    `halaman` adalah nomor halaman ini (mulai 1). Bila diberikan, halaman
+    ke-MAKS_HALAMAN_MANIFEST yang masih `lagi: true` ditolak, sehingga paging
+    tidak berjalan selamanya. Pemanggil yang tidak mengirim `halaman` wajib
+    menghitung sendiri.
     """
     if not isinstance(data, dict) or not isinstance(data.get("berkas"), list):
         raise BalasanTidakSah("Halaman manifest tidak sah.")
@@ -214,7 +257,9 @@ def halaman_manifest(data, kursor_masuk: str | None) -> HalamanManifest:
             raise BalasanTidakSah("Kursor manifest dari produksi tidak sah.") from None
         if kursor == kursor_masuk:
             raise BalasanTidakSah("Manifest produksi tidak maju; periksa connector di site.")
-    info = data.get("info") if kursor_masuk is None and isinstance(data.get("info"), dict) else None
+        if halaman is not None and halaman >= MAKS_HALAMAN_MANIFEST:
+            raise BalasanTidakSah("Manifest produksi terlalu panjang.")
+    info = _info_manifest(data.get("info")) if kursor_masuk is None else None
     return HalamanManifest(entri, dilewati, kursor, lagi, info)
 
 
@@ -285,6 +330,10 @@ class RakitRentang:
         self.mtime: int | None = None
         self._h = hashlib.sha256()
 
+    def total_maks(self) -> int:
+        """Ukuran terbesar yang diterima: manifest + 10% + 8 MiB (berkas yang tumbuh wajar)."""
+        return self.entri.ukuran + self.entri.ukuran // 10 + UKURAN_PAKET
+
     def permintaan(self) -> tuple[str, int, int]:
         return self.entri.path, self.dari, self.panjang
 
@@ -302,6 +351,14 @@ class RakitRentang:
         if meta.get("dari") != self.dari or total is None or mtime is None \
                 or len(isi) > self.panjang or self.dari + len(isi) > total:
             raise BalasanTidakSah("Rentang berkas tidak sesuai permintaan.")
+        if total > self.total_maks():
+            # Berkas (menurut connector) tumbuh jauh melebihi manifest. Tidak
+            # diikuti: bisa jadi connector yang disusupi mencoba memenuhi disk
+            # dashboard. BERUBAH (bukan BalasanTidakSah) karena berkas yang
+            # sungguh tumbuh juga sah; pemanggil mengulang dari awal lalu
+            # melewatinya dengan peringatan, dan tarik berikutnya membawa
+            # ukuran baru dari manifest.
+            return BERUBAH
         if self.total is None:
             self.total, self.mtime = total, mtime
         elif (total, mtime) != (self.total, self.mtime):
@@ -369,6 +426,7 @@ URUTAN_SUMBER = ("pesanan_hpos", "pesanan_posts", "comments", "users", "gravity_
                  "fluent_forms", "flamingo", "posts")
 _MAKS_ANGKA = 2**62
 _FORMAT_DIUBAH = "%Y-%m-%d %H:%M:%S"
+_POLA_DIUBAH = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 
 
 def urai_tanda_air(data) -> dict | None:
@@ -386,7 +444,9 @@ def urai_tanda_air(data) -> dict | None:
         bersih = {"maks_id": maks_id, "jumlah": jumlah}
         if kunci == "posts":
             diubah = nilai.get("diubah")
-            bersih["diubah"] = diubah[:19] if isinstance(diubah, str) else ""
+            # Hanya format post_modified_gmt; teks lain dari connector tidak
+            # disimpan (nilai ini juga dikirim balik sebagai posts_sejak).
+            bersih["diubah"] = diubah if isinstance(diubah, str) and _POLA_DIUBAH.fullmatch(diubah) else ""
             # None berarti "tidak dihitung" (tanpa posts_sejak), bukan nol.
             bersih["diubah_sejak"] = _bulat(nilai.get("diubah_sejak"), _MAKS_ANGKA)
         sumber[kunci] = bersih
@@ -415,11 +475,14 @@ def _post_diubah(lama: dict, baru: dict) -> str | None:
     return None
 
 
-def bandingkan_tanda_air(lama: dict | None, baru: dict) -> list[str]:
+def bandingkan_tanda_air(lama: dict | None, baru: dict | None) -> list[str]:
     """Daftar data baru/berubah di produksi sejak tarik, dalam kalimat (spec §8.2)."""
     if not lama or not isinstance(lama.get("sumber"), dict):
         return ["Tanda air saat tarik tidak tersedia; data baru di produksi tidak dapat diperiksa."]
-    ls, bs = lama["sumber"], baru.get("sumber", {})
+    if not isinstance(baru, dict) or not isinstance(baru.get("sumber"), dict):
+        # Mis. urai_tanda_air() mengembalikan None untuk balasan rusak.
+        return ["Tanda air produksi saat ini tidak tersedia; data baru di produksi tidak bisa dipastikan."]
+    ls, bs = lama["sumber"], baru["sumber"]
     hasil = []
     for kunci in URUTAN_SUMBER:
         label = LABEL_SUMBER[kunci]
