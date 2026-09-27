@@ -1081,3 +1081,65 @@ def test_galat_tak_terduga_sesudah_tukar(sesi, site_staging, staging_aktif, prod
     assert st.status == StatusStaging.gagal and st.dorong_gagal_pada is not None
     assert sesi.query(StagingSnapshot).one().status == "tersedia"
     assert prod.dorongan[_kemajuan(sesi, job)["dorong_id"]]["status"] == "ditukar"
+
+
+# ---- fix putaran 2 -------------------------------------------------------------
+
+
+def test_rekonsiliasi_lama_gagal_final_tidak_menandai_staging_gagal(sesi, site_staging, staging_aktif, prod, pb):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    lama_id = _dorongan_lama(prod, "ditukar", hasil={"tukar": {"selesai": True, "status": "ditukar"}})
+    job_lama = _job_lama(sesi, site_staging, lama_id, "b" * 32)
+    prod.kejadian["bersihkan"] = ["putus_awal"] * 5
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.error_class == STAGING_DITOLAK and "coba lagi nanti" in e.value.pesan.lower()
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.galat == e.value.pesan
+    assert st.dorong_gagal_pada is None
+    assert prod.unggahan == {} and prod.dorongan[lama_id]["status"] == "ditukar"
+    assert not _kemajuan(sesi, job_lama).get("produksi_bersih")
+
+
+def test_rekonsiliasi_lama_yang_terputus_tetap_kandidat(sesi, site_staging, staging_aktif, prod, pb, monkeypatch):
+    """Penanda bersih, baris snapshot, dan log aktivitas dorongan lama di-commit bersama."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    lama_id = _dorongan_lama(prod, "memulihkan")
+    job_lama = _job_lama(sesi, site_staging, lama_id, "b" * 32, langkah="pulihkan")
+    sesi.add(StagingSnapshot(site_id=site_staging.site_id, job_id=job_lama.id, jenis="sebelum_dorong",
+                             status="tersedia", path=f"{site_staging.site_id}/snapshot/j{job_lama.id}"))
+    sesi.commit()
+
+    def mati(*a, **kw):
+        raise RuntimeError("worker mati")
+
+    monkeypatch.setattr(umum, "catat_aktivitas", mati)
+    with pytest.raises(RuntimeError):
+        _jalankan(sesi, site_staging, prod, _job_baru(sesi, site_staging, "hanya_kode"))
+    sesi.rollback()
+    assert not _kemajuan(sesi, job_lama).get("produksi_bersih")
+    assert sesi.query(StagingSnapshot).filter(StagingSnapshot.job_id == job_lama.id).count() == 1
+
+
+def test_urutan_pra_tukar_tidak_mengaku_dipulihkan(sesi, site_staging, staging_aktif, prod, pb):
+    """409 urutan saat status masih terimpor (mis. tabel hasil impor hilang): produksi tidak pernah diubah."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.tolak_tukar = {"wpmgr_staging_urutan": 1}
+    with pytest.raises(SiteError) as e:
+        _dorong(sesi, site_staging, prod, "timpa_penuh")
+    assert e.value.error_class == STAGING_GAGAL
+    assert "sudah dipulihkan" not in e.value.pesan and "tidak pernah diubah" in e.value.pesan
+    assert prod.langkah == ["siapkan", "impor", "tukar", "pulihkan"]
+    assert prod.berkas["wp-content/themes/t/style.css"][0] == b"body{}"
+    assert _staging(sesi, site_staging).dorong_gagal_pada is None
+
+
+def test_pulihkan_pra_tukar_menolak_token_tidak_sah(prod):
+    """Tiruan setia connector: pulihkan pra-tukar tanpa token sah ditolak 400 (token_sah)."""
+    prod.dorongan["a" * 32] = {"status": "siap", "potongan": {}, "hasil": {}}
+    r = prod._terapkan_inti({"dorong_id": "a" * 32, "langkah": "pulihkan", "token": "bukan-token"}, "pulihkan")
+    assert r.status_code == 400 and r.json()["code"] == "wpmgr_staging_permintaan"
+    assert prod.dorongan["a" * 32]["status"] == "siap"

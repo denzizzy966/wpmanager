@@ -25,6 +25,7 @@ from wpmgr.staging.pembantu import StatusPembantu
 GB = 1024**3
 SECRET = "f" * 64
 AWALAN = "/wp-json/wpmgr/v1"
+_POLA_TOKEN = re.compile(r"[0-9a-f]{32,64}")
 _POLA_WAKTU = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 
 
@@ -426,6 +427,10 @@ class ProduksiPalsu:
             token_cocok = hashlib.sha256((token or "").encode()).hexdigest() == d.get("token_hash")
             if d["status"] in STATUS_MENYENTUH_PRODUKSI and not token_cocok:
                 return _galat(403, "wpmgr_staging_token", "Token pemulihan tidak cocok.")
+            if d["status"] in STATUS_PRA_TUKAR and not (isinstance(token, str)
+                                                        and _POLA_TOKEN.fullmatch(token)):
+                # pulihkan_inti(): pembatalan pra-tukar tetap butuh token sah (token_sah()).
+                return _galat(400, "wpmgr_staging_permintaan", "Token pemulihan tidak sah.")
             if d["status"] in STATUS_PRA_TUKAR or d["status"] in STATUS_MENYENTUH_PRODUKSI:
                 self._pulihkan_produksi(id_, d)
                 return _json(200, d["hasil"]["pulihkan"])

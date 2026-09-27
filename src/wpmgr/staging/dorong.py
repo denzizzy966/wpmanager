@@ -202,6 +202,8 @@ PESAN_AKHIR = {
 PESAN_LAMA_GAGAL = ("Dorongan sebelumnya masih setengah diterapkan di produksi dan belum dapat dituntaskan; "
                     "periksa site lalu coba lagi.")
 PESAN_LAMA_SEMENTARA = "Dorongan sebelumnya di produksi belum dapat diperiksa atau dituntaskan (connector tidak menjawab)."
+PESAN_LAMA_AKHIR = ("Dorongan sebelumnya di produksi belum dapat diperiksa atau dituntaskan (connector tidak "
+                    "menjawab); dorong baru tidak dimulai, produksi dan staging tidak diubah. Coba lagi nanti.")
 
 
 class PotonganKurang(Exception):
@@ -368,6 +370,13 @@ def _pindah(sesi, job, langkah: str, **lain) -> str:
     return langkah
 
 
+class GalatLamaSementara(SiteError):
+    """Dorongan lama belum bisa diperiksa/dituntaskan karena gangguan: diulang, belum ada yang disentuh."""
+
+    def __init__(self) -> None:
+        super().__init__(TRANSIENT, PESAN_LAMA_SEMENTARA)
+
+
 class TolakPraTukar(Exception):
     """Connector menolak tukar di pra-pemeriksaan: produksi belum tersentuh."""
 
@@ -416,8 +425,8 @@ def _jeda(percobaan: int) -> None:
     time.sleep(umum.JEDA_ULANG[min(percobaan, len(umum.JEDA_ULANG) - 1)])
 
 
-def _tukar(sesi, job, klien, dasar: dict, token: str) -> str | None:
-    """Kirim tukar sampai connector menjawab pasti. None = ditukar; teks = gagal pasti (alasan).
+def _tukar(sesi, job, klien, dasar: dict, token: str) -> tuple[str, str] | None:
+    """Kirim tukar sampai connector menjawab pasti. None = ditukar; (kode, alasan) = gagal pasti.
 
     Tidak ada keputusan yang diambil dari hasil yang tidak diketahui: tukar
     dikirim ulang, dan connector membalas keadaan sebenarnya (hasil tersimpan
@@ -435,7 +444,7 @@ def _tukar(sesi, job, klien, dasar: dict, token: str) -> str | None:
             if exc.kode in KODE_TUKAR_PRA:
                 raise TolakPraTukar(exc.kode) from None
             if exc.kode in KODE_TUKAR_GAGAL:
-                return bersih_teks(exc.pesan, 300) or "tukar ditolak connector"
+                return exc.kode, bersih_teks(exc.pesan, 300) or "tukar ditolak connector"
             if not _ragu(exc):
                 # Kode lain (token, direbut, tidak ada, 4xx asing): keadaan
                 # produksi tidak terbukti; tidak dipulihkan atas dugaan.
@@ -525,7 +534,7 @@ def terapkan(sesi, job, staging, klien, site_url: str, dorong_id: str, jumlah: i
                 langkah = _pindah(sesi, job, "tukar", tolak_pra_tukar=None)
             elif langkah == "tukar":
                 try:
-                    alasan = _tukar(sesi, job, klien, dasar, token)
+                    gagal = _tukar(sesi, job, klien, dasar, token)
                 except TolakPraTukar as tolak:
                     # Status connector masih siap/terimpor: produksi tidak
                     # tersentuh dan dorongan yang terunggah tetap utuh. Kembali
@@ -535,8 +544,8 @@ def terapkan(sesi, job, staging, klien, site_url: str, dorong_id: str, jumlah: i
                     if tolak.kode == "wpmgr_staging_maintenance":
                         raise SiteError(TRANSIENT, PESAN_MAINTENANCE_ULANG) from None
                     raise umum.GalatDitolakTanpaUbah(PESAN_TOLAK_PRA[tolak.kode]) from None
-                langkah = (_pindah(sesi, job, "selesai") if alasan is None
-                           else _pindah(sesi, job, "pulihkan", galat_tukar=alasan))
+                langkah = (_pindah(sesi, job, "selesai") if gagal is None
+                           else _pindah(sesi, job, "pulihkan", galat_tukar_kode=gagal[0], galat_tukar=gagal[1]))
             elif langkah == "pulihkan":
                 _pulihkan(sesi, job, klien, dasar, token)
                 langkah = _pindah(sesi, job, "dipulihkan", pulih_terkonfirmasi=True)
@@ -545,9 +554,19 @@ def terapkan(sesi, job, staging, klien, site_url: str, dorong_id: str, jumlah: i
                 if staging is not None and not _hidup(status):
                     sesi.get(Staging, staging.id, populate_existing=True).dorong_gagal_pada = umum.sekarang()
                     sesi.commit()
-                alasan = umum.kemajuan(job).get("galat_tukar") or "tukar ditolak connector"
-                raise umum.galat_gagal(f"Terapkan di produksi gagal: {alasan}. Produksi sudah dipulihkan dari "
-                                       "salinan lokal connector.")
+                k = umum.kemajuan(job)
+                alasan = k.get("galat_tukar") or "tukar ditolak connector"
+                if k.get("galat_tukar_kode") == "wpmgr_staging_tukar":
+                    # gagal_tukar(): penukaran sempat berjalan lalu dibalik connector.
+                    raise umum.galat_gagal(f"Terapkan di produksi gagal: {alasan}. Produksi sudah dipulihkan "
+                                           "dari salinan lokal connector.")
+                # 409 urutan: bisa pra-pemeriksaan (status masih terimpor, mis.
+                # tabel hasil impor tidak ditemukan) atau jawaban atas tukar yang
+                # dikirim ulang sesudah connector memulihkan sendiri. Keduanya
+                # berakhir pada keadaan sebelum dorong; kalimatnya benar untuk keduanya.
+                raise umum.galat_gagal(f"Terapkan di produksi tidak tuntas: {alasan}. Produksi dalam keadaan "
+                                       "sebelum dorong (tidak pernah diubah, atau diubah lalu dipulihkan "
+                                       "connector).")
             elif langkah == "selesai":
                 _selesai(klien, dasar, token)
                 langkah = _pindah(sesi, job, "beres")
@@ -647,13 +666,13 @@ def _tuntaskan_dorongan_lama(sesi, job, klien, dorong_id: str, token) -> str | N
     def bersih_atau_ulang() -> None:
         ok, _ = _bersihkan_rinci(klien, dorong_id, detak=detak)
         if not ok:
-            raise SiteError(TRANSIENT, PESAN_LAMA_SEMENTARA)
+            raise GalatLamaSementara()
 
     ok, galat = _bersihkan_rinci(klien, dorong_id, detak=detak)
     if ok:
         return "dibersihkan"
     if galat is None or (_ragu(galat) and galat.kode != KODE_SIBUK):
-        raise SiteError(TRANSIENT, PESAN_LAMA_SEMENTARA)
+        raise GalatLamaSementara()
     if galat.kode not in (KODE_SIBUK, "wpmgr_staging_perlu_pemulihan"):
         log.warning("Dorongan lama %s tidak dapat dibersihkan: %s (%s)", dorong_id, galat.error_class, galat.kode)
         return None
@@ -664,21 +683,21 @@ def _tuntaskan_dorongan_lama(sesi, job, klien, dorong_id: str, token) -> str | N
     try:
         h = umum.ulangi(klien.staging_terapkan, {**dasar, "langkah": "selesai"}, token)
         if h.get("selesai") is not True:
-            raise SiteError(TRANSIENT, PESAN_LAMA_SEMENTARA)
+            raise GalatLamaSementara()
         hasil = "diselesaikan"
     except SiteError as exc:
         if exc.error_class == BERKAS_HILANG:
             return "dibersihkan"
         if exc.kode != "wpmgr_staging_urutan":
             if _ragu(exc):
-                raise SiteError(TRANSIENT, PESAN_LAMA_SEMENTARA) from None
+                raise GalatLamaSementara() from None
             # Dorongan baru belum menyentuh apa pun: ditolak tanpa menandai staging gagal.
             raise umum.GalatDitolakTanpaUbah(PESAN_LAMA_GAGAL) from None
         try:
             _pulihkan(sesi, job, klien, dasar, token)
         except SiteError as exc2:
             if exc2.error_class == TRANSIENT:
-                raise SiteError(TRANSIENT, PESAN_LAMA_SEMENTARA) from None
+                raise GalatLamaSementara() from None
             raise umum.GalatDitolakTanpaUbah(PESAN_LAMA_GAGAL) from None
         hasil = "dipulihkan"
     bersih_atau_ulang()
@@ -715,15 +734,20 @@ def selesaikan_dorongan_lama(sesi, job, site, klien) -> None:
         hasil = _tuntaskan_dorongan_lama(sesi, job, klien, dorong_id, token)
         if hasil is None:
             continue
-        _tandai_bersih(sesi, j)
+        # Baris snapshot, dorong_gagal_pada, log aktivitas, dan penanda bersih
+        # job lama di-commit BERSAMA (commit di _tandai_bersih): worker yang mati
+        # di tengah meninggalkan job lama tetap kandidat, bukan setengah dicatat.
         if hasil == "dipulihkan":
-            _buang_snapshot(sesi, site.id, j.id)
+            _hapus_baris_snapshot(sesi, site.id, j.id)
             st = sesi.scalar(select(Staging).where(Staging.site_id == site.id))
             if st is not None:
                 st.dorong_gagal_pada = None if _hidup(cek_halaman(site.url)) else umum.sekarang()
         umum.catat_aktivitas(sesi, site.id, job, f"Dorongan sebelumnya (job #{j.id}) {hasil} di produksi",
                              {"job_lama": j.id, "hasil": hasil})
-        sesi.commit()
+        _tandai_bersih(sesi, j)
+        if hasil == "dipulihkan":
+            # Sesudah commit: direktori yatim bila mati di sini dibersihkan prune-staging.
+            _hapus_dir_staging(f"{site.id}/snapshot/j{j.id}")
 
 
 # ---- snapshot -----------------------------------------------------------------
@@ -780,11 +804,16 @@ def _buang_snapshot(sesi, site_id, job_id) -> None:
     Mengembalikan produksi ke snapshot seperti itu hanya menghapus data yang
     masuk sesudahnya, jadi ia tidak boleh tampil sebagai titik kembali.
     """
+    _hapus_baris_snapshot(sesi, site_id, job_id)
+    sesi.commit()
+    _hapus_dir_staging(f"{site_id}/snapshot/j{job_id}")
+
+
+def _hapus_baris_snapshot(sesi, site_id, job_id) -> None:
+    """Hapus baris snapshot milik job ini (tanpa commit)."""
     for row in sesi.scalars(select(StagingSnapshot).where(StagingSnapshot.site_id == site_id,
                                                           StagingSnapshot.job_id == job_id)).all():
         sesi.delete(row)
-    sesi.commit()
-    _hapus_dir_staging(f"{site_id}/snapshot/j{job_id}")
 
 
 # ---- job ----------------------------------------------------------------------
@@ -1142,7 +1171,17 @@ def boleh_batal(job) -> bool:
     return umum.kemajuan(job).get("langkah_terapkan") not in LANGKAH_SESUDAH_TUKAR
 
 
-def akhiri_gagal(sesi, job, site_id, klien) -> SiteError | None:
+def _staging_utuh(sesi, site_id, pesan: str) -> SiteError:
+    """Kegagalan final yang tidak menyentuh produksi maupun staging: staging tidak dibiarkan gagal."""
+    st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
+    if st is not None:
+        st.status = StatusStaging.siap if st.ditarik_pada else StatusStaging.gagal
+        st.galat = pesan
+        sesi.commit()
+    return SiteError(STAGING_DITOLAK, pesan)
+
+
+def akhiri_gagal(sesi, job, site_id, klien, galat: Exception | None = None) -> SiteError | None:
     """Penanganan kegagalan FINAL dorong/kembalikan (putusan F9a). Tidak pernah melempar.
 
     - Area dorong di produksi dibersihkan upaya-terbaik dengan tenggat pendek.
@@ -1153,6 +1192,10 @@ def akhiri_gagal(sesi, job, site_id, klien) -> SiteError | None:
       dikembalikan untuk dilempar pemanggil.
     """
     k = umum.kemajuan(job)
+    if isinstance(galat, GalatLamaSementara) and "tahap_dorong" not in k:
+        # Percobaan habis saat menuntaskan dorongan lama: dorongan baru belum
+        # dimulai (belum ada dorong_id, unggahan, atau snapshot).
+        return _staging_utuh(sesi, site_id, PESAN_LAMA_AKHIR)
     langkah = k.get("langkah_terapkan")
     pulih = bool(k.get("pulih_terkonfirmasi"))
     dorong_id = k.get("dorong_id")
@@ -1168,12 +1211,7 @@ def akhiri_gagal(sesi, job, site_id, klien) -> SiteError | None:
         # Penolakan pra-pemeriksaan tukar (mis. pemeliharaan lain yang tidak
         # kunjung usai): produksi dan staging utuh, jadi staging tidak
         # dibiarkan berstatus gagal dan pesannya pesan final "coba lagi nanti".
-        st = sesi.scalar(select(Staging).where(Staging.site_id == site_id))
-        if st is not None:
-            st.status = StatusStaging.siap if st.ditarik_pada else StatusStaging.gagal
-            st.galat = pesan_tolak
-            sesi.commit()
-        return SiteError(STAGING_DITOLAK, pesan_tolak)
+        return _staging_utuh(sesi, site_id, pesan_tolak)
     pesan = PESAN_AKHIR.get(langkah)
     if pesan is None:
         return None
@@ -1185,7 +1223,7 @@ def akhiri_gagal(sesi, job, site_id, klien) -> SiteError | None:
     return SiteError(STAGING_GAGAL, pesan)
 
 
-def _setelah_gagal(sesi, job, site_id, klien) -> SiteError | None:
+def _setelah_gagal(sesi, job, site_id, klien, galat: Exception) -> SiteError | None:
     try:
         sesi.rollback()
         status = sesi.scalar(select(Staging.status).where(Staging.site_id == site_id))
@@ -1194,7 +1232,7 @@ def _setelah_gagal(sesi, job, site_id, klien) -> SiteError | None:
             # produksi dan snapshot masih dibutuhkan putaran berikutnya.
             return None
         sesi.refresh(job)
-        return akhiri_gagal(sesi, job, site_id, klien)
+        return akhiri_gagal(sesi, job, site_id, klien, galat)
     except Exception:
         log.exception("Pembersihan sesudah dorong gagal (job %s) tidak tuntas", job.id)
         return None
@@ -1232,7 +1270,7 @@ def tangani_staging_dorong(sesi, job, klien) -> dict:
     except umum.KlaimHilang:
         raise
     except Exception as exc:
-        pengganti = _setelah_gagal(sesi, job, site_id, klien)
+        pengganti = _setelah_gagal(sesi, job, site_id, klien, exc)
         if pengganti is not None:
             raise pengganti from exc
         raise
