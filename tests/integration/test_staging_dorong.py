@@ -5,7 +5,7 @@ import time
 
 import httpx
 import pytest
-from staging_palsu import PembantuPalsu, ProduksiPalsu
+from staging_palsu import GB, PembantuPalsu, ProduksiPalsu
 
 from wpmgr.errors import STAGING_DITOLAK, STAGING_GAGAL, TRANSIENT, SiteError
 from wpmgr.jobs.queue import buat_job
@@ -1267,3 +1267,85 @@ def test_dorong_tolak_pra_tukar_tanpa_gagal_staging_tetap_siap(sesi, site_stagin
         _dorong(sesi, site_staging, prod, "hanya_kode")
     st = _staging(sesi, site_staging)
     assert st.status == StatusStaging.siap and st.galat == e.value.pesan and st.gagal_asal is None
+
+
+# ---- putusan R21: penolakan tarik sebelum salinan disentuh ----------------------
+
+
+def _status_pembantu(pb, **ubah):
+    from dataclasses import replace
+
+    pb.status_palsu = replace(pb.status_palsu, **ubah)
+
+
+def test_tarik_ditolak_disk_tidak_menandai_staging_yang_sudah_ditarik(sesi, site_staging, staging_aktif, prod, pb):
+    """R21: tarik ditolak (disk) sebelum salinan disentuh; staging tetap siap tanpa penanda, dorong boleh."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    asli = pb.status_palsu
+    _status_pembantu(pb, disk_total=100 * GB, disk_bebas=10 * GB)
+    with pytest.raises(SiteError) as e:
+        _tarik(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_DITOLAK and "Sisa disk" in e.value.pesan
+    _selesaikan_gagal(sesi)
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.siap and st.gagal_asal is None and st.galat == e.value.pesan
+    pb.status_palsu = asli
+    assert _dorong(sesi, site_staging, prod, "hanya_kode")["dorong_gagal"] is False
+
+
+def test_tarik_ditolak_ram_staging_dijeda_tetap_dijeda(sesi, site_staging, staging_aktif, prod, pb):
+    """R21: staging dijeda yang ditarik ulang dan ditolak karena RAM tetap dijeda, tanpa penanda."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    st = _staging(sesi, site_staging)
+    st.status, st.aktif = StatusStaging.dijeda, False
+    sesi.commit()
+    _status_pembantu(pb, mem_tersedia=GB)
+    with pytest.raises(SiteError) as e:
+        _tarik(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_DITOLAK and "RAM" in e.value.pesan
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.dijeda and st.gagal_asal is None
+
+
+def test_tarik_ditolak_batas_aktif_staging_dijeda_tetap_dijeda(sesi, site_staging, staging_aktif, prod, pb,
+                                                               monkeypatch):
+    _siap(sesi, site_staging, staging_aktif, prod)
+    st = _staging(sesi, site_staging)
+    st.status, st.aktif = StatusStaging.dijeda, False
+    sesi.commit()
+    monkeypatch.setattr(tarik, "jumlah_aktif", lambda sesi, staging: 99)
+    with pytest.raises(SiteError) as e:
+        _tarik(sesi, site_staging, prod)
+    assert e.value.error_class == STAGING_DITOLAK
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.dijeda and st.gagal_asal is None
+
+
+def test_tarik_ditolak_pada_staging_belum_pernah_ditarik(sesi, site_staging, staging_aktif, prod, pb):
+    """R21: staging yang belum pernah ditarik tetap gagal dengan pesan penolakan; dorong menolak (belum ditarik)."""
+    _status_pembantu(pb, mem_tersedia=GB)
+    with pytest.raises(SiteError) as e:
+        _tarik(sesi, site_staging, prod)
+    _selesaikan_gagal(sesi)
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.galat == e.value.pesan and st.ditarik_pada is None
+    with pytest.raises(SiteError) as e2:
+        _dorong(sesi, site_staging, prod, "hanya_kode")
+    assert e2.value.error_class == STAGING_DITOLAK and e2.value.pesan == dorong.PESAN_BELUM_TARIK
+
+
+def test_tarik_ditolak_sesudah_salinan_disentuh_tetap_menandai_salinan(sesi, site_staging, staging_aktif, prod, pb):
+    """Tarik yang dilanjutkan sesudah mulai menulis files/ lalu ditolak: salinan setengah jadi -> gagal 'salinan'."""
+    _siap(sesi, site_staging, staging_aktif, prod)
+    st = _staging(sesi, site_staging)
+    st.aktif = False
+    sesi.commit()
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_tarik, {"kemajuan": {"tahap": "berkas"}})
+    job.attempts = job.max_attempts
+    sesi.commit()
+    _status_pembantu(pb, mem_tersedia=GB)
+    site = sesi.get(Site, site_staging.site_id)
+    with pytest.raises(SiteError):
+        tarik.tangani_staging_tarik(sesi, job, prod.klien(site))
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.gagal and st.gagal_asal == umum.ASAL_SALINAN

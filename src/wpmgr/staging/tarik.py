@@ -26,7 +26,7 @@ from sqlalchemy import func, select
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import isi_mu_plugin_staging
 from wpmgr.crypto import dekripsi_secret
-from wpmgr.errors import BAD_RESPONSE, SiteError
+from wpmgr.errors import BAD_RESPONSE, STAGING_DITOLAK, SiteError
 from wpmgr.fitur import STAGING, punya_fitur
 from wpmgr.models import Staging, StatusStaging
 from wpmgr.staging import umum
@@ -633,12 +633,31 @@ def _bangun_ulang_indeks(sesi, job, akar: Path, peringatan: list[str]) -> None:
 # ---- job ----------------------------------------------------------------------
 
 
+# Tahap tarik sebelum salinan (files/ dan database staging) mulai ditulis.
+# Manifest hanya ditulis ke area kerja tarik/, bukan ke salinan.
+TAHAP_SEBELUM_SALINAN = (None, "manifest")
+
+
+def salinan_belum_disentuh(job) -> bool:
+    """Putusan R21: tarik ini belum menulis apa pun ke salinan staging (termasuk percobaan sebelumnya)."""
+    return umum.kemajuan(job).get("tahap") in TAHAP_SEBELUM_SALINAN
+
+
+def _tolak(job, pesan: str) -> SiteError:
+    """Penolakan tarik: tanpa ubah bila salinan belum disentuh (status dan `gagal_asal` tetap, R21).
+
+    Sesudah salinan mulai ditulis, penolakan yang sama berarti salinan
+    setengah jadi: galat biasa, yang oleh pembungkus ditandai `gagal` 'salinan'.
+    """
+    return umum.GalatDitolakTanpaUbah(pesan) if salinan_belum_disentuh(job) else umum.galat_ditolak(pesan)
+
+
 def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = True) -> dict:
     if not punya_fitur(site, STAGING):
-        raise umum.galat_ditolak("Connector site ini belum mengizinkan staging. Aktifkan 'Izinkan staging' "
-                                 "di Pengaturan -> WP Manager (connector 3.0).")
+        raise _tolak(job, "Connector site ini belum mengizinkan staging. Aktifkan 'Izinkan staging' "
+                          "di Pengaturan -> WP Manager (connector 3.0).")
     if not staging.sandi_hash or not staging.rahasia_router_terenkripsi:
-        raise umum.galat_ditolak("Akses preview staging belum dibuat; buat ulang kata sandi preview.")
+        raise _tolak(job, "Akses preview staging belum dibuat; buat ulang kata sandi preview.")
     akar = umum.dir_site(site.id)
     tarik_dir = akar / "tarik"
     pertama = staging.ditarik_pada is None
@@ -654,7 +673,7 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
         if not staging.aktif:
             pesan = cek_ram(status) or cek_maks_aktif(jumlah_aktif(sesi, staging), get_settings().staging_maks_aktif)
             if pesan:
-                raise umum.galat_ditolak(pesan)
+                raise _tolak(job, pesan)
 
         if baru:
             shutil.rmtree(tarik_dir, ignore_errors=True)
@@ -672,7 +691,7 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
             beda = selisih(produksi, lokal)
             pesan = cek_disk(status, kebutuhan_disk(beda.byte, k["info"]["ukuran_db"]))
             if pesan:
-                raise umum.galat_ditolak(pesan)
+                raise _tolak(job, pesan)
             info = k["info"]
             if k.get("berkas_dilewati"):
                 _tambah_peringatan(k, f"{k['berkas_dilewati']} berkas dilewati (nama bukan UTF-8, symlink, "
@@ -722,6 +741,14 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
             k = _simpan(sesi, job, k, tahap="sertifikat")
     except umum.Dibatalkan:
         shutil.rmtree(tarik_dir, ignore_errors=True)
+        raise
+    except umum.GalatDitolakTanpaUbah:
+        raise
+    except SiteError as exc:
+        # Penolakan dari tahap manifest (multisite, wp-content di luar
+        # ABSPATH, connector menolak) sebelum salinan disentuh: tanpa ubah (R21).
+        if exc.error_class == STAGING_DITOLAK and salinan_belum_disentuh(job):
+            raise umum.GalatDitolakTanpaUbah(exc.pesan) from None
         raise
     except PathTidakAman:
         # Container staging menukar direktori di files/ dengan symlink di sela
