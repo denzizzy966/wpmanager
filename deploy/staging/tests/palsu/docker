@@ -38,6 +38,12 @@ case "${1-}" in
     printf 'contoh/image@sha256:%s\n' "$(printf 'c%.0s' $(seq 1 64))"
     ;;
   exec)
+    # Impor yang tidak pernah selesai: mencatat pid lalu menunggu lama,
+    # untuk test penerusan SIGTERM.
+    if [[ -f "$PALSU/exec-lama" && "$*" == *"--binary-mode"* ]]; then
+      echo "$$" > "$PALSU/exec-lama.pid"
+      exec sleep 300
+    fi
     if [[ " $* " == *" -i "* ]]; then
       n=$(( $(cat "$PALSU/n" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$PALSU/n"

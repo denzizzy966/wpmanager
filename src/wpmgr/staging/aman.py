@@ -18,6 +18,7 @@ import errno
 import os
 import re
 import stat
+import sys
 import uuid
 from pathlib import Path
 from typing import BinaryIO
@@ -53,15 +54,26 @@ BATAS_DIUBAH = 64 * 1024
 # di sela langkah tidak pernah diikuti. Windows (dev) tidak punya ketiganya;
 # di sana dipakai pemeriksaan lstat per komponen, yang cukup untuk dev tetapi
 # tidak kebal balapan.
-_ADA_DIR_FD = (
-    hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
-    and os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd
-    # os.replace tidak tercantum di supports_dir_fd; os.rename dengan dir_fd
-    # di POSIX sama-sama menimpa secara atomik (renameat).
-    and os.unlink in os.supports_dir_fd and os.rename in os.supports_dir_fd
-    and os.stat in os.supports_dir_fd and os.stat in os.supports_follow_symlinks
-    and os.utime in os.supports_fd
-)
+
+
+def _dukung_dir_fd(o=os, platform: str = sys.platform) -> bool:
+    ada = (
+        hasattr(o, "O_NOFOLLOW") and hasattr(o, "O_DIRECTORY")
+        and o.open in o.supports_dir_fd and o.mkdir in o.supports_dir_fd
+        # os.replace tidak tercantum di supports_dir_fd; os.rename dengan dir_fd
+        # di POSIX sama-sama menimpa secara atomik (renameat).
+        and o.unlink in o.supports_dir_fd and o.rename in o.supports_dir_fd
+        and o.stat in o.supports_dir_fd and o.stat in o.supports_follow_symlinks
+        and o.utime in o.supports_fd
+    )
+    if not ada and platform.startswith("linux"):
+        # Produksi berjalan di Linux: cadangan lstat bisa kalah balapan dengan
+        # container, jadi lebih baik gagal keras daripada diam-diam kurang aman.
+        raise RuntimeError("Python ini tidak mendukung O_NOFOLLOW/dir_fd; akses berkas staging tidak aman")
+    return ada
+
+
+_ADA_DIR_FD = _dukung_dir_fd()
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _BINER = getattr(os, "O_BINARY", 0)

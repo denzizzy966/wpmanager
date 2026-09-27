@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -163,10 +164,6 @@ def test_tenggat_keras(pembantu):
     assert time.monotonic() - mulai < 15
 
 
-def test_jeda_henti_lima_detik():
-    assert modul_pembantu.JEDA_HENTI == 5
-
-
 @POSIX
 def test_tenggat_mengirim_sigterm_dulu(pembantu, catatan):
     mulai = time.monotonic()
@@ -205,8 +202,42 @@ def test_tenggat_sigkill_ke_seluruh_grup(pembantu, catatan, monkeypatch):
     assert not _hidup(anak)
 
 
-def test_keluaran_dibatasi(pembantu):
-    assert len(pembantu.jalankan("berisik")) == BATAS_KELUARAN
+def test_keluaran_tepat_batas_diterima(pembantu, monkeypatch):
+    monkeypatch.setenv("PALSU_UKURAN", str(BATAS_KELUARAN))
+    assert len(pembantu.jalankan("pas")) == BATAS_KELUARAN
+
+
+def test_keluaran_melebihi_batas_menjadi_galat_tetap(pembantu):
+    with pytest.raises(GalatPembantu) as e:
+        pembantu.jalankan("berisik")
+    assert e.value.kode == "lain"
+    assert e.value.pesan == modul_pembantu.PESAN_MELIMPAH
+
+
+@pytest.mark.parametrize("perintah", ["banjir", "banjir-galat"])
+def test_banjir_keluaran_dihentikan_tanpa_menampung(pembantu, monkeypatch, perintah):
+    """Keluaran tanpa akhir (wp-cli dari salinan site yang disusupi) tidak ditulis ke disk
+    dan tidak ditampung melebihi batas: proses dihentikan begitu batasnya lewat."""
+    def tanpa_berkas_sementara(*_a, **_k):
+        raise AssertionError("keluaran pembantu tidak boleh ditampung di berkas sementara")
+
+    monkeypatch.setattr("tempfile.TemporaryFile", tanpa_berkas_sementara)
+    tambah_asli = modul_pembantu._Penampung.tambah
+    terbesar = []
+
+    def tambah(self, blok):
+        hasil = tambah_asli(self, blok)
+        terbesar.append((len(self.data), self.batas))
+        return hasil
+
+    monkeypatch.setattr(modul_pembantu._Penampung, "tambah", tambah)
+    mulai = time.monotonic()
+    with pytest.raises(GalatPembantu) as e:
+        pembantu.jalankan(perintah, timeout=60)
+    assert e.value.kode == "lain"
+    assert e.value.pesan == modul_pembantu.PESAN_MELIMPAH
+    assert time.monotonic() - mulai < 15
+    assert terbesar and all(n <= batas for n, batas in terbesar)
 
 
 def test_db_impor_mengalirkan_berkas_berurutan(pembantu, catatan, tmp_path):
@@ -238,6 +269,27 @@ def test_db_impor_berkas_tidak_terbaca_menghentikan_tanpa_eof(pembantu, catatan,
     assert catatan() == []
 
 
+def test_db_impor_berhenti_mengalirkan_setelah_tenggat(pembantu, catatan, tmp_path):
+    """Skrip tidak membaca stdin dan cucunya (anak root di bawah sudo) tetap memegang
+    pipa: penulisan yang terblokir ditinggalkan, panggilan kembali tepat waktu."""
+    besar = tmp_path / "besar.sql"
+    besar.write_bytes(b"INSERT INTO t VALUES (1);\n" * 200_000)  # ~5 MB, jauh di atas buffer pipa
+    mulai = time.monotonic()
+    try:
+        with pytest.raises(GalatPembantu) as e:
+            pembantu.jalankan("tuli", masukan=[besar], timeout=1)
+        lama = time.monotonic() - mulai
+    finally:
+        for c in catatan():
+            if "cucu" in c:
+                try:
+                    os.kill(c["cucu"], getattr(signal, "SIGKILL", signal.SIGTERM))
+                except OSError:
+                    pass
+    assert e.value.kode == "waktu"
+    assert lama < 1 + modul_pembantu.JEDA_HENTI + 3
+
+
 def test_status_diurai_dan_disaring(pembantu, monkeypatch):
     monkeypatch.setenv("PALSU_STATUS", json.dumps({
         "mem_tersedia": 4294967296, "disk_total": 200, "disk_bebas": 60,
@@ -267,6 +319,34 @@ def test_sandi_dan_htpasswd():
     h = hash_sandi(sandi)
     assert re.fullmatch(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}", h)
     assert bcrypt.checkpw(sandi.encode(), h.encode())
+
+
+def test_tulis_akses_router_tidak_mengikuti_symlink_sementara(tmp_path):
+    luar = tmp_path / "luar.txt"
+    luar.write_bytes(b"asli")
+    (tmp_path / "router").mkdir()
+    try:
+        os.symlink(luar, tmp_path / "router" / "toko.htpasswd.tmp")
+    except OSError:
+        pytest.skip("symlink tidak diizinkan di sistem ini")
+    tulis_akses_router(tmp_path, "toko", hash_sandi("x"), "e" * 64)
+    assert luar.read_bytes() == b"asli"
+    nama = sorted(p.name for p in (tmp_path / "router").iterdir())
+    assert nama == ["toko.htpasswd", "toko.htpasswd.tmp", "toko.rahasia"]
+    if hasattr(os, "O_NOFOLLOW"):
+        assert (tmp_path / "router" / "toko.htpasswd").stat().st_mode & 0o777 == 0o600
+
+
+def test_stderr_di_log_satu_baris(pembantu, catatan, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="wpmgr.staging.pembantu")
+    monkeypatch.setenv("PALSU_KELUAR", "4")
+    monkeypatch.setenv("PALSU_STDERR", "baris satu\r\nWARNING palsu: disuntikkan\n")
+    with pytest.raises(GalatPembantu):
+        pembantu.jalan("toko")
+    catatan_log = [r.getMessage() for r in caplog.records if "gagal (kode keluar" in r.getMessage()]
+    assert len(catatan_log) == 1
+    assert "\n" not in catatan_log[0] and "\r" not in catatan_log[0]
+    assert "baris satu\\r\\nWARNING palsu" in catatan_log[0]
 
 
 def test_tulis_dan_hapus_akses_router(tmp_path):

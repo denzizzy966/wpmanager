@@ -120,12 +120,42 @@ trap bersihkan EXIT
 
 atur_tenggat() { TENGGAT=$(( SECONDS + $1 )); }
 
+# Pid `timeout` yang sedang ditunggu di shell utama (kosong bila tidak ada).
+ANAK=""
+
 # Menjalankan perintah dengan sisa tenggat subperintah ini.
+#
+# Dijalankan di latar lalu ditunggu dengan `wait`: bash menunda jebakan sinyal
+# sampai perintah latar depan selesai, sedangkan `wait` langsung terinterupsi.
+# Dengan begitu SIGTERM dari dashboard (diteruskan sudo ke skrip ini) segera
+# diteruskan ke `timeout`, yang meneruskannya ke perintahnya (putusan F10a).
+# `<&0` wajib: tanpa pengalihan eksplisit, perintah latar di shell
+# non-interaktif mendapat stdin /dev/null dan `docker exec -i` tidak menerima SQL.
+# Status keluarnya diteruskan apa adanya, jadi jebakan ERR dan `|| galat ...`
+# pemanggil berlaku sama seperti sebelumnya.
 dibatasi() {
-  local sisa=$(( TENGGAT - SECONDS ))
+  local sisa=$(( TENGGAT - SECONDS )) rc=0
   (( sisa > 0 )) || galat docker "tenggat habis"
-  timeout -k 10 "$sisa" "$@"
+  timeout -k 10 "$sisa" "$@" <&0 &
+  ANAK=$!
+  wait "$ANAK" || rc=$?
+  ANAK=""
+  return "$rc"
 }
+
+# SIGTERM/SIGINT (dashboard menghentikan panggilan yang melewati tenggatnya):
+# teruskan ke perintah yang sedang berjalan, lalu keluar lewat jalur galat
+# tetap supaya jebakan EXIT tetap membersihkan berkas opsi klien dan cadangan
+# router. Hanya berlaku di shell utama; subshell substitusi perintah berakhir
+# bersama pipanya.
+dihentikan() {
+  trap - TERM INT
+  if [[ -n "$ANAK" ]]; then
+    kill -TERM "$ANAK" 2>/dev/null || true
+  fi
+  galat internal "dihentikan oleh pemanggil"
+}
+trap dihentikan TERM INT
 
 dk() { dibatasi docker "$@"; }
 

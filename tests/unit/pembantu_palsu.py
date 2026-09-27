@@ -35,11 +35,32 @@ def main() -> int:
         _catat(catatan, {"anak": anak.pid})
         time.sleep(60)
         return 0
+    if perintah == "tuli":
+        # Tidak pernah membaca stdin, dan punya cucu di sesi lain yang memegang
+        # stdin/stdout/stderr: seperti anak root `docker exec -i` di bawah sudo
+        # yang tidak terjangkau killpg pengguna dashboard.
+        cucu = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
+            stdin=0, stdout=1, stderr=2, start_new_session=hasattr(os, "setsid"),
+        )
+        _catat(catatan, {"cucu": cucu.pid})
+        time.sleep(60)
+        return 0
+    if perintah in ("banjir", "banjir-galat"):
+        aliran = sys.stdout.buffer if perintah == "banjir" else sys.stderr.buffer
+        blok = b"x" * (1 << 20)
+        while True:
+            aliran.write(blok)
+            aliran.flush()
+    if perintah == "pas":
+        sys.stdout.buffer.write(b"y" * int(os.environ["PALSU_UKURAN"]))
+        return 0
     masukan = sys.stdin.buffer.read()
     _catat(catatan, {"argv": argumen, "stdin": masukan.decode("utf-8", "replace")})
     keluar = os.environ.get("PALSU_KELUAR")
     if keluar:
-        sys.stderr.write(os.environ.get("PALSU_STDERR", ""))
+        sys.stderr.buffer.write(os.environ.get("PALSU_STDERR", "").encode("utf-8"))
         return int(keluar)
     if perintah == "status":
         sys.stdout.write(os.environ.get("PALSU_STATUS", "{}"))

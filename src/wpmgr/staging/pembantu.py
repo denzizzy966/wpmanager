@@ -21,8 +21,8 @@ import secrets
 import shlex
 import signal
 import subprocess
-import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -70,12 +70,20 @@ _POLA_PREFIX = re.compile(r"[A-Za-z0-9_]{1,20}")
 _POLA_HASH = re.compile(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
 _POLA_RAHASIA = re.compile(r"[0-9a-f]{64}")
 
+# Keluaran wp-cli dikendalikan kode salinan site yang bisa saja disusupi:
+# stdout dan stderr ditampung di memori sampai batas ini saja, tidak pernah ke
+# disk, dan skrip dihentikan begitu batasnya terlewati.
 BATAS_KELUARAN = 4 * 1024 * 1024
 BATAS_STDERR = 64 * 1024
 BATAS_STDERR_LOG = 2000
+PESAN_MELIMPAH = "Keluaran skrip pembantu melebihi batas; perintah dihentikan."
+_BLOK = 64 * 1024
 # Tenggat habis: SIGTERM ke grup proses sudo, tunggu sebentar, lalu SIGKILL
 # (putusan F10a).
 JEDA_HENTI = 5
+# Sesudah urutan henti: batas menunggu proses dan pembaca pipa. Anak root di
+# bawah sudo bisa tetap memegang pipa; mereka ditinggalkan, bukan ditunggu.
+TENGGANG_AKHIR = 2
 _ADA_KILLPG = hasattr(os, "killpg")
 TIMEOUT_BAWAAN = 120
 TIMEOUT_SIAPKAN = 900
@@ -146,6 +154,35 @@ def _pesan(subperintah: str, kode: str) -> str:
     return f"{aksi} gagal. {PESAN_UMUM[kode]}" if aksi else PESAN_UMUM[kode]
 
 
+class _Penampung:
+    """Menyimpan paling banyak `batas` byte pertama sebuah aliran; sisanya dibuang."""
+
+    def __init__(self, batas: int) -> None:
+        self.batas = batas
+        self.data = bytearray()
+        self.melimpah = False
+
+    def tambah(self, blok: bytes) -> bool:
+        """True tepat sekali: saat batas pertama kali terlewati."""
+        sisa = self.batas - len(self.data)
+        if len(blok) <= sisa:
+            self.data += blok
+            return False
+        self.data += blok[:max(sisa, 0)]
+        baru = not self.melimpah
+        self.melimpah = True
+        return baru
+
+
+def _baca_aliran(aliran, penampung: _Penampung, saat_melimpah) -> None:
+    try:
+        while blok := aliran.read(_BLOK):
+            if penampung.tambah(blok):
+                saat_melimpah()
+    except (OSError, ValueError):
+        pass
+
+
 def _sinyal(proses: subprocess.Popen, paksa: bool) -> None:
     if proses.poll() is not None:
         return
@@ -173,21 +210,40 @@ def _hentikan(proses: subprocess.Popen) -> None:
         _sinyal(proses, paksa=True)
 
 
-def _alirkan(proses: subprocess.Popen, masukan: list[Path]) -> None:
-    """Alirkan berkas berurutan ke stdin; OSError hanya dilempar untuk galat baca.
+def _tulis_penuh(stdin, blok: bytes) -> None:
+    tampilan = memoryview(blok)
+    while tampilan:
+        n = stdin.write(tampilan)
+        tampilan = tampilan[n or 0:]
 
-    Stdin tidak ditutup di sini: bila baca gagal, pemanggil harus menghentikan
-    proses dulu, karena EOF membuat skrip mengimpor potongan yang terpotong.
+
+def _alirkan(stdin, masukan: list[Path], berhenti: threading.Event) -> None:
+    """Alirkan berkas berurutan ke stdin sampai selesai atau `berhenti` diset.
+
+    OSError hanya dilempar untuk galat baca berkas. Stdin tidak ditutup di
+    sini: bila baca gagal, pemanggil menghentikan proses dulu, supaya anak
+    langsungnya (sudo/skrip) tidak melihat EOF lalu mengimpor potongan yang
+    terpotong. Anak root di bawahnya tidak terjangkau sinyal pengguna
+    dashboard; untuk mereka skrip pembantu sendiri meneruskan SIGTERM.
     """
     for berkas in masukan:
         with open(berkas, "rb") as f:
-            while blok := f.read(1 << 20):
+            while blok := f.read(_BLOK):
+                if berhenti.is_set():
+                    return
                 try:
-                    proses.stdin.write(blok)
+                    _tulis_penuh(stdin, blok)
                 except OSError:
                     # Proses berhenti lebih dulu (pipa putus; di Windows bisa
                     # EINVAL); kode keluarnya yang menjelaskan.
                     return
+
+
+def _tutup(berkas) -> None:
+    try:
+        berkas.close()
+    except OSError:
+        pass
 
 
 class Pembantu:
@@ -205,66 +261,131 @@ class Pembantu:
     def _galat(subperintah: str, kode_keluar: int, stderr: str) -> GalatPembantu:
         kode = KODE_KELUAR.get(kode_keluar, "lain")
         # Stderr bisa memuat path VPS atau keluaran docker/wp-cli: hanya untuk
-        # log server, dipotong. Kategorinya dari kode keluar, bukan dari teks
-        # `GALAT <kode>` (dalam kasus tenggat bisa tercetak dua baris).
+        # log server, satu baris (baris baru di-escape supaya tidak bisa
+        # memalsukan entri log), dipotong. Kategorinya dari kode keluar, bukan
+        # dari teks `GALAT <kode>` (dalam kasus tenggat bisa tercetak dua baris).
+        satu_baris = stderr.strip().replace("\r", "\\r").replace("\n", "\\n")
         log.warning("Skrip pembantu %s gagal (kode keluar %s): %s", subperintah or "-", kode_keluar,
-                    bersih_teks(stderr.strip(), BATAS_STDERR_LOG))
+                    bersih_teks(satu_baris, BATAS_STDERR_LOG))
         return GalatPembantu(kode, _pesan(subperintah, kode))
 
     def jalankan(self, *argumen: str, masukan: Iterable[Path] = (), timeout: float = TIMEOUT_BAWAAN) -> str:
         masukan = list(masukan)
         subperintah = argumen[0] if argumen and argumen[0] in AKSI else ""
-        with tempfile.TemporaryFile() as keluar, tempfile.TemporaryFile() as galat:
-            try:
-                proses = subprocess.Popen(
-                    [*self.perintah, *argumen],
-                    stdin=subprocess.PIPE if masukan else subprocess.DEVNULL,
-                    stdout=keluar, stderr=galat,
-                    # Grup proses sendiri, supaya tenggat bisa menghentikan
-                    # sudo beserta anaknya sekaligus (putusan F10a).
-                    start_new_session=_ADA_KILLPG,
-                )
-            except OSError:
-                # Pesan OSError memuat path biner; UI hanya mendapat pesan tetap.
-                raise GalatPembantu("lain", _pesan(subperintah, "lain")) from None
-            habis = threading.Event()
+        mulai = time.monotonic()
+        try:
+            proses = subprocess.Popen(
+                [*self.perintah, *argumen],
+                stdin=subprocess.PIPE if masukan else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                # Tanpa buffer: tulisan yang terblokir tidak memegang kunci
+                # BufferedWriter, dan baca mengembalikan apa yang ada.
+                bufsize=0,
+                # Grup proses sendiri, supaya tenggat bisa menghentikan
+                # sudo beserta anaknya sekaligus (putusan F10a).
+                start_new_session=_ADA_KILLPG,
+            )
+        except OSError:
+            # Pesan OSError memuat path biner; UI hanya mendapat pesan tetap.
+            raise GalatPembantu("lain", _pesan(subperintah, "lain")) from None
 
-            def hentikan() -> None:
-                habis.set()
-                _hentikan(proses)
+        sebab: list[str] = []
+        kunci = threading.Lock()
+        berhenti = threading.Event()
 
-            pengawas = threading.Timer(timeout, hentikan)
-            pengawas.daemon = True
-            pengawas.start()
+        def hentikan(alasan: str) -> None:
+            with kunci:
+                if sebab:
+                    return
+                sebab.append(alasan)
+            berhenti.set()
+            _hentikan(proses)
+
+        def melimpah() -> None:
+            # Dari thread pembaca: jangan menunggu JEDA_HENTI di sana, pembaca
+            # harus tetap menguras pipa supaya skrip bisa menerima sinyalnya.
+            threading.Thread(target=hentikan, args=("keluaran",), daemon=True).start()
+
+        keluar, galat = _Penampung(BATAS_KELUARAN), _Penampung(BATAS_STDERR)
+        pembaca = [
+            threading.Thread(target=_baca_aliran, args=(proses.stdout, keluar, melimpah), daemon=True),
+            threading.Thread(target=_baca_aliran, args=(proses.stderr, galat, melimpah), daemon=True),
+        ]
+        for t_ in pembaca:
+            t_.start()
+        pengawas = threading.Timer(timeout, hentikan, ("waktu",))
+        pengawas.daemon = True
+        pengawas.start()
+        try:
+            if masukan:
+                self._suapi(proses, masukan, berhenti, hentikan)
             try:
-                if masukan:
-                    try:
-                        _alirkan(proses, masukan)
-                    except OSError:
-                        # Berkas masukan milik dashboard tidak terbaca: hentikan
-                        # skrip sebelum stdin ditutup (lihat _alirkan).
-                        _hentikan(proses)
-                        log.exception("Berkas masukan skrip pembantu %s tidak terbaca", subperintah or "-")
-                        raise GalatPembantu("lain", "Berkas masukan untuk skrip pembantu tidak terbaca.") from None
-                    finally:
-                        try:
-                            proses.stdin.close()
-                        except OSError:
-                            pass
-                kode = proses.wait()
-            finally:
-                pengawas.cancel()
-            if habis.is_set():
-                pengawas.join(JEDA_HENTI + 1)
-                log.warning("Skrip pembantu %s melewati tenggat %s detik", subperintah or "-", int(timeout))
-                raise GalatPembantu("waktu", f"Skrip pembantu tidak selesai dalam {int(timeout)} detik.")
-            keluar.seek(0)
-            teks = keluar.read(BATAS_KELUARAN).decode("utf-8", "replace")
-            galat.seek(0)
-            teks_galat = galat.read(BATAS_STDERR).decode("utf-8", "replace")
+                kode = proses.wait(max(0.0, mulai + timeout + JEDA_HENTI + TENGGANG_AKHIR - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                # Tidak mati juga sesudah SIGKILL (mis. sudo tak terjangkau).
+                hentikan("waktu")
+                sebab[:] = ["waktu"]
+                kode = None
+        finally:
+            pengawas.cancel()
+        batas_pembaca = time.monotonic() + TENGGANG_AKHIR
+        for t_ in pembaca:
+            t_.join(max(0.0, batas_pembaca - time.monotonic()))
+        # Pipa hanya ditutup bila pembacanya sudah selesai: menutup fd yang
+        # sedang dibaca thread lain berisiko nomor fd dipakai ulang.
+        for t_, aliran in zip(pembaca, (proses.stdout, proses.stderr)):
+            if not t_.is_alive():
+                _tutup(aliran)
+        if sebab:
+            raise self._galat_berhenti(sebab[0], subperintah, timeout)
+        if keluar.melimpah or galat.melimpah:
+            raise self._galat_berhenti("keluaran", subperintah, timeout)
         if kode != 0:
-            raise self._galat(subperintah, kode, teks_galat)
-        return teks
+            raise self._galat(subperintah, kode, galat.data.decode("utf-8", "replace"))
+        return keluar.data.decode("utf-8", "replace")
+
+    @staticmethod
+    def _suapi(proses: subprocess.Popen, masukan: list[Path], berhenti: threading.Event, hentikan) -> None:
+        """Alirkan masukan lewat thread penulis yang bisa ditinggalkan.
+
+        Tulisan ke pipa yang tidak dibaca (anak root `docker exec -i` yang
+        tidak terjangkau sinyal) bisa terblokir selamanya; thread utama hanya
+        menunggu sampai tenggat/henti lalu meninggalkannya. Hanya thread penulis
+        yang menutup stdin, kecuali saat ia sudah selesai karena galat baca.
+        """
+        galat_baca: list[OSError] = []
+
+        def menulis() -> None:
+            try:
+                _alirkan(proses.stdin, masukan, berhenti)
+            except OSError as e:
+                galat_baca.append(e)
+                return
+            _tutup(proses.stdin)
+
+        penulis = threading.Thread(target=menulis, daemon=True)
+        penulis.start()
+        # Berhenti menunggu juga bila anak langsung sudah keluar: pipa bisa
+        # masih dipegang cucunya, dan kode keluarnya yang menjelaskan.
+        while penulis.is_alive() and not berhenti.is_set() and proses.poll() is None:
+            penulis.join(0.1)
+        if galat_baca:
+            # Berkas masukan milik dashboard tidak terbaca: hentikan skrip
+            # sebelum stdin ditutup (lihat _alirkan).
+            hentikan("baca")
+            _tutup(proses.stdin)
+            log.error("Berkas masukan skrip pembantu tidak terbaca: %s", galat_baca[0])
+
+    @staticmethod
+    def _galat_berhenti(alasan: str, subperintah: str, timeout: float) -> GalatPembantu:
+        nama = subperintah or "-"
+        if alasan == "waktu":
+            log.warning("Skrip pembantu %s melewati tenggat %s detik", nama, int(timeout))
+            return GalatPembantu("waktu", f"Skrip pembantu tidak selesai dalam {int(timeout)} detik.")
+        if alasan == "baca":
+            return GalatPembantu("lain", "Berkas masukan untuk skrip pembantu tidak terbaca.")
+        log.warning("Keluaran skrip pembantu %s melebihi batas; proses dihentikan", nama)
+        return GalatPembantu("lain", PESAN_MELIMPAH)
 
     def siapkan(self) -> str:
         return self.jalankan("siapkan", timeout=TIMEOUT_SIAPKAN)
@@ -318,12 +439,20 @@ def hash_sandi(sandi: str) -> str:
 
 
 def _tulis_atomik(path: Path, teks: str) -> None:
-    sementara = path.with_name(path.name + ".tmp")
-    # Byte apa adanya: write_text() di Windows mengubah "\n" menjadi "\r\n",
-    # dan skrip pembantu (Linux) menolak baris htpasswd yang berakhiran "\r".
-    sementara.write_bytes(teks.encode("ascii"))
-    os.chmod(sementara, 0o600)
-    os.replace(sementara, path)
+    # Nama sementara acak dengan O_EXCL|O_NOFOLLOW: nama tetap yang sudah
+    # berupa symlink tidak pernah diikuti. O_BINARY supaya "\n" tidak menjadi
+    # "\r\n" di Windows; skrip pembantu (Linux) menolak baris yang berakhiran "\r".
+    sementara = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+    bendera = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+               | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0))
+    fd = os.open(sementara, bendera, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(teks.encode("ascii"))
+        os.replace(sementara, path)
+    except BaseException:
+        sementara.unlink(missing_ok=True)
+        raise
 
 
 def tulis_akses_router(dir_staging: Path, nama: str, sandi_hash: str, rahasia: str) -> None:

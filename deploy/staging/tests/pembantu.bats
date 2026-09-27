@@ -607,3 +607,32 @@ tulis_mounts() {
   [[ "$output" == *"GALAT ditolak"* ]]
   ! grep -q '^\[run\]' "$PALSU/docker.log" || false
 }
+
+@test "SIGTERM dari pemanggil menghentikan docker exec yang sedang berjalan" {
+  printf 'layanan:db' > "$PALSU/wadah/wpmgr-stg-db"
+  printf 'sandi-user' > "$S/etc/db/toko"
+  touch "$PALSU/exec-lama"
+  mkfifo "$BATS_TEST_TMPDIR/masuk"
+  # stdin tetap terbuka (penulis fd 8), seperti dashboard yang masih mengalirkan SQL.
+  "$SKRIP" db-impor toko < "$BATS_TEST_TMPDIR/masuk" > "$BATS_TEST_TMPDIR/keluar" 2>&1 3>&- &
+  pid=$!
+  exec 8> "$BATS_TEST_TMPDIR/masuk"
+  for _ in $(seq 1 100); do
+    [[ -s "$PALSU/exec-lama.pid" ]] && break
+    sleep 0.1
+  done
+  anak="$(cat "$PALSU/exec-lama.pid")"
+  kill -0 "$anak"
+  kill -TERM "$pid"
+  rc=0
+  wait "$pid" || rc=$?
+  exec 8>&-
+  for _ in $(seq 1 50); do
+    kill -0 "$anak" 2>/dev/null || break
+    sleep 0.1
+  done
+  ! kill -0 "$anak" 2>/dev/null || { kill -KILL "$anak"; false; }
+  [ "$rc" -eq 9 ]
+  grep -q '^GALAT internal: dihentikan' "$BATS_TEST_TMPDIR/keluar"
+  [ "$(grep -c '^GALAT' "$BATS_TEST_TMPDIR/keluar")" -eq 1 ]
+}

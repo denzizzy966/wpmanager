@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -246,3 +247,16 @@ def test_hapus_berkas(pohon):
     with pytest.raises(PathTidakAman):
         hapus_berkas(akar, "wp-content/uploads/rahasia.env")
     assert (luar / "rahasia.env").exists()
+
+
+def test_linux_tanpa_dir_fd_adalah_galat_keras():
+    import types
+
+    from wpmgr.staging.aman import _dukung_dir_fd
+
+    tanpa = types.SimpleNamespace(supports_dir_fd=set(), supports_fd=set(), supports_follow_symlinks=set())
+    with pytest.raises(RuntimeError):
+        _dukung_dir_fd(tanpa, "linux")
+    assert _dukung_dir_fd(tanpa, "win32") is False
+    if sys.platform == "linux":
+        assert _dukung_dir_fd(os, sys.platform) is True
