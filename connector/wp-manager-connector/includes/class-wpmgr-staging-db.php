@@ -56,8 +56,20 @@ class WPMGR_Staging_Db {
         return is_array( $r ) ? $r : null;
     }
 
+    /**
+     * wpdb::prepare() (WP >= 4.8.3) mengganti '%' di dalam argumen dengan
+     * placeholder acak yang hanya dikembalikan oleh $wpdb->query(). kueri()
+     * memakai mysqli_query() langsung, jadi pengembalian itu dilakukan di
+     * sini: tanpa itu `LIKE 'id|%'` menjadi `LIKE 'id|{hash}'` dan
+     * lepas_kunci()/penyegaran kunci diam-diam tidak mengenai baris apa pun.
+     * Aman juga untuk nilai()/baris() (query() tidak menemukan placeholder lagi).
+     */
     public function siapkan( $sql ) {
-        return call_user_func_array( array( $this->wpdb, 'prepare' ), func_get_args() );
+        $siap = call_user_func_array( array( $this->wpdb, 'prepare' ), func_get_args() );
+        if ( is_string( $siap ) && method_exists( $this->wpdb, 'remove_placeholder_escape' ) ) {
+            $siap = $this->wpdb->remove_placeholder_escape( $siap );
+        }
+        return $siap;
     }
 
     public function suka( $t ) {
