@@ -1,0 +1,387 @@
+"""Validasi dan pembersihan untuk staging (spec §13).
+
+Semua yang datang dari connector -- path, nama tabel, angka, teks -- adalah
+masukan penyerang: site produksi bisa saja sudah disusupi. Aturan path di
+sini adalah cermin WPMGR_Staging_Path di connector; keduanya harus tetap
+sama ketatnya.
+
+Direktori `files/`, `ekspor/`, dan `log/` staging di-bind mount ke container
+yang menjalankan kode salinan produksi sebagai UID dashboard (putusan R13).
+Proses PHP di sana bisa menukar path apa pun di pohon itu dengan symlink kapan
+saja, termasuk di sela pemeriksaan dan pemakaian. Karena itu dashboard hanya
+membaca/menulis di pohon itu lewat `buka_baca`, `baca_terbatas`,
+`tulis_atomik`, dan `hapus_berkas` (putusan F1): setiap komponen dibuka
+tanpa mengikuti symlink, dan hanya berkas biasa yang dibaca.
+"""
+
+import errno
+import os
+import re
+import stat
+import uuid
+from pathlib import Path
+from typing import BinaryIO
+from urllib.parse import urlsplit
+
+POLA_NAMA = re.compile(r"[a-z0-9-]{1,40}")
+POLA_ID_DORONG = re.compile(r"[0-9a-f]{32}")
+POLA_TABEL = re.compile(r"[A-Za-z0-9_$]{1,64}")
+POLA_SHA256 = re.compile(r"[0-9a-f]{64}")
+_POLA_ANGKA = re.compile(r"-?[0-9]{1,20}")
+_POLA_VERSI = re.compile(r"([0-9]{1,2})\.([0-9]{1,2})")
+_KENDALI = re.compile(r"[\x00-\x1f\x7f\\]")
+_POLA_WP_AKAR = re.compile(r"wp-[a-z0-9-]+\.php")
+
+VERSI_PHP = ("7.4", "8.0", "8.1", "8.2", "8.3")
+VERSI_PHP_BAWAAN = "8.1"
+MAKS_PATH = 1024
+MAKS_SEGMEN = 255
+BACKUP_KONTEN = frozenset({"updraft", "ai1wm-backups", "wpvividbackups"})
+# Berkas milik staging sendiri: tidak pernah dihapus/ditimpa saat tarik.
+DILINDUNGI_STAGING = frozenset({"wp-config.php", "wp-content/mu-plugins/wpmgr-staging.php"})
+TIDAK_PERNAH_DITULIS = frozenset({
+    "wp-config.php", ".maintenance",
+    "wp-content/mu-plugins/wpmgr-staging.php", "wp-content/mu-plugins/wpmgr-dorong-aman.php",
+})
+AKAR_INTI = frozenset({"index.php", "xmlrpc.php", "license.txt", "readme.html", ".htaccess"})
+# `log/diubah` hanya memuat satu stempel waktu; container bisa mengisinya
+# dengan apa saja (atau menautkannya ke /dev/zero), jadi pembacaannya dibatasi.
+BATAS_DIUBAH = 64 * 1024
+
+# Linux (produksi) punya O_NOFOLLOW, O_DIRECTORY, dan dir_fd: setiap komponen
+# dibuka relatif terhadap deskriptor induknya, sehingga symlink yang ditukar
+# di sela langkah tidak pernah diikuti. Windows (dev) tidak punya ketiganya;
+# di sana dipakai pemeriksaan lstat per komponen, yang cukup untuk dev tetapi
+# tidak kebal balapan.
+_ADA_DIR_FD = (
+    hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+    and os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd
+    # os.replace tidak tercantum di supports_dir_fd; os.rename dengan dir_fd
+    # di POSIX sama-sama menimpa secara atomik (renameat).
+    and os.unlink in os.supports_dir_fd and os.rename in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd and os.stat in os.supports_follow_symlinks
+    and os.utime in os.supports_fd
+)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_BINER = getattr(os, "O_BINARY", 0)
+# O_NONBLOCK: membuka FIFO untuk dibaca tanpa ini menggantung selamanya.
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+class PathTidakAman(ValueError):
+    pass
+
+
+def nama_sah(nama) -> bool:
+    return isinstance(nama, str) and POLA_NAMA.fullmatch(nama) is not None
+
+
+def nama_dari_url(url: str) -> str:
+    """Label subdomain staging dari host produksi (spec §5.1)."""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    host = host.removeprefix("www.")
+    nama = re.sub(r"[^a-z0-9-]+", "-", host.replace(".", "-"))
+    nama = re.sub(r"-{2,}", "-", nama).strip("-")[:40].strip("-")
+    return nama or "situs"
+
+
+def versi_php_staging(versi: str | None) -> tuple[str, bool]:
+    """Versi image staging: sama dengan produksi, atau terdekat yang lebih tinggi (spec §7.1)."""
+    cocok = _POLA_VERSI.match(versi or "")
+    if cocok is None:
+        return VERSI_PHP_BAWAAN, True
+    diminta = (int(cocok.group(1)), int(cocok.group(2)))
+    for v in VERSI_PHP:
+        besar, kecil = (int(x) for x in v.split("."))
+        if (besar, kecil) == diminta:
+            return v, False
+        if (besar, kecil) > diminta:
+            return v, True
+    return VERSI_PHP[-1], True
+
+
+def bersih_teks(nilai, panjang: int) -> str | None:
+    """Teks yang aman disimpan di kolom text PostgreSQL.
+
+    PostgreSQL menolak NUL, dan psycopg menolak surrogate tunggal (bisa
+    dikirim lewat escape \\ud800 di JSON). Keduanya dibuang di sini, sebelum
+    dipotong, supaya satu nilai beracun tidak menggagalkan seluruh commit.
+    """
+    if nilai is None:
+        return None
+    teks = nilai if isinstance(nilai, str) else str(nilai)
+    teks = teks.encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
+    return teks[:panjang]
+
+
+def angka(nilai, bawah: int, atas: int) -> int | None:
+    if isinstance(nilai, bool):
+        return None
+    if isinstance(nilai, int):
+        n = nilai
+    elif isinstance(nilai, str) and _POLA_ANGKA.fullmatch(nilai):
+        n = int(nilai)
+    else:
+        return None
+    return max(bawah, min(atas, n))
+
+
+def path_sah(p) -> str:
+    if not isinstance(p, str) or not p:
+        raise PathTidakAman("Path kosong atau bukan teks")
+    try:
+        mentah = p.encode("utf-8")
+    except UnicodeEncodeError:
+        raise PathTidakAman("Path bukan UTF-8 yang sah") from None
+    if len(mentah) > MAKS_PATH:
+        raise PathTidakAman("Path terlalu panjang")
+    if _KENDALI.search(p):
+        raise PathTidakAman("Path memuat karakter terlarang")
+    if p.startswith("/") or re.match(r"[A-Za-z]:", p):
+        raise PathTidakAman("Path absolut ditolak")
+    for segmen in p.split("/"):
+        if segmen in ("", ".", ".."):
+            raise PathTidakAman("Path memuat segmen terlarang")
+        if len(segmen.encode("utf-8")) > MAKS_SEGMEN:
+            raise PathTidakAman("Nama berkas terlalu panjang")
+    return p
+
+
+def dikecualikan(p: str) -> bool:
+    if p in ("wp-config.php", ".maintenance") or p.lower().endswith(".log"):
+        return True
+    for d in ("wp-content/cache", "wp-content/wpmgr-dorong"):
+        if p == d or p.startswith(d + "/"):
+            return True
+    bagian = p.split("/")
+    return len(bagian) >= 2 and bagian[0] == "wp-content" and (
+        bagian[1] in BACKUP_KONTEN or bagian[1].startswith("backups-dup-")
+    )
+
+
+def boleh_didorong(p) -> bool:
+    try:
+        path_sah(p)
+    except PathTidakAman:
+        return False
+    if dikecualikan(p) or p in TIDAK_PERNAH_DITULIS:
+        return False
+    if p.startswith("wp-content/plugins/wp-manager-connector/"):
+        return False
+    if p.startswith(("wp-content/", "wp-admin/", "wp-includes/")):
+        return True
+    if "/" in p:
+        return False
+    return p in AKAR_INTI or _POLA_WP_AKAR.fullmatch(p) is not None
+
+
+def jalur_di_dalam(akar: Path, relatif: str) -> Path:
+    """Path tulis di bawah `akar`, tidak pernah lewat symlink dan tidak pernah keluar.
+
+    Hanya pemeriksaan sesaat: di pohon yang di-bind mount ke container, baca
+    dan tulis tetap lewat `buka_baca`/`tulis_atomik`/`hapus_berkas`, yang
+    tidak memberi celah antara periksa dan pakai.
+    """
+    path_sah(relatif)
+    bagian = relatif.split("/")
+    sekarang = akar
+    for b in bagian:
+        sekarang = sekarang / b
+        if sekarang.is_symlink():
+            raise PathTidakAman("Path melewati symlink")
+    akar_nyata = Path(os.path.realpath(akar))
+    induk = Path(os.path.realpath(sekarang.parent))
+    if induk != akar_nyata and akar_nyata not in induk.parents:
+        raise PathTidakAman("Path keluar dari akar staging")
+    return sekarang
+
+
+# ---- akses berkas di pohon yang di-bind mount (putusan F1) ----------------
+
+
+def _tautan(st: os.stat_result) -> bool:
+    # Junction Windows bukan S_ISLNK tetapi sama berbahayanya.
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE)
+
+
+def _buka_dir(nama: str, dir_fd: int | None = None) -> int:
+    try:
+        return os.open(nama, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=dir_fd)
+    except OSError as e:
+        # ELOOP: komponen itu symlink. ENOTDIR: bukan direktori (atau symlink,
+        # tergantung kernel). Keduanya berarti path ini tidak boleh dilalui.
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise PathTidakAman("Path melewati symlink atau bukan direktori") from None
+        raise
+
+
+def _fd_induk(akar: Path, bagian: list[str], buat: bool) -> int:
+    """Deskriptor direktori `akar/bagian...`, setiap komponen dibuka tanpa mengikuti symlink.
+
+    `akar` sendiri juga dibuka dengan O_NOFOLLOW; path di atasnya (direktori
+    staging milik dashboard/root) berada di luar jangkauan container.
+    """
+    fd = _buka_dir(os.fspath(akar))
+    try:
+        for b in bagian:
+            if buat:
+                try:
+                    os.mkdir(b, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            baru = _buka_dir(b, fd)
+            os.close(fd)
+            fd = baru
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _periksa_jalur(akar: Path, bagian: list[str], buat: bool) -> Path:
+    """Cadangan tanpa dir_fd (Windows dev): lstat setiap komponen dari akar ke bawah."""
+    p = Path(akar)
+    for i, b in enumerate(["", *bagian]):
+        if i:
+            p = p / b
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            if not (buat and i):
+                raise
+            os.mkdir(p, 0o755)
+            st = os.lstat(p)
+        if _tautan(st) or not stat.S_ISDIR(st.st_mode):
+            raise PathTidakAman("Path melewati symlink atau bukan direktori")
+    return p
+
+
+def _pecah(relatif: str) -> tuple[list[str], str]:
+    path_sah(relatif)
+    *induk, nama = relatif.split("/")
+    return induk, nama
+
+
+def buka_baca(akar: Path, relatif: str) -> BinaryIO:
+    """Buka berkas biasa `akar/relatif` untuk dibaca biner.
+
+    Melempar `PathTidakAman` bila path tidak sah, melewati/berupa symlink,
+    atau bukan berkas biasa (direktori, FIFO, device); `FileNotFoundError`
+    bila tidak ada. Pemanggil yang mengirim berkas ke produksi melewati
+    berkas yang ditolak dengan peringatan.
+    """
+    induk, nama = _pecah(relatif)
+    lstat_awal = None
+    if _ADA_DIR_FD:
+        dfd = _fd_induk(akar, induk, buat=False)
+        try:
+            fd = os.open(nama, os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC, dir_fd=dfd)
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise PathTidakAman("Path berupa symlink") from None
+            raise
+        finally:
+            os.close(dfd)
+    else:
+        jalur = _periksa_jalur(akar, induk, buat=False) / nama
+        lstat_awal = os.lstat(jalur)
+        if _tautan(lstat_awal) or not stat.S_ISREG(lstat_awal.st_mode):
+            raise PathTidakAman("Path berupa symlink atau bukan berkas biasa")
+        fd = os.open(jalur, os.O_RDONLY | _BINER)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PathTidakAman("Path bukan berkas biasa")
+        if lstat_awal is not None and (st.st_dev, st.st_ino) != (lstat_awal.st_dev, lstat_awal.st_ino):
+            raise PathTidakAman("Berkas berganti saat dibuka")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def baca_terbatas(akar: Path, relatif: str, maks: int, dari: int = 0) -> bytes:
+    """Paling banyak `maks` byte dari `akar/relatif` mulai posisi `dari`."""
+    if maks < 0 or dari < 0:
+        raise ValueError("Batas baca tidak sah")
+    with buka_baca(akar, relatif) as f:
+        if dari:
+            f.seek(dari)
+        return f.read(maks)
+
+
+def tulis_atomik(akar: Path, relatif: str, isi: bytes, mtime: int | None = None) -> None:
+    """Tulis `akar/relatif` lewat berkas sementara lalu rename, membuat direktori induk.
+
+    Tujuan yang berupa symlink ditolak. Rename sendiri tidak pernah mengikuti
+    symlink, jadi symlink yang muncul sesudah pemeriksaan hanya tertimpa,
+    bukan diikuti.
+    """
+    induk, nama = _pecah(relatif)
+    # Nama sementara pendek: akhiran pada nama asli yang sudah 250 byte
+    # melanggar batas 255 byte per nama berkas.
+    sementara = f".wpmgr-{uuid.uuid4().hex[:12]}.tmp"
+    if _ADA_DIR_FD:
+        dfd = _fd_induk(akar, induk, buat=True)
+        try:
+            try:
+                if _tautan(os.stat(nama, dir_fd=dfd, follow_symlinks=False)):
+                    raise PathTidakAman("Tujuan tulis berupa symlink")
+            except FileNotFoundError:
+                pass
+            fd = os.open(sementara, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o644,
+                         dir_fd=dfd)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(isi)
+                    f.flush()
+                    if mtime is not None:
+                        os.utime(f.fileno(), (mtime, mtime))
+                os.rename(sementara, nama, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except BaseException:
+                try:
+                    os.unlink(sementara, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(dfd)
+        return
+    d = _periksa_jalur(akar, induk, buat=True)
+    tujuan = d / nama
+    try:
+        if _tautan(os.lstat(tujuan)):
+            raise PathTidakAman("Tujuan tulis berupa symlink")
+    except FileNotFoundError:
+        pass
+    jalur_sementara = d / sementara
+    try:
+        with open(jalur_sementara, "xb") as f:
+            f.write(isi)
+        if mtime is not None:
+            os.utime(jalur_sementara, (mtime, mtime))
+        os.replace(jalur_sementara, tujuan)
+    except BaseException:
+        jalur_sementara.unlink(missing_ok=True)
+        raise
+
+
+def hapus_berkas(akar: Path, relatif: str) -> None:
+    """Hapus `akar/relatif` (berkas atau symlink itu sendiri); diam bila tidak ada."""
+    induk, nama = _pecah(relatif)
+    try:
+        if _ADA_DIR_FD:
+            dfd = _fd_induk(akar, induk, buat=False)
+            try:
+                os.unlink(nama, dir_fd=dfd)
+            finally:
+                os.close(dfd)
+        else:
+            os.unlink(_periksa_jalur(akar, induk, buat=False) / nama)
+    except FileNotFoundError:
+        pass
