@@ -48,6 +48,7 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -765,6 +766,20 @@ def _tuntaskan_dorongan_lama(sesi, job, klien, dorong_id: str, token) -> str | N
     return hasil
 
 
+def syarat_dorongan_lama_belum_bersih(site_id) -> tuple:
+    """Syarat SQL job dorong/kembalikan lama yang dorongannya belum terbukti bersih.
+
+    Dipakai rekonsiliasi di bawah dan `pangkas_snapshot`: snapshot job seperti
+    ini tidak boleh dipangkas selama rekonsiliasi masih menganggapnya kandidat.
+    """
+    kemajuan_lama = Job.payload["kemajuan"]
+    return (Job.site_id == site_id,
+            Job.tipe.in_((JobType.staging_dorong, JobType.staging_kembalikan)),
+            Job.status.in_((JobStatus.failed, JobStatus.success, JobStatus.unknown)),
+            kemajuan_lama["unggah_mulai"].astext == "true",
+            func.coalesce(kemajuan_lama["produksi_bersih"].astext, "false") != "true")
+
+
 def selesaikan_dorongan_lama(sesi, job, site, klien) -> None:
     """Dorongan dari job dorong/kembalikan lama yang belum terbukti bersih dituntaskan dulu.
 
@@ -777,13 +792,8 @@ def selesaikan_dorongan_lama(sesi, job, site, klien) -> None:
     Yang diselesaikan (tukar sudah terjadi) mempertahankan snapshotnya dan
     tidak mengubah `dorong_gagal_pada` (dinilai ulang di akhir dorongan baru).
     """
-    kemajuan_lama = Job.payload["kemajuan"]
     lama = sesi.scalars(
-        select(Job).where(Job.site_id == job.site_id, Job.id != job.id,
-                          Job.tipe.in_((JobType.staging_dorong, JobType.staging_kembalikan)),
-                          Job.status.in_((JobStatus.failed, JobStatus.success, JobStatus.unknown)),
-                          kemajuan_lama["unggah_mulai"].astext == "true",
-                          func.coalesce(kemajuan_lama["produksi_bersih"].astext, "false") != "true")
+        select(Job).where(Job.id != job.id, *syarat_dorongan_lama_belum_bersih(job.site_id))
         .order_by(Job.id.desc()).limit(MAKS_JOB_LAMA)
     ).all()
     for j in lama:
@@ -808,7 +818,7 @@ def selesaikan_dorongan_lama(sesi, job, site, klien) -> None:
         _tandai_bersih(sesi, j)
         if hasil == "dipulihkan":
             # Sesudah commit: direktori yatim bila mati di sini dibersihkan prune-staging.
-            _hapus_dir_staging(f"{site.id}/snapshot/j{j.id}")
+            hapus_dir_staging(f"{site.id}/snapshot/j{j.id}")
 
 
 # ---- snapshot -----------------------------------------------------------------
@@ -828,8 +838,13 @@ def ukuran_dir(path: Path) -> int:
     return total
 
 
-def _hapus_dir_staging(relatif: str) -> None:
+def hapus_dir_staging(relatif: str) -> None:
     """Hapus direktori di bawah WPMGR_STAGING_DIR tanpa pernah mengikuti symlink."""
+    if sys.platform.startswith("linux") and not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        # Pohon files/, log/, ekspor/ ditulis container staging. rmtree non-fd
+        # bisa dibelokkan symlink yang ditukar di tengah jalan ke luar akar
+        # staging (data PostgreSQL, kode dashboard, .env): lebih baik gagal keras.
+        raise RuntimeError("shutil.rmtree di Python ini tidak kebal symlink; penghapusan staging tidak aman")
     try:
         p = jalur_di_dalam(get_settings().jalur_staging, relatif)
     except PathTidakAman:
@@ -846,6 +861,8 @@ def _hapus_dir_staging(relatif: str) -> None:
 
 
 def pangkas_snapshot(sesi, site_id, n: int) -> int:
+    """Pangkas snapshot sah melebihi `n` terbaru; snapshot job lama yang belum bersih dipertahankan."""
+    ditahan = set(sesi.scalars(select(Job.id).where(*syarat_dorongan_lama_belum_bersih(site_id))).all())
     daftar = sesi.scalars(
         select(StagingSnapshot)
         .where(StagingSnapshot.site_id == site_id, StagingSnapshot.status.in_(("tersedia", "dipakai")))
@@ -853,7 +870,9 @@ def pangkas_snapshot(sesi, site_id, n: int) -> int:
     ).all()
     dipangkas = 0
     for s in daftar[n:]:
-        _hapus_dir_staging(s.path)
+        if s.job_id is not None and s.job_id in ditahan:
+            continue
+        hapus_dir_staging(s.path)
         s.status = "dipangkas"
         dipangkas += 1
     return dipangkas
@@ -867,7 +886,7 @@ def _buang_snapshot(sesi, site_id, job_id) -> None:
     """
     _hapus_baris_snapshot(sesi, site_id, job_id)
     sesi.commit()
-    _hapus_dir_staging(f"{site_id}/snapshot/j{job_id}")
+    hapus_dir_staging(f"{site_id}/snapshot/j{job_id}")
 
 
 def _hapus_baris_snapshot(sesi, site_id, job_id) -> None:

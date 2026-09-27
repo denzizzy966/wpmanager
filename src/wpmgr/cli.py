@@ -21,12 +21,17 @@ from wpmgr.kunci import (
     KUNCI_GEOIP,
     KUNCI_RETENSI,
     KUNCI_SSL,
+    KUNCI_STAGING_JEDA,
+    KUNCI_STAGING_PANGKAS,
+    KUNCI_STAGING_SERTIFIKAT,
     KUNCI_UPTIME,
     kunci_advisory,
 )
 from wpmgr.models import JobType, Site, SiteStatus, User
 from wpmgr.retensi import pangkas
 from wpmgr.ssl_cek import cek_semua_ssl
+from wpmgr.staging.cron import jeda_otomatis, pangkas_staging, perpanjang_sertifikat
+from wpmgr.staging.pembantu import Pembantu
 from wpmgr.traffic import kumpulkan_ga4
 from wpmgr.uptime import buat_klien_http, cek_satu, jalankan_putaran
 
@@ -171,6 +176,52 @@ def collect_ga4() -> dict | None:
     return hasil
 
 
+def _staging_mati() -> bool:
+    if not get_settings().staging_aktif:
+        print("Staging tidak aktif (WPMGR_STAGING_DOMAIN kosong); dilewati")
+        return True
+    return False
+
+
+def staging_jeda_otomatis() -> int:
+    if _staging_mati():
+        return 0
+    with kunci_advisory(db.engine, KUNCI_STAGING_JEDA) as dapat:
+        if not dapat:
+            print("Jeda otomatis staging lain masih berjalan; dilewati")
+            return 0
+        with get_session() as sesi:
+            n = jeda_otomatis(sesi, Pembantu.dari_setelan(), datetime.now(timezone.utc))
+    print(f"{n} staging dijeda otomatis")
+    return n
+
+
+def renew_staging_certs() -> dict | None:
+    if _staging_mati():
+        return None
+    with kunci_advisory(db.engine, KUNCI_STAGING_SERTIFIKAT) as dapat:
+        if not dapat:
+            print("Perpanjangan sertifikat staging lain masih berjalan; dilewati")
+            return None
+        with get_session() as sesi:
+            hasil = perpanjang_sertifikat(sesi, Pembantu.dari_setelan(), datetime.now(timezone.utc))
+    print(f"Sertifikat staging: {hasil['berhasil']} berhasil, {hasil['gagal']} gagal")
+    return hasil
+
+
+def prune_staging() -> dict | None:
+    if _staging_mati():
+        return None
+    with kunci_advisory(db.engine, KUNCI_STAGING_PANGKAS) as dapat:
+        if not dapat:
+            print("Pemangkasan staging lain masih berjalan; dilewati")
+            return None
+        with get_session() as sesi:
+            hasil = pangkas_staging(sesi, Pembantu.dari_setelan(), datetime.now(timezone.utc))
+    print(", ".join(f"{k}: {v}" for k, v in hasil.items()))
+    return hasil
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wpmgr")
     sub = parser.add_subparsers(dest="perintah", required=True)
@@ -189,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("update-geoip")
     sub.add_parser("collect-ga4")
     sub.add_parser("prune-monitoring")
+    sub.add_parser("staging-jeda-otomatis")
+    sub.add_parser("renew-staging-certs")
+    sub.add_parser("prune-staging")
 
     args = parser.parse_args(argv)
     if args.perintah == "enqueue-scans":
@@ -213,6 +267,12 @@ def main(argv: list[str] | None = None) -> int:
         collect_ga4()
     elif args.perintah == "prune-monitoring":
         prune_monitoring()
+    elif args.perintah == "staging-jeda-otomatis":
+        staging_jeda_otomatis()
+    elif args.perintah == "renew-staging-certs":
+        renew_staging_certs()
+    elif args.perintah == "prune-staging":
+        prune_staging()
     return 0
 
 

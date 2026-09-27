@@ -10,3 +10,7 @@
 45   2 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli collect-ga4        >> /var/log/wpmgr/cron.log 2>&1
 15   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli prune-monitoring   >> /var/log/wpmgr/cron.log 2>&1
 0    4 1 * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli update-geoip       >> /var/log/wpmgr/cron.log 2>&1
+# Lapis 3 -- staging
+10   * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli staging-jeda-otomatis >> /var/log/wpmgr/cron.log 2>&1
+20   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli renew-staging-certs   >> /var/log/wpmgr/cron.log 2>&1
+40   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli prune-staging         >> /var/log/wpmgr/cron.log 2>&1
