@@ -26,6 +26,7 @@ from wpmgr.models import (
     User,
 )
 from wpmgr.site_client import SiteClient
+from wpmgr.staging.tarik import tangani_staging_tarik
 
 
 def buat_klien(site: Site) -> SiteClient:
@@ -328,4 +329,5 @@ HANDLER = {
     JobType.update_connector: tangani_update_connector,
     JobType.collect_events: tangani_collect_events,
     JobType.collect_traffic: tangani_collect_traffic,
+    JobType.staging_tarik: tangani_staging_tarik,
 }
