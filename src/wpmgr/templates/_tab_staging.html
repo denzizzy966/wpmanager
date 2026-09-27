@@ -1,0 +1,153 @@
+{# Tab Staging. Semua nilai dari site, connector, Mailpit, dan job dirender
+   lewat x-text; nama site dan pesan tetap server dibaca dari data-*
+   (autoescape Jinja), tidak pernah disisipkan ke ekspresi Alpine. #}
+<section x-show="tab === 'staging'">
+  <div x-data="tabStaging('{{ site.id }}')" x-init="mulai($el.dataset, tab)"
+       data-nama="{{ site.nama }}" data-pesan-diubah="{{ pesan_diubah_segarkan }}">
+    <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+    <p class="info" x-show="info" x-text="info" role="status"></p>
+    <p class="redup" x-show="!data && !galat">Memuat data staging…</p>
+
+    <template x-if="data && !data.izin_connector">
+      <p class="galat">Connector site ini belum mengizinkan staging. Aktifkan <em>Izinkan staging</em> di
+         <em>Pengaturan → WP Manager</em> di wp-admin site ini (connector 3.0).</p>
+    </template>
+
+    <template x-if="sandi">
+      <div class="panel">
+        <p><strong>Kata sandi preview</strong> (hanya ditampilkan sekali, simpan sekarang): pengguna <code>staging</code>,
+           kata sandi <code x-text="sandi"></code>
+           <button type="button" @click="salin(sandi)">Salin</button>
+           <button type="button" @click="tutupSandi()">Tutup</button></p>
+      </div>
+    </template>
+
+    <template x-if="data && data.job">
+      <div class="panel">
+        <p><strong x-text="teksJob(data.job.tipe)"></strong>
+           <span x-show="data.job.status === 'pending'" class="redup">(menunggu giliran worker)</span>
+           — <span x-text="data.job.progres.teks"></span></p>
+        <div class="batang-progres" x-show="data.job.progres.persen !== null">
+          <div :style="`width:${data.job.progres.persen || 0}%`"></div>
+        </div>
+        <button type="button" @click="batal()" :disabled="!data.staging || data.staging.batal_diminta"
+                x-text="data.staging && data.staging.batal_diminta ? 'Pembatalan diminta…' : 'Batalkan'"></button>
+      </div>
+    </template>
+
+    <template x-if="data && !data.staging">
+      <div>
+        <p>Site ini belum punya staging.</p>
+        <button type="button" @click="buatAtauSegarkan(false)" :disabled="!data.izin_connector || !!data.job">Buat staging</button>
+      </div>
+    </template>
+
+    <template x-if="data && data.staging">
+      <div>
+        <p>Status: <strong x-text="data.staging.status_teks"></strong>
+           <span x-show="data.staging.galat" class="galat" x-text="'— ' + data.staging.galat"></span></p>
+        <p class="galat" x-show="data.staging.gagal_asal === 'salinan'">
+          Salinan staging belum utuh (penyegaran terakhir gagal); segarkan ulang sebelum mendorong.</p>
+        <div class="panel peringatan" x-show="data.staging.dorong_gagal_pada || data.staging.gagal_asal === 'produksi'" role="alert">
+          <strong>Produksi mungkin bermasalah.</strong>
+          Dorong atau pengembalian terakhir gagal sesudah produksi diubah
+          (<span x-text="waktu(data.staging.dorong_gagal_pada)"></span>). Periksa site produksi sekarang, lalu
+          jalankan <strong>Dorong ke produksi</strong> lagi atau gunakan <strong>Kembalikan</strong> pada snapshot terbaru.
+        </div>
+        <p>Preview: <a :href="aman(data.staging.url)" target="_blank" rel="noopener noreferrer" x-text="data.staging.url"></a>
+           · pengguna <code>staging</code>
+           · <span x-text="data.staging.sertifikat_pada ? 'HTTPS aktif' : 'sertifikat sedang diterbitkan'"></span></p>
+        <p class="redup">Berkas <span x-text="data.staging.ukuran_file_teks"></span> · database
+           <span x-text="data.staging.ukuran_db_teks"></span> · PHP <span x-text="data.staging.versi_php || '—'"></span>
+           · tarik terakhir <span x-text="waktu(data.staging.ditarik_pada)"></span>
+           <span x-show="data.staging.diubah_sejak_tarik">· diubah sesudahnya</span></p>
+        <div class="toolbar">
+          <button type="button" @click="buatAtauSegarkan(data.staging.diubah_sejak_tarik)"
+                  :disabled="!!data.job || !data.izin_connector">Segarkan dari produksi</button>
+          <button type="button" x-show="data.staging.aktif" @click="aksi('jeda', 'Staging dijeda.')" :disabled="!!data.job">Jeda</button>
+          <button type="button" x-show="!data.staging.aktif" @click="aksi('jalan', 'Staging dijalankan.')"
+                  :disabled="!data.staging.ditarik_pada">Jalankan</button>
+          <button type="button" @click="sso()" :disabled="!data.staging.ditarik_pada || !data.staging.aktif">Masuk admin staging</button>
+          <button type="button" @click="bukaDorong()" :disabled="!!alasanDorong()">Dorong ke produksi</button>
+          <button type="button" @click="sandiBaru()" :disabled="!!data.job">Buat ulang kata sandi</button>
+          <button type="button" @click="hapus()" :disabled="!!data.job">Hapus staging</button>
+        </div>
+        <p class="redup" x-show="alasanDorong()" x-text="'Dorong ke produksi belum bisa: ' + alasanDorong()"></p>
+
+        <div class="panel" x-show="dialogDorong">
+          <h3>Dorong ke produksi</h3>
+          <p><label><input type="radio" value="hanya_kode" x-model="mode"> Hanya kode — tema, plugin, mu-plugin, dan
+             berkas upload baru. Database produksi tidak disentuh (aman untuk toko online).</label></p>
+          <p><label><input type="radio" value="timpa_penuh" x-model="mode"> Timpa penuh — semua berkas dan database
+             staging menggantikan produksi.</label></p>
+          <p class="redup">Snapshot produksi selalu dibuat sebelum dorongan dan bisa dikembalikan.</p>
+          <button type="button" @click="cekTandaAir()" :disabled="memeriksa"
+                  x-text="memeriksa ? 'Memeriksa…' : 'Periksa data baru di produksi'"></button>
+          <template x-if="perubahan !== null">
+            <div>
+              <p x-show="perubahan.length === 0">Tidak ada data baru di produksi sejak staging ditarik.</p>
+              <p x-show="perubahan.length">Data baru di produksi sejak staging ditarik:</p>
+              <ul x-show="perubahan.length"><template x-for="(p, i) in perubahan" :key="i"><li x-text="p"></li></template></ul>
+            </div>
+          </template>
+          <p x-show="mode === 'timpa_penuh'">
+            <label>Ketik nama site bila produksi punya data baru (data itu akan terhapus):
+              <input x-model="konfirmasiNama" autocomplete="off"></label></p>
+          <button type="button" @click="dorong()" :disabled="!bolehDorong()">Dorong</button>
+          <button type="button" @click="dialogDorong = false">Batal</button>
+        </div>
+
+        <h3>Email staging</h3>
+        <p class="redup">Email yang dikirim staging ditangkap dan tidak pernah sampai ke penerima.</p>
+        <button type="button" @click="muatEmail()">Muat email</button>
+        <p class="redup" x-show="email && email.length === 0">Belum ada email yang ditangkap.</p>
+        <table x-show="email && email.length">
+          <tr><th>Waktu</th><th>Dari</th><th>Ke</th><th>Subjek</th><th></th></tr>
+          <template x-for="m in email || []" :key="m.id">
+            <tr><td x-text="waktu(m.waktu)"></td><td x-text="m.dari"></td><td x-text="m.ke.join(', ')"></td>
+                <td x-text="m.subjek"></td><td><button type="button" @click="bukaEmail(m.id)">Buka</button></td></tr>
+          </template>
+        </table>
+        <template x-if="emailTerbuka">
+          <div class="panel">
+            <h4 x-text="emailTerbuka.subjek || '(tanpa subjek)'"></h4>
+            <p class="redup">Dari <span x-text="emailTerbuka.dari"></span> ke <span x-text="emailTerbuka.ke.join(', ')"></span></p>
+            <pre class="pesan-detail" x-text="emailTerbuka.teks"></pre>
+            <button type="button" @click="emailTerbuka = null">Tutup</button>
+          </div>
+        </template>
+      </div>
+    </template>
+
+    <h3>Uji update</h3>
+    <p class="redup">Jalankan dari halaman <a href="/updates">Update</a> dengan tombol <em>Uji di staging dulu</em>.
+       Penilaian bersifat heuristik; keputusan update produksi tetap di tangan Anda.</p>
+    <p class="redup" x-show="data && data.uji.length === 0">Belum ada uji.</p>
+    <table x-show="data && data.uji.length">
+      <tr><th>Waktu</th><th>Paket</th><th>Hasil</th><th>Alasan</th><th>Catatan</th></tr>
+      <template x-for="u in (data ? data.uji : [])" :key="u.id">
+        <tr>
+          <td x-text="waktu(u.dibuat_pada)"></td>
+          <td x-text="teksPaket(u.paket)"></td>
+          <td><span :class="u.hasil === 'lolos' ? 'dg-badge-success' : 'dg-badge-danger'" x-text="u.hasil === 'lolos' ? 'Lolos' : 'Gagal'"></span></td>
+          <td x-text="u.alasan.join('; ') || '—'"></td>
+          <td class="redup" x-text="(u.catatan || []).join('; ') || '—'"></td>
+        </tr>
+      </template>
+    </table>
+
+    <h3>Snapshot produksi</h3>
+    <p class="redup" x-show="data && data.snapshot.length === 0">Belum ada snapshot.</p>
+    <table x-show="data && data.snapshot.length">
+      <tr><th>Waktu</th><th>Mode dorong</th><th>Ukuran</th><th>Status</th><th></th></tr>
+      <template x-for="s in (data ? data.snapshot : [])" :key="s.id">
+        <tr>
+          <td x-text="waktu(s.dibuat_pada)"></td>
+          <td x-text="teksMode(s.mode)"></td>
+          <td x-text="s.ukuran_teks"></td><td x-text="s.status"></td>
+          <td><button type="button" x-show="snapshotSah(s)" @click="kembalikan(s.id, s.mode)" :disabled="!!(data && data.job)">Kembalikan</button></td>
+        </tr>
+      </template>
+    </table>
+  </div>
+</section>

@@ -297,8 +297,11 @@ def _dict_snapshot(s: StagingSnapshot) -> dict:
 
 def _dict_uji(u: StagingUji) -> dict:
     periksa = u.pemeriksaan if isinstance(u.pemeriksaan, dict) else {}
+    # `catatan` (R17): halaman yang sudah gagal sebelum update, ditampilkan
+    # terpisah dari alasan kegagalan.
     return {"id": u.id, "hasil": u.hasil, "paket": u.paket, "alasan": periksa.get("alasan") or [],
-            "halaman": periksa.get("halaman") or [], "dibuat_pada": _iso(u.dibuat_pada)}
+            "catatan": periksa.get("catatan") or [], "halaman": periksa.get("halaman") or [],
+            "dibuat_pada": _iso(u.dibuat_pada)}
 
 
 def _daftar_snapshot(sesi, site_id, batas: int) -> list[dict]:

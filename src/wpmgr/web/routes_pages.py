@@ -18,12 +18,16 @@ from wpmgr.models import (
     CatatanError,
     Site,
     SitePackage,
+    Staging,
+    StatusStaging,
     UptimeStatus,
     User,
 )
 from wpmgr.pairing import buat_site
+from wpmgr.staging.uji import PESAN_KONFIRMASI
 from wpmgr.traffic import anomali_site
 from wpmgr.web.auth import pengguna_saat_ini
+from wpmgr.web.routes_staging import PESAN_DIUBAH_SEGARKAN
 
 router = APIRouter()
 
@@ -52,7 +56,13 @@ def halaman_kesehatan(request: Request, pengguna: PenggunaHalaman):
 
 @router.get("/updates")
 def halaman_updates(request: Request, pengguna: PenggunaHalaman):
-    return _tpl().TemplateResponse(request, "updates.html", {"pengguna": pengguna})
+    # Pesan konfirmasi uji dibawa ke JS lewat data-* supaya JS mengenali
+    # 409 yang meminta konfirmasi dengan perbandingan persis, bukan tebakan
+    # substring atas teks yang juga memuat nama site.
+    return _tpl().TemplateResponse(request, "updates.html", {
+        "pengguna": pengguna, "staging_aktif": get_settings().staging_aktif,
+        "pesan_konfirmasi_uji": PESAN_KONFIRMASI,
+    })
 
 
 @router.get("/sites")
@@ -142,7 +152,8 @@ def simpan_site(
 
 TAB_DETAIL = [
     ("ringkasan", "Ringkasan"), ("paket", "Paket"), ("uptime", "Uptime"),
-    ("error", "Error"), ("login", "Login"), ("traffic", "Traffic"), ("aktivitas", "Aktivitas"),
+    ("error", "Error"), ("login", "Login"), ("traffic", "Traffic"), ("staging", "Staging"),
+    ("aktivitas", "Aktivitas"),
 ]
 # [0-9] dan \Z, bukan \d dan $ (lihat POLA_PROPERTY di traffic.py): \d juga
 # cocok dengan digit non-ASCII, dan $ cocok sebelum baris baru di akhir --
@@ -157,7 +168,9 @@ def _bulan_lalu(hari_ini: date) -> str:
 
 @router.get("/sites/{site_id}")
 def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalaman, tab: str = "ringkasan"):
-    sah = {k for k, _ in TAB_DETAIL}
+    staging_aktif = get_settings().staging_aktif
+    tab_detail = [t for t in TAB_DETAIL if t[0] != "staging" or staging_aktif]
+    sah = {k for k, _ in tab_detail}
     # Hanya nilai dari daftar putih yang boleh masuk ke ekspresi Alpine di template.
     tab = tab if tab in sah else "ringkasan"
     sekarang = datetime.now(timezone.utc)
@@ -195,18 +208,22 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
         )
         keamanan = nilai_keamanan(sesi, site, sekarang)
         anomali = anomali_site(sesi, site.id, sekarang.date())
+        staging = sesi.scalar(select(Staging).where(Staging.site_id == site_id)) if staging_aktif else None
     lencana = {
         "uptime": "!" if site.uptime_status == UptimeStatus.mati else "",
         "error": jumlah_error or "",
         "login": {"perlu_diperiksa": "!", "diserang": "serangan"}.get(keamanan.status.value, ""),
         "traffic": "!" if anomali else "",
+        "staging": "!" if staging is not None and (
+            staging.status == StatusStaging.gagal or staging.dorong_gagal_pada is not None) else "",
     }
     return _tpl().TemplateResponse(
         request, "site_detail.html",
         {"pengguna": pengguna, "site": site, "paket": paket, "riwayat": riwayat,
-         "tab": tab, "tab_detail": TAB_DETAIL, "lencana": lencana,
+         "tab": tab, "tab_detail": tab_detail, "staging_aktif": staging_aktif, "lencana": lencana,
          "bulan_lalu": _bulan_lalu(sekarang.date()),
-         "ga4_aktif": bool(get_settings().ga4_credentials)},
+         "ga4_aktif": bool(get_settings().ga4_credentials),
+         "pesan_diubah_segarkan": PESAN_DIUBAH_SEGARKAN},
     )
 
 

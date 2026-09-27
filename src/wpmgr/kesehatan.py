@@ -13,25 +13,35 @@ from wpmgr.keamanan import (
     error_menyalakan_chip,
     nilai_keamanan,
 )
-from wpmgr.models import CatatanError, Site, SiteStatus, TrafficHarian, UptimeStatus
+from wpmgr.models import (
+    CatatanError,
+    Site,
+    SiteStatus,
+    Staging,
+    StatusStaging,
+    TrafficHarian,
+    UptimeStatus,
+)
 from wpmgr.ssl_cek import sisa_hari_ssl, ssl_bermasalah
+from wpmgr.staging.umum import ASAL_PRODUKSI
 from wpmgr.traffic import anomali_site
 from wpmgr.uptime import persen_uptime_per_site
 from wpmgr.versi import lebih_lama
 
 URUTAN_CHIP = [
-    "mati", "perlu_diperiksa", "diserang", "error_baru", "ssl", "koneksi",
-    "penangkap_terbatas", "traffic_anjlok", "traffic_melonjak", "connector_usang",
+    "mati", "perlu_diperiksa", "dorong_gagal", "diserang", "error_baru", "ssl", "koneksi",
+    "penangkap_terbatas", "staging_gagal", "traffic_anjlok", "traffic_melonjak", "connector_usang",
 ]
 TINGKAT_MASALAH = {
-    "mati": 1, "perlu_diperiksa": 1,
-    "diserang": 2, "error_baru": 2, "ssl": 2, "koneksi": 2, "penangkap_terbatas": 2,
+    "mati": 1, "perlu_diperiksa": 1, "dorong_gagal": 1,
+    "diserang": 2, "error_baru": 2, "ssl": 2, "koneksi": 2, "penangkap_terbatas": 2, "staging_gagal": 2,
     "traffic_anjlok": 3, "traffic_melonjak": 3, "connector_usang": 3,
 }
 TAB_MASALAH = {
-    "mati": "uptime", "perlu_diperiksa": "login", "diserang": "login", "error_baru": "error",
-    "ssl": "uptime", "koneksi": "ringkasan", "penangkap_terbatas": "ringkasan",
-    "traffic_anjlok": "traffic", "traffic_melonjak": "traffic", "connector_usang": "ringkasan",
+    "mati": "uptime", "perlu_diperiksa": "login", "dorong_gagal": "staging", "diserang": "login",
+    "error_baru": "error", "ssl": "uptime", "koneksi": "ringkasan", "penangkap_terbatas": "ringkasan",
+    "staging_gagal": "staging", "traffic_anjlok": "traffic", "traffic_melonjak": "traffic",
+    "connector_usang": "ringkasan",
 }
 TINGKAT_SEHAT = 4
 
@@ -77,6 +87,28 @@ def _traffic_kemarin(sesi: Session, kemarin, site_ids: list) -> dict:
     return hasil
 
 
+def masalah_staging(st: Staging | None) -> list[str]:
+    """Chip staging satu site, tanpa menghitung satu kegagalan dua kali.
+
+    - `dorong_gagal`: produksi bermasalah sesudah dorong/kembalikan, yaitu
+      `dorong_gagal_pada` terisi atau staging `gagal` berasal 'produksi'
+      (salinannya utuh; yang rusak produksi).
+    - `staging_gagal`: salinan staging sendiri gagal, yaitu `gagal` berasal
+      'salinan' atau tanpa penanda asal (baris sebelum R20).
+    Keduanya menyala bersamaan hanya bila memang dua masalah (R22: salinan
+    sudah belum utuh sebelum dorongan yang gagal di produksi).
+    """
+    if st is None:
+        return []
+    gagal = st.status == StatusStaging.gagal
+    masalah = []
+    if st.dorong_gagal_pada is not None or (gagal and st.gagal_asal == ASAL_PRODUKSI):
+        masalah.append("dorong_gagal")
+    if gagal and st.gagal_asal != ASAL_PRODUKSI:
+        masalah.append("staging_gagal")
+    return masalah
+
+
 def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
     sekarang = sekarang or datetime.now(timezone.utc)
     hari_ini = sekarang.date()
@@ -88,6 +120,10 @@ def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
     persen = persen_uptime_per_site(sesi, sekarang - timedelta(hours=24), site_ids)
     errors = _error_per_site(sesi, sekarang, site_ids)
     traffic = _traffic_kemarin(sesi, hari_ini - timedelta(days=1), site_ids)
+    # Fitur staging mati: tab Staging tidak ada, jadi chip-nya tidak punya tujuan.
+    stagings = {}
+    if site_ids and get_settings().staging_aktif:
+        stagings = {st.site_id: st for st in sesi.scalars(select(Staging).where(Staging.site_id.in_(site_ids)))}
 
     semua = []
     for site in sites:
@@ -116,6 +152,8 @@ def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
             masalah.append("traffic_melonjak")
         if lebih_lama(site.connector_version, versi_terbaru) or (site.connector_version and not site.fitur):
             masalah.append("connector_usang")
+        st = stagings.get(site.id)
+        masalah.extend(masalah_staging(st))
 
         utama = min(masalah, key=lambda m: (TINGKAT_MASALAH[m], URUTAN_CHIP.index(m)), default=None)
         semua.append({
@@ -138,6 +176,7 @@ def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
             "ssl_error": site.ssl_error,
             "koneksi": site.status.value,
             "connector_version": site.connector_version,
+            "staging_status": st.status.value if st is not None else None,
         })
 
     semua.sort(key=lambda b: (b["tingkat"], b["nama"].lower()))

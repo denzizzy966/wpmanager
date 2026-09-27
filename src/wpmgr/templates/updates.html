@@ -1,17 +1,23 @@
 {% extends "base.html" %}
 {% block judul %}Semua Update — WP Manager{% endblock %}
 {% block isi %}
-<div x-data="layarUpdate()" x-init="muat()">
+{# Pesan konfirmasi uji dibaca JS dari data-* (autoescape), bukan dari ekspresi Alpine. #}
+<div x-data="layarUpdate()" x-init="siapkan($el.dataset); muat()"
+     data-staging="{{ '1' if staging_aktif else '0' }}" data-pesan-konfirmasi="{{ pesan_konfirmasi_uji }}">
   <h1>Semua Update</h1>
 
   <div class="toolbar">
     <button @click="jalankanUpdate()" :disabled="terpilih.length === 0 || berjalan">
       <span x-text="berjalan ? 'Sedang berjalan…' : `Update ${terpilih.length} item terpilih`"></span>
     </button>
+    {% if staging_aktif %}
+    <button @click="ujiStaging()" :disabled="terpilih.length === 0 || berjalan">Uji di staging dulu</button>
+    {% endif %}
     <button @click="muat()" :disabled="berjalan">Muat ulang</button>
   </div>
 
   <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+  <p class="info" x-show="info" x-text="info" role="status"></p>
 
   <div x-show="progres.length" class="progres">
     <template x-for="j in progres" :key="j.id">
@@ -19,6 +25,7 @@
         <span x-text="j.site_nama"></span> —
         <span x-text="j.slug || j.tipe"></span> —
         <span x-text="j.status"></span>
+        <span x-show="j.progres" x-text="' — ' + j.progres"></span>
       </div>
     </template>
   </div>

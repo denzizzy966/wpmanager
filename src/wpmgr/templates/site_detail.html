@@ -237,6 +237,8 @@
     </template>
   </section>
 
+  {% if staging_aktif %}{% include "_tab_staging.html" %}{% endif %}
+
   <section x-show="tab === 'aktivitas'">
     <ul>
       {% for r in riwayat %}
@@ -246,4 +248,5 @@
   </section>
 </div>
 <script src="/static/app/detail.js"></script>
+{% if staging_aktif %}<script src="/static/app/staging.js"></script>{% endif %}
 {% endblock %}
