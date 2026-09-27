@@ -248,7 +248,18 @@ def test_json_bersarang_dalam_tidak_meledak_saat_klasifikasi():
     (507, "wpmgr_staging_disk_penuh", "staging_gagal"),
     # Kode yang sama dengan status lain tidak ikut: 500 impor tetap sementara.
     (500, "wpmgr_staging_impor", TRANSIENT),
-    (409, "wpmgr_staging_urutan", BAD_RESPONSE),
+    # Task 16: kode 409 dorong yang tidak berubah bila diulang. Urutan,
+    # potongan kurang, nomor bentrok, tabel lama, kunci hilang, dan dorongan
+    # lama yang perlu dipulihkan tidak pernah pulih dengan mengirim ulang
+    # permintaan yang sama; pemanggil menanganinya (unggah ulang, rekonsiliasi).
+    (409, "wpmgr_staging_urutan", "staging_gagal"),
+    (409, "wpmgr_staging_kurang", "staging_gagal"),
+    (409, "wpmgr_staging_nomor_bentrok", "staging_gagal"),
+    (409, "wpmgr_staging_tabel_lama", "staging_gagal"),
+    (409, "wpmgr_staging_perlu_pemulihan", "staging_gagal"),
+    (409, "wpmgr_staging_kunci_hilang", "staging_gagal"),
+    # Mode pemeliharaan milik pihak lain (update inti WordPress): coba nanti.
+    (409, "wpmgr_staging_maintenance", "staging_ditolak"),
 ])
 def test_tabel_kode_staging(status, kode, kelas):
     body = json.dumps({"code": kode, "message": "x", "data": {"status": status}})
@@ -281,3 +292,22 @@ def test_kode_staging_dipetakan_sebelum_cabang_status():
     assert klasifikasi_respons(413, {}, kode("wpmgr_staging_baris_terlalu_besar")) == STAGING_GAGAL
     assert STAGING_GAGAL not in DAPAT_DIULANG
     assert KELAS_STAGING == {"staging_mati", "staging_ditolak", "staging_gagal", "terlalu_besar", "berkas_hilang"}
+
+
+def test_site_error_membawa_kode_dan_data_connector():
+    polos = SiteError(TRANSIENT, "x")
+    assert polos.kode is None and polos.data == {}
+    e = SiteError(TRANSIENT, "x", kode="wpmgr_staging_tukar", data={"pemulihan": "dipulihkan"})
+    assert e.kode == "wpmgr_staging_tukar" and e.data == {"pemulihan": "dipulihkan"}
+    # data yang bukan objek (masukan penyerang) tidak pernah dipercaya.
+    assert SiteError(TRANSIENT, "x", data=["a"]).data == {}
+
+
+def test_data_plugin_hanya_dari_balasan_connector():
+    from wpmgr.errors import data_plugin
+
+    body = json.dumps({"code": "wpmgr_staging_tukar", "message": "x", "data": {"status": 500, "pemulihan": "memulihkan"}})
+    assert data_plugin(body) == {"status": 500, "pemulihan": "memulihkan"}
+    assert data_plugin(json.dumps({"code": "rest_x", "data": {"a": 1}})) is None
+    assert data_plugin(json.dumps({"code": "wpmgr_x", "data": [1]})) is None
+    assert data_plugin("<html>") is None

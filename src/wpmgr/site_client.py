@@ -13,7 +13,9 @@ from wpmgr.errors import (
     UNKNOWN,
     UPGRADE_FAILED,
     SiteError,
+    data_plugin,
     klasifikasi_respons,
+    kode_plugin,
     pesan_plugin,
 )
 from wpmgr.signing import new_nonce, sign
@@ -378,7 +380,7 @@ class SiteClient:
         kelas = klasifikasi_respons(status, headers, teks)
         if kelas is None:
             return None
-        return SiteError(kelas, (pesan_plugin(teks) or teks)[:500])
+        return SiteError(kelas, (pesan_plugin(teks) or teks)[:500], kode=kode_plugin(teks), data=data_plugin(teks))
 
     @classmethod
     def _json_objek(cls, status: int, headers: dict, isi: bytes) -> dict:
@@ -397,10 +399,11 @@ class SiteClient:
 
     def _staging_json(self, method: str, route: str, badan: dict | None = None, query: str = "",
                       berefek: bool = False, terapkan: bool = False,
-                      header_tambahan: dict | None = None) -> dict:
+                      header_tambahan: dict | None = None, tenggat: float | None = None) -> dict:
         body = json.dumps(badan, separators=(",", ":")).encode("utf-8") if badan is not None else b""
-        timeout, tenggat = ((TIMEOUT_STAGING_TERAPKAN, TENGGAT_STAGING_TERAPKAN) if terapkan
-                            else (TIMEOUT_STAGING, TENGGAT_STAGING))
+        timeout, batas = ((TIMEOUT_STAGING_TERAPKAN, TENGGAT_STAGING_TERAPKAN) if terapkan
+                          else (TIMEOUT_STAGING, TENGGAT_STAGING))
+        tenggat = batas if tenggat is None else min(batas, tenggat)
         return self._json_objek(*self._kirim(method, f"{PREFIX}{route}", body, timeout, tenggat, berefek, query,
                                              "application/json", header_tambahan, BATAS_JSON_STAGING))
 
@@ -457,5 +460,8 @@ class SiteClient:
         return self._staging_json("POST", "/staging/terapkan", badan, berefek=True, terapkan=True,
                                   header_tambahan=header)
 
-    def staging_bersihkan(self, dorong_id: str) -> dict:
-        return self._staging_json("POST", "/staging/bersihkan", {"dorong_id": dorong_id}, berefek=True)
+    def staging_bersihkan(self, dorong_id: str, tenggat: float | None = None) -> dict:
+        # `tenggat` pendek untuk pembersihan upaya-terbaik saat job gagal final
+        # (putusan F9a): job yang sudah gagal tidak boleh tertahan lama di sini.
+        return self._staging_json("POST", "/staging/bersihkan", {"dorong_id": dorong_id}, berefek=True,
+                                  tenggat=tenggat)

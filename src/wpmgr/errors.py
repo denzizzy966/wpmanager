@@ -77,14 +77,45 @@ KELAS_KODE_STAGING = {
     # penuh (sisa < max(512 MB, 5%)). Yang kedua tidak pulih dalam jeda
     # ulang job; mengulang hanya menunda pesan yang sama.
     (507, "wpmgr_staging_disk_penuh"): STAGING_GAGAL,
+    # Task 16: kode dorong yang jawabannya tidak berubah bila permintaan yang
+    # sama dikirim ulang. Langkah yang diulang sesudah respons hilang tidak
+    # pernah mendapat 409 dari connector (putusan F4: dibalas hasil
+    # tersimpan), jadi 409 ini selalu kondisi sungguhan, bukan balapan:
+    # - urutan: dorongan tidak lagi menunggu langkah/unggahan ini (sudah
+    #   dipulihkan, dibatalkan, atau belum siap);
+    # - kurang: potongan belum ada di area dorong (pemanggil mengunggah ulang);
+    # - nomor_bentrok: nomor potongan sudah dipakai dengan isi berbeda
+    #   (berkas staging berubah di tengah dorong);
+    # - tabel_lama: wpmgr_old_* dari dorongan lama yang belum dibersihkan;
+    # - perlu_pemulihan: dorongan lama masih setengah diterapkan;
+    # - kunci_hilang: kunci dorong direbut dorongan lain di tengah permintaan.
+    (409, "wpmgr_staging_urutan"): STAGING_GAGAL,
+    (409, "wpmgr_staging_kurang"): STAGING_GAGAL,
+    (409, "wpmgr_staging_nomor_bentrok"): STAGING_GAGAL,
+    (409, "wpmgr_staging_tabel_lama"): STAGING_GAGAL,
+    (409, "wpmgr_staging_perlu_pemulihan"): STAGING_GAGAL,
+    (409, "wpmgr_staging_kunci_hilang"): STAGING_GAGAL,
+    # .maintenance milik pihak lain (mis. update inti WordPress yang sedang
+    # berjalan): ditampilkan ke pengguna, dicoba lagi nanti, tidak diulang segera.
+    (409, "wpmgr_staging_maintenance"): STAGING_DITOLAK,
 }
 
 
 class SiteError(Exception):
-    def __init__(self, error_class: str, pesan: str) -> None:
+    """Galat dari site. `kode` dan `data` hanya terisi dari balasan connector sendiri.
+
+    `kode` adalah `code` WP_Error (`wpmgr_*`) dan `data` adalah objek `data`
+    miliknya (mis. `pemulihan` pada galat tukar). Keduanya dipakai job dorong
+    untuk membedakan "connector menjawab pasti gagal" dari "hasil tidak
+    diketahui"; galat kabel tidak pernah punya kode.
+    """
+
+    def __init__(self, error_class: str, pesan: str, kode: str | None = None, data: dict | None = None) -> None:
         super().__init__(pesan)
         self.error_class = error_class
         self.pesan = pesan
+        self.kode = kode
+        self.data = data if isinstance(data, dict) else {}
 
     @property
     def dapat_diulang(self) -> bool:
@@ -114,6 +145,14 @@ def _json_plugin(body: str) -> dict | None:
 def kode_plugin(body: str) -> str | None:
     data = _json_plugin(body)
     return None if data is None else str(data["code"])
+
+
+def data_plugin(body: str) -> dict | None:
+    """Objek `data` dari balasan connector (WP_Error), atau None bila tidak ada/bukan objek."""
+    data = _json_plugin(body)
+    if data is None or not isinstance(data.get("data"), dict):
+        return None
+    return data["data"]
 
 
 def pesan_plugin(body: str) -> str | None:

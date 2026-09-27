@@ -497,3 +497,38 @@ def test_content_encoding_selain_identity_ditolak():
     meta, _ = klien(lambda r: httpx.Response(200, content=data,
                                              headers={"Content-Encoding": "identity"})).staging_file(["a"])
     assert meta["berkas"][0]["path"] == "a"
+
+
+# ---- Task 16 -----------------------------------------------------------------
+
+
+def test_galat_staging_membawa_kode_dan_data_connector():
+    tukar = {"code": "wpmgr_staging_tukar", "message": "Penukaran gagal dan sudah dipulihkan otomatis: x",
+             "data": {"status": 500, "pemulihan": "dipulihkan"}}
+    with pytest.raises(SiteError) as e:
+        klien(lambda r: httpx.Response(500, json=tukar)).staging_terapkan({"langkah": "tukar"}, "b" * 32)
+    assert e.value.error_class == TRANSIENT
+    assert e.value.kode == "wpmgr_staging_tukar"
+    assert e.value.data == {"status": 500, "pemulihan": "dipulihkan"}
+    # Galat kabel tidak punya kode connector: hasilnya tidak diketahui.
+    def putus(r):
+        raise httpx.ReadError("putus", request=r)
+
+    with pytest.raises(SiteError) as e:
+        klien(putus).staging_terapkan({"langkah": "tukar"}, "b" * 32)
+    assert e.value.error_class == UNKNOWN and e.value.kode is None
+
+
+def test_bersihkan_memakai_tenggat_pendek_bila_diminta(monkeypatch):
+    dipakai = []
+    asli = site_client.minta_bertenggat
+
+    def catat(*a, **kw):
+        dipakai.append(kw["tenggat"])
+        return asli(*a, **kw)
+
+    monkeypatch.setattr(site_client, "minta_bertenggat", catat)
+    k = klien(lambda r: httpx.Response(200, json={"lagi": False}))
+    assert k.staging_bersihkan("a" * 32) == {"lagi": False}
+    assert k.staging_bersihkan("a" * 32, tenggat=7.0) == {"lagi": False}
+    assert dipakai == [site_client.TENGGAT_STAGING, 7.0]
