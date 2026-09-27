@@ -1,0 +1,15 @@
+# Aturan iptables isolasi staging tidak bertahan setelah reboot; unit ini
+# menjalankan `wpmgr-staging siapkan` (idempoten) setiap boot setelah Docker.
+[Unit]
+Description=Siapkan jaringan, isolasi, dan layanan staging WP Manager
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wpmgr-staging siapkan
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

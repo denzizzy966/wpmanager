@@ -408,6 +408,131 @@ pengunjung/penyerang.
 **Atribusi:** data negara berasal dari [DB-IP Lite](https://db-ip.com/db/lite.php)
 ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)).
 
+## Staging (Lapis 3)
+
+Setiap site bisa punya satu salinan staging di VPS dashboard, untuk menguji update, preview client,
+bekerja, dan mendorong hasil ke produksi dengan snapshot yang bisa dikembalikan. Staging berjalan di
+Docker, tetapi proses dashboard **tidak** punya akses Docker. Semua lewat satu skrip root
+`/usr/local/sbin/wpmgr-staging` yang dipanggil `sudo -n`. Fitur ini mati selama `WPMGR_STAGING_DOMAIN`
+kosong.
+
+**Prasyarat VPS:** Docker (butuh sudo), nginx host, certbot 2.9, `setpriv` (paket util-linux), dan
+wildcard DNS `*.staging.<domain>` yang mengarah ke IP VPS. Untuk `staging.halosocia.my.id`, record ini
+**sudah ada**: `A *.staging.halosocia.my.id -> 169.58.91.181`, ditambahkan manual di panel DNS
+Hostinger (Hostinger tidak punya plugin certbot, karena itu setiap host staging diterbitkan lewat
+HTTP-01, bukan DNS-01 — lihat langkah 4 di bawah).
+
+**Pemasangan (sekali, sebagai root, dari `/opt/wpmgr`):**
+
+```bash
+# 1. Skema, paket connector 3.0, lalu "Perbarui connector" di halaman Site
+.venv/bin/python -m alembic upgrade head
+.venv/bin/python -m wpmgr.cli build-connector
+
+# 2. Skrip pembantu, konfigurasinya, dan sudoers
+install -o root -g root -m 0755 deploy/staging/wpmgr-staging /usr/local/sbin/wpmgr-staging
+install -d -o root -g root -m 0755 /etc/wpmgr-staging
+install -o root -g root -m 0644 deploy/staging/staging.conf.contoh /etc/wpmgr-staging/staging.conf
+#    isi DOMAIN dan ACME_EMAIL (sama dengan WPMGR_STAGING_EMAIL_ACME) di staging.conf
+install -d -o wpmgr -g wpmgr -m 0700 /var/lib/wpmgr/staging
+install -o root -g root -m 0440 deploy/staging/sudoers-wpmgr-staging /etc/sudoers.d/wpmgr-staging
+visudo -cf /etc/sudoers.d/wpmgr-staging
+
+# 3. Jaringan, isolasi iptables, MariaDB, Mailpit, router, wp-cli (idempoten)
+wpmgr-staging siapkan
+cp deploy/staging/wpmgr-staging-siapkan.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable wpmgr-staging-siapkan
+
+# 4. nginx host (SEKALI; staging baru tidak butuh reload)
+cp deploy/staging/nginx-wpmgr-staging.conf /etc/nginx/sites-enabled/wpmgr-staging.conf
+nginx -t && systemctl reload nginx
+
+# 5. Variabel .env, cron, dan worker khusus staging
+crontab -u wpmgr deploy/crontab
+cp deploy/wpmgr-worker@.service /etc/systemd/system/ && systemctl daemon-reload
+systemctl enable --now wpmgr-worker@staging
+systemctl restart 'wpmgr-worker@*' wpmgr-web
+```
+
+`/usr/local/sbin/wpmgr-staging` harus tetap root-owned `0755` dan direktori `/usr/local/sbin` sendiri
+tidak boleh ditulisi `wpmgr` — pada Ubuntu 24.04 baku ini sudah begitu; jangan mengubah pemiliknya.
+Sudoers hanya memberi `wpmgr` hak menjalankan skrip itu (`env_reset` aktif, tanpa baris `env_keep`),
+jadi variabel lingkungan yang dikirim `wpmgr` (termasuk dua kait test skrip pembantu,
+`WPMGR_STG_PATH`/`WPMGR_STG_KONF`) tidak pernah ikut lewat ke proses root.
+
+Lalu aktifkan **Izinkan staging** di **Pengaturan → WP Manager** di wp-admin setiap site yang akan
+distaging. Tanpa setelan itu connector membalas 403 untuk semua endpoint staging.
+
+Periksa hasilnya dengan `sudo -u wpmgr sudo -n /usr/local/sbin/wpmgr-staging status`. Perintah ini
+harus mencetak JSON berisi memori, disk, dan container. Baru setelah itu buat staging pertama dari UI
+dan tunggu job tarik selesai — pemakaian pertama inilah yang benar-benar menguji wp-cli di dalam
+container (dijalankan sebagai UID numerik dashboard tanpa entri `/etc/passwd`, jadi `HOME` tidak
+otomatis terset); kalau wp-cli gagal karena itu, galatnya baru terlihat di sini, bukan saat `siapkan`.
+
+Catatan:
+
+- **`wpmgr-worker@staging` wajib.** Job staging hanya diambil instans worker yang namanya diawali
+  `staging`, karena tarik site 20 GB bisa berjalan berjam-jam dan tidak boleh memakan worker umum.
+  Tarik dan uji boleh berjalan bersamaan dengan scan/update site yang sama. Dorong dan kembalikan
+  tidak boleh.
+- **Jumlah worker staging harus tetap satu.** Jangan mengaktifkan instans kedua (mis.
+  `wpmgr-worker@staging2`): kode tidak mencegahnya, tetapi RAM (±6,4 GB tersedia) dan disk VPS
+  dihitung per operasi, bukan dikoordinasikan lintas worker, sehingga dua tarik/dorong 20 GB berjalan
+  bersamaan bisa menghabiskannya.
+- **`/etc/letsencrypt/options-ssl-nginx.conf`** dibuat certbot `--nginx` dan dipakai site lain di
+  `sites-enabled`. Bila berkas itu tidak ada di VPS, ganti baris `include` dengan baris `ssl_protocols`/
+  `ssl_ciphers` dari server block site lain sebelum `nginx -t`.
+- **Sertifikat diterbitkan satu per host staging**, bukan wildcard (DNS Hostinger tidak punya plugin
+  certbot untuk DNS-01), jadi tunduk pada batas laju Let's Encrypt per domain terdaftar
+  (`halosocia.my.id`). Membuat/menghapus banyak staging dalam waktu singkat bisa memicu batas itu;
+  `wpmgr-staging sertifikat` memakai `--keep-until-expiring` supaya penerbitan ulang untuk host yang
+  sama tidak ikut menghitung.
+- **Image dipin lewat digest** di `/etc/wpmgr-staging/digest.lock`, yang diisi pada pemakaian pertama
+  setiap image. Untuk memperbarui image (mis. rilis keamanan PHP), hapus barisnya lalu jalankan
+  `wpmgr-staging siapkan`. Container staging memakai image baru pada tarik berikutnya.
+- **Isolasi:** container staging boleh ke internet (update plugin), tetapi tidak ke host atau jaringan
+  privat. Aturan itu ada di rantai `INPUT` dan `DOCKER-USER` untuk jembatan `br-wpmgrstg`.
+- **Kata sandi preview** ditampilkan sekali saat staging dibuat atau kata sandinya dibuat ulang
+  (pengguna `staging`). Tombol **Masuk admin staging** melewati Basic Auth dengan tautan bertanda
+  tangan yang berlaku 12 jam.
+- **Email dari staging** tidak pernah terkirim: semua dialihkan ke Mailpit dan bisa dibaca di tab
+  Staging. Plugin yang mengirim email lewat API HTTP penyedia (bukan SMTP/PHPMailer) tetap mengirim
+  sungguhan; spanduk di wp-admin staging mengingatkan hal ini.
+
+| Variabel | Default | Untuk |
+|---|---|---|
+| `WPMGR_STAGING_DOMAIN` | *(kosong = fitur mati)* | Domain induk staging, mis. `staging.halosocia.my.id` |
+| `WPMGR_STAGING_DIR` | `/var/lib/wpmgr/staging` | Berkas staging, snapshot, dan area kerja (0700 milik `wpmgr`) |
+| `WPMGR_STAGING_PEMBANTU` | `/usr/local/sbin/wpmgr-staging` | Lokasi skrip pembantu |
+| `WPMGR_STAGING_MAKS_AKTIF` | `3` | Staging aktif paling banyak |
+| `WPMGR_STAGING_JEDA_HARI` | `3` | Jeda otomatis setelah sekian hari tanpa akses |
+| `WPMGR_STAGING_SNAPSHOT` | `3` | Snapshot produksi yang disimpan per site |
+| `WPMGR_STAGING_EMAIL_ACME` | *(kosong)* | Email Let's Encrypt; salin juga ke `ACME_EMAIL` di `/etc/wpmgr-staging/staging.conf` |
+
+Cron baru (`deploy/crontab`): `staging-jeda-otomatis` tiap jam, `renew-staging-certs` dan
+`prune-staging` harian.
+
+Test skrip pembantu berjalan di container bats dengan `docker` tiruan:
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/code" -w /code bats/bats:1.11.0 deploy/staging/tests
+```
+
+Keterbatasan staging:
+
+- Konsistensi database hanya dijamin per potongan (2.000 baris). Tabel tanpa primary key yang
+  ditulisi selama tarik bisa kehilangan atau menggandakan baris, dan job mencatatnya sebagai peringatan.
+- **Site dengan tabel produksi berpartisi (`PARTITION`) atau CREATE TABLE yang memuat komentar SQL**
+  (umum pada dump MySQL 8) **tidak bisa didorong (timpa penuh).** Connector menolak keduanya saat
+  mengimpor ulang, jadi pemeriksaan awal (R8) menolak job sejak awal dengan pesan jelas, sebelum apa
+  pun diunggah — supaya rollback tidak pernah mustahil di tengah jalan.
+- Tanda air hanya mengenal posts, komentar, user, pesanan WooCommerce, Gravity Forms, WPForms, Fluent
+  Forms, dan Flamingo. Data plugin lain bisa tertimpa oleh **timpa penuh**; snapshot tetap
+  memungkinkan pengembalian.
+- **Kembalikan** snapshot dari dorongan *hanya kode* memulihkan berkas saja. Ekspor database di snapshot
+  itu disimpan untuk pemulihan manual.
+- Multisite dan site dengan `wp-content` di luar folder WordPress belum didukung.
+
 ## Keterbatasan yang diketahui
 
 Reaper memulihkan job berstatus `running` yang sudah terkunci lebih lama
@@ -462,4 +587,6 @@ Keterbatasan pemantauan (Lapis 2):
 | `tests/unit/`, `tests/integration/`, `tests/e2e/` | Tiga lapis test Python (lihat bagian test di atas) |
 | `connector/tests/` | Test PHPUnit plugin connector |
 | `deploy/` | Berkas siap salin ke VPS: unit systemd, crontab, konfigurasi nginx |
+| `src/wpmgr/staging/` | Lapis 3: validasi, skrip pembantu, paket biner, rencana, job tarik/uji/dorong/kembalikan, cron |
+| `deploy/staging/` | Skrip pembantu root, sudoers, nginx host staging, unit systemd, test bats |
 | `docs/superpowers/` | Spesifikasi desain dan rencana implementasi lapis ini |

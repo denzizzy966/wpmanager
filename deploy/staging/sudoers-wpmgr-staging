@@ -1,0 +1,6 @@
+# /etc/sudoers.d/wpmgr-staging -- root:root 0440.
+# Periksa sebelum dipakai: visudo -cf /etc/sudoers.d/wpmgr-staging
+# User dashboard hanya boleh menjalankan skrip pembantu; skrip itu sendiri
+# memvalidasi setiap subperintah dan argumen (spec §7.3).
+Defaults!/usr/local/sbin/wpmgr-staging env_reset
+wpmgr ALL=(root) NOPASSWD: /usr/local/sbin/wpmgr-staging
