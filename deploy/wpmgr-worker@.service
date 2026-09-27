@@ -10,6 +10,9 @@ After=network.target postgresql.service
 User=wpmgr
 WorkingDirectory=/opt/wpmgr
 EnvironmentFile=/opt/wpmgr/.env
+# Instans `staging` (wpmgr-worker@staging) hanya memproses job staging, yang
+# bisa berjalan berjam-jam; instans lain tidak pernah mengambilnya.
+Environment=WPMGR_WORKER_INSTANS=%i
 ExecStart=/opt/wpmgr/.venv/bin/python -m wpmgr.worker
 Restart=always
 RestartSec=5

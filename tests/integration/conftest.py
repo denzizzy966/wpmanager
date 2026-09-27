@@ -98,3 +98,30 @@ def var_sementara(tmp_path, monkeypatch):
     monkeypatch.setenv("WPMGR_VAR_DIR", str(tmp_path / "var"))
     get_settings.cache_clear()
     return tmp_path / "var"
+
+
+@pytest.fixture
+def staging_aktif(tmp_path, monkeypatch):
+    """Fitur staging menyala dengan WPMGR_STAGING_DIR di direktori sementara."""
+    from wpmgr.config import get_settings
+
+    monkeypatch.setenv("WPMGR_STAGING_DOMAIN", "staging.contoh.id")
+    monkeypatch.setenv("WPMGR_STAGING_DIR", str(tmp_path / "stg"))
+    get_settings.cache_clear()
+    yield tmp_path / "stg"
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def site_staging(sesi, site, staging_aktif):
+    from wpmgr.crypto import enkripsi_secret
+    from wpmgr.models import Staging
+    from wpmgr.staging.pembantu import hash_sandi
+
+    site.secret_terenkripsi = enkripsi_secret("f" * 64)
+    site.fitur = ["self_update", "staging"]
+    st = Staging(site_id=site.id, nama="contoh-test", sandi_hash=hash_sandi("rahasia-preview"),
+                 rahasia_router_terenkripsi=enkripsi_secret("e" * 64))
+    sesi.add(st)
+    sesi.commit()
+    return st

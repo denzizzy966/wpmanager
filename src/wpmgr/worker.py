@@ -1,4 +1,5 @@
 import logging
+import os
 import signal
 import time
 
@@ -10,6 +11,7 @@ from wpmgr.errors import (
     BLOCKED,
     CONNECTOR_MISSING,
     INTERNAL_ERROR,
+    KELAS_STAGING,
     PACKAGE_MISSING,
     TRANSIENT,
     UNKNOWN,
@@ -24,7 +26,15 @@ from wpmgr.jobs.queue import (
     tandai_unknown,
     worker_id,
 )
-from wpmgr.models import ActivityLog, Job, JobStatus, JobType, Site, SiteStatus
+from wpmgr.models import (
+    JOB_STAGING,
+    ActivityLog,
+    Job,
+    JobStatus,
+    JobType,
+    Site,
+    SiteStatus,
+)
 
 log = logging.getLogger("wpmgr.worker")
 JEDA_ANTREAN_KOSONG = 5.0
@@ -44,6 +54,11 @@ def _tangani_sinyal(signum, frame):
     global _berhenti
     _berhenti = True
     log.info("Sinyal %s diterima; berhenti setelah job berjalan selesai", signum)
+
+
+def jenis_worker(instans: str) -> str:
+    """Instans systemd `wpmgr-worker@staging*` hanya mengambil job staging."""
+    return "staging" if instans.startswith("staging") else "umum"
 
 
 def _masih_milik_kita(sesi: Session, job_id: int, worker: str) -> bool:
@@ -76,8 +91,8 @@ def _pulihkan_status(sesi: Session, site: Site) -> None:
         site.status = SiteStatus.active
 
 
-def proses_satu(sesi: Session, worker: str, buat_klien_fn=buat_klien) -> bool:
-    job = ambil_job(sesi, worker)
+def proses_satu(sesi: Session, worker: str, buat_klien_fn=buat_klien, jenis: str | None = None) -> bool:
+    job = ambil_job(sesi, worker, jenis)
     if job is None:
         return False
 
@@ -91,7 +106,11 @@ def proses_satu(sesi: Session, worker: str, buat_klien_fn=buat_klien) -> bool:
         if not _masih_milik_kita(sesi, job_id, worker):
             log.warning("Klaim job %s sudah diambil alih; hasil tidak ditulis", job_id)
             return True
-        _pulihkan_status(sesi, site)
+        if job.tipe not in JOB_STAGING:
+            # Job staging tidak membuktikan apa pun tentang koneksi ke
+            # produksi (uji update bahkan tidak menghubunginya), jadi
+            # suksesnya juga tidak memulihkan status site (putusan F8).
+            _pulihkan_status(sesi, site)
         selesai_sukses(sesi, job, hasil if isinstance(hasil, dict) else {})
         return True
     except SiteError as exc:
@@ -137,7 +156,10 @@ def _catat_kegagalan(sesi, job, site, exc: SiteError, worker: str, buat_klien_fn
         # Sejak R55 ping dan inventory tidak pernah menghasilkan unknown. Bila
         # tetap terjadi, keduanya read-only dan aman diulang; menandainya
         # `unknown` berarti tidak ada yang akan pernah melihatnya lagi (klaim
-        # hanya mengambil `pending`, reaper hanya `running`).
+        # hanya mengambil `pending`, reaper hanya `running`). Job staging juga
+        # masuk ke sini (putusan F26): setiap langkahnya dapat dilanjutkan dan
+        # idempoten, jadi tulis yang terputus sesudah dikirim diulang, bukan
+        # dibiarkan menggantung sebagai `unknown`.
         kelas = TRANSIENT
 
     if kelas == UNKNOWN:
@@ -163,14 +185,21 @@ def _catat_kegagalan(sesi, job, site, exc: SiteError, worker: str, buat_klien_fn
         # memperbaikinya, bukan percobaan ulang update yang sama.
         antrekan_scan(sesi, site.id)
 
-    status_baru = STATUS_SITE_DARI_ERROR.get(kelas)
+    # Staging yang gagal bukan kabar tentang site produksi: galatnya disimpan
+    # di staging.galat, bukan menimpa galat koneksi atau status site. Untuk
+    # job staging ini berlaku apa pun kelasnya (putusan F8): 403
+    # wpmgr_staging_token dibaca auth_error, dan tanpa pengecualian ini site
+    # sehat berubah menjadi needs_reconnect.
+    sentuh_site = job.tipe not in JOB_STAGING and kelas not in KELAS_STAGING
+    status_baru = STATUS_SITE_DARI_ERROR.get(kelas) if sentuh_site else None
     if kelas == TRANSIENT and job.status != JobStatus.failed:
         # Masih akan diulang. Satu gangguan jaringan sesaat bukan alasan
         # menyatakan site tak terjangkau.
         status_baru = None
     if status_baru is not None and site.status != SiteStatus.disabled:
         site.status = status_baru
-    site.last_error = exc.pesan[:2000]
+    if sentuh_site:
+        site.last_error = exc.pesan[:2000]
     sesi.add(
         ActivityLog(
             site_id=site.id, job_id=job.id, level="error",
@@ -186,12 +215,13 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _tangani_sinyal)
     signal.signal(signal.SIGINT, _tangani_sinyal)
     worker = worker_id()
-    log.info("Worker %s mulai", worker)
+    jenis = jenis_worker(os.environ.get("WPMGR_WORKER_INSTANS", ""))
+    log.info("Worker %s (%s) mulai", worker, jenis)
 
     while not _berhenti:
         try:
             with get_session() as sesi:
-                ada = proses_satu(sesi, worker, buat_klien)
+                ada = proses_satu(sesi, worker, buat_klien, jenis)
         except Exception:
             log.exception("Kesalahan tak terduga di loop worker")
             ada = False

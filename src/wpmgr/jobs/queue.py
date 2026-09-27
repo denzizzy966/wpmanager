@@ -3,8 +3,8 @@ import socket
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import String, bindparam, select, text
 from sqlalchemy import func as safunc
-from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from wpmgr.errors import BAD_RESPONSE, DAPAT_DIULANG, UNKNOWN
@@ -13,8 +13,16 @@ from wpmgr.models import Job, JobStatus, JobType
 # Percobaan pertama ditambah satu ulangan.
 BATAS_PERCOBAAN_BAD_RESPONSE = 2
 
+_STAGING = "('staging_tarik', 'staging_uji_update', 'staging_dorong', 'staging_kembalikan')"
+_STAGING_BACA = "('staging_tarik', 'staging_uji_update')"
+
+# Satu job berjalan per site, dengan dua pengecualian (Koreksi #1): tarik
+# dan uji staging hanya membaca produksi, jadi tidak menahan dan tidak
+# ditahan job non-staging. Dorong/kembalikan menulis ke produksi dan tetap
+# eksklusif terhadap semuanya. `:jenis` memisahkan worker staging (job
+# berjam-jam) dari worker umum.
 SQL_AMBIL = text(
-    """
+    f"""
     UPDATE jobs
        SET status       = 'running',
            locked_at    = now(),
@@ -28,16 +36,22 @@ SQL_AMBIL = text(
             WHERE j.status = 'pending'
               AND j.scheduled_for <= now()
               AND s.status <> 'disabled'
+              AND (CAST(:jenis AS text) IS NULL
+                   OR (CAST(:jenis AS text) = 'staging') = (j.tipe IN {_STAGING}))
               AND NOT EXISTS (
                     SELECT 1 FROM jobs j2
                      WHERE j2.site_id = j.site_id
-                       AND j2.status = 'running')
+                       AND j2.status = 'running'
+                       AND NOT (j.tipe IN {_STAGING_BACA} AND j2.tipe NOT IN {_STAGING})
+                       AND NOT (j2.tipe IN {_STAGING_BACA} AND j.tipe NOT IN {_STAGING}))
             ORDER BY j.scheduled_for
               FOR UPDATE OF j, s SKIP LOCKED
             LIMIT 1)
     RETURNING id
     """
-)
+# Nilai bawaan None: pemanggil lama (dan test antrean Lapis 1) yang hanya
+# mengirim :worker tetap mendapat perilaku "klaim apa saja".
+).bindparams(bindparam("jenis", value=None, type_=String))
 
 
 def worker_id() -> str:
@@ -90,8 +104,8 @@ def antrekan_scan(sesi: Session, site_id: uuid.UUID) -> Job | None:
     return antrekan_jika_belum(sesi, site_id, JobType.scan_site)
 
 
-def ambil_job(sesi: Session, worker: str) -> Job | None:
-    baris = sesi.execute(SQL_AMBIL, {"worker": worker}).first()
+def ambil_job(sesi: Session, worker: str, jenis: str | None = None) -> Job | None:
+    baris = sesi.execute(SQL_AMBIL, {"worker": worker, "jenis": jenis}).first()
     sesi.commit()
     if baris is None:
         return None
@@ -128,14 +142,20 @@ def _batas_percobaan(job: Job, error_class: str) -> int:
     return job.max_attempts
 
 
+def akan_diulang(job: Job, error_class: str) -> bool:
+    """Apakah kegagalan kelas ini pada percobaan `job.attempts` dijadwalkan ulang.
+
+    Satu sumber kebenaran untuk `selesai_gagal` dan pembungkus job staging,
+    yang harus tahu lebih dulu apakah kegagalannya final.
+    """
+    return error_class in DAPAT_DIULANG and job.attempts < _batas_percobaan(job, error_class)
+
+
 def selesai_gagal(sesi: Session, job: Job, error_class: str, pesan: str) -> None:
     job.error_class = error_class
     job.error = pesan[:2000]
     _lepas_kunci(job)
-    boleh_ulang = (
-        error_class in DAPAT_DIULANG and job.attempts < _batas_percobaan(job, error_class)
-    )
-    if boleh_ulang:
+    if akan_diulang(job, error_class):
         job.status = JobStatus.pending
         job.scheduled_for = safunc.now() + timedelta(minutes=jeda_menit(job.attempts))
         job.started_at = None
