@@ -31,10 +31,13 @@ SUBNET=172.31.250.0/24
 PENGGUNA_UID=1000
 PENGGUNA_GID=1000
 MEMINFO=$S/meminfo
+BRNF=$S/brnf
 TANPA_IPTABLES=1
 KONF
   printf 'MemTotal:       11000000 kB\nMemAvailable:    4194304 kB\n' > "$S/meminfo"
   printf 'rootrahasia' > "$S/etc/db-root"
+  printf '1
+' > "$S/brnf"
   ID=0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0
   D64="$(printf 'b%.0s' $(seq 1 64))"
   printf 'php81=wordpress@sha256:%s\n' "$D64" > "$S/etc/digest.lock"
@@ -948,4 +951,63 @@ CP
   [ "$(cat "$S/target-luar")" = "JANGAN-DISENTUH" ]
   [ ! -L "$S/staging/$ID/files/wp-config.php" ]
   grep -qF "define( 'DB_NAME', 'stg_toko' );" "$S/staging/$ID/files/wp-config.php"
+}
+
+# ---- br_netfilter harus aktif agar isolasi berlaku ---------------------------------
+
+siapkan_dengan_iptables() {
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s
+nginx=n@sha256:%s
+mailpit=p@sha256:%s
+' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+}
+
+@test "siapkan menerima bridge-nf-call-iptables=1 tanpa modprobe" {
+  siapkan_dengan_iptables
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+  [ ! -e "$PALSU/modprobe.log" ]
+}
+
+@test "siapkan menolak bridge-nf-call-iptables=0 dengan kode 7 dan tidak menulis sysctl" {
+  siapkan_dengan_iptables
+  printf '0
+' > "$S/brnf"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"br_netfilter/bridge-nf-call-iptables harus aktif"* ]]
+  [ "$(cat "$S/brnf")" = 0 ]
+  # Aturan sudah terpasang sebelum pemeriksaan (pemeriksaan sesudah aturan).
+  grep -q 'WPMGR-STG-ANTAR' "$PALSU/iptables.log"
+}
+
+@test "siapkan menolak berkas sysctl yang tidak ada sesudah mencoba modprobe sekali" {
+  siapkan_dengan_iptables
+  rm -f "$S/brnf"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 7 ]
+  [ "$(grep -c '^\[br_netfilter\]$' "$PALSU/modprobe.log")" -eq 1 ]
+  [ ! -e "$S/brnf" ]
+}
+
+@test "modprobe yang memunculkan sysctl bernilai 1 diterima" {
+  siapkan_dengan_iptables
+  rm -f "$S/brnf"
+  touch "$PALSU/modprobe-buat"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+}
+
+@test "TANPA_IPTABLES=1 melewati pemeriksaan br_netfilter" {
+  printf '0
+' > "$S/brnf"
+  printf 'mariadb=m@sha256:%s
+nginx=n@sha256:%s
+mailpit=p@sha256:%s
+' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
 }

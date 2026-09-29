@@ -179,7 +179,7 @@ muat_konf() {
     nilai="${BASH_REMATCH[2]}"
     case "$kunci" in
       DOMAIN|STAGING_DIR|KONF_DIR|CERT_DIR|ACME_DIR|LE_DIR|LOG_DIR|ACME_EMAIL|ROUTER_PORT|MAIL_PORT|SUBNET|\
-PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT|MEMINFO|NGINX_GROUP)
+PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT|MEMINFO|BRNF|NGINX_GROUP)
         printf -v "K_$kunci" '%s' "$nilai" ;;
       *) galat konfigurasi "kunci konfigurasi tidak dikenal" ;;
     esac
@@ -201,6 +201,8 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
   TANPA_IPTABLES="${K_TANPA_IPTABLES:-0}"
   TANPA_SERTIFIKAT="${K_TANPA_SERTIFIKAT:-0}"
   MEMINFO="${K_MEMINFO:-/proc/meminfo}"
+  # Kait test: berkas sysctl br_netfilter (lihat pastikan_brnf).
+  BRNF="${K_BRNF:-/proc/sys/net/bridge/bridge-nf-call-iptables}"
   # Grup pemilik kunci privat sertifikat staging (putusan review Task 21):
   # worker nginx host (bukan master, yang start sebagai root) yang membaca
   # ssl_certificate_key berbasis variabel, jadi kunci itu harus terbaca
@@ -214,7 +216,7 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
   # dua, koma, spasi, atau `..` akan mengubah arti argumen itu, jadi hanya
   # karakter aman yang diterima.
   local p
-  for p in "$STAGING_DIR" "$KONF_DIR" "$CERT_DIR" "$ACME_DIR" "$LE_DIR" "$LOG_DIR" "$MEMINFO"; do
+  for p in "$STAGING_DIR" "$KONF_DIR" "$CERT_DIR" "$ACME_DIR" "$LE_DIR" "$LOG_DIR" "$MEMINFO" "$BRNF"; do
     [[ "$p" =~ $POLA_JALUR && "$p" != *..* ]] || galat konfigurasi "path konfigurasi tidak sah"
   done
   if [[ -n "$AKAR_LOKAL" || -n "$AKAR_DAEMON" ]]; then
@@ -502,6 +504,22 @@ pasang_iptables() {
 # Aturan ada di rantai sendiri supaya urutannya selalu benar: rantai
 # dikosongkan dan diisi ulang di setiap `siapkan` (idempoten), dan lompatan
 # dari DOCKER-USER dipasang sesudah rantainya terisi (-C sebelum -I).
+# Lalu lintas antar-container di satu jembatan hanya melewati iptables bila
+# br_netfilter aktif dan bridge-nf-call-iptables=1; tanpa itu rantai
+# DOCKER-USER tidak pernah melihatnya dan isolasi diam-diam tidak berlaku.
+# Skrip TIDAK menulis sysctl-nya (operator yang membuatnya permanen, lihat
+# README); hanya mencoba memuat modul sekali dan menolak bila masih bukan 1.
+pastikan_brnf() {
+  local nilai=""
+  if [[ ! -e "$BRNF" ]]; then
+    modprobe br_netfilter >/dev/null 2>&1 || true
+  fi
+  if [[ -r "$BRNF" ]]; then
+    nilai="$(cat "$BRNF" 2>/dev/null || true)"
+  fi
+  [[ "$nilai" == 1 ]]     || galat konfigurasi "br_netfilter/bridge-nf-call-iptables harus aktif agar isolasi staging berlaku"
+}
+
 pasang_isolasi_antar() {
   local rantai=WPMGR-STG-ANTAR
   iptables -N "$rantai" 2>/dev/null || iptables -n -L "$rantai" >/dev/null \
@@ -590,7 +608,10 @@ cmd_siapkan() {
     dk network create --driver bridge --subnet "$SUBNET" --opt "com.docker.network.bridge.name=$JEMBATAN" \
       --label wpmgr.staging=layanan:jaringan "$JARINGAN" >/dev/null || galat docker "jaringan staging tidak dapat dibuat"
   fi
-  [[ "$TANPA_IPTABLES" == 1 ]] || pasang_iptables
+  if [[ "$TANPA_IPTABLES" != 1 ]]; then
+    pasang_iptables
+    pastikan_brnf
+  fi
   pastikan_wpcli
   tulis_router_bawaan
 

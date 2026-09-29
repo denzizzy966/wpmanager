@@ -455,6 +455,11 @@ install -d -o wpmgr -g wpmgr -m 0700 /var/lib/wpmgr/staging
 install -o root -g root -m 0440 deploy/staging/sudoers-wpmgr-staging /etc/sudoers.d/wpmgr-staging
 visudo -cf /etc/sudoers.d/wpmgr-staging
 
+# 3a. br_netfilter (WAJIB agar isolasi antar-container berlaku; siapkan menolak bila mati).
+#     Skrip tidak menulis sysctl; jadikan permanen:
+echo br_netfilter > /etc/modules-load.d/br_netfilter.conf
+echo 'net.bridge.bridge-nf-call-iptables=1' > /etc/sysctl.d/99-wpmgr-staging.conf
+modprobe br_netfilter && sysctl --system
 # 3. Jaringan, isolasi iptables, MariaDB, Mailpit, router, wp-cli (idempoten)
 wpmgr-staging siapkan
 cp deploy/staging/wpmgr-staging-siapkan.service /etc/systemd/system/

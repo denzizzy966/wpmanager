@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# modprobe tiruan: mencatat modul; dengan $PALSU/modprobe-buat berkas sysctl br_netfilter muncul bernilai 1.
+printf '[%s]' "$@" >> "$PALSU/modprobe.log"
+printf '\n' >> "$PALSU/modprobe.log"
+if [[ -f "$PALSU/modprobe-buat" ]]; then
+  printf '1\n' > "$BATS_TEST_TMPDIR/srv/brnf"
+fi
+exit 0
