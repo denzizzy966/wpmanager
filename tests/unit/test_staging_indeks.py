@@ -120,3 +120,18 @@ def test_muat_menolak_indeks_melebihi_batas(tmp_path):
     assert len(ind.muat(maks=3)) == 3
     with pytest.raises(IndeksTerlaluBesar):
         ind.muat(maks=2)
+
+
+def test_pindai_lokal_dibatasi_jumlah_entri(tmp_path):
+    from wpmgr.errors import STAGING_GAGAL, SiteError
+    from wpmgr.staging.indeks import MAKS_ENTRI_MANIFEST
+
+    akar = tmp_path / "files"
+    (akar / "d").mkdir(parents=True)
+    for nama in ("a.php", "b.php", "d/c.php"):
+        (akar / nama).write_bytes(b"x")
+    assert MAKS_ENTRI_MANIFEST == 2_000_000
+    assert len(pindai_lokal(akar, {}, maks=3)) == 3  # tepat di batas: lolos
+    with pytest.raises(SiteError) as exc:
+        pindai_lokal(akar, {}, maks=2)
+    assert exc.value.error_class == STAGING_GAGAL and "melebihi batas 2 berkas" in exc.value.pesan

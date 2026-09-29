@@ -16,9 +16,27 @@ from wpmgr.staging.sql_impor import (
 
 AWAL = b"DROP TABLE IF EXISTS `t`;\nCREATE TABLE `t` (`id` int);\n"
 DELAPAN_MB = 8 * 1024 * 1024
-# Lebih longgar dari "beberapa detik" pada mesin lambat, tetapi jauh di
-# bawah waktu versi kuadratik (15,7 detik untuk 40 KB).
-BATAS_DETIK = 3.0
+# Tes kelinearan memakai RASIO waktu (bukan waktu mutlak, yang goyah pada mesin
+# lambat/berbeban): masukan 4x lebih besar harus ~4x lebih lama; versi kuadratik
+# ~16x. Diambil waktu terbaik dari beberapa ulangan untuk meredam gangguan sesaat.
+UKURAN_KECIL = 256 * 1024
+UKURAN_BESAR = 1024 * 1024
+NISBAH_MAKS = 8
+
+
+def _waktu_terbaik(kerjakan, ulangan: int = 3) -> float:
+    terbaik = float("inf")
+    for _ in range(ulangan):
+        mulai = time.perf_counter()
+        kerjakan()
+        terbaik = min(terbaik, time.perf_counter() - mulai)
+    return terbaik
+
+
+def _harus_linear(waktu) -> None:
+    """`waktu(ukuran)` -> detik terbaik; 4x ukuran tidak boleh memakan lebih dari 8x waktu (+ 50 ms galat)."""
+    kecil, besar = waktu(UKURAN_KECIL), waktu(UKURAN_BESAR)
+    assert besar < NISBAH_MAKS * kecil + 0.05, (kecil, besar)
 
 
 def test_sesuaikan_hanya_create_table():
@@ -75,22 +93,38 @@ def test_periksa_menolak(sql):
 
 
 @pytest.mark.parametrize("unit", [b"'\\", b"\"\\", b"`", b"/*", b"/*!50000 ", b"''", b";", b"INSERT INTO t;", b"--"])
-def test_masukan_jahat_8mb_tetap_linear(unit):
-    sql = unit * (DELAPAN_MB // len(unit))
-    mulai = time.perf_counter()
-    periksa_sql(sql)
-    sesuaikan_mariadb(AWAL[:26] + sql)
-    sesuaikan_mariadb(sql)
-    assert time.perf_counter() - mulai < BATAS_DETIK
+def test_masukan_jahat_tetap_linear(unit):
+    def waktu(ukuran: int) -> float:
+        sql = unit * (ukuran // len(unit))
+
+        def kerjakan():
+            periksa_sql(sql)
+            sesuaikan_mariadb(AWAL[:26] + sql)
+            sesuaikan_mariadb(sql)
+
+        return _waktu_terbaik(kerjakan)
+
+    _harus_linear(waktu)
 
 
-def test_dump_sah_8mb_cepat():
+def test_dump_sah_diterima_dan_linear():
     baris = b"('" + b"a" * 200 + b"','b\\'c',123),"
-    sql = AWAL + b"INSERT INTO `t` VALUES " + baris * (DELAPAN_MB // len(baris)) + b"(1,'x',2);\n"
-    mulai = time.perf_counter()
-    assert periksa_sql(sql) is None
-    sesuaikan_mariadb(sql)
-    assert time.perf_counter() - mulai < BATAS_DETIK
+
+    def buat(ukuran: int) -> bytes:
+        return AWAL + b"INSERT INTO `t` VALUES " + baris * (ukuran // len(baris)) + b"(1,'x',2);\n"
+
+    assert periksa_sql(buat(DELAPAN_MB)) is None
+
+    def waktu(ukuran: int) -> float:
+        sql = buat(ukuran)
+
+        def kerjakan():
+            periksa_sql(sql)
+            sesuaikan_mariadb(sql)
+
+        return _waktu_terbaik(kerjakan)
+
+    _harus_linear(waktu)
 
 
 # ---- R8: pra-pemeriksaan dorong (Task 16) ------------------------------------

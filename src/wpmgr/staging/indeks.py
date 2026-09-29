@@ -29,11 +29,16 @@ from wpmgr.staging.aman import (
     path_sah,
 )
 from wpmgr.staging.rencana import Entri, entri_dari
+from wpmgr.staging.umum import galat_gagal
 
 log = logging.getLogger(__name__)
 
 # Peringatan pemindaian yang disimpan untuk ditampilkan; sisanya hanya dihitung.
 MAKS_PERINGATAN = 50
+# Batas entri manifest produksi (tarik) dan pemindaian files/ staging: isi
+# files/ dikendalikan kode staging (bisa disusupi), jadi pemindaiannya tidak
+# boleh menumbuhkan `hasil` (dan indeks di memori/disk) tanpa batas.
+MAKS_ENTRI_MANIFEST = 2_000_000
 
 
 class IndeksTerlaluBesar(ValueError):
@@ -160,7 +165,7 @@ class _Peringatan:
 
 
 def pindai_lokal(akar: Path, indeks: dict[str, Entri], peringatan: list[str] | None = None,
-                 tautan: list[str] | None = None) -> dict[str, Entri]:
+                 tautan: list[str] | None = None, maks: int = MAKS_ENTRI_MANIFEST) -> dict[str, Entri]:
     """Isi files/ staging saat ini. Hash diambil dari indeks bila ukuran dan mtime sama.
 
     Symlink (termasuk direktori symlink) dan yang bukan berkas biasa (FIFO,
@@ -168,6 +173,10 @@ def pindai_lokal(akar: Path, indeks: dict[str, Entri], peringatan: list[str] | N
     diberikan. Path relatif setiap symlink yang ditemukan ditambahkan ke
     `tautan` bila diberikan, supaya pemanggil bisa menghapusnya. Ukuran dan mtime diambil dari deskriptor yang sama yang
     di-hash, jadi berkas yang ditukar di sela langkah tidak tercampur.
+
+    Lebih dari `maks` berkas (bawaan MAKS_ENTRI_MANIFEST, sama dengan batas
+    manifest produksi) menghentikan pemindaian dengan galat gagal; pemanggil
+    tidak pernah menerima hasil yang terpotong.
     """
     hasil: dict[str, Entri] = {}
     akar = Path(akar)
@@ -211,6 +220,9 @@ def pindai_lokal(akar: Path, indeks: dict[str, Entri], peringatan: list[str] | N
             e = _entri_berkas(akar, relatif, indeks.get(relatif), catat)
             if e is not None:
                 hasil[relatif] = e
+                if len(hasil) > maks:
+                    raise galat_gagal(f"Isi files/ staging melebihi batas {maks} berkas; "
+                                      "bersihkan berkas yang tidak perlu lalu ulangi.")
     catat.tutup()
     return hasil
 

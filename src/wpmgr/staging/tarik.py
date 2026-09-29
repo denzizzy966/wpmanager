@@ -44,7 +44,7 @@ from wpmgr.staging.aman import (
     tulis_bertahap,
     versi_php_staging,
 )
-from wpmgr.staging.indeks import Indeks, IndeksTerlaluBesar, pindai_lokal
+from wpmgr.staging.indeks import MAKS_ENTRI_MANIFEST, Indeks, IndeksTerlaluBesar, pindai_lokal
 from wpmgr.staging.pembantu import GalatPembantu, tulis_akses_router
 from wpmgr.staging.rencana import (
     BERUBAH,
@@ -88,7 +88,7 @@ TAMBAHAN_PERMINTAAN = 16
 # manifest.jsonl. Diperiksa SEBELUM ditulis, supaya berkas lokal dan
 # Indeks.muat() atasnya tidak pernah bisa digiring melewati batas ini.
 BATAS_HALAMAN_MANIFEST = 5000
-MAKS_ENTRI_MANIFEST = 2_000_000
+# MAKS_ENTRI_MANIFEST hidup di `indeks` (juga batas pemindaian files/ staging).
 MAKS_BYTE_MANIFEST = 512 * 1024 * 1024
 # Penghapusan berkas lokal: titik potongan (batal, detak) setiap sekian berkas.
 HAPUS_PER_TITIK = 500
