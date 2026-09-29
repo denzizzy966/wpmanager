@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import shutil
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from sqlalchemy import func, select
 
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import isi_mu_plugin_staging
-from wpmgr.crypto import dekripsi_secret
+from wpmgr.crypto import dekripsi_secret, enkripsi_secret
 from wpmgr.errors import BAD_RESPONSE, STAGING_DITOLAK, SiteError
 from wpmgr.fitur import STAGING, punya_fitur
 from wpmgr.models import Staging, StatusStaging
@@ -647,6 +648,39 @@ def _tolak(job, pesan: str) -> SiteError:
     return umum.GalatDitolakTanpaUbah(pesan) if salinan_belum_disentuh(job) else umum.galat_ditolak(pesan)
 
 
+def berkas_secret_staging(sesi, staging: Staging, info: dict, db_dir: Path) -> Path:
+    """Tulis SQL yang mengganti `wpmgr_secret` salinan dengan secret milik staging ini (putusan R25).
+
+    Database staging adalah salinan produksi, termasuk secret connector yang
+    berlaku di produksi. Tanpa penggantian, PHP di salinan (mis. lewat
+    plugin berbahaya atau akun admin yang diambil alih) memegang kunci
+    produksi. Secret dibuat sekali per staging, disimpan Fernet di baris
+    Staging, dan dipakai ulang di setiap segarkan (SSO yang sudah terbuka
+    tetap berlaku). Pernyataan ini ditulis dashboard sendiri (bukan potongan
+    connector), jadi tidak melewati `periksa_sql`; isinya heksadesimal murni
+    dan nama tabel dari manifest yang sudah divalidasi. Namanya
+    `<idx>-999999.sql`, sehingga terurut tepat sesudah potongan terakhir tabel
+    options dan sebelum tabel berikutnya.
+    """
+    nama_opsi = f"{info['prefix']}options"
+    idx = next((i for i, t in enumerate(info["tabel"]) if t["nama"] == nama_opsi), None)
+    if idx is None:
+        raise umum.galat_gagal(f"Produksi tidak melaporkan tabel options ({nama_opsi}); "
+                               "secret connector salinan tidak dapat diganti, tarik dihentikan.")
+    if not staging.secret_connector_terenkripsi:
+        staging.secret_connector_terenkripsi = enkripsi_secret(secrets.token_hex(32))
+        # Dikomit sebelum impor: secret yang sudah tertanam di database
+        # staging harus selalu dapat dibaca dashboard.
+        sesi.commit()
+    rahasia = dekripsi_secret(staging.secret_connector_terenkripsi)
+    berkas = db_dir / f"{idx:04d}-999999.sql"
+    berkas.write_bytes(
+        f"INSERT INTO `{nama_opsi}` (`option_name`, `option_value`, `autoload`) "
+        f"VALUES ('wpmgr_secret', '{rahasia}', 'no') "
+        f"ON DUPLICATE KEY UPDATE `option_value` = VALUES(`option_value`);".encode("ascii"))
+    return berkas
+
+
 def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = True) -> dict:
     if not punya_fitur(site, STAGING):
         raise _tolak(job, "Connector site ini belum mengizinkan staging. Aktifkan 'Izinkan staging' "
@@ -725,6 +759,7 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
             # utuh, tidak pernah dilanjutkan di tengah: db-buat idempoten, dan
             # db-impor di skrip pembantu membuang lalu membuat ulang database
             # sebelum mengimpor.
+            berkas_secret_staging(sesi, staging, info, tarik_dir / "db")
             with umum.detak_latar(sesi, job):
                 pb.db_buat(staging.nama, site.id, info["prefix"])
                 pb.db_impor(staging.nama, [tarik_dir / "prelude.sql", *sorted((tarik_dir / "db").glob("*.sql"))])

@@ -418,6 +418,11 @@ class Staging(Base):
     sandi_hash: Mapped[str | None] = mapped_column(Text)
     # Kunci secure_link router untuk SSO dan probe (Koreksi #5), Fernet.
     rahasia_router_terenkripsi: Mapped[bytes | None] = mapped_column(LargeBinary)
+    # Putusan R25: secret connector milik salinan ini (Fernet, seperti
+    # Site.secret_terenkripsi). Menggantikan `wpmgr_secret` produksi di
+    # database staging setiap tarik, supaya salinan yang diambil alih tidak
+    # pernah memegang kunci yang berlaku di produksi. NULL = belum pernah ditarik.
+    secret_connector_terenkripsi: Mapped[bytes | None] = mapped_column(LargeBinary)
     versi_php: Mapped[str | None] = mapped_column(Text)
     ukuran_file: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     ukuran_db: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")

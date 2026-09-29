@@ -11,6 +11,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import sessionmaker
 from staging_palsu import GB, PembantuPalsu, ProduksiPalsu
 
+from wpmgr.crypto import enkripsi_secret
 from wpmgr.errors import STAGING_DITOLAK, TRANSIENT, SiteError
 from wpmgr.jobs.queue import buat_job
 from wpmgr.models import (
@@ -57,6 +58,7 @@ def siap(sesi, site_staging):
     site_staging.aktif = True
     site_staging.status = StatusStaging.siap
     site_staging.tanda_air = {"sumber": {"comments": {"maks_id": 3, "jumlah": 2}}}
+    site_staging.secret_connector_terenkripsi = enkripsi_secret("d" * 64)
     sesi.commit()
     return site_staging
 
@@ -444,6 +446,38 @@ def test_sso_staging(klien_web, sesi, siap):
     sesi.refresh(siap)
     assert siap.dibuka_pada is not None
     assert sesi.query(ActivityLog).filter(ActivityLog.pesan.like("SSO staging dibuka%")).count() == 1
+
+
+def _token_sso(url: str) -> str:
+    from urllib.parse import parse_qs, urlsplit
+
+    return parse_qs(urlsplit(url).query)["sso"][0]
+
+
+def test_sso_staging_memakai_secret_staging_bukan_produksi(klien_web, sesi, siap):
+    """R25: token SSO staging ditandatangani secret staging; secret produksi tidak berlaku di sana."""
+    from wpmgr.crypto import enkripsi_secret
+    from wpmgr.sso import TokenTidakValid, baca_token, buat_token
+
+    rahasia = "a1" * 32
+    siap.secret_connector_terenkripsi = enkripsi_secret(rahasia)
+    sesi.commit()
+    token = _token_sso(klien_web.get(f"/api/sites/{siap.site_id}/staging/sso").json()["url"])
+    assert baca_token(rahasia, token)["site_id"] == str(siap.site_id)
+    with pytest.raises(TokenTidakValid):
+        baca_token("f" * 64, token)
+    # Kebalikannya: token produksi (secret "f"*64) ditolak connector staging yang memegang secret staging.
+    with pytest.raises(TokenTidakValid):
+        baca_token(rahasia, buat_token("f" * 64, str(siap.site_id)))
+
+
+def test_sso_staging_tanpa_secret_staging_minta_segarkan(klien_web, sesi, siap):
+    siap.secret_connector_terenkripsi = None
+    sesi.commit()
+    r = klien_web.get(f"/api/sites/{siap.site_id}/staging/sso")
+    assert r.status_code == 409 and "Segarkan" in r.json()["detail"]
+    sesi.refresh(siap)
+    assert siap.dibuka_pada is None
 
 
 def test_sso_ditolak_saat_dijeda(klien_web, sesi, siap):

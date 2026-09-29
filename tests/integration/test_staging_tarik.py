@@ -1,6 +1,7 @@
 import errno
 import hashlib
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -703,3 +704,45 @@ def test_direktori_kosong_setelah_hapus_dirapikan(sesi, site_staging, staging_ak
     _jalankan(sesi, site_staging, prod)
     assert not (files / "wp-content/themes").exists()
     assert (files / "wp-content/uploads/besar.bin").exists()
+
+
+# ---- R25: secret connector per staging -------------------------------------------
+
+
+def _secret_di_sql(sql: bytes) -> str:
+    cocok = re.findall(rb"INSERT INTO `wp_options` \(`option_name`, `option_value`, `autoload`\) "
+                       rb"VALUES \('wpmgr_secret', '([0-9a-f]{64})', 'no'\) "
+                       rb"ON DUPLICATE KEY UPDATE `option_value` = VALUES\(`option_value`\);", sql)
+    assert len(cocok) == 1, sql
+    return cocok[0].decode("ascii")
+
+
+def test_tarik_mengganti_secret_connector_dengan_secret_staging(sesi, site_staging, staging_aktif, prod, pb):
+    """Salinan tidak boleh memegang secret produksi (R25): diganti sesudah tabel options diimpor."""
+    from wpmgr.crypto import dekripsi_secret
+
+    _jalankan(sesi, site_staging, prod)
+    sesi.refresh(site_staging)
+    assert site_staging.secret_connector_terenkripsi is not None
+    rahasia = dekripsi_secret(site_staging.secret_connector_terenkripsi)
+    assert re.fullmatch(r"[0-9a-f]{64}", rahasia)
+    site = sesi.get(Site, site_staging.site_id)
+    assert rahasia != dekripsi_secret(site.secret_terenkripsi)
+    assert _secret_di_sql(pb.sql) == rahasia
+    # Ditanam segera sesudah potongan terakhir tabel options, sebelum tabel lain.
+    posisi = pb.sql.index(b"'wpmgr_secret'")
+    assert pb.sql.index(b"CREATE TABLE `wp_options`") < posisi < pb.sql.index(b"CREATE TABLE `wp_posts`")
+
+    # Segarkan memakai secret staging yang sama (SSO yang sudah terbuka tetap berlaku).
+    _jalankan(sesi, site_staging, prod)
+    sesi.refresh(site_staging)
+    assert dekripsi_secret(site_staging.secret_connector_terenkripsi) == rahasia
+    assert _secret_di_sql(pb.sql) == rahasia
+
+
+def test_tarik_tanpa_tabel_options_ditolak(sesi, site_staging, staging_aktif, prod, pb):
+    del prod.tabel["wp_options"]
+    with pytest.raises(SiteError) as exc:
+        _jalankan(sesi, site_staging, prod)
+    assert "options" in exc.value.pesan
+    assert "db_impor" not in pb.nama_panggilan()

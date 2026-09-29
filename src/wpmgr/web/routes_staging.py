@@ -124,6 +124,7 @@ PESAN_SIBUK = "Tunggu pekerjaan staging yang sedang berjalan selesai."
 PESAN_SIBUK_NONAKTIF = (" Site ini dinonaktifkan, jadi pekerjaan staging yang tertunda tidak dijalankan sampai "
                         "site diaktifkan lagi.")
 PESAN_BELUM_DISALIN = "Staging belum selesai disalin; segarkan staging dulu."
+PESAN_SECRET_BELUM = "Salinan ini belum memakai secret connector sendiri. Segarkan staging dulu."
 PESAN_DIUBAH_SEGARKAN = ("Staging diubah sejak tarik terakhir; perubahan itu akan tertimpa. Konfirmasi untuk tetap "
                          "menyegarkan.")
 PESAN_DIJEDA_SSO = "Staging sedang dijeda; jalankan dulu."
@@ -870,10 +871,15 @@ def sso_staging(site_id: uuid.UUID, pengguna: PenggunaApi):
             raise HTTPException(status_code=409, detail=PESAN_DIJEDA_SSO)
         if not st.rahasia_router_terenkripsi:
             raise HTTPException(status_code=409, detail=uji_mod.PESAN_AKSES_BELUM)
+        if not st.secret_connector_terenkripsi:
+            # Salinan lama (dibuat sebelum R25) masih memegang secret produksi
+            # di database-nya; tarik berikutnya menggantinya.
+            raise HTTPException(status_code=409, detail=PESAN_SECRET_BELUM)
         host = umum.host_staging(st)
-        # Salinan membawa secret connector produksi, jadi token SSO produksi
-        # juga berlaku di staging; tautan secure_link melewati Basic Auth (Koreksi #5).
-        token = buat_token(dekripsi_secret(site.secret_terenkripsi), str(site.id))
+        # Token ditandatangani secret milik staging (R25), bukan secret produksi:
+        # connector salinan menolak token produksi dan sebaliknya. Tautan
+        # secure_link melewati Basic Auth (Koreksi #5).
+        token = buat_token(dekripsi_secret(st.secret_connector_terenkripsi), str(site.id))
         url = f"https://{host}" + tautan_masuk(dekripsi_secret(st.rahasia_router_terenkripsi), host, token,
                                                int(time.time()))
         st.dibuka_pada = datetime.now(timezone.utc)
