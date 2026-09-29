@@ -1,8 +1,76 @@
 <?php
 use PHPUnit\Framework\TestCase;
 
+/**
+ * wpdb tiruan di bawah WPMGR_Staging_Db ASLI (I5): siapkan()/kueri()/nilai()/
+ * kolom()/baris() sungguhan ikut berjalan, bukan ditiru.
+ *
+ * - prepare() meniru WP >= 4.8.3: '%' di dalam argumen diganti placeholder
+ *   acak; hanya remove_placeholder_escape() yang mengembalikannya.
+ * - query() memodelkan JALUR mysqli_query() yang dipakai kueri() di produksi
+ *   (dbh berupa mysqli): TIDAK menghapus placeholder. Karena itu SQL yang
+ *   keluar dari siapkan() harus sudah bersih; bila WPMGR_Staging_Db::siapkan()
+ *   berhenti mengembalikan '%', `LIKE 'id|%'` menjadi `LIKE 'id|{hash}'`,
+ *   lepas_kunci()/penyegaran kunci tidak mengenai baris, dan test kunci gagal.
+ * - get_col()/get_var()/get_row() meniru wpdb sungguhan (lewat query() yang
+ *   menghapus placeholder).
+ * Perilaku database-nya sendiri ada di WPMGR_FakeDbDorong (induk).
+ */
+final class WPMGR_FakeWpdbDorong {
+    const PH = '{9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08}';
+
+    public $prefix     = 'wp_';
+    public $options    = 'wp_options';
+    public $dbh        = null;
+    public $last_error = '';
+    private $induk;
+
+    public function __construct( $induk ) {
+        $this->induk = $induk;
+    }
+
+    public function esc_like( $t ) {
+        return addcslashes( $t, '_%\\' );
+    }
+
+    public function prepare( $sql ) {
+        $args = array_map( function ( $a ) {
+            return is_int( $a ) ? $a : str_replace( '%', self::PH, addslashes( (string) $a ) );
+        }, array_slice( func_get_args(), 1 ) );
+        return vsprintf( str_replace( '%s', "'%s'", $sql ), $args );
+    }
+
+    public function remove_placeholder_escape( $q ) {
+        return str_replace( self::PH, '%', $q );
+    }
+
+    public function query( $sql ) {
+        $r                = $this->induk->jalankan_kueri( $sql );
+        $this->last_error = $this->induk->galat_tiruan();
+        return $r;
+    }
+
+    public function get_col( $sql ) {
+        $r                = $this->induk->jalankan_kolom( $this->remove_placeholder_escape( $sql ) );
+        $this->last_error = $this->induk->galat_tiruan();
+        return $r;
+    }
+
+    public function get_var( $sql ) {
+        $r                = $this->induk->jalankan_nilai( $this->remove_placeholder_escape( $sql ) );
+        $this->last_error = $this->induk->galat_tiruan();
+        return $r;
+    }
+
+    public function get_row( $sql, $format = null ) {
+        $r                = $this->induk->jalankan_baris( $this->remove_placeholder_escape( $sql ) );
+        $this->last_error = $this->induk->galat_tiruan();
+        return $r;
+    }
+}
+
 /** DB tiruan: cukup untuk kunci opsi, SHOW TABLES, DROP/CREATE/RENAME. */
-final class WPMGR_FakeDbDorong {
+final class WPMGR_FakeDbDorong extends WPMGR_Staging_Db {
     public $kueri      = array();
     public $tabel      = array();
     public $opsi       = array();
@@ -32,28 +100,13 @@ final class WPMGR_FakeDbDorong {
     );
     public $jawaban_nilai = array();
 
-    public function prefix() {
-        return 'wp_';
+    public function __construct() {
+        parent::__construct( new WPMGR_FakeWpdbDorong( $this ) );
     }
 
-    public function opsi() {
-        return 'wp_options';
-    }
-
-    public function suka( $t ) {
-        return addcslashes( $t, '_%\\' );
-    }
-
-    public function galat_terakhir() {
+    /** Dipanggil WPMGR_FakeWpdbDorong sebagai $wpdb->last_error. */
+    public function galat_tiruan() {
         return $this->galat;
-    }
-
-    public function siapkan( $sql ) {
-        $args = array_slice( func_get_args(), 1 );
-        $args = array_map( function ( $a ) {
-            return is_int( $a ) ? $a : addslashes( (string) $a );
-        }, $args );
-        return vsprintf( str_replace( '%s', "'%s'", $sql ), $args );
     }
 
     private static function pola_like( $like ) {
@@ -70,7 +123,7 @@ final class WPMGR_FakeDbDorong {
         return '' !== $this->galat;
     }
 
-    public function kolom( $sql ) {
+    public function jalankan_kolom( $sql ) {
         $this->kueri[] = $sql;
         if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
             return array();
@@ -84,7 +137,7 @@ final class WPMGR_FakeDbDorong {
         return array();
     }
 
-    public function nilai( $sql ) {
+    public function jalankan_nilai( $sql ) {
         $this->kueri[] = $sql;
         if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
             return null;
@@ -104,7 +157,7 @@ final class WPMGR_FakeDbDorong {
         return null;
     }
 
-    public function baris( $sql ) {
+    public function jalankan_baris( $sql ) {
         $this->kueri[] = $sql;
         if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
             return null;
@@ -121,10 +174,11 @@ final class WPMGR_FakeDbDorong {
         return null;
     }
 
-    public function kueri( $sql ) {
+    /** Mengembalikan false + galat (seperti $wpdb->query()) bila gagal, selain itu true. */
+    public function jalankan_kueri( $sql ) {
         $this->kueri[] = $sql;
         if ( $this->tandai_gagal_bila_cocok( $sql ) ) {
-            return 'galat tiruan';
+            return false;
         }
         if ( preg_match( "/^INSERT IGNORE INTO wp_options .*VALUES \('wpmgr_dorong_kunci', '([^']*)'/", $sql, $m ) ) {
             if ( ! isset( $this->opsi['wpmgr_dorong_kunci'] ) ) {
@@ -153,7 +207,8 @@ final class WPMGR_FakeDbDorong {
             foreach ( explode( ', ', $m[1] ) as $pasang ) {
                 if ( ! preg_match( '/^`([^`]+)` TO `([^`]+)`\z/', $pasang, $p ) || ! in_array( $p[1], $tabel, true )
                     || in_array( $p[2], $tabel, true ) ) {
-                    return 'RENAME gagal: ' . $pasang;
+                    $this->galat = 'RENAME gagal: ' . $pasang;
+                    return false;
                 }
                 $tabel = array_values( array_diff( $tabel, array( $p[1] ) ) );
                 $tabel[] = $p[2];
@@ -313,6 +368,48 @@ final class DorongTest extends TestCase {
         $this->db->nilai_override = array( 1 => self::ID . '|' . ( time() + 5 ) );
         $this->assertTrue( $d->kunci( self::ID ),
             'Penyegaran dari pemegang yang sama tidak boleh dianggap kunci hilang hanya karena stempel waktu berbeda.' );
+    }
+
+    // ---- I5: jalur kueri() sungguhan lewat wpdb tiruan yang meng-escape '%' di
+    // argumen prepare() (WP >= 4.8.3) dan hanya dikembalikan siapkan(). ----
+
+    public function test_lepas_kunci_menghapus_baris_kunci_lewat_kueri_sungguhan(): void {
+        $d = $this->dorong();
+        $this->assertTrue( $d->kunci( self::ID ) );
+        $this->assertArrayHasKey( 'wpmgr_dorong_kunci', $this->db->opsi );
+        $this->assertTrue( $d->lepas_kunci( self::ID ) );
+        $this->assertArrayNotHasKey( 'wpmgr_dorong_kunci', $this->db->opsi,
+            'Baris kunci harus terhapus: LIKE terkirim dengan % asli, bukan placeholder acak.' );
+        $hapus = array_values( preg_grep( '/^DELETE FROM wp_options/', $this->db->kueri ) );
+        $this->assertCount( 1, $hapus );
+        $this->assertStringEndsWith( "LIKE '" . self::ID . "|%'", $hapus[0] );
+        $this->assertStringNotContainsString( WPMGR_FakeWpdbDorong::PH, $hapus[0] );
+    }
+
+    public function test_lepas_kunci_tidak_menghapus_kunci_milik_id_lain(): void {
+        $d = $this->dorong();
+        $this->assertTrue( $d->kunci( self::ID ) );
+        $this->assertTrue( $d->lepas_kunci( self::ID2 ) );
+        $this->assertStringStartsWith( self::ID . '|', $this->db->opsi['wpmgr_dorong_kunci'] );
+    }
+
+    public function test_kunci_menyegarkan_stempel_waktu_lewat_kueri_sungguhan(): void {
+        $d = $this->dorong();
+        $this->db->opsi['wpmgr_dorong_kunci'] = self::ID . '|' . ( time() - 5000 );
+        $this->assertTrue( $d->kunci( self::ID ) );
+        $stempel = (int) explode( '|', $this->db->opsi['wpmgr_dorong_kunci'] )[1];
+        $this->assertGreaterThan( time() - 100, $stempel, 'UPDATE penyegaran harus mengenai baris kunci.' );
+        $ubah = array_values( preg_grep( '/^UPDATE wp_options SET option_value/', $this->db->kueri ) );
+        $this->assertCount( 1, $ubah );
+        $this->assertStringEndsWith( "LIKE '" . self::ID . "|%'", $ubah[0] );
+        $this->assertStringNotContainsString( WPMGR_FakeWpdbDorong::PH, $ubah[0] );
+    }
+
+    public function test_wpdb_tiruan_meng_escape_persen_di_argumen_seperti_wpdb_asli(): void {
+        $w = new WPMGR_FakeWpdbDorong( $this->db );
+        $q = $w->prepare( 'SELECT %s', 'a%' );
+        $this->assertSame( "SELECT 'a" . WPMGR_FakeWpdbDorong::PH . "'", $q );
+        $this->assertSame( "SELECT 'a%'", $w->remove_placeholder_escape( $q ) );
     }
 
     // ---- Fix C1 (review putaran 1, Kritis): push yang DIREBUT tidak boleh

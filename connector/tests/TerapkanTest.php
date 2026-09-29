@@ -1048,6 +1048,49 @@ final class TerapkanTest extends TestCase {
     }
 
     // ------------------------------------------------------------------
+    // R25: secret connector milik produksi tidak pernah ditimpa dorongan.
+    // Opsi wpmgr_* produksi dipertahankan (termasuk wpmgr_secret), dan opsi
+    // wpmgr_* yang hanya ada di salinan staging dibuang.
+    // ------------------------------------------------------------------
+
+    /** Pola LIKE MySQL (backslash + x = x literal, % = .*, _ = .) menjadi regex PCRE. */
+    private static function like_ke_regex( $like ) {
+        $r = '';
+        $n = strlen( $like );
+        for ( $i = 0; $i < $n; $i++ ) {
+            $c = $like[ $i ];
+            if ( '\\' === $c && $i + 1 < $n ) {
+                $r .= preg_quote( $like[ ++$i ], '/' );
+            } elseif ( '%' === $c ) {
+                $r .= '.*';
+            } elseif ( '_' === $c ) {
+                $r .= '.';
+            } else {
+                $r .= preg_quote( $c, '/' );
+            }
+        }
+        return '/^' . $r . '\z/';
+    }
+
+    public function test_pertahankan_opsi_mencakup_wpmgr_secret_produksi(): void {
+        $this->siap_dengan_sql();
+        $this->sampai_selesai( 'impor' );
+        $opsi = array_values( array_filter( $this->db->kueri, function ( $q ) {
+            return false !== strpos( $q, '`wpmgr_tmp_wp_options`' ) && 1 === preg_match( '/^(INSERT IGNORE|UPDATE|DELETE)/', $q );
+        } ) );
+        $this->assertCount( 3, $opsi );
+        foreach ( $opsi as $q ) {
+            $this->assertSame( 1, preg_match( "/LIKE '([^']*)'/", $q, $m ), $q );
+            $regex = self::like_ke_regex( $m[1] );
+            $this->assertSame( 1, preg_match( $regex, 'wpmgr_secret' ), $m[1] );
+            $this->assertSame( 0, preg_match( $regex, 'blogname' ), $m[1] );
+        }
+        // INSERT IGNORE + UPDATE menyalin nilai dari tabel PRODUKSI (o) ke salinan (tmp), bukan sebaliknya.
+        $this->assertStringContainsString( 'SELECT o.option_name, o.option_value, o.autoload FROM `wp_options` o', $opsi[0] );
+        $this->assertStringContainsString( 'SET t.option_value = o.option_value', $opsi[1] );
+    }
+
+    // ------------------------------------------------------------------
     // Kontrol kompensasi R10: ENGINE/CREATE_OPTIONS dibaca ulang.
     // ------------------------------------------------------------------
 
