@@ -24,6 +24,24 @@ _BENTROK = (
     f" AND NOT (j2.tipe IN {_STAGING_BACA} AND j.tipe NOT IN {_STAGING})"
 )
 
+# Job yang menahan job lain di site yang sama: yang sedang berjalan, dan (I1)
+# dorong/kembalikan TERTUNDA yang sudah menyentuh produksi (`unggah_mulai`
+# atau `langkah_terapkan` di kemajuan) -- menunggu percobaan ulang atau
+# pemulihan, produksi bisa setengah diterapkan, jadi job Lapis 1 (update,
+# scan, ...) tidak boleh berjalan di atasnya. Hanya berlaku bagi kandidat
+# non-staging (`:kand` = alias tabel kandidat); tarik/uji staging tidak
+# bisa berdampingan dengan dorong tertunda (uq_jobs_staging_aktif).
+def _menahan(kand: str) -> str:
+    return (
+        "(j2.status = 'running'"
+        " OR (j2.status = 'pending'"
+        " AND j2.tipe IN ('staging_dorong', 'staging_kembalikan')"
+        f" AND {kand}.tipe NOT IN {_STAGING}"
+        " AND (j2.payload #> '{kemajuan,langkah_terapkan}' IS NOT NULL"
+        " OR (j2.payload #>> '{kemajuan,unggah_mulai}') = 'true')))"
+    )
+
+
 # Satu job berjalan per site, dengan dua pengecualian (Koreksi #1): tarik
 # dan uji staging hanya membaca produksi, jadi tidak menahan dan tidak
 # ditahan job non-staging. Dorong/kembalikan menulis ke produksi dan tetap
@@ -54,7 +72,8 @@ SQL_AMBIL = text(
               AND NOT EXISTS (
                     SELECT 1 FROM jobs j2
                      WHERE j2.site_id = j.site_id
-                       AND j2.status = 'running'
+                       AND j2.id <> j.id
+                       AND {_menahan('j')}
                        AND {_BENTROK})
             ORDER BY j.scheduled_for
               FOR UPDATE OF j, s SKIP LOCKED
@@ -77,7 +96,7 @@ SQL_BENTROK = text(
       FROM jobs j
       JOIN jobs j2 ON j2.site_id = j.site_id AND j2.id <> j.id
      WHERE j.id = :id
-       AND j2.status = 'running'
+       AND {_menahan('j')}
        AND {_BENTROK}
      LIMIT 1
     """

@@ -854,6 +854,47 @@ def test_matriks_klaim(sesi, site, berjalan, diklaim, jenis, boleh):
     assert (hasil is not None and hasil.id == kandidat.id) is boleh
 
 
+def _dorong_tertunda(sesi, site, tipe, **kemajuan):
+    job = buat_job(sesi, site.id, tipe, {"kemajuan": kemajuan})
+    job.attempts = 1
+    job.scheduled_for = datetime.now(timezone.utc) - timedelta(minutes=1)
+    sesi.commit()
+    return job
+
+
+@pytest.mark.parametrize("tipe", [JobType.staging_dorong, JobType.staging_kembalikan])
+@pytest.mark.parametrize("kemajuan", [{"langkah_terapkan": "tukar"}, {"unggah_mulai": True}])
+def test_dorong_tertunda_setengah_jalan_menahan_job_lapis1(sesi, site, tipe, kemajuan):
+    """I1: dorong/kembalikan tertunda yang sudah menyentuh produksi memblokir update/scan di site itu."""
+    _dorong_tertunda(sesi, site, tipe, **kemajuan)
+    update = buat_job(sesi, site.id, JobType.update_package)
+    assert ambil_job(sesi, "w1", "umum") is None
+    sesi.expire_all()
+    assert sesi.get(Job, update.id).status == JobStatus.pending
+
+
+@pytest.mark.parametrize("kemajuan", [{}, {"tahap_dorong": "rencana"}, {"unggah_mulai": False}])
+def test_dorong_tertunda_belum_menyentuh_produksi_tidak_menahan(sesi, site, kemajuan):
+    _dorong_tertunda(sesi, site, JobType.staging_dorong, **kemajuan)
+    update = buat_job(sesi, site.id, JobType.update_package)
+    assert ambil_job(sesi, "w1", "umum").id == update.id
+
+
+def test_dorong_tertunda_setengah_jalan_menahan_di_pemeriksaan_ulang(sesi, site):
+    """Pemeriksaan ulang (SQL_BENTROK) memakai definisi yang sama, bukan hanya penyaring cepat."""
+    from wpmgr.jobs import queue
+
+    _dorong_tertunda(sesi, site, JobType.staging_dorong, langkah_terapkan="tukar")
+    update = buat_job(sesi, site.id, JobType.update_package)
+    assert queue._masih_eksklusif(sesi, update.id, site.id) is False
+    sesi.rollback()
+
+
+def test_dorong_tertunda_setengah_jalan_tidak_menahan_dirinya_dan_job_staging(sesi, site):
+    dorong = _dorong_tertunda(sesi, site, JobType.staging_dorong, langkah_terapkan="tukar")
+    assert ambil_job(sesi, "w1", "staging").id == dorong.id
+
+
 def test_klaim_bentrok_diperiksa_ulang_sesudah_snapshot_basi(sesi, site, monkeypatch):
     """M1: klaim yang lolos NOT EXISTS berdasarkan snapshot basi dibatalkan oleh pemeriksaan ulang."""
     from wpmgr.jobs import queue
