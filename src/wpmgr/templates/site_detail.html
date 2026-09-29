@@ -46,7 +46,7 @@
     {% endif %}
 
     <h3>Cabut site</h3>
-    <div x-data="{ konfirmasi: false, galatCabut: '' }">
+    <div x-data="{ konfirmasi: false, galatCabut: '', bisaPaksa: false, namaPaksa: '' }">
       <p>Mencabut site menghapus datanya dari dashboard berikut secret-nya. Plugin
          <code>wp-manager-connector</code> dan user <code>wpmgr</code> di site itu harus dihapus
          manual lewat wp-admin.</p>
@@ -58,11 +58,29 @@
           fetch('/api/sites/{{ site.id }}', { method: 'DELETE' })
             .then(async (r) => {
               if (r.ok) { window.location = '/sites'; return; }
+              bisaPaksa = r.status === 409;
               galatCabut = 'Site tidak dicabut. ' + await pesanGalat(r);
             })
             .catch((e) => { galatCabut = 'Gagal menghubungi server: ' + e.message; })">Ya, cabut</button>
         <button type="button" @click="konfirmasi = false">Batal</button>
         <p class="galat" x-show="galatCabut" x-text="galatCabut" role="alert"></p>
+        <div x-show="bisaPaksa" data-nama="{{ site.nama }}">
+          <p>Bila dorongan lama di produksi memang tidak bisa dibuktikan bersih lagi (misalnya site klien
+             sudah tidak dapat dijangkau), pencabutan bisa dipaksa. Dorongan itu ditandai bersih tanpa bukti
+             dari connector dan dicatat di log aktivitas. Pekerjaan staging yang sedang berjalan tetap
+             menolak. Ketik nama site persis untuk melanjutkan.</p>
+          <input x-model="namaPaksa" placeholder="{{ site.nama }}" aria-label="Nama site untuk pencabutan paksa">
+          <button type="button" :disabled="namaPaksa !== $el.parentElement.dataset.nama" @click="
+            galatCabut = '';
+            fetch('/api/sites/{{ site.id }}?paksa=1', {
+              method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ konfirmasi: namaPaksa }) })
+              .then(async (r) => {
+                if (r.ok) { window.location = '/sites'; return; }
+                galatCabut = 'Site tidak dicabut. ' + await pesanGalat(r);
+              })
+              .catch((e) => { galatCabut = 'Gagal menghubungi server: ' + e.message; })">Cabut paksa</button>
+        </div>
       </div>
     </div>
   </section>

@@ -771,6 +771,80 @@ def test_hapus_site_ditolak_saat_snapshot_dibutuhkan_rekonsiliasi(klien_web, ses
     assert sesi.query(Site).count() == 1
 
 
+def _cabut_paksa(klien_web, site_id, konfirmasi=None, paksa=1):
+    badan = None if konfirmasi is None else {"konfirmasi": konfirmasi}
+    return klien_web.request("DELETE", f"/api/sites/{site_id}", params={"paksa": paksa}, json=badan)
+
+
+def _jejak_paksa(sesi):
+    sesi.expire_all()
+    return sesi.query(ActivityLog).filter(ActivityLog.pesan.like("Pencabutan paksa%")).all()
+
+
+def test_cabut_paksa_menolak_tanpa_atau_dengan_konfirmasi_salah(klien_web, sesi, site, staging_aktif, pb):
+    """I4: `?paksa=1` wajib disertai nama site persis."""
+    job = buat_job(sesi, site.id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.failed
+    job.payload = {"mode": "hanya_kode", "kemajuan": {"unggah_mulai": True}}
+    sesi.commit()
+    for konfirmasi in (None, "", site.nama.upper(), site.nama + " ", "lain"):
+        r = _cabut_paksa(klien_web, site.id, konfirmasi)
+        assert r.status_code == 400 and "persis" in r.json()["detail"], konfirmasi
+    sesi.expire_all()
+    assert sesi.query(Site).count() == 1
+    assert _jejak_paksa(sesi) == []
+
+
+def test_cabut_paksa_melewati_dorongan_lama_yang_tak_terbukti_bersih(klien_web, sesi, site, staging_aktif, pb):
+    job = buat_job(sesi, site.id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.failed
+    job.payload = {"mode": "hanya_kode", "kemajuan": {"unggah_mulai": True, "tahap_dorong": "terapkan"}}
+    sesi.commit()
+    job_id, nama = job.id, site.nama
+    # Tanpa paksa tetap ditolak.
+    assert klien_web.delete(f"/api/sites/{site.id}").status_code == 409
+    r = _cabut_paksa(klien_web, site.id, nama)
+    assert r.status_code == 200
+    sesi.expire_all()
+    assert sesi.query(Site).count() == 0
+    jejak = _jejak_paksa(sesi)
+    assert len(jejak) == 1 and jejak[0].site_id is None and jejak[0].level == "warning"
+    assert nama in jejak[0].pesan and "1 dorongan" in jejak[0].pesan
+    assert jejak[0].detail["job_id"] == [job_id]
+
+
+def test_cabut_paksa_melewati_dorong_tertunda_setengah_jalan(klien_web, sesi, siap, pb):
+    job = buat_job(sesi, siap.site_id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.payload = {"mode": "hanya_kode", "kemajuan": {"langkah_terapkan": "tukar"}}
+    sesi.commit()
+    site = sesi.get(Site, siap.site_id)
+    assert klien_web.delete(f"/api/sites/{site.id}").status_code == 409
+    assert _cabut_paksa(klien_web, site.id, site.nama).status_code == 200
+    sesi.expire_all()
+    assert sesi.query(Site).count() == 0 and _jumlah_job(sesi) == 0
+    assert pb.nama_panggilan()[:3] == ["hapus", "db_hapus", "router_muat"]
+    assert len(_jejak_paksa(sesi)) == 1
+
+
+def test_cabut_paksa_tetap_menolak_job_staging_berjalan(klien_web, sesi, site, staging_aktif, pb):
+    job = buat_job(sesi, site.id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.running
+    sesi.commit()
+    r = _cabut_paksa(klien_web, site.id, site.nama)
+    assert r.status_code == 409 and "berjalan" in r.json()["detail"]
+    sesi.expire_all()
+    assert sesi.query(Site).count() == 1
+    assert _jejak_paksa(sesi) == []
+
+
+def test_cabut_paksa_0_sama_dengan_tanpa_paksa(klien_web, sesi, site, staging_aktif, pb):
+    job = buat_job(sesi, site.id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.failed
+    job.payload = {"mode": "hanya_kode", "kemajuan": {"unggah_mulai": True}}
+    sesi.commit()
+    assert _cabut_paksa(klien_web, site.id, site.nama, paksa=0).status_code == 409
+
+
 def test_hapus_staging_baris_dihapus_sebelum_berkas(klien_web, sesi, engine, siap, staging_aktif, pb, monkeypatch):
     """Berkas baru dipindah ke nisan sesudah penghapusan baris ter-commit: tidak pernah ada baris tanpa berkas."""
     from wpmgr.web import routes_staging

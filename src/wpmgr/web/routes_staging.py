@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import flag_modified
 
 from wpmgr import db
 from wpmgr.config import get_settings
@@ -39,6 +40,7 @@ from wpmgr.fitur import STAGING, punya_fitur
 from wpmgr.jobs.handlers import buat_klien
 from wpmgr.models import (
     JOB_STAGING,
+    ActivityLog,
     Job,
     JobStatus,
     JobType,
@@ -57,7 +59,7 @@ from wpmgr.sso import buat_token
 from wpmgr.staging import dorong as dorong_mod
 from wpmgr.staging import uji as uji_mod
 from wpmgr.staging import umum
-from wpmgr.staging.aman import angka, bersih_teks, nama_dari_url
+from wpmgr.staging.aman import angka, bersih_json, bersih_teks, nama_dari_url
 from wpmgr.staging.cron import (
     _ada_job_staging,
     _ada_staging,
@@ -532,8 +534,44 @@ PESAN_HAPUS_SITE_REKONSILIASI = ("Dorongan sebelumnya di produksi belum terbukti
 KUNCI_KEMAJUAN_PRODUKSI = ("tahap_dorong", "tahap_balik", "langkah_terapkan")
 
 
-def bersihkan_untuk_hapus_site(sesi, site: Site) -> None:
+PESAN_PAKSA_KONFIRMASI = "Konfirmasi harus persis sama dengan nama site."
+
+
+def _tandai_produksi_bersih_paksa(sesi, site: Site, pengguna: User) -> None:
+    """Override I4: dorongan lama yang tak bisa dibuktikan bersih ditandai `produksi_bersih` oleh operator.
+
+    Mencakup job dorong/kembalikan tertunda yang sudah menyentuh produksi dan
+    job lama yang belum terbukti bersih (rekonsiliasi). Dicatat di log
+    aktivitas TANPA site_id (baris site segera dihapus dan kaskade akan
+    menghapus catatan yang justru paling dibutuhkan).
+    """
+    tertunda = sesi.scalars(select(Job).where(
+        Job.site_id == site.id, Job.tipe.in_((JobType.staging_dorong, JobType.staging_kembalikan)),
+        Job.status == JobStatus.pending)).all()
+    lama = sesi.scalars(select(Job).where(*dorong_mod.syarat_dorongan_lama_belum_bersih(site.id))).all()
+    ditandai = []
+    for j in [*(j for j in tertunda if any(k in umum.kemajuan(j) for k in KUNCI_KEMAJUAN_PRODUKSI)), *lama]:
+        # Tanpa commit: kunci sites/staging dipegang pemanggil sampai baris site dihapus.
+        payload = dict(j.payload or {})
+        payload["kemajuan"] = {**(payload.get("kemajuan") or {}), "produksi_bersih": True,
+                               "ditandai_bersih_paksa": True}
+        j.payload = payload
+        flag_modified(j, "payload")
+        ditandai.append(j.id)
+    sesi.add(ActivityLog(
+        level="warning", user_id=pengguna.id,
+        pesan=bersih_teks(f"Pencabutan paksa site '{site.nama}' oleh {pengguna.email}: {len(ditandai)} dorongan "
+                          "lama ditandai bersih tanpa bukti dari connector", 500),
+        detail=bersih_json({"site_id": str(site.id), "job_id": ditandai})))
+
+
+def bersihkan_untuk_hapus_site(sesi, site: Site, paksa: bool = False, pengguna: User | None = None) -> None:
     """Dipanggil `DELETE /api/sites/{id}` di bawah kunci sites, sebelum baris site dihapus.
+
+    `paksa` (I4, sesudah konfirmasi nama site di route): dorongan lama yang tidak
+    bisa dibuktikan bersih (job tertunda setengah jalan, atau rekonsiliasi)
+    tidak lagi menahan pencabutan; job itu ditandai `produksi_bersih` dan
+    dicatat. Job staging yang sedang BERJALAN tetap menolak, paksa atau bukan.
 
     Kaskade site menghapus job, snapshot, dan staging-nya. Karena itu site
     ditolak dicabut, dengan atau tanpa baris Staging, selama:
@@ -552,13 +590,17 @@ def bersihkan_untuk_hapus_site(sesi, site: Site) -> None:
         Job.site_id == site.id, Job.tipe.in_(JOB_STAGING), Job.status == JobStatus.running).limit(1))
     if berjalan is not None:
         raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_BERJALAN)
-    tertunda = sesi.scalars(select(Job).where(
-        Job.site_id == site.id, Job.tipe.in_((JobType.staging_dorong, JobType.staging_kembalikan)),
-        Job.status == JobStatus.pending)).all()
-    if any(any(k in umum.kemajuan(j) for k in KUNCI_KEMAJUAN_PRODUKSI) for j in tertunda):
-        raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_DORONG)
-    if sesi.scalar(select(Job.id).where(*dorong_mod.syarat_dorongan_lama_belum_bersih(site.id)).limit(1)) is not None:
-        raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_REKONSILIASI)
+    if paksa:
+        _tandai_produksi_bersih_paksa(sesi, site, pengguna)
+    else:
+        tertunda = sesi.scalars(select(Job).where(
+            Job.site_id == site.id, Job.tipe.in_((JobType.staging_dorong, JobType.staging_kembalikan)),
+            Job.status == JobStatus.pending)).all()
+        if any(any(k in umum.kemajuan(j) for k in KUNCI_KEMAJUAN_PRODUKSI) for j in tertunda):
+            raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_DORONG)
+        if sesi.scalar(select(Job.id).where(
+                *dorong_mod.syarat_dorongan_lama_belum_bersih(site.id)).limit(1)) is not None:
+            raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_REKONSILIASI)
     st = _kunci_staging(sesi, site.id)
     if st is None:
         return

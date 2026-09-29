@@ -273,21 +273,32 @@ def url_sso(site_id: uuid.UUID, pengguna: PenggunaApi):
         return {"url": f"{site.url}/?wpmgr_sso={token}"}
 
 
+class KonfirmasiPaksa(BaseModel):
+    konfirmasi: str = ""
+
+
 @router.delete("/api/sites/{site_id}")
-def hapus_site(site_id: uuid.UUID, pengguna: PenggunaApi):
+def hapus_site(site_id: uuid.UUID, pengguna: PenggunaApi, paksa: int = 0, badan: KonfirmasiPaksa | None = None):
+    """Cabut site. `?paksa=1` + `{"konfirmasi": "<nama site>"}` (persis) melewati penahan dorongan
+    lama yang tak bisa dibuktikan bersih (I4); job staging yang berjalan tetap menolak."""
     from wpmgr.staging.cron import _kunci_site
-    from wpmgr.web.routes_staging import bersihkan_untuk_hapus_site
+    from wpmgr.web.routes_staging import (
+        PESAN_PAKSA_KONFIRMASI,
+        bersihkan_untuk_hapus_site,
+    )
 
     with db.SessionLocal() as sesi:
         site = sesi.get(Site, site_id)
         if site is None:
             raise HTTPException(status_code=404, detail="Site tidak ditemukan")
+        if paksa and (badan is None or badan.konfirmasi != site.nama):
+            raise HTTPException(status_code=400, detail=PESAN_PAKSA_KONFIRMASI)
         # Kaskade menghapus baris staging, tetapi container, database, dan
         # akses router staging tetap hidup: dibongkar dulu, di bawah kunci
         # sites yang sama dengan route staging dan cron. Galat pembantu
         # menolak pencabutan (502) supaya tidak ada container yatim.
         _kunci_site(sesi, site_id)
-        bersihkan_untuk_hapus_site(sesi, site)
+        bersihkan_untuk_hapus_site(sesi, site, paksa=bool(paksa), pengguna=pengguna)
         nama = site.nama
         sesi.delete(site)
         # ActivityLog untuk penghapusan sengaja dibuat tanpa site_id: baris
