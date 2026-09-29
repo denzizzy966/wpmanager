@@ -898,6 +898,81 @@ def test_tanpa_perubahan_tidak_menyentuh_produksi(sesi, site_staging, prod, pb):
     assert sesi.query(ActivityLog).filter(ActivityLog.pesan.like("%tidak ada perubahan%")).count() == 1
 
 
+# ---- minor 3/4: pangkas hanya menghitung titik kembali sah, dengan pola nisan ------------
+
+
+def _snap_dengan_job(sesi, site_staging, staging_aktif, nama, status_job, langkah=None, umur_hari=0):
+    from datetime import datetime, timedelta, timezone
+
+    job = buat_job(sesi, site_staging.site_id, JobType.staging_dorong,
+                   {"mode": "hanya_kode", "kemajuan": {"langkah_terapkan": langkah} if langkah else {}})
+    job.status = status_job
+    sesi.commit()
+    rel = f"{site_staging.site_id}/snapshot/{nama}"
+    (staging_aktif / rel).mkdir(parents=True)
+    snap = StagingSnapshot(site_id=site_staging.site_id, job_id=job.id, jenis="sebelum_dorong", status="tersedia",
+                           ukuran=1, path=rel, dibuat_pada=datetime.now(timezone.utc) - timedelta(days=umur_hari))
+    sesi.add(snap)
+    sesi.commit()
+    return snap
+
+
+def test_pangkas_snapshot_hanya_menghitung_titik_kembali_sah(sesi, site_staging, staging_aktif):
+    # Tiga titik kembali sah (job sukses) dan dua sisa dorongan yang tidak pernah menukar (lebih baru).
+    sah = [_snap_dengan_job(sesi, site_staging, staging_aktif, f"j{i}", JobStatus.success, umur_hari=10 - i)
+           for i in range(3)]
+    bukan = [_snap_dengan_job(sesi, site_staging, staging_aktif, f"x{i}", JobStatus.failed, umur_hari=i)
+             for i in range(2)]
+    dihapus = []
+    n = dorong.pangkas_snapshot(sesi, site_staging.site_id, 2, hapus=dihapus.append)
+    sesi.commit()
+    assert n == 1 and dihapus == [sah[0].path], "yang terlama dari titik kembali sah, bukan sisa dorongan baru"
+    for s in sah[1:] + bukan:
+        sesi.refresh(s)
+        assert s.status == "tersedia"
+    sesi.refresh(sah[0])
+    assert sah[0].status == "dipangkas"
+
+
+def test_pangkas_snapshot_titik_kembali_lewat_tukar_dihitung_walau_job_belum_sukses(sesi, site_staging, staging_aktif):
+    a = _snap_dengan_job(sesi, site_staging, staging_aktif, "j0", JobStatus.failed, langkah="tukar", umur_hari=3)
+    b = _snap_dengan_job(sesi, site_staging, staging_aktif, "j1", JobStatus.success, umur_hari=2)
+    dihapus = []
+    assert dorong.pangkas_snapshot(sesi, site_staging.site_id, 1, hapus=dihapus.append) == 1
+    assert dihapus == [a.path] and b.status == "tersedia"
+
+
+def test_pangkas_snapshot_nisan_rename_lalu_hapus_di_luar_transaksi(sesi, site_staging, staging_aktif):
+    lama = _snap_dengan_job(sesi, site_staging, staging_aktif, "j0", JobStatus.success, umur_hari=5)
+    baru = _snap_dengan_job(sesi, site_staging, staging_aktif, "j1", JobStatus.success, umur_hari=1)
+    (staging_aktif / lama.path / "besar.bin").write_bytes(b"x")
+    n, nisan = dorong.pangkas_snapshot_nisan(sesi, site_staging.site_id, 1)
+    sesi.commit()
+    assert n == 1 and len(nisan) == 1 and nisan[0].startswith(".hapus-")
+    # Sesudah commit: direktori asli sudah tidak ada, isinya masih di nisan (belum di-rmtree).
+    assert not (staging_aktif / lama.path).exists() and (staging_aktif / nisan[0] / "besar.bin").exists()
+    assert (staging_aktif / baru.path).is_dir()
+    dorong.hapus_nisan(staging_aktif, nisan[0])
+    assert not (staging_aktif / nisan[0]).exists()
+
+
+def test_dorong_sukses_memangkas_lewat_nisan_tanpa_sisa(sesi, site_staging, staging_aktif, prod, pb, monkeypatch):
+    from wpmgr.config import get_settings
+
+    monkeypatch.setenv("WPMGR_STAGING_SNAPSHOT", "1")
+    get_settings.cache_clear()
+    try:
+        _siap(sesi, site_staging, staging_aktif, prod)
+        lama = _snap_dengan_job(sesi, site_staging, staging_aktif, "j-lama", JobStatus.success, umur_hari=9)
+        _dorong(sesi, site_staging, prod, "hanya_kode")
+        sesi.refresh(lama)
+        assert lama.status == "dipangkas"
+        assert not (staging_aktif / lama.path).exists()
+        assert not [n for n in os.listdir(staging_aktif) if n.startswith(".hapus-")]
+    finally:
+        get_settings.cache_clear()
+
+
 def test_handler_terdaftar():
     from wpmgr.jobs.handlers import HANDLER
 

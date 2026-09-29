@@ -52,6 +52,18 @@ def _lepas_staging(sesi: Session, job: Job) -> None:
 
 
 def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) -> int:
+    """Kembalikan job `running` yang kuncinya basi ke `pending`, atau tandai `unknown` bila jatah habis.
+
+    Urutan kunci: baris `jobs` yatim (FOR UPDATE SKIP LOCKED), lalu baris
+    `staging` (FOR UPDATE, lewat `_lepas_staging`). Reaper TIDAK mengambil kunci
+    `sites`, jadi urutannya berbeda dari kontrak route/cron di
+    `wpmgr.staging.cron` (sites -> staging). Itu aman: jalur sites -> staging
+    hanya MENYISIPKAN baris job baru atau membaca job, tidak pernah mengunci
+    baris job yang sudah ada sesudah baris staging, jadi tidak ada siklus
+    (jobs -> staging di sini, tidak pernah staging -> jobs yang sama). SKIP
+    LOCKED membuat reaper melewati job yang sedang disentuh worker hidup, dan
+    tidak menunggu kunci sites yang dipegang route/cron.
+    """
     batas = func.now() - timedelta(minutes=batas_menit)
     yatim = sesi.scalars(
         select(Job)

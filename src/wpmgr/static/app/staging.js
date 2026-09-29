@@ -319,7 +319,7 @@ function tabStaging(siteId) {
       return paket.map((p) => `${p.slug} ${p.dari || '?'} → ${p.ke}`).join(', ');
     },
     teksMode(mode) { return TEKS_MODE_SNAPSHOT[mode] || '—'; },
-    snapshotSah(s) { return SNAPSHOT_SAH.includes(s.status); },
+    snapshotSah(s) { return SNAPSHOT_SAH.includes(s.status) && s.bisa_dikembalikan !== false; },
     aman(url) { return typeof url === 'string' && url.startsWith('https://') ? url : '#'; },
     teksJob(tipe) { return TEKS_JOB_STAGING[tipe] || tipe; },
     waktu(iso) { return iso ? new Date(iso).toLocaleString('id-ID') : '—'; },

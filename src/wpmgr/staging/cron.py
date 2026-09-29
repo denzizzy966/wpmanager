@@ -29,7 +29,6 @@ foreign key; FOR UPDATE memblokirnya, NO KEY UPDATE tidak.
 import logging
 import os
 import re
-import secrets
 import stat
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -53,16 +52,17 @@ from wpmgr.staging.aman import (
     TOLERANSI_JAM,
     PathTidakAman,
     adalah_tautan,
-    hapus_berkas,
-    hapus_tautan,
     jalur_di_dalam,
 )
 from wpmgr.staging.dorong import (
     STATUS_SNAPSHOT_SAH,
-    hapus_dir_staging,
     pangkas_snapshot,
     syarat_dorongan_lama_belum_bersih,
 )
+from wpmgr.staging.dorong import (
+    hapus_nisan as _hapus_nisan,  # dipindah ke dorong; nama lama dipakai rute
+)
+from wpmgr.staging.dorong import ke_nisan as _ke_nisan
 from wpmgr.staging.pembantu import GalatPembantu
 
 log = logging.getLogger("wpmgr.staging.cron")
@@ -228,37 +228,6 @@ def _ada_staging(sesi, site_id) -> bool:
 def _ada_snapshot(sesi, site_id) -> bool:
     return sesi.scalar(select(StagingSnapshot.id).where(
         StagingSnapshot.site_id == site_id, StagingSnapshot.status.in_(STATUS_SNAPSHOT_SAH)).limit(1)) is not None
-
-
-def _ke_nisan(akar: Path, relatif: str, site_id) -> str | None:
-    """Pindahkan `akar/relatif` (tanpa mengikuti symlink) ke nisan di akar; nama nisan atau None."""
-    nisan = f".hapus-{site_id}-{secrets.token_hex(6)}"
-    try:
-        os.rename(akar / relatif, akar / nisan)
-    except OSError as exc:
-        log.warning("Sisa staging %s tidak dapat dipindahkan untuk dihapus: %s", relatif, type(exc).__name__)
-        return None
-    return nisan
-
-
-def _hapus_nisan(akar: Path, nisan: str) -> None:
-    try:
-        st = os.lstat(akar / nisan)
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        log.warning("Nisan staging %s tidak terbaca: %s", nisan, type(exc).__name__)
-        return
-    try:
-        if adalah_tautan(st):
-            # Tautannya saja yang dihapus; targetnya tidak pernah disentuh.
-            hapus_tautan(akar, nisan)
-        elif stat.S_ISDIR(st.st_mode):
-            hapus_dir_staging(nisan)
-        else:
-            hapus_berkas(akar, nisan)
-    except (OSError, PathTidakAman) as exc:
-        log.warning("Nisan staging %s tidak dapat dihapus: %s", nisan, type(exc).__name__)
 
 
 def _nisan_selain_snapshot(akar: Path, nama: str, site_id) -> list[str]:

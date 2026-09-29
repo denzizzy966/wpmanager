@@ -327,10 +327,18 @@ def test_tanda_air_galat_connector_dipetakan_tanpa_teks_mentah(klien_web, siap, 
     assert "/var/lib" not in r.json()["detail"]
 
 
-def test_kembalikan_butuh_nama_dan_snapshot_milik_site(klien_web, sesi, siap, pb):
-    snap = StagingSnapshot(site_id=siap.site_id, jenis="sebelum_dorong", status="tersedia", ukuran=1, path="x")
+def _snapshot_titik_kembali(sesi, site_id, status="tersedia") -> StagingSnapshot:
+    """Snapshot dengan job dorong pemilik yang sukses: titik kembali produksi yang sah."""
+    job = buat_job(sesi, site_id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.success
+    snap = StagingSnapshot(site_id=site_id, job_id=job.id, jenis="sebelum_dorong", status=status, ukuran=1, path="x")
     sesi.add(snap)
     sesi.commit()
+    return snap
+
+
+def test_kembalikan_butuh_nama_dan_snapshot_milik_site(klien_web, sesi, siap, pb):
+    snap = _snapshot_titik_kembali(sesi, siap.site_id)
     dasar = f"/api/sites/{siap.site_id}/staging/kembalikan"
     assert klien_web.post(dasar, json={"snapshot_id": snap.id, "konfirmasi_nama": "contoh"}).status_code == 422
     assert klien_web.post(dasar, json={"snapshot_id": 999999, "konfirmasi_nama": "Contoh"}).status_code == 404
@@ -338,11 +346,36 @@ def test_kembalikan_butuh_nama_dan_snapshot_milik_site(klien_web, sesi, siap, pb
     assert sesi.get(Job, r.json()["job_id"]).tipe == JobType.staging_kembalikan
 
 
-def test_kembalikan_tanpa_staging_dan_tanpa_gerbang_salinan(klien_web, sesi, site, staging_aktif, pb):
-    site.fitur = ["staging"]
-    snap = StagingSnapshot(site_id=site.id, jenis="sebelum_dorong", status="tersedia", ukuran=1, path="x")
+def test_kembalikan_ditolak_bila_snapshot_bukan_titik_kembali(klien_web, sesi, siap, pb):
+    """Minor 4: sisa dorongan yang tak pernah menukar ditolak saat antre, bukan setelah job jalan."""
+    job = buat_job(sesi, siap.site_id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.failed
+    snap = StagingSnapshot(site_id=siap.site_id, job_id=job.id, jenis="sebelum_dorong", status="tersedia",
+                           ukuran=1, path="x")
     sesi.add(snap)
     sesi.commit()
+    r = klien_web.post(f"/api/sites/{siap.site_id}/staging/kembalikan",
+                       json={"snapshot_id": snap.id, "konfirmasi_nama": "Contoh"})
+    assert r.status_code == 409 and r.json()["detail"] == dorong.PESAN_SNAPSHOT_BUKAN_TITIK
+    assert _jumlah_job(sesi) == 1  # hanya job dorong milik snapshot
+
+
+def test_daftar_snapshot_menandai_bisa_dikembalikan(klien_web, sesi, siap):
+    sah = _snapshot_titik_kembali(sesi, siap.site_id)
+    job = buat_job(sesi, siap.site_id, JobType.staging_dorong, {"mode": "hanya_kode"})
+    job.status = JobStatus.failed
+    sisa = StagingSnapshot(site_id=siap.site_id, job_id=job.id, jenis="sebelum_dorong", status="tersedia",
+                           ukuran=1, path="y")
+    dipangkas = _snapshot_titik_kembali(sesi, siap.site_id, status="dipangkas")
+    sesi.add(sisa)
+    sesi.commit()
+    peta = {s["id"]: s["bisa_dikembalikan"] for s in klien_web.get(f"/api/sites/{siap.site_id}/staging/snapshot").json()}
+    assert peta == {sah.id: True, sisa.id: False, dipangkas.id: False}
+
+
+def test_kembalikan_tanpa_staging_dan_tanpa_gerbang_salinan(klien_web, sesi, site, staging_aktif, pb):
+    site.fitur = ["staging"]
+    snap = _snapshot_titik_kembali(sesi, site.id)
     dasar = f"/api/sites/{site.id}/staging/kembalikan"
     r = klien_web.post(dasar, json={"snapshot_id": snap.id, "konfirmasi_nama": "Contoh"})
     assert r.status_code == 200
@@ -355,9 +388,7 @@ def test_kembalikan_tanpa_staging_dan_tanpa_gerbang_salinan(klien_web, sesi, sit
 def test_kembalikan_boleh_saat_salinan_gagal(klien_web, sesi, siap, pb):
     siap.status = StatusStaging.gagal
     siap.gagal_asal = "salinan"
-    snap = StagingSnapshot(site_id=siap.site_id, jenis="sebelum_dorong", status="tersedia", ukuran=1, path="x")
-    sesi.add(snap)
-    sesi.commit()
+    snap = _snapshot_titik_kembali(sesi, siap.site_id)
     r = klien_web.post(f"/api/sites/{siap.site_id}/staging/kembalikan",
                        json={"snapshot_id": snap.id, "konfirmasi_nama": "Contoh"})
     assert r.status_code == 200
@@ -672,9 +703,7 @@ def _isi_body(body, site_id, snap_id):
 @pytest.mark.parametrize("metode,path,body", RUTE_TERKUNCI)
 def test_rute_menunggu_kunci_lalu_memeriksa_ulang(klien_web, engine, sesi, siap, pb, sql, metode, path, body):
     """Route antre dan hapus/jeda/sandi memeriksa "sibuk" di bawah kunci yang sama dengan cron (F29)."""
-    snap = StagingSnapshot(site_id=siap.site_id, jenis="sebelum_dorong", status="tersedia", ukuran=1, path="x")
-    sesi.add(snap)
-    sesi.commit()
+    snap = _snapshot_titik_kembali(sesi, siap.site_id)
     body = _isi_body(body, siap.site_id, snap.id)
     lain = sessionmaker(bind=engine, future=True)()
     lain.execute(text(sql), {"site": siap.site_id})

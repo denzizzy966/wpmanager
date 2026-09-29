@@ -93,6 +93,7 @@ from wpmgr.staging.aman import (
     buka_baca,
     daftar_direktori,
     hapus_berkas,
+    hapus_tautan,
     jalur_di_dalam,
     path_sah,
 )
@@ -867,19 +868,87 @@ def hapus_dir_staging(relatif: str) -> None:
     shutil.rmtree(p, ignore_errors=True)
 
 
-def pangkas_snapshot(sesi, site_id, n: int, hapus=None) -> int:
-    """Pangkas snapshot sah melebihi `n` terbaru; snapshot job lama yang belum bersih dipertahankan.
+def ke_nisan(akar: Path, relatif: str, site_id) -> str | None:
+    """Pindahkan `akar/relatif` (tanpa mengikuti symlink) ke nisan di akar; nama nisan atau None."""
+    nisan = f".hapus-{site_id}-{secrets.token_hex(6)}"
+    try:
+        os.rename(akar / relatif, akar / nisan)
+    except OSError as exc:
+        log.warning("Sisa staging %s tidak dapat dipindahkan untuk dihapus: %s", relatif, type(exc).__name__)
+        return None
+    return nisan
 
-    `hapus(path)` menggantikan penghapusan langsung: cron memakainya untuk
-    memindahkan direktori ke nisan lalu menghapusnya sesudah kunci dilepas.
+
+def hapus_nisan(akar: Path, nisan: str) -> None:
+    try:
+        st = os.lstat(akar / nisan)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning("Nisan staging %s tidak terbaca: %s", nisan, type(exc).__name__)
+        return
+    try:
+        if adalah_tautan(st):
+            # Tautannya saja yang dihapus; targetnya tidak pernah disentuh.
+            hapus_tautan(akar, nisan)
+        elif stat.S_ISDIR(st.st_mode):
+            hapus_dir_staging(nisan)
+        else:
+            hapus_berkas(akar, nisan)
+    except (OSError, PathTidakAman) as exc:
+        log.warning("Nisan staging %s tidak dapat dihapus: %s", nisan, type(exc).__name__)
+
+
+def pangkas_snapshot_nisan(sesi, site_id, n: int) -> tuple[int, list[str]]:
+    """`pangkas_snapshot` dengan pola nisan: direktori dipindah (rename atomik) di dalam transaksi.
+
+    Pemanggil meng-commit lebih dulu, lalu memanggil `hapus_nisan` untuk setiap
+    nama yang dikembalikan, di luar transaksi (rmtree snapshot besar tidak
+    boleh menahan kunci baris). Nisan sisa transaksi yang gagal dihapus cron.
+    """
+    akar = get_settings().jalur_staging
+    nisan: list[str] = []
+
+    def pindah(path: str) -> None:
+        try:
+            jalur_di_dalam(akar, path)
+            st = os.lstat(akar / path)
+        except (PathTidakAman, OSError):
+            return
+        if adalah_tautan(st) or not stat.S_ISDIR(st.st_mode):
+            return
+        nama = ke_nisan(akar, path, site_id)
+        if nama is not None:
+            nisan.append(nama)
+
+    return pangkas_snapshot(sesi, site_id, n, hapus=pindah), nisan
+
+
+def titik_kembali(sesi, s: StagingSnapshot) -> bool:
+    """Snapshot ini titik kembali produksi yang sah: masih ada dan dorongan pemiliknya pernah menukar."""
+    return s.status in STATUS_SNAPSHOT_SAH and _dorongan_pernah_menukar(sesi, s.job_id)
+
+
+def pangkas_snapshot(sesi, site_id, n: int, hapus=None) -> int:
+    """Pangkas titik kembali sah melebihi `n` terbaru; snapshot job lama yang belum bersih dipertahankan.
+
+    Hanya titik kembali yang sah (`titik_kembali`) yang dihitung terhadap `n`
+    dan yang bisa dipangkas: snapshot dorongan yang belum/tidak pernah menukar
+    bukan titik kembali, jadi tidak mendorong titik kembali yang sah keluar
+    dari jatah (dan snapshot dorongan yang sedang berjalan tidak dibuang).
+    Snapshot tanpa job pemilik (baris job dihapus) tetap dihitung seperti
+    semula: tidak ada bukti bahwa ia bukan titik kembali.
+
+    `hapus(path)` menggantikan penghapusan langsung: cron dan `cek` memakainya
+    untuk memindahkan direktori ke nisan lalu menghapusnya sesudah commit.
     """
     hapus = hapus or hapus_dir_staging
     ditahan = set(sesi.scalars(select(Job.id).where(*syarat_dorongan_lama_belum_bersih(site_id))).all())
-    daftar = sesi.scalars(
+    daftar = [s for s in sesi.scalars(
         select(StagingSnapshot)
         .where(StagingSnapshot.site_id == site_id, StagingSnapshot.status.in_(("tersedia", "dipakai")))
         .order_by(StagingSnapshot.dibuat_pada.desc(), StagingSnapshot.id.desc())
-    ).all()
+    ).all() if s.job_id is None or _dorongan_pernah_menukar(sesi, s.job_id)]
     dipangkas = 0
     for s in daftar[n:]:
         # Snapshot kandidat rekonsiliasi dipertahankan walau melebihi `n`.
@@ -1192,14 +1261,18 @@ class _Dorong:
                   "peringatan": list(k.get("peringatan") or [])[:10]}
         hasil = tuntaskan_sukses(self.sesi, self.job, self.site, self.staging, self.klien, k,
                                  f"Dorong ke produksi ({LABEL_MODE[self.mode]})", detail)
-        pangkas_snapshot(self.sesi, self.site.id, get_settings().staging_snapshot)
+        # Pola nisan (seperti cron): rename di transaksi, commit, lalu rmtree di luar.
+        _, nisan = pangkas_snapshot_nisan(self.sesi, self.site.id, get_settings().staging_snapshot)
         self.sesi.commit()
+        for n in nisan:
+            hapus_nisan(get_settings().jalur_staging, n)
         shutil.rmtree(self.kerja, ignore_errors=True)
         return hasil
 
     def tanpa_perubahan(self, k: dict) -> dict:
         st = self.sesi.get(Staging, self.staging.id, populate_existing=True)
-        st.status = StatusStaging.siap
+        # Bukan `siap` mentah: salinan yang belum utuh sebelum job ini tetap begitu (R18/R22).
+        st.status = umum.status_sukses_produksi(self.job, st)
         umum.catat_aktivitas(self.sesi, self.site.id, self.job,
                              f"Dorong ke produksi ({LABEL_MODE[self.mode]}): tidak ada perubahan")
         self.sesi.commit()

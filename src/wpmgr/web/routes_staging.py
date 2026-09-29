@@ -292,9 +292,12 @@ def _dict_staging(st: Staging) -> dict:
     return hasil
 
 
-def _dict_snapshot(s: StagingSnapshot) -> dict:
+def _dict_snapshot(s: StagingSnapshot, bisa_dikembalikan: bool) -> dict:
     detail = s.detail if isinstance(s.detail, dict) else {}
+    # `bisa_dikembalikan`: masih ada DAN dorongan pemiliknya pernah menukar produksi;
+    # snapshot sisa dorongan yang gagal sebelum tukar bukan titik kembali (minor 4).
     return {"id": s.id, "status": s.status, "jenis": s.jenis, "ukuran_teks": format_byte(s.ukuran),
+            "bisa_dikembalikan": bisa_dikembalikan,
             "mode": detail.get("mode"), "jumlah_berkas": detail.get("jumlah_berkas"),
             "perubahan": detail.get("perubahan") or [], "dibuat_pada": _iso(s.dibuat_pada)}
 
@@ -320,7 +323,7 @@ def _dict_uji(u: StagingUji) -> dict:
 
 
 def _daftar_snapshot(sesi, site_id, batas: int) -> list[dict]:
-    return [_dict_snapshot(s) for s in sesi.scalars(
+    return [_dict_snapshot(s, dorong_mod.titik_kembali(sesi, s)) for s in sesi.scalars(
         select(StagingSnapshot).where(StagingSnapshot.site_id == site_id)
         .order_by(StagingSnapshot.dibuat_pada.desc(), StagingSnapshot.id.desc()).limit(batas))]
 
@@ -702,6 +705,9 @@ def antrekan_kembalikan(site_id: uuid.UUID, req: PermintaanKembalikan, pengguna:
             raise HTTPException(status_code=404, detail="Snapshot tidak ditemukan atau sudah dipangkas.")
         if req.konfirmasi_nama != site.nama:
             raise HTTPException(status_code=422, detail=dorong_mod.PESAN_KONFIRMASI_BALIK)
+        if not dorong_mod.titik_kembali(sesi, snap):
+            # Job kembalikan juga menolaknya, tetapi setelah antre; tolak di sini.
+            raise HTTPException(status_code=409, detail=dorong_mod.PESAN_SNAPSHOT_BUKAN_TITIK)
         _tolak_bila_sibuk(sesi, site)
         payload = {"snapshot_id": snap.id, "konfirmasi_nama": req.konfirmasi_nama}
         job, = _simpan_job(sesi, [_job_baru(site_id, JobType.staging_kembalikan, payload, pengguna)])
