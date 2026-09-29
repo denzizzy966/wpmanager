@@ -4,6 +4,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from wpmgr.errors import UNKNOWN
+from wpmgr.jobs.queue import dalam_batas_pemulihan
 from wpmgr.models import (
     JOB_STAGING,
     ActivityLog,
@@ -35,7 +36,7 @@ def _lepas_staging(sesi: Session, job: Job) -> None:
     salinan yang utuh, selain itu status staging sebelum job itu dikembalikan
     (salinan yang belum utuh tetap dengan galatnya).
     """
-    st =sesi.scalar(select(Staging).where(Staging.site_id == job.site_id,
+    st = sesi.scalar(select(Staging).where(Staging.site_id == job.site_id,
                                            Staging.status.in_(STATUS_KERJA_STAGING)).with_for_update())
     if st is None:
         return
@@ -44,6 +45,10 @@ def _lepas_staging(sesi: Session, job: Job) -> None:
     st.gagal_asal = asal if status == StatusStaging.gagal else None
     st.galat = galat
     st.batal_diminta_pada = None
+    if umum.menyentuh_produksi(job):
+        # Kegagalan final sesudah tukar (jendela pemulihan 24 jam habis): sama
+        # dengan `dorong.akhiri_gagal`, produksi ditandai belum terbukti sehat.
+        st.dorong_gagal_pada = umum.sekarang()
 
 
 def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) -> int:
@@ -59,7 +64,9 @@ def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) ->
         job.locked_at = None
         job.locked_by = None
         job.started_at = None
-        if job.attempts < job.max_attempts:
+        # Produksi yang sudah ditukar dipulihkan terus sampai batas 24 jam (R26),
+        # bukan sampai max_attempts: pemulihan tidak boleh bergantung pada WP-Cron.
+        if job.attempts < job.max_attempts or dalam_batas_pemulihan(job):
             job.status = JobStatus.pending
             pesan = f"Job dipulihkan dari worker yang mati ({pemegang}); dijadwalkan ulang"
         else:

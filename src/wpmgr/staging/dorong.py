@@ -19,8 +19,11 @@ Mesin keadaan terapkan (`langkah_terapkan`, dipakai juga Kembalikan)::
 Aturan yang dijaga:
 - `langkah_terapkan = "tukar"` di-commit SEBELUM permintaan tukar pertama
   (tulis-lebih-dulu). Sejak titik itu produksi dianggap mungkin tersentuh:
-  batal tidak berlaku lagi, snapshot tidak pernah dibuang, dan kegagalan
-  final dicatat di `dorong_gagal_pada`.
+  batal tidak berlaku lagi, snapshot tidak pernah dibuang, dan job tidak
+  berhenti di `max_attempts`: galat sementara/tak pasti dicoba lagi tiap
+  <= 15 menit sampai 24 jam sejak tukar dikirim (`tukar_pada`, putusan R26;
+  `jobs.queue.dalam_batas_pemulihan`, juga dipakai reaper). Hanya sesudah
+  itu kegagalan menjadi final dan dicatat di `dorong_gagal_pada`.
 - `pulihkan` HANYA dijalankan sesudah connector menjawab pasti bahwa tukar
   tidak tuntas (wpmgr_staging_tukar dengan data.pemulihan, atau 409 urutan
   saat tukar dikirim ulang). Hasil yang tidak diketahui (koneksi putus,
@@ -383,6 +386,9 @@ def unggah_semua(sesi, job, staging, klien, sumber: SumberDorong, dorong_id: str
 
 
 def _pindah(sesi, job, langkah: str, **lain) -> str:
+    if langkah == "tukar" and "tukar_pada" not in umum.kemajuan(job):
+        # Awal jendela pemulihan 24 jam (R26); tidak digeser oleh percobaan ulang.
+        lain["tukar_pada"] = umum.sekarang().isoformat()
     umum.simpan_kemajuan(sesi, job, langkah_terapkan=langkah, **lain)
     return langkah
 

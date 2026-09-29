@@ -24,6 +24,22 @@ from wpmgr.staging.rencana import Entri
 
 pytestmark = pytest.mark.integration
 
+
+@pytest.fixture(autouse=True)
+def _jendela_pemulihan_nol(monkeypatch):
+    """Test di berkas ini memaksa kegagalan FINAL lewat `attempts = max_attempts`.
+
+    Sejak R26 job yang sudah menukar produksi terus dicoba sampai 24 jam sejak
+    tukar; jendela dinolkan di sini supaya perilaku final tetap teruji.
+    Perilaku R26 sendiri diuji di test_staging_antrean.py dan
+    `test_r26_*` (yang memulihkan batas 24 jam).
+    """
+    from datetime import timedelta
+
+    from wpmgr.jobs import queue
+
+    monkeypatch.setattr(queue, "BATAS_PEMULIHAN", timedelta(0))
+
 MTIME = 1_700_000_000
 SQL_EKSPOR = b"DROP TABLE IF EXISTS `wp_posts`;\nCREATE TABLE `wp_posts` (`id` int);\n"
 
@@ -42,7 +58,8 @@ def prod(monkeypatch):
         "wp-content/plugins/p/p.php": (b"<?php //p", MTIME),
         "wp-content/uploads/lama.jpg": (b"jpg", MTIME),
     }
-    p.tabel = {"wp_posts": [b"CREATE TABLE `wp_posts` (`id` int);\n"]}
+    p.tabel = {"wp_options": [b"CREATE TABLE `wp_options` (`option_name` varchar(191));\n"],
+               "wp_posts": [b"CREATE TABLE `wp_posts` (`id` int);\n"]}
     monkeypatch.setattr(umum, "buat_http", p.http)
     return p
 
@@ -907,7 +924,8 @@ def test_snapshot_menyimpan_sql_produksi_mentah(sesi, site_staging, staging_akti
     _dorong(sesi, site_staging, prod, "timpa_penuh", konfirmasi="Contoh")
     snap = sesi.query(StagingSnapshot).one()
     isi = b"".join(p.read_bytes() for p in sorted((staging_aktif / snap.path / "db").glob("*.sql")))
-    assert isi == CREATE_MYSQL8
+    # Tabel wp_options (fixture) ikut di snapshot; tabel wp_posts persis mentah di ujungnya.
+    assert isi.endswith(CREATE_MYSQL8)
 
 
 def test_r8_memeriksa_create_produksi_mentah(sesi, site_staging, staging_aktif, prod, pb):
@@ -1079,6 +1097,30 @@ def test_gagal_final_di_selesai(sesi, site_staging, staging_aktif, prod, pb):
     assert st.dorong_gagal_pada is not None and st.galat == dorong.PESAN_AKHIR["selesai"]
     assert sesi.query(StagingSnapshot).one().status == "tersedia"
     assert prod.dorongan[_kemajuan(sesi, job)["dorong_id"]]["status"] == "ditukar"
+
+
+def test_r26_gagal_sesudah_tukar_diulang_walau_percobaan_habis(sesi, site_staging, staging_aktif, prod, pb,
+                                                                monkeypatch):
+    """R26: tukar sudah dikirim dan connector tak menjawab: job dicoba lagi, bukan final di max_attempts."""
+    from datetime import timedelta
+
+    from wpmgr.jobs import queue
+
+    monkeypatch.setattr(queue, "BATAS_PEMULIHAN", timedelta(hours=24))
+    _siap(sesi, site_staging, staging_aktif, prod)
+    prod.kejadian["selesai"] = [httpx.Response(500, text="galat")] * 10
+    job = _job_baru(sesi, site_staging, "hanya_kode")
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _jalankan(sesi, site_staging, prod, job)
+    assert e.value.error_class != STAGING_GAGAL
+    assert "tukar_pada" in _kemajuan(sesi, job)
+    st = _staging(sesi, site_staging)
+    assert st.status == StatusStaging.mendorong and st.dorong_gagal_pada is None
+    assert st.galat.startswith("Terputus, dilanjutkan otomatis")
+    assert sesi.query(StagingSnapshot).one().status == "tersedia"
+    assert queue.akan_diulang(sesi.get(Job, job.id), TRANSIENT)
 
 
 def test_gagal_final_di_pulihkan(sesi, site_staging, staging_aktif, prod, pb):

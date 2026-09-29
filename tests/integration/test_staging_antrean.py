@@ -723,6 +723,8 @@ def test_reaper_asal_gagal_per_tipe_job(sesi, site_staging, tipe, status_kerja, 
     job = ambil_job(sesi, "w1", "staging")
     job.attempts = job.max_attempts
     job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    # Jendela pemulihan 24 jam (R26) sudah lewat: kegagalan ini final.
+    job.dibuat_pada = datetime.now(timezone.utc) - timedelta(hours=25)
     sesi.commit()
     assert pulihkan_job_yatim(sesi) == 1
     sesi.expire_all()
@@ -749,11 +751,146 @@ def test_reaper_kembalikan_pada_salinan_rusak_mempertahankan_galat(sesi, site_st
     site_staging.status, site_staging.galat = StatusStaging.mendorong, None
     job.attempts = job.max_attempts
     job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    job.dibuat_pada = datetime.now(timezone.utc) - timedelta(hours=25)  # jendela R26 lewat
     sesi.commit()
     assert pulihkan_job_yatim(sesi) == 1
     sesi.expire_all()
     st = sesi.get(Staging, site_staging.id)
     assert (st.status, st.gagal_asal, st.galat) == (StatusStaging.gagal, "salinan", galat)
+
+
+# ---- R26: pemulihan sesudah tukar tidak berhenti di max_attempts -------------------
+
+
+def _tukar_pada(jam_lalu: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=jam_lalu)).isoformat()
+
+
+def _job_tukar(sesi, site, tipe=JobType.staging_dorong, jam_lalu=1.0, **kemajuan):
+    k = {"langkah_terapkan": "tukar", "tukar_pada": _tukar_pada(jam_lalu), **kemajuan}
+    job = buat_job(sesi, site.id, tipe, {"kemajuan": k})
+    job.attempts = job.max_attempts
+    sesi.commit()
+    return job
+
+
+@pytest.mark.parametrize("tipe", [JobType.staging_dorong, JobType.staging_kembalikan])
+@pytest.mark.parametrize("kelas", [TRANSIENT, UNKNOWN])
+def test_akan_diulang_sesudah_tukar_tidak_berhenti_di_max_attempts(sesi, site, tipe, kelas):
+    from wpmgr.jobs.queue import akan_diulang
+
+    job = _job_tukar(sesi, site, tipe)
+    assert job.attempts == job.max_attempts
+    assert akan_diulang(job, kelas) is True
+
+
+def test_akan_diulang_sesudah_tukar_hanya_untuk_transient_dan_unknown(sesi, site):
+    from wpmgr.jobs.queue import akan_diulang
+
+    job = _job_tukar(sesi, site)
+    for kelas in (STAGING_GAGAL, STAGING_DITOLAK, AUTH_ERROR, BAD_RESPONSE, TERLALU_BESAR):
+        assert akan_diulang(job, kelas) is False, kelas
+
+
+def test_akan_diulang_berhenti_sesudah_24_jam_sejak_tukar(sesi, site):
+    from wpmgr.jobs.queue import akan_diulang
+
+    assert akan_diulang(_job_tukar(sesi, site, jam_lalu=23.9), TRANSIENT) is True
+    sesi.query(Job).delete()
+    sesi.commit()
+    assert akan_diulang(_job_tukar(sesi, site, jam_lalu=24.1), TRANSIENT) is False
+
+
+@pytest.mark.parametrize("kemajuan", [
+    {"langkah_terapkan": "siapkan"}, {"langkah_terapkan": "cek_ulang"},
+    {"langkah_terapkan": "dipulihkan", "pulih_terkonfirmasi": True}, {},
+])
+def test_akan_diulang_sebelum_tukar_atau_terpulihkan_tetap_dibatasi_max_attempts(sesi, site, kemajuan):
+    from wpmgr.jobs.queue import akan_diulang
+
+    job = buat_job(sesi, site.id, JobType.staging_dorong, {"kemajuan": {**kemajuan, "tukar_pada": _tukar_pada(1)}})
+    job.attempts = job.max_attempts
+    sesi.commit()
+    assert akan_diulang(job, TRANSIENT) is False
+
+
+def test_job_non_produksi_tidak_mendapat_jendela_pemulihan(sesi, site):
+    from wpmgr.jobs.queue import akan_diulang
+
+    job = buat_job(sesi, site.id, JobType.staging_tarik, {"kemajuan": {"langkah_terapkan": "tukar"}})
+    job.attempts = job.max_attempts
+    sesi.commit()
+    assert akan_diulang(job, TRANSIENT) is False
+
+
+def test_jeda_ulang_sesudah_tukar_dibatasi_15_menit_walau_percobaan_banyak(sesi, site):
+    from wpmgr.jobs.queue import selesai_gagal
+
+    job = _job_tukar(sesi, site)
+    job.attempts = 60  # 2**60 menit meluap di timedelta bila tidak dibatasi
+    sesi.commit()
+    selesai_gagal(sesi, job, TRANSIENT, "putus")
+    sesi.expire_all()
+    job = sesi.get(Job, job.id)
+    assert job.status == JobStatus.pending
+    jeda = job.scheduled_for - datetime.now(timezone.utc)
+    assert timedelta(minutes=10) < jeda <= timedelta(minutes=15, seconds=5)
+
+
+def test_worker_mengulang_galat_sementara_sesudah_tukar_walau_percobaan_habis(sesi, site, monkeypatch):
+    monkeypatch.setitem(handlers.HANDLER, JobType.staging_dorong, _gagal_dengan(TRANSIENT))
+    job = _job_tukar(sesi, site)
+    assert proses_satu(sesi, "w1", buat_klien_fn=lambda s: None, jenis="staging")
+    sesi.expire_all()
+    job = sesi.get(Job, job.id)
+    assert job.status == JobStatus.pending and job.error_class == TRANSIENT
+
+
+def test_worker_mengakhiri_galat_sementara_sesudah_24_jam(sesi, site, monkeypatch):
+    monkeypatch.setitem(handlers.HANDLER, JobType.staging_dorong, _gagal_dengan(TRANSIENT))
+    job = _job_tukar(sesi, site, jam_lalu=25)
+    assert proses_satu(sesi, "w1", buat_klien_fn=lambda s: None, jenis="staging")
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.failed
+
+
+def test_reaper_tidak_menyerah_pada_dorong_sesudah_tukar_dalam_24_jam(sesi, site_staging):
+    from wpmgr.jobs.reaper import pulihkan_job_yatim
+
+    site_staging.status = StatusStaging.mendorong
+    site_staging.ditarik_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    buat_job(sesi, site_staging.site_id, JobType.staging_dorong,
+             {"kemajuan": {"langkah_terapkan": "tukar", "tukar_pada": _tukar_pada(2), "status_staging_awal": "siap"}})
+    job = ambil_job(sesi, "w1", "staging")
+    job.attempts = job.max_attempts
+    job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    sesi.commit()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.pending
+    st = sesi.get(Staging, site_staging.id)
+    assert st.status == StatusStaging.mendorong and st.dorong_gagal_pada is None
+
+
+def test_reaper_menyerah_sesudah_24_jam_dan_menandai_dorong_gagal_pada(sesi, site_staging):
+    from wpmgr.jobs.reaper import pulihkan_job_yatim
+
+    site_staging.status = StatusStaging.mendorong
+    site_staging.ditarik_pada = datetime.now(timezone.utc)
+    sesi.commit()
+    buat_job(sesi, site_staging.site_id, JobType.staging_dorong,
+             {"kemajuan": {"langkah_terapkan": "tukar", "tukar_pada": _tukar_pada(30), "status_staging_awal": "siap"}})
+    job = ambil_job(sesi, "w1", "staging")
+    job.attempts = job.max_attempts
+    job.locked_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    sesi.commit()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.unknown
+    st = sesi.get(Staging, site_staging.id)
+    assert (st.status, st.gagal_asal) == (StatusStaging.gagal, "produksi")
+    assert st.dorong_gagal_pada is not None
 
 
 def test_reaper_yang_menjadwalkan_ulang_tidak_mengubah_staging(sesi, site_staging):

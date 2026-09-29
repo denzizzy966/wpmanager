@@ -23,7 +23,11 @@ from wpmgr.errors import (
     UNKNOWN,
     SiteError,
 )
-from wpmgr.jobs.queue import akan_diulang
+from wpmgr.jobs.queue import (  # noqa: F401
+    LANGKAH_SESUDAH_TUKAR,
+    akan_diulang,
+    menyentuh_produksi,
+)
 from wpmgr.models import (
     ActivityLog,
     Job,
@@ -401,8 +405,8 @@ def status_istirahat(st: Staging) -> StatusStaging:
 ASAL_SALINAN = "salinan"
 ASAL_PRODUKSI = "produksi"
 JOB_PRODUKSI = frozenset({JobType.staging_dorong, JobType.staging_kembalikan})
-# Langkah terapkan sejak tukar dikirim ke produksi (tulis-lebih-dulu di dorong).
-LANGKAH_SESUDAH_TUKAR = frozenset({"tukar", "pulihkan", "dipulihkan", "selesai", "beres"})
+# LANGKAH_SESUDAH_TUKAR dan menyentuh_produksi hidup di `jobs.queue` (dipakai
+# juga keputusan ulang worker dan reaper, putusan R26) dan diimpor di atas.
 STATUS_KERJA = frozenset({StatusStaging.menyalin, StatusStaging.berjalan_uji, StatusStaging.mendorong})
 # Status kerja tarik/uji: salinan sedang (atau menunggu untuk) disegarkan.
 STATUS_SALINAN_KERJA = frozenset({StatusStaging.menyalin.value, StatusStaging.berjalan_uji.value})
@@ -464,12 +468,6 @@ def status_sukses_produksi(job: Job, st: Staging) -> StatusStaging:
     if salinan_tidak_utuh_sebelum(job):
         return status_sebelum(job, st)[0]
     return status_istirahat(st)
-
-
-def menyentuh_produksi(job: Job) -> bool:
-    """Tukar sudah dikirim ke produksi dan tidak terbukti dipulihkan."""
-    k = kemajuan(job)
-    return k.get("langkah_terapkan") in LANGKAH_SESUDAH_TUKAR and not k.get("pulih_terkonfirmasi")
 
 
 def status_gagal_final(job: Job, st: Staging, pesan: str) -> tuple[StatusStaging, str | None, str]:

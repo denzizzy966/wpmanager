@@ -25,6 +25,22 @@ from wpmgr.staging import dorong, tarik, umum
 
 pytestmark = pytest.mark.integration
 
+
+@pytest.fixture(autouse=True)
+def _jendela_pemulihan_nol(monkeypatch):
+    """Test di berkas ini memaksa kegagalan FINAL lewat `attempts = max_attempts`.
+
+    Sejak R26 job yang sudah menukar produksi terus dicoba sampai 24 jam sejak
+    tukar; jendela dinolkan di sini supaya perilaku final tetap teruji.
+    Perilaku R26 sendiri diuji di test_staging_antrean.py dan
+    `test_r26_*` (yang memulihkan batas 24 jam).
+    """
+    from datetime import timedelta
+
+    from wpmgr.jobs import queue
+
+    monkeypatch.setattr(queue, "BATAS_PEMULIHAN", timedelta(0))
+
 MTIME = 1_700_000_000
 SQL_EKSPOR = b"DROP TABLE IF EXISTS `wp_posts`;\nCREATE TABLE `wp_posts` (`id` int);\n"
 
@@ -41,7 +57,8 @@ def prod(monkeypatch):
         "index.php": (b"<?php // inti", MTIME),
         "wp-content/themes/t/style.css": (b"body{}", MTIME),
     }
-    p.tabel = {"wp_posts": [b"DROP TABLE IF EXISTS `wp_posts`;\nCREATE TABLE `wp_posts` (`id` int);\n",
+    p.tabel = {"wp_options": [b"CREATE TABLE `wp_options` (`option_name` varchar(191));\n"],
+               "wp_posts": [b"DROP TABLE IF EXISTS `wp_posts`;\nCREATE TABLE `wp_posts` (`id` int);\n",
                             b"INSERT INTO `wp_posts` (`id`) VALUES ('7');\n"]}
     monkeypatch.setattr(umum, "buat_http", p.http)
     return p

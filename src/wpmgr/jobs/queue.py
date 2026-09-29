@@ -2,13 +2,13 @@ import logging
 import os
 import socket
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import String, bindparam, select, text
 from sqlalchemy import func as safunc
 from sqlalchemy.orm import Session
 
-from wpmgr.errors import BAD_RESPONSE, DAPAT_DIULANG, UNKNOWN
+from wpmgr.errors import BAD_RESPONSE, DAPAT_DIULANG, TRANSIENT, UNKNOWN
 from wpmgr.models import Job, JobStatus, JobType
 
 log = logging.getLogger("wpmgr.jobs.queue")
@@ -187,6 +187,50 @@ def jeda_menit(attempts: int) -> int:
     return 2**attempts
 
 
+# ---- pemulihan produksi sesudah tukar (putusan R26) ----------------------------
+
+# Langkah terapkan sejak tukar dikirim ke produksi (tulis-lebih-dulu di dorong).
+LANGKAH_SESUDAH_TUKAR = frozenset({"tukar", "pulihkan", "dipulihkan", "selesai", "beres"})
+_JOB_PRODUKSI = frozenset({JobType.staging_dorong, JobType.staging_kembalikan})
+# Produksi yang setengah ditukar tidak boleh dibiarkan bergantung pada WP-Cron:
+# job dicoba lagi terus (jeda dibatasi) sampai batas ini, tidak berhenti di max_attempts.
+JEDA_PEMULIHAN_MAKS_MENIT = 15
+BATAS_PEMULIHAN = timedelta(hours=24)
+
+
+def menyentuh_produksi(job: Job) -> bool:
+    """Dorong/kembalikan yang sudah mengirim tukar ke produksi dan tidak terbukti dipulihkan."""
+    if job.tipe not in _JOB_PRODUKSI:
+        return False
+    k = (job.payload or {}).get("kemajuan") or {}
+    return k.get("langkah_terapkan") in LANGKAH_SESUDAH_TUKAR and not k.get("pulih_terkonfirmasi")
+
+
+def _mulai_tukar(job: Job) -> datetime | None:
+    k = (job.payload or {}).get("kemajuan") or {}
+    try:
+        mulai = datetime.fromisoformat(k["tukar_pada"])
+    except (KeyError, TypeError, ValueError):
+        # Job dari sebelum penanda ini ada: batas dihitung dari pembuatan job.
+        return job.dibuat_pada
+    return mulai if mulai.tzinfo else mulai.replace(tzinfo=timezone.utc)
+
+
+def dalam_batas_pemulihan(job: Job, sekarang: datetime | None = None) -> bool:
+    """Produksi tersentuh dan batas 24 jam sejak tukar dikirim belum lewat (R26).
+
+    Selama benar, percobaan ulang (worker, pembungkus staging, reaper) tidak
+    berhenti di `max_attempts`. Sesudahnya kegagalan menjadi final dengan
+    `dorong_gagal_pada` dan pesan tetap "dipulihkan otomatis oleh connector".
+    """
+    if not menyentuh_produksi(job):
+        return False
+    mulai = _mulai_tukar(job)
+    if mulai is None:
+        return True
+    return (sekarang or datetime.now(timezone.utc)) - mulai < BATAS_PEMULIHAN
+
+
 def _lepas_kunci(job: Job) -> None:
     job.locked_at = None
     job.locked_by = None
@@ -219,6 +263,8 @@ def akan_diulang(job: Job, error_class: str) -> bool:
     Satu sumber kebenaran untuk `selesai_gagal` dan pembungkus job staging,
     yang harus tahu lebih dulu apakah kegagalannya final.
     """
+    if error_class in (TRANSIENT, UNKNOWN) and dalam_batas_pemulihan(job):
+        return True
     return error_class in DAPAT_DIULANG and job.attempts < _batas_percobaan(job, error_class)
 
 
@@ -228,7 +274,12 @@ def selesai_gagal(sesi: Session, job: Job, error_class: str, pesan: str) -> None
     _lepas_kunci(job)
     if akan_diulang(job, error_class):
         job.status = JobStatus.pending
-        job.scheduled_for = safunc.now() + timedelta(minutes=jeda_menit(job.attempts))
+        menit = jeda_menit(job.attempts)
+        if dalam_batas_pemulihan(job):
+            # Backoff eksponensial yang tak dibatasi melewati batas 24 jam dan
+            # meluap di timedelta; pemulihan produksi dicoba tiap <= 15 menit.
+            menit = min(jeda_menit(min(job.attempts, 10)), JEDA_PEMULIHAN_MAKS_MENIT)
+        job.scheduled_for = safunc.now() + timedelta(minutes=menit)
         job.started_at = None
     else:
         job.status = JobStatus.failed

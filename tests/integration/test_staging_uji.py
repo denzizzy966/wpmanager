@@ -55,7 +55,8 @@ def cepat(monkeypatch):
 def prod():
     p = ProduksiPalsu()
     p.berkas = {"index.php": (b"<?php", 1700000000)}
-    p.tabel = {"wp_posts": [b"CREATE TABLE `wp_posts` (`id` int);\n"]}
+    p.tabel = {"wp_options": [b"CREATE TABLE `wp_options` (`option_name` varchar(191));\n"],
+               "wp_posts": [b"CREATE TABLE `wp_posts` (`id` int);\n"]}
     return p
 
 
