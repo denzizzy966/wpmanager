@@ -226,6 +226,7 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
   [[ "$ROUTER_PORT" =~ ^127\.0\.0\.1:[0-9]{2,5}$ && "$MAIL_PORT" =~ ^127\.0\.0\.1:[0-9]{2,5}$ ]] \
     || galat konfigurasi "port router/mail harus di 127.0.0.1"
   [[ "$SUBNET" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || galat konfigurasi "SUBNET tidak sah"
+  hitung_ip_layanan
   [[ "$NGINX_GROUP" =~ $POLA_GRUP ]] || galat konfigurasi "NGINX_GROUP tidak sah"
   # gid_nginx dipakai lagi di bawah (sesudah GID_W ada) tanpa memanggil
   # getent group sekali lagi.
@@ -280,6 +281,29 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
       (( g != gid_nginx )) || galat konfigurasi "pengguna dashboard tidak boleh anggota NGINX_GROUP"
     done
   fi
+}
+
+# Alamat tetap layanan bersama di dalam SUBNET (putusan R25): tiga alamat
+# host paling atas (broadcast-1 router, -2 mail, -3 db). Docker membagikan
+# alamat dinamis container situs dari bawah (.2, .3, ...), jadi keduanya
+# tidak bertabrakan. Aturan iptables antar-container memakai alamat ini.
+ip_dari_angka() {
+  printf '%d.%d.%d.%d' $(( ($1 >> 24) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 8) & 255 )) $(( $1 & 255 ))
+}
+
+hitung_ip_layanan() {
+  local ip="${SUBNET%/*}" pref="${SUBNET#*/}" a b c d o masker jaringan siaran
+  IFS=. read -r a b c d <<< "$ip"
+  for o in "$a" "$b" "$c" "$d"; do
+    (( 10#$o <= 255 )) || galat konfigurasi "SUBNET tidak sah"
+  done
+  (( 10#$pref >= 16 && 10#$pref <= 28 )) || galat konfigurasi "SUBNET harus berukuran /16 sampai /28"
+  masker=$(( (0xFFFFFFFF << (32 - 10#$pref)) & 0xFFFFFFFF ))
+  jaringan=$(( ((10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d) & masker ))
+  siaran=$(( jaringan | (~masker & 0xFFFFFFFF) ))
+  IP_ROUTER="$(ip_dari_angka $(( siaran - 1 )))"
+  IP_MAIL="$(ip_dari_angka $(( siaran - 2 )))"
+  IP_DB="$(ip_dari_angka $(( siaran - 3 )))"
 }
 
 # ---- validasi ------------------------------------------------------------
@@ -463,6 +487,33 @@ pasang_iptables() {
     iptables -C DOCKER-USER -i "$JEMBATAN" ! -o "$JEMBATAN" -d "$j" -j DROP 2>/dev/null \
       || iptables -I DOCKER-USER -i "$JEMBATAN" ! -o "$JEMBATAN" -d "$j" -j DROP
   done
+  pasang_isolasi_antar
+}
+
+# Isolasi di dalam jembatan staging (putusan R25): semua container berbagi
+# satu jembatan dengan komunikasi antar-container aktif, jadi PHP di staging
+# A bisa menjangkau http://wp-B/ langsung (melewati Basic Auth) dan API
+# Mailpit tanpa kata sandi. Lalu lintas jembatan->jembatan dibatasi pada:
+# balasan (established/related), router -> container mana pun di tcp/80,
+# container mana pun -> db tcp/3306, dan -> mail tcp/1025 (SMTP). Sisanya
+# dibuang. Lalu lintas host->container (port terbitan 127.0.0.1) tidak
+# melewati rantai FORWARD ini.
+#
+# Aturan ada di rantai sendiri supaya urutannya selalu benar: rantai
+# dikosongkan dan diisi ulang di setiap `siapkan` (idempoten), dan lompatan
+# dari DOCKER-USER dipasang sesudah rantainya terisi (-C sebelum -I).
+pasang_isolasi_antar() {
+  local rantai=WPMGR-STG-ANTAR
+  iptables -N "$rantai" 2>/dev/null || iptables -n -L "$rantai" >/dev/null \
+    || galat docker "rantai iptables staging tidak dapat dibuat"
+  iptables -F "$rantai"
+  iptables -A "$rantai" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A "$rantai" -s "$IP_ROUTER" -p tcp --dport 80 -j ACCEPT
+  iptables -A "$rantai" -d "$IP_DB" -p tcp --dport 3306 -j ACCEPT
+  iptables -A "$rantai" -d "$IP_MAIL" -p tcp --dport 1025 -j ACCEPT
+  iptables -A "$rantai" -j DROP
+  iptables -C DOCKER-USER -i "$JEMBATAN" -o "$JEMBATAN" -j "$rantai" 2>/dev/null \
+    || iptables -I DOCKER-USER -i "$JEMBATAN" -o "$JEMBATAN" -j "$rantai"
 }
 
 pastikan_wpcli() {
@@ -499,15 +550,31 @@ KONF
   chmod 0644 "$KONF_DIR/router/conf.d/00-bawaan.conf"
 }
 
+# Layanan yang sudah ada hanya dijalankan ulang bila alamat tetapnya sudah
+# sesuai dan (bila diminta lewat $4) variabel lingkungan wajibnya ada;
+# selain itu (container lama tanpa alamat tetap, atau tanpa auth Mailpit)
+# dibuat ulang. Data db ada di volume bernama, jadi ikut bertahan.
 jalankan_layanan() {
-  local nama="$1" peran="$2"
-  shift 2
+  local nama="$1" peran="$2" ip="$3" env_wajib="$4" ip_lama env_ada cocok=1
+  shift 4
   if pastikan_milik "$nama" "layanan:$peran"; then
-    dk start "$nama" >/dev/null || galat docker "layanan staging tidak dapat dijalankan"
-  else
-    dk run -d --name "$nama" --label "wpmgr.staging=layanan:$peran" --network "$JARINGAN" \
-      --restart unless-stopped "$@" >/dev/null || galat docker "layanan staging tidak dapat dibuat"
+    ip_lama="$(dk inspect --type container \
+      --format '{{with index .NetworkSettings.Networks "wpmgr-staging"}}{{with .IPAMConfig}}{{.IPv4Address}}{{end}}{{end}}' \
+      "$nama")" || galat docker "layanan staging tidak terbaca"
+    [[ "$ip_lama" == "$ip" ]] || cocok=0
+    if [[ -n "$env_wajib" ]]; then
+      env_ada="$(dk inspect --type container --format '{{range .Config.Env}}{{println .}}{{end}}' "$nama")" \
+        || galat docker "layanan staging tidak terbaca"
+      [[ $'\n'"$env_ada"$'\n' == *$'\n'"$env_wajib"$'\n'* ]] || cocok=0
+    fi
+    if (( cocok )); then
+      dk start "$nama" >/dev/null || galat docker "layanan staging tidak dapat dijalankan"
+      return 0
+    fi
+    dk rm -f "$nama" >/dev/null || galat docker "layanan lama tidak dapat dihapus"
   fi
+  dk run -d --name "$nama" --label "wpmgr.staging=layanan:$peran" --network "$JARINGAN" --ip "$ip" \
+    --restart unless-stopped "$@" >/dev/null || galat docker "layanan staging tidak dapat dibuat"
 }
 
 cmd_siapkan() {
@@ -529,7 +596,7 @@ cmd_siapkan() {
 
   # Putusan F21: substitusi perintah disimpan ke variabel dulu, supaya
   # kegagalannya menghentikan skrip lewat `set -e`.
-  local env_db sandi img_db img_mail img_router m_konf m_htpasswd m_log
+  local env_db sandi img_db img_mail img_router m_konf m_htpasswd m_log auth_mail env_mail
   sandi="$(cat "$KONF_DIR/db-root")"
   img_db="$(image mariadb mariadb:11.4)"
   img_mail="$(image mailpit axllent/mailpit:latest)"
@@ -544,17 +611,31 @@ cmd_siapkan() {
   env_db="$(mktemp)"
   SEMENTARA+=("$env_db")
   printf 'MARIADB_ROOT_PASSWORD=%s\n' "$sandi" > "$env_db"
-  jalankan_layanan wpmgr-stg-db db --memory 1g --env-file "$env_db" -v wpmgr-stg-db:/var/lib/mysql \
+  jalankan_layanan wpmgr-stg-db db "$IP_DB" "" --memory 1g --env-file "$env_db" -v wpmgr-stg-db:/var/lib/mysql \
     "$img_db" --innodb-buffer-pool-size=256M --max-allowed-packet=64M --local-infile=0
   rm -f "$env_db"
-  jalankan_layanan wpmgr-stg-mail mail --memory 128m -p "$MAIL_PORT:8025" "$img_mail"
+  # Mailpit menampung email SEMUA staging dan API-nya tanpa auth bisa dibaca
+  # staging mana pun (putusan R25): UI dan API dikunci kata sandi buatan
+  # skrip ini. Kredensial disimpan root 0600 dan dibaca dashboard lewat
+  # subperintah `mail-kredensial`; masuk ke container lewat env-file, bukan argumen.
+  if [[ ! -s "$KONF_DIR/mail-auth" ]]; then
+    printf 'wpmgr:%s' "$(acak 24)" > "$KONF_DIR/mail-auth"
+    chmod 0600 "$KONF_DIR/mail-auth"
+  fi
+  auth_mail="$(cat "$KONF_DIR/mail-auth")"
+  env_mail="$(mktemp)"
+  SEMENTARA+=("$env_mail")
+  printf 'MP_UI_AUTH=%s\n' "$auth_mail" > "$env_mail"
+  jalankan_layanan wpmgr-stg-mail mail "$IP_MAIL" "MP_UI_AUTH=$auth_mail" --memory 128m --env-file "$env_mail" \
+    -p "$MAIL_PORT:8025" "$img_mail"
+  rm -f "$env_mail"
   # Layanan bersama berjalan sebagai root di container, jadi tidak satu pun
   # memasang path yang bisa ditulis user dashboard (putusan R13): db memakai
   # volume bernama, mail tanpa mount, router hanya memasang KONF_DIR/router
   # (berkas hasil render template tetap, ditulis root) read-only dan LOG_DIR
   # milik root. Berkas kiriman dashboard di STAGING_DIR/router tidak pernah
   # dipasang; router-muat membacanya, memvalidasi, lalu merender ulang.
-  jalankan_layanan wpmgr-stg-router router --memory 128m -p "$ROUTER_PORT:80" \
+  jalankan_layanan wpmgr-stg-router router "$IP_ROUTER" "" --memory 128m -p "$ROUTER_PORT:80" \
     -v "$m_konf:/etc/nginx/conf.d:ro" \
     -v "$m_htpasswd:/etc/nginx/wpmgr-htpasswd:ro" \
     -v "$m_log:/var/log/wpmgr-akses" \
@@ -754,8 +835,25 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, LOCK TABLES, C
   install -d -m 0700 "$KONF_DIR/db"
   printf '%s' "$pw" > "$KONF_DIR/db/$nama"
   chmod 0600 "$KONF_DIR/db/$nama"
-  wp_config "$nama" "$db" "$pw" "$3" | sbg_pengguna tee "$STAGING_DIR/$2/files/wp-config.php" >/dev/null \
+  tulis_wp_config "$nama" "$db" "$pw" "$3" "$STAGING_DIR/$2/files"
+}
+
+# Ditulis SEBAGAI user dashboard tanpa mengikuti symlink: berkas sementara
+# baru (mktemp: O_EXCL, nama acak, di direktori yang sama) lalu `mv -fT`
+# menggantikan wp-config.php. rename() mengganti symlink itu sendiri, tidak
+# pernah menulis ke tujuannya. Direktori files/ bisa diubah user dashboard,
+# jadi `tee` langsung ke wp-config.php akan mengikuti symlink yang ditanam
+# di sana (putusan I3).
+tulis_wp_config() {
+  local nama="$1" db="$2" pw="$3" prefix="$4" dir="$5" sementara
+  sementara="$(sbg_pengguna mktemp -p "$dir" .wp-config.XXXXXXXXXX)" \
     || galat ditolak "wp-config.php staging tidak dapat ditulis"
+  if wp_config "$nama" "$db" "$pw" "$prefix" | sbg_pengguna tee "$sementara" >/dev/null \
+    && sbg_pengguna mv -fT -- "$sementara" "$dir/wp-config.php"; then
+    return 0
+  fi
+  sbg_pengguna rm -f -- "$sementara" || true
+  galat ditolak "wp-config.php staging tidak dapat ditulis"
 }
 
 cmd_db_hapus() {
@@ -1023,6 +1121,21 @@ cmd_status() {
     "$mem" "$total" "$bebas" "$wadah" "$akses"
 }
 
+# ---- kredensial Mailpit ----------------------------------------------------
+
+# Dashboard membaca API Mailpit (email staging di UI) lewat port terbitan
+# 127.0.0.1; kredensialnya "pengguna:sandi" yang dibuat `siapkan` dan hanya
+# terbaca root, jadi diambil lewat subperintah ini (sudo sudah dipakai untuk
+# semua panggilan pembantu; tidak ada berkas yang dibuka ke user dashboard).
+cmd_mail_kredensial() {
+  local isi
+  [[ -s "$KONF_DIR/mail-auth" && ! -L "$KONF_DIR/mail-auth" ]] \
+    || galat ditolak "kredensial mail belum dibuat; jalankan 'wpmgr-staging siapkan' dulu"
+  isi="$(cat "$KONF_DIR/mail-auth")"
+  [[ "$isi" =~ ^wpmgr:[0-9a-f]{48}$ ]] || galat konfigurasi "kredensial mail rusak"
+  printf '%s\n' "$isi"
+}
+
 # ---- utama ---------------------------------------------------------------
 
 utama() {
@@ -1030,7 +1143,7 @@ utama() {
   [[ $# -gt 0 ]] && shift
   muat_konf
   case "$perintah" in
-    siapkan|router-muat|status)
+    siapkan|router-muat|status|mail-kredensial)
       [[ $# -eq 0 ]] || galat argumen "subperintah ini tidak menerima argumen" ;;
     buat|db-buat)
       [[ $# -eq 3 ]] || galat argumen "jumlah argumen salah" ;;
@@ -1062,6 +1175,7 @@ utama() {
     router-muat) cmd_router_muat ;;
     sertifikat) cmd_sertifikat "$@" ;;
     status) cmd_status ;;
+    mail-kredensial) cmd_mail_kredensial ;;
   esac
 }
 

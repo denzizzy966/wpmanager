@@ -45,6 +45,23 @@ ROUTE = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def mailpit_tiruan(monkeypatch):
+    """Mailpit palsu untuk semua test: mencatat permintaan (termasuk Authorization) dan menjawab kosong."""
+    from wpmgr.web import routes_staging
+
+    routes_staging._kredensial_mail.clear()
+    diminta: list[httpx.Request] = []
+
+    def jawab(r):
+        diminta.append(r)
+        return httpx.Response(200, json={"messages": []}) if r.method == "GET" else httpx.Response(200, text="ok")
+
+    monkeypatch.setattr(umum, "buat_http", lambda: httpx.Client(transport=httpx.MockTransport(jawab)))
+    yield diminta
+    routes_staging._kredensial_mail.clear()
+
+
 @pytest.fixture
 def pb(staging_aktif, monkeypatch):
     palsu = PembantuPalsu(staging_aktif)
@@ -233,7 +250,7 @@ def test_hapus_mempertahankan_snapshot(klien_web, sesi, siap, staging_aktif, pb)
     (staging_aktif / "router" / "contoh-test.rahasia").write_bytes(b"e" * 64)
     r = klien_web.delete(f"/api/sites/{siap.site_id}/staging")
     assert r.status_code == 200
-    assert [p[0] for p in pb.panggilan] == ["hapus", "db_hapus", "router_muat"]
+    assert [p[0] for p in pb.panggilan] == ["hapus", "db_hapus", "router_muat", "mail_kredensial"]
     assert not (akar / "files").exists() and not (akar / "indeks.jsonl").exists()
     assert (akar / "snapshot" / "j1").exists()
     assert not (staging_aktif / "router" / "contoh-test.rahasia").exists()
@@ -510,7 +527,7 @@ def test_uji_banyak_dibatasi_jumlah_item_dan_site(klien_web, sesi, siap, pb):
     assert _jumlah_job(sesi) == 0
 
 
-def test_email_mailpit_disaring_per_staging(klien_web, siap, monkeypatch):
+def test_email_mailpit_disaring_per_staging(klien_web, siap, pb, monkeypatch):
     diminta = []
 
     def mailpit(r):
@@ -544,7 +561,49 @@ def test_email_mailpit_disaring_per_staging(klien_web, siap, monkeypatch):
     assert klien_web.get(f"/api/sites/{siap.site_id}/staging/email/..%2Fx").status_code == 404
 
 
-def test_email_mailpit_dibatasi_ukurannya(klien_web, siap, monkeypatch):
+def test_email_mailpit_memakai_basic_auth_dari_pembantu(klien_web, siap, pb, mailpit_tiruan):
+    import base64
+
+    assert klien_web.get(f"/api/sites/{siap.site_id}/staging/email").status_code == 200
+    assert klien_web.get(f"/api/sites/{siap.site_id}/staging/email").status_code == 200
+    assert base64.b64decode(mailpit_tiruan[0].headers["authorization"].split()[1]) == b"wpmgr:" + b"a" * 48
+    # Kredensial dibaca sekali dari pembantu lalu disimpan di memori proses.
+    assert pb.nama_panggilan().count("mail_kredensial") == 1
+
+
+def test_email_mailpit_kredensial_pembantu_gagal_502(klien_web, siap, pb):
+    pb.gagal["mail_kredensial"] = GalatPembantu("ditolak", "x")
+    r = klien_web.get(f"/api/sites/{siap.site_id}/staging/email")
+    assert r.status_code == 502 and r.json()["detail"] == "Kotak email staging tidak dapat dibaca."
+
+
+def test_email_mailpit_401_membuang_kredensial_tersimpan(klien_web, siap, pb, monkeypatch):
+    from wpmgr.web import routes_staging
+
+    monkeypatch.setattr(umum, "buat_http", lambda: httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(401))))
+    assert klien_web.get(f"/api/sites/{siap.site_id}/staging/email").status_code == 502
+    assert routes_staging._kredensial_mail == {}
+
+
+def test_hapus_staging_membuang_email_bertag_di_mailpit(klien_web, siap, pb, mailpit_tiruan):
+    assert klien_web.delete(f"/api/sites/{siap.site_id}/staging").status_code == 200
+    hapus = [r for r in mailpit_tiruan if r.method == "DELETE"]
+    assert len(hapus) == 1
+    assert hapus[0].url.path == "/api/v1/search" and hapus[0].url.params["query"] == 'tag:"contoh-test"'
+    assert hapus[0].headers["authorization"].startswith("Basic ")
+
+
+def test_hapus_staging_tetap_berhasil_bila_mailpit_mati(klien_web, sesi, siap, pb, monkeypatch):
+    def mati(r):
+        raise httpx.ConnectError("mati")
+
+    monkeypatch.setattr(umum, "buat_http", lambda: httpx.Client(transport=httpx.MockTransport(mati)))
+    assert klien_web.delete(f"/api/sites/{siap.site_id}/staging").status_code == 200
+    assert sesi.query(Staging).filter(Staging.site_id == siap.site_id).count() == 0
+
+
+def test_email_mailpit_dibatasi_ukurannya(klien_web, siap, pb, monkeypatch):
     besar = {"messages": [{"ID": "a1", "Tags": ["contoh-test"], "Snippet": "x" * 5000}]}
     monkeypatch.setattr("wpmgr.web.routes_staging.BATAS_EMAIL_BYTE", 1000)
     monkeypatch.setattr(umum, "buat_http", lambda: httpx.Client(transport=httpx.MockTransport(
@@ -553,7 +612,7 @@ def test_email_mailpit_dibatasi_ukurannya(klien_web, siap, monkeypatch):
     assert r.status_code == 502 and "terlalu besar" in r.json()["detail"]
 
 
-def test_email_mailpit_punya_tenggat_total(klien_web, siap, monkeypatch):
+def test_email_mailpit_punya_tenggat_total(klien_web, siap, pb, monkeypatch):
     lepas = threading.Event()
 
     def lambat(r):
@@ -645,7 +704,7 @@ def test_hapus_site_menghapus_staging_dulu(klien_web, sesi, siap, staging_aktif,
     (staging_aktif / "router" / "contoh-test.htpasswd").write_bytes(b"x")
     r = klien_web.delete(f"/api/sites/{siap.site_id}")
     assert r.status_code == 200
-    assert pb.nama_panggilan() == ["hapus", "db_hapus", "router_muat"]
+    assert pb.nama_panggilan() == ["hapus", "db_hapus", "router_muat", "mail_kredensial"]
     assert not (staging_aktif / "router" / "contoh-test.htpasswd").exists()
     sesi.expire_all()
     assert sesi.query(Site).count() == 0

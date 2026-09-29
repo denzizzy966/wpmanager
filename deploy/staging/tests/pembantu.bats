@@ -359,7 +359,10 @@ tulis_mounts() {
   grep -qF "define( 'WPMGR_DISABLE_MONITORING', true );" "$cfg"
   grep -qF "define( 'DISABLE_WP_CRON', true );" "$cfg"
   grep -qF "'/wpmgr-log/php-error.log'" "$cfg"
-  grep -qF "[--reuid=1000][--regid=1000][--clear-groups][--][tee][$cfg]" "$PALSU/setpriv.log"
+  # Ditulis lewat berkas sementara baru lalu mv -fT (putusan I3), semuanya sebagai user dashboard.
+  grep -q "^\[--reuid=1000\]\[--regid=1000\]\[--clear-groups\]\[--\]\[tee\]\[$S/staging/$ID/files/.wp-config.[A-Za-z0-9]*\]$" "$PALSU/setpriv.log"
+  grep -q "^\[--reuid=1000\]\[--regid=1000\]\[--clear-groups\]\[--\]\[mv\]\[-fT\]\[--\]\[$S/staging/$ID/files/.wp-config.[A-Za-z0-9]*\]\[$cfg\]$" "$PALSU/setpriv.log"
+  [ -z "$(ls -A "$S/staging/$ID/files" | grep '^\.wp-config\.' || true)" ]
   sql="$(cat "$PALSU"/stdin-2)"
   [[ "$sql" == *"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, LOCK TABLES, CREATE TEMPORARY TABLES, REFERENCES, CREATE VIEW, SHOW VIEW ON \`stg_toko_a\`.*"* ]]
   [[ "$sql" != *"GRANT ALL"* ]]
@@ -643,6 +646,25 @@ tulis_mounts() {
   grep -qxF "[network][create][--driver][bridge][--subnet][172.31.250.0/24][--opt][com.docker.network.bridge.name=br-wpmgrstg][--label][wpmgr.staging=layanan:jaringan][wpmgr-staging]" "$PALSU/docker.log"
   grep -qxF "[-I][INPUT][-i][br-wpmgrstg][-j][DROP]" "$PALSU/iptables.log"
   grep -qxF "[-I][DOCKER-USER][-i][br-wpmgrstg][!][-o][br-wpmgrstg][-d][172.16.0.0/12][-j][DROP]" "$PALSU/iptables.log"
+  # Isolasi antar-container (R25): rantai sendiri, alamat tetap di puncak subnet.
+  iptables_urut='[-A][WPMGR-STG-ANTAR][-m][conntrack][--ctstate][ESTABLISHED,RELATED][-j][ACCEPT]
+[-A][WPMGR-STG-ANTAR][-s][172.31.250.254][-p][tcp][--dport][80][-j][ACCEPT]
+[-A][WPMGR-STG-ANTAR][-d][172.31.250.252][-p][tcp][--dport][3306][-j][ACCEPT]
+[-A][WPMGR-STG-ANTAR][-d][172.31.250.253][-p][tcp][--dport][1025][-j][ACCEPT]
+[-A][WPMGR-STG-ANTAR][-j][DROP]'
+  [ "$(grep '^\[-A\]' "$PALSU/iptables.log")" = "$iptables_urut" ]
+  grep -qxF "[-I][DOCKER-USER][-i][br-wpmgrstg][-o][br-wpmgrstg][-j][WPMGR-STG-ANTAR]" "$PALSU/iptables.log"
+  # Rantai terisi penuh SEBELUM lompatan dipasang.
+  [ "$(grep -n '^\[-I\]\[DOCKER-USER\]\[-i\]\[br-wpmgrstg\]\[-o\]' "$PALSU/iptables.log" | cut -d: -f1)" -gt "$(grep -n '^\[-A\]\[WPMGR-STG-ANTAR\]\[-j\]\[DROP\]' "$PALSU/iptables.log" | cut -d: -f1)" ]
+  # Alamat tetap untuk db, mail, dan router.
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-db\].*\[--network\]\[wpmgr-staging\]\[--ip\]\[172.31.250.252\]' "$PALSU/docker.log"
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-mail\].*\[--network\]\[wpmgr-staging\]\[--ip\]\[172.31.250.253\]' "$PALSU/docker.log"
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-router\].*\[--network\]\[wpmgr-staging\]\[--ip\]\[172.31.250.254\]' "$PALSU/docker.log"
+  # Mailpit dikunci kata sandi; kredensial tidak muncul di argumen docker.
+  [[ "$(cat "$S/etc/mail-auth")" =~ ^wpmgr:[0-9a-f]{48}$ ]]
+  [ "$(stat -c %a "$S/etc/mail-auth")" = 600 ]
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-mail\].*\[--env-file\]\[[^]]*\]' "$PALSU/docker.log"
+  ! grep -q 'MP_UI_AUTH\|wpmgr:[0-9a-f]\{48\}' "$PALSU/docker.log" || false
   [[ "$(cat "$S/etc/db-root")" =~ ^[0-9a-f]{64}$ ]]
   grep -q '^wpcli=[0-9a-f]\{128\}$' "$S/etc/digest.lock"
   grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-router\]' "$PALSU/docker.log"
@@ -830,4 +852,100 @@ CP
   [ "$(cat "$S/etc/router/conf.d/stg-lama.conf")" = "lama" ]
   [ "$(cat "$S/etc/router/htpasswd/lama")" = "staging:lama" ]
   [ ! -e "$S/etc/router/conf.d/stg-toko.conf" ]
+}
+
+# ---- isolasi jaringan (putusan R25) ---------------------------------------------
+
+@test "siapkan memasang lompatan ke rantai isolasi dengan -C sebelum -I dan mengosongkan rantai dulu" {
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\nmailpit=p@sha256:%s\n' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+  # iptables tiruan: -C selalu "belum ada", jadi -I harus mengikuti -C.
+  c="$(grep -n '^\[-C\]\[DOCKER-USER\]\[-i\]\[br-wpmgrstg\]\[-o\]\[br-wpmgrstg\]\[-j\]\[WPMGR-STG-ANTAR\]$' "$PALSU/iptables.log" | cut -d: -f1)"
+  i="$(grep -n '^\[-I\]\[DOCKER-USER\]\[-i\]\[br-wpmgrstg\]\[-o\]\[br-wpmgrstg\]\[-j\]\[WPMGR-STG-ANTAR\]$' "$PALSU/iptables.log" | cut -d: -f1)"
+  [ "$c" -lt "$i" ]
+  f="$(grep -n '^\[-F\]\[WPMGR-STG-ANTAR\]$' "$PALSU/iptables.log" | cut -d: -f1)"
+  a="$(grep -n '^\[-A\]\[WPMGR-STG-ANTAR\]' "$PALSU/iptables.log" | head -1 | cut -d: -f1)"
+  [ "$f" -lt "$a" ]
+}
+
+@test "siapkan membuat ulang layanan lama tanpa alamat tetap dan hanya menjalankan ulang yang sudah sesuai" {
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\nmailpit=p@sha256:%s\n' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+  printf 'wpmgr:%s' "$(printf 'c%.0s' $(seq 1 48))" > "$S/etc/mail-auth"
+  # db: milik staging, tanpa alamat tetap (container lama) -> dibuat ulang.
+  printf 'layanan:db' > "$PALSU/wadah/wpmgr-stg-db"
+  # router: alamat tetap sudah benar -> hanya dijalankan ulang.
+  printf 'layanan:router' > "$PALSU/wadah/wpmgr-stg-router"
+  printf '172.31.250.254' > "$PALSU/wadah/wpmgr-stg-router.ip"
+  # mail: alamat benar tetapi tanpa auth -> dibuat ulang.
+  printf 'layanan:mail' > "$PALSU/wadah/wpmgr-stg-mail"
+  printf '172.31.250.253' > "$PALSU/wadah/wpmgr-stg-mail.ip"
+  printf 'PATH=/x\n' > "$PALSU/wadah/wpmgr-stg-mail.env"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+  grep -qxF "[rm][-f][wpmgr-stg-db]" "$PALSU/docker.log"
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-db\].*\[--ip\]\[172.31.250.252\]' "$PALSU/docker.log"
+  grep -qxF "[rm][-f][wpmgr-stg-mail]" "$PALSU/docker.log"
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-mail\].*\[--ip\]\[172.31.250.253\]' "$PALSU/docker.log"
+  grep -qxF "[start][wpmgr-stg-router]" "$PALSU/docker.log"
+  ! grep -qxF "[rm][-f][wpmgr-stg-router]" "$PALSU/docker.log" || false
+  ! grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-stg-router\]' "$PALSU/docker.log" || false
+
+  # Kedua kali: semuanya sudah sesuai (alamat tetap + env auth) -> hanya start.
+  : > "$PALSU/docker.log"
+  printf '172.31.250.252' > "$PALSU/wadah/wpmgr-stg-db.ip"
+  printf 'PATH=/x\nMP_UI_AUTH=%s\n' "$(cat "$S/etc/mail-auth")" > "$PALSU/wadah/wpmgr-stg-mail.env"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+  ! grep -q '^\[rm\]\|^\[run\]' "$PALSU/docker.log" || false
+  grep -qxF "[start][wpmgr-stg-mail]" "$PALSU/docker.log"
+}
+
+@test "alamat tetap layanan mengikuti SUBNET dan SUBNET yang tidak sah ditolak" {
+  sed -i 's#^SUBNET=.*#SUBNET=10.99.4.0/22#' "$WPMGR_STG_KONF"
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\nmailpit=p@sha256:%s\n' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+  grep -qxF "[-A][WPMGR-STG-ANTAR][-s][10.99.7.254][-p][tcp][--dport][80][-j][ACCEPT]" "$PALSU/iptables.log"
+  grep -qxF "[-A][WPMGR-STG-ANTAR][-d][10.99.7.252][-p][tcp][--dport][3306][-j][ACCEPT]" "$PALSU/iptables.log"
+  for salah in 10.99.4.0/8 10.99.4.0/30 300.1.1.0/24; do
+    sed -i "s#^SUBNET=.*#SUBNET=$salah#" "$WPMGR_STG_KONF"
+    run "$SKRIP" status
+    [ "$status" -eq 7 ]
+  done
+}
+
+@test "mail-kredensial hanya mencetak kredensial yang dibuat siapkan" {
+  run "$SKRIP" mail-kredensial
+  [ "$status" -eq 3 ]
+  printf 'wpmgr:%s' "$(printf 'd%.0s' $(seq 1 48))" > "$S/etc/mail-auth"
+  run "$SKRIP" mail-kredensial
+  [ "$status" -eq 0 ]
+  [ "$output" = "wpmgr:$(printf 'd%.0s' $(seq 1 48))" ]
+  printf 'sembarang; rm -rf /' > "$S/etc/mail-auth"
+  run "$SKRIP" mail-kredensial
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"kredensial mail rusak"* && "$output" != *sembarang* ]]
+  run "$SKRIP" mail-kredensial ekstra
+  [ "$status" -eq 2 ]
+}
+
+# ---- wp-config tidak mengikuti symlink (putusan I3) --------------------------------
+
+@test "db-buat tidak menulis lewat symlink wp-config.php yang ditanam di files/" {
+  printf 'layanan:db' > "$PALSU/wadah/wpmgr-stg-db"
+  mkdir -p "$S/staging/$ID/files"
+  printf 'JANGAN-DISENTUH' > "$S/target-luar"
+  ln -s "$S/target-luar" "$S/staging/$ID/files/wp-config.php"
+  run "$SKRIP" db-buat toko "$ID" wp_
+  [ "$status" -eq 0 ]
+  [ "$(cat "$S/target-luar")" = "JANGAN-DISENTUH" ]
+  [ ! -L "$S/staging/$ID/files/wp-config.php" ]
+  grep -qF "define( 'DB_NAME', 'stg_toko' );" "$S/staging/$ID/files/wp-config.php"
 }

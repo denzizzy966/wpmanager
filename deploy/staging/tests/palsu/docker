@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # docker tiruan untuk test skrip pembantu: mencatat panggilan dan menjawab
-# dari berkas di $PALSU (wadah/<nama> = label, wadah/<nama>.image = image).
+# dari berkas di $PALSU (wadah/<nama> = label, wadah/<nama>.image = image,
+# .ip = alamat tetap di jaringan staging, .env = baris variabel lingkungan).
 printf '[%s]' "$@" >> "$PALSU/docker.log"
 printf '\n' >> "$PALSU/docker.log"
 case "${1-}" in
@@ -21,6 +22,8 @@ case "${1-}" in
       exit 1
     fi
     case "$format" in
+      *IPAMConfig*) cat "$PALSU/wadah/$nama.ip" 2>/dev/null || true ;;
+      *Config.Env*) cat "$PALSU/wadah/$nama.env" 2>/dev/null || true ;;
       *Labels*) cat "$PALSU/wadah/$nama" ;;
       *Mounts*) cat "$PALSU/wadah/$nama.mounts" 2>/dev/null || true ;;
       *User*) cat "$PALSU/wadah/$nama.user" 2>/dev/null || true ;;

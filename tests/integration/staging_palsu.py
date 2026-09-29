@@ -519,6 +519,10 @@ class PembantuPalsu:
     def router_muat(self):
         self._catat("router_muat")
 
+    def mail_kredensial(self):
+        self._catat("mail_kredensial")
+        return "wpmgr", "a" * 48
+
     def sertifikat(self, nama):
         self._catat("sertifikat", nama)
 

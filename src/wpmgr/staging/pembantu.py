@@ -65,10 +65,12 @@ AKSI = {
     "router-muat": "Memuat ulang router staging",
     "sertifikat": "Menerbitkan sertifikat staging",
     "status": "Membaca status server staging",
+    "mail-kredensial": "Membaca kredensial kotak email staging",
 }
 _POLA_PREFIX = re.compile(r"[A-Za-z0-9_]{1,20}")
 _POLA_HASH = re.compile(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
 _POLA_RAHASIA = re.compile(r"[0-9a-f]{64}")
+_POLA_KREDENSIAL_MAIL = re.compile(r"wpmgr:[0-9a-f]{48}")
 
 # Keluaran wp-cli dikendalikan kode salinan site yang bisa saja disusupi:
 # stdout dan stderr ditampung di memori sampai batas ini saja, tidak pernah ke
@@ -436,6 +438,14 @@ class Pembantu:
 
     def status(self) -> StatusPembantu:
         return urai_status(self.jalankan("status"))
+
+    def mail_kredensial(self) -> tuple[str, str]:
+        """(pengguna, sandi) Basic Auth Mailpit yang dibuat `siapkan` (putusan R25)."""
+        teks = self.jalankan("mail-kredensial").strip()
+        if not _POLA_KREDENSIAL_MAIL.fullmatch(teks):
+            raise GalatPembantu("lain", PESAN_TIDAK_TUNTAS)
+        pengguna, _, sandi = teks.partition(":")
+        return pengguna, sandi
 
 
 def sandi_baru() -> str:

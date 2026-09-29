@@ -14,6 +14,7 @@ harus dituntaskan begitu site diaktifkan lagi. Route menolaknya dengan
 pesan yang menyebut sebabnya.
 """
 
+import base64
 import json
 import logging
 import re
@@ -471,6 +472,7 @@ def _bongkar_staging(pb, st: Staging) -> None:
     pb.db_hapus(st.nama)
     hapus_akses_router(get_settings().jalur_staging, st.nama)
     pb.router_muat()
+    hapus_email_staging(st.nama, pb)
 
 
 @router.delete("/api/sites/{site_id}/staging")
@@ -910,13 +912,30 @@ def _teks(nilai, panjang: int) -> str | None:
     return bersih_teks(nilai, panjang) if isinstance(nilai, str) else None
 
 
-def _mailpit(path: str, params: dict | None = None) -> dict:
+# Kredensial Basic Auth Mailpit (R25) diambil dari skrip pembantu (berkasnya
+# hanya terbaca root) dan disimpan di memori proses; 401 membuangnya supaya
+# kredensial yang diputar ulang `siapkan` terbaca lagi pada permintaan berikut.
+_kredensial_mail: dict[str, str] = {}
+
+
+def _header_mail(pb=None) -> dict:
+    if not _kredensial_mail:
+        try:
+            pengguna, sandi = (pb or umum.buat_pembantu()).mail_kredensial()
+        except GalatPembantu:
+            raise HTTPException(status_code=502, detail=PESAN_EMAIL_GAGAL) from None
+        _kredensial_mail.update(pengguna=pengguna, sandi=sandi)
+    token = base64.b64encode(f"{_kredensial_mail['pengguna']}:{_kredensial_mail['sandi']}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def _minta_mailpit(metode: str, path: str, params: dict | None = None, pb=None) -> tuple[int, bytes]:
     url = get_settings().staging_mailpit_url + path + ("?" + urlencode(params) if params else "")
     http = umum.buat_http()
     try:
         status, _, isi = minta_bertenggat(
-            http, "GET", url, headers={"Accept": "application/json", "Accept-Encoding": "identity",
-                                       "Connection": "close"},
+            http, metode, url, headers={"Accept": "application/json", "Accept-Encoding": "identity",
+                                        "Connection": "close", **_header_mail(pb)},
             timeout=TIMEOUT_EMAIL, tenggat=TENGGAT_EMAIL, batas_byte=BATAS_EMAIL_BYTE)
     except MelebihiBatas:
         raise HTTPException(status_code=502, detail="Balasan kotak email staging terlalu besar.") from None
@@ -924,6 +943,28 @@ def _mailpit(path: str, params: dict | None = None) -> dict:
         raise HTTPException(status_code=502, detail=PESAN_EMAIL_GAGAL) from None
     finally:
         http.close()
+    if status == 401:
+        _kredensial_mail.clear()
+    return status, isi
+
+
+def hapus_email_staging(nama: str, pb=None) -> None:
+    """Buang email milik satu staging dari Mailpit bersama (putusan minor 8).
+
+    Nama staging bisa dipakai ulang; tanpa ini staging baru bernama sama
+    melihat email lama. Upaya terbaik: kegagalan hanya dicatat, tidak
+    menggagalkan penghapusan staging.
+    """
+    try:
+        status, _ = _minta_mailpit("DELETE", "/api/v1/search", {"query": f'tag:"{nama}"'}, pb)
+        if status != 200:
+            log.warning("Email staging %s tidak dapat dibuang dari Mailpit (status %s)", nama, status)
+    except HTTPException as exc:
+        log.warning("Email staging %s tidak dapat dibuang dari Mailpit: %s", nama, exc.detail)
+
+
+def _mailpit(path: str, params: dict | None = None) -> dict:
+    status, isi = _minta_mailpit("GET", path, params)
     if status == 404:
         raise HTTPException(status_code=404, detail=PESAN_EMAIL_HILANG)
     try:

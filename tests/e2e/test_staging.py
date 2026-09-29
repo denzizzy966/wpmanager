@@ -104,11 +104,31 @@ def _akar_daemon() -> str:
     return sumber
 
 
+PENANDA_AKAR = ".wpmgr-e2e-akar"
+
+
+def _hapus_akar_e2e() -> None:
+    """Hapus AKAR_E2E hanya bila jelas milik e2e ini (putusan minor 5).
+
+    `WPMGR_E2E_STG_AKAR` yang salah arah (mis. ke direktori kerja) tidak boleh
+    dihapus: akar harus berawalan `wpmgr-e2e`, atau sudah berpenanda (dibuat
+    fixture ini), atau akar bawaan (`var/e2e-stg` di repo), atau belum ada / kosong.
+    """
+    akar = AKAR_E2E.resolve()
+    milik_e2e = (akar.name.startswith("wpmgr-e2e") or (akar / PENANDA_AKAR).is_file()
+                 or akar == (AKAR_REPO / "var" / "e2e-stg").resolve())
+    if akar.exists() and any(akar.iterdir()) and not milik_e2e:
+        pytest.fail(f"WPMGR_E2E_STG_AKAR ({akar}) bukan direktori e2e (nama harus berawalan 'wpmgr-e2e' "
+                    f"atau berisi {PENANDA_AKAR}); tidak dihapus.")
+    shutil.rmtree(akar, ignore_errors=True)
+
+
 @pytest.fixture(scope="module")
 def runtime_staging():
     _bersihkan_runtime()
-    shutil.rmtree(AKAR_E2E, ignore_errors=True)
+    _hapus_akar_e2e()
     (AKAR_E2E / "staging").mkdir(parents=True)
+    (AKAR_E2E / PENANDA_AKAR).write_bytes(b"")
     subprocess.run(["docker", "compose", "--profile", "staging", "up", "-d", "--build", "pembantu"],
                    check=True, capture_output=True, timeout=600)
     konf = "\n".join([
@@ -277,7 +297,14 @@ def test_alur_staging_lengkap(sesi, site_terpasang, runtime_staging):
     # Cookie secure_link membuka preview tanpa kata sandi (probe dan SSO).
     kue = "; ".join(f"{a}={b}" for a, b in cookie_akses(RAHASIA, HOST, int(time.time())).items())
     assert _halaman(headers={"Cookie": kue}).status_code == 200
-    token = buat_token(dekripsi_secret(site.secret_terenkripsi), str(site.id))
+    # R25: token SSO memakai secret milik staging, yang juga tertanam di database salinan
+    # (menggantikan wpmgr_secret produksi).
+    rahasia_stg = dekripsi_secret(st.secret_connector_terenkripsi)
+    assert rahasia_stg != dekripsi_secret(site.secret_terenkripsi)
+    di_db = _docker("exec", "-e", f"MYSQL_PWD={sandi_root}", "wpmgr-stg-db", "mariadb", "-uroot", "-N", "-e",
+                    f"SELECT option_value FROM stg_{NAMA.replace('-', '_')}.wp_options WHERE option_name='wpmgr_secret'")
+    assert di_db == rahasia_stg
+    token = buat_token(rahasia_stg, str(site.id))
     masuk = _halaman(tautan_masuk(RAHASIA, HOST, token, int(time.time())), follow_redirects=False)
     assert masuk.status_code == 302 and masuk.headers["location"].startswith("/?wpmgr_sso=")
     assert "wpmgr_stg_m=" in masuk.headers.get("set-cookie", "")
@@ -288,8 +315,11 @@ def test_alur_staging_lengkap(sesi, site_terpasang, runtime_staging):
     # Email dari staging tertangkap Mailpit dengan tag nama staging.
     httpx.post(f"{ROUTER}/wp-login.php?action=lostpassword", headers={"Host": HOST},
                auth=("staging", SANDI), data={"user_login": "admin", "redirect_to": ""}, timeout=30)
+    # R25: API Mailpit dikunci; tanpa kredensial dari pembantu ditolak.
+    assert httpx.get(f"{MAILPIT}/api/v1/messages", timeout=10).status_code == 401
+    kredensial_mail = Pembantu.dari_setelan().mail_kredensial()
     assert tunggu_hingga(lambda: httpx.get(f"{MAILPIT}/api/v1/search", params={"query": f'tag:"{NAMA}"'},
-                                           timeout=10).json().get("messages"), 30)
+                                           auth=kredensial_mail, timeout=10).json().get("messages"), 30)
 
     # --- 2. Segarkan inkremental ----------------------------------------
     tulis_di_kontainer("/var/www/html/wp-content/uploads/e2e-baru.txt", "baru dari produksi")

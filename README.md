@@ -536,8 +536,9 @@ Catatan:
   `NGINX_GROUP`, tidak cuma nginx. Di Ubuntu baku itu termasuk pool php-fpm site lain, kalau
   semuanya juga dijalankan sebagai `www-data` (pola umum di shared hosting) — proses itu ikut bisa
   membaca `privkey.pem` staging manapun. Dampaknya terbatas pada bisa MENYAMAR sebagai host staging
-  itu lewat TLS (mis. terminasi TLS palsu di tempat lain); staging tidak menyimpan rahasia produksi
-  apa pun, dan kunci ini bukan kunci SSH/kredensial database. Skrip pembantu menolak start
+  itu lewat TLS (mis. terminasi TLS palsu di tempat lain); kunci ini bukan kunci SSH/kredensial
+  database (perlu diingat: salinan staging sendiri memuat data produksi, lihat catatan "Isi salinan
+  staging" di bawah). Skrip pembantu menolak start
   (`GALAT konfigurasi`) bila `NGINX_GROUP` adalah grup `root`, grup utama pengguna dashboard, atau
   salah satu grup tambahan pengguna dashboard — tapi **`wpmgr` sendiri tidak boleh pernah dijadikan
   anggota `NGINX_GROUP`** lewat cara lain (mis. `usermod -aG www-data wpmgr`): pengecekan itu hanya
@@ -569,6 +570,27 @@ Catatan:
 - **Kata sandi preview** ditampilkan sekali saat staging dibuat atau kata sandinya dibuat ulang
   (pengguna `staging`). Tombol **Masuk admin staging** melewati Basic Auth dengan tautan bertanda
   tangan yang berlaku 12 jam.
+- **Isi salinan staging = salinan penuh produksi.** Database staging memuat semua data produksi,
+  termasuk kredensial pihak ketiga yang disimpan di database (kunci API payment/email/SMTP,
+  token integrasi, hash kata sandi pengguna, dan sebagainya), dan kode PHP-nya (plugin/tema) berjalan
+  di container yang bisa dimodifikasi siapa pun yang mengambil alih staging itu. Karena itu
+  staging TIDAK dianggap tempat yang aman untuk rahasia, dan isolasinya ditegakkan berlapis:
+  (a) setiap tarik mengganti `wpmgr_secret` connector di database salinan dengan secret acak milik
+  staging itu sendiri (disimpan terenkripsi di dashboard, dipakai SSO staging), sehingga salinan
+  tidak pernah memegang kunci yang berlaku di produksi dan token produksi tidak berlaku di staging;
+  dorong tidak pernah menyalin secret staging ke produksi (opsi `wpmgr_*` produksi dipertahankan);
+  (b) `wpmgr-staging siapkan` membatasi lalu lintas antar-container di jembatan `br-wpmgrstg` lewat
+  rantai iptables `WPMGR-STG-ANTAR` (dipanggil dari `DOCKER-USER`): hanya balasan koneksi,
+  router -> container tcp/80, container -> db tcp/3306, dan container -> mail tcp/1025 yang lolos,
+  sisanya dibuang, jadi satu staging tidak bisa menjangkau staging lain atau API Mailpit; db, mail,
+  dan router memakai alamat tetap di puncak `SUBNET` (container lama tanpa alamat tetap dibuat ulang
+  oleh `siapkan`, jadi jalankan `wpmgr-staging siapkan` lagi sesudah memperbarui skrip); dan
+  (c) UI/API Mailpit dikunci Basic Auth dengan kredensial buatan `siapkan`
+  (`/etc/wpmgr-staging/mail-auth`, hanya terbaca root, diambil dashboard lewat
+  `wpmgr-staging mail-kredensial`). Isolasi ini membatasi dampak satu staging yang disusupi
+  terhadap staging lain dan terhadap kunci produksi; ia tidak menyembunyikan data produksi dari
+  orang yang memang boleh membuka staging itu. Staging lama (dibuat sebelum perubahan ini) baru
+  memakai secret sendiri setelah disegarkan.
 - **Email dari staging** tidak pernah terkirim: semua dialihkan ke Mailpit dan bisa dibaca di tab
   Staging. Plugin yang mengirim email lewat API HTTP penyedia (bukan SMTP/PHPMailer) tetap mengirim
   sungguhan; spanduk di wp-admin staging mengingatkan hal ini.
@@ -592,7 +614,7 @@ Docker Desktop; dashboard di pytest memanggilnya lewat `WPMGR_STAGING_PEMBANTU_A
 Akar staging adalah bind mount `./var/e2e-stg` (di-`.gitignore`). Bind mount Windows di Docker
 Desktop menyimpan pemilik Unix (`chown` bertahan), jadi cek pemilik skrip tetap berlaku; test hanya
 menyerahkan direktori site ke UID 33 seperti yang terjadi di VPS, setelah lebih dulu membuktikan
-skrip menolak direktori milik root. Router staging di `localhost:8090`, Mailpit di `localhost:8025`.
+skrip menolak direktori milik root. Router staging di `localhost:8090`, Mailpit di `localhost:8025` (Basic Auth; kredensial dari `wpmgr-staging mail-kredensial`).
 
 ```bash
 docker compose up -d wp wpdb wpcli     # plus `db` bila PostgreSQL test belum jalan

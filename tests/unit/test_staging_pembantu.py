@@ -391,3 +391,13 @@ def test_tautan_masuk_sesuai_secure_link_nginx():
     m = base64.urlsafe_b64encode(hashlib.md5(f"{e}{host} {rahasia}".encode()).digest()).decode().rstrip("=")
     assert tautan == f"/__wpmgr_masuk?e={e}&m={m}&sso=abc.def%2B%2F"
     assert cookie_akses(rahasia, host, 1_790_000_000) == {"wpmgr_stg_m": m, "wpmgr_stg_e": str(e)}
+
+
+def test_mail_kredensial_hanya_menerima_bentuk_tetap(monkeypatch):
+    p = Pembantu(["x"])
+    monkeypatch.setattr(p, "jalankan", lambda *a, **k: "wpmgr:" + "ab" * 24 + "\n")
+    assert p.mail_kredensial() == ("wpmgr", "ab" * 24)
+    for salah in ("", "wpmgr:pendek", "root:" + "ab" * 24, "wpmgr:" + "ab" * 24 + "\nx"):
+        monkeypatch.setattr(p, "jalankan", lambda *a, _s=salah, **k: _s)
+        with pytest.raises(GalatPembantu):
+            p.mail_kredensial()
