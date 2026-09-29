@@ -346,11 +346,13 @@ def test_pangkas_mempertahankan_snapshot_dorongan_lama_belum_bersih(sesi, stagin
     akar = staging_aktif
     hidup = _staging(sesi, "hidup")
     lama = buat_job(sesi, hidup.site_id, JobType.staging_dorong,
-                    payload={"kemajuan": {"unggah_mulai": True, "dorong_id": "a" * 32}})
+                    payload={"kemajuan": {"unggah_mulai": True, "dorong_id": "a" * 32,
+                                           "langkah_terapkan": "tukar"}})
     lama.status = JobStatus.failed
     sesi.commit()
     bersih = buat_job(sesi, hidup.site_id, JobType.staging_dorong,
-                      payload={"kemajuan": {"unggah_mulai": True, "produksi_bersih": True}})
+                      payload={"kemajuan": {"unggah_mulai": True, "produksi_bersih": True,
+                                            "langkah_terapkan": "selesai"}})
     bersih.status = JobStatus.failed
     sesi.commit()
     baris = []
