@@ -2,6 +2,8 @@
 printf '[%s]' "$@" >> "$PALSU/certbot.log"
 printf '\n' >> "$PALSU/certbot.log"
 [[ -f "$PALSU/certbot-gagal" ]] && exit 1
+# `delete` (prod-hapus) hanya dicatat; tidak menerbitkan apa pun.
+[[ "${1-}" == delete ]] && exit 0
 konfig="" nama=""
 while [[ $# -gt 0 ]]; do
   case "$1" in

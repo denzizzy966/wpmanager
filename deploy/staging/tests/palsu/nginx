@@ -2,7 +2,8 @@
 # nginx host tiruan untuk prod-domain: -T mencetak $PALSU/nginx-T (konfigurasi
 # lengkap tiruan), -t gagal bila $PALSU/nginx-t-gagal ada dan mencetak isi
 # $PALSU/nginx-t-peringatan ke stderr bila ada (nginx -t tetap keluar 0 pada
-# peringatan "conflicting server name").
+# peringatan "conflicting server name"). Bila $PALSU/nginx-t-tahan ada, -t
+# mencatat pid ke nginx-t-tahan.pid lalu menunggu (test SIGTERM).
 printf '[%s]' "$@" >> "$PALSU/nginx.log"
 printf '\n' >> "$PALSU/nginx.log"
 case "${1-}" in
@@ -14,6 +15,11 @@ case "${1-}" in
     fi
     ;;
   -t)
+    # Uji yang tidak pernah selesai (test SIGTERM): pid dicatat lalu menunggu.
+    if [[ -f "$PALSU/nginx-t-tahan" ]]; then
+      echo "$$" > "$PALSU/nginx-t-tahan.pid"
+      exec sleep 300
+    fi
     if [[ -f "$PALSU/nginx-t-peringatan" ]]; then
       cat "$PALSU/nginx-t-peringatan" >&2
     fi

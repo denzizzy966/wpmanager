@@ -1820,11 +1820,14 @@ siap_aktifkan() {
   aktifkan_hosting
   tulis_state_prod toko pratinjau
   printf 'LAMA' > "$(NGF)"
+  chmod 0644 "$(NGF)"
   touch "$PALSU/nginx-t-gagal"
   run "$SKRIP" prod-domain toko
   [ "$status" -eq 10 ]
   [[ "$output" == *"GALAT nginx"* ]]
   [ "$(cat "$(NGF)")" = "LAMA" ]
+  # Dipulihkan dengan mode aslinya, bukan 0600 dari umask skrip.
+  [ "$(stat -c %a "$(NGF)")" = 644 ]
   [ ! -e "$PALSU/systemctl.log" ]
   [ -z "$(ls -A "$S/nginx-hosting" | grep '^\.' || true)" ]
 }
@@ -1994,13 +1997,95 @@ siap_aktifkan() {
   [ "$(cat "$S/hcerts/$DOM/privkey.pem")" = "kunci-lama" ]
   [ "$(stat -c %a:%u:%g "$S/hcerts/$DOM/privkey.pem")" = "600:0:0" ]
   [ ! -e "$PALSU/systemctl.log" ]
-  # Reload gagal: sertifikat lama dipulihkan lalu nginx dimuat ulang lagi.
+  # Reload gagal: sertifikat lama dipulihkan, nginx diuji ulang, lalu dimuat
+  # ulang lagi (pola hapus_domain).
   rm -f "$PALSU/nginx-t-gagal"
+  : > "$PALSU/nginx.log"
   touch "$PALSU/reload-gagal"
   run "$SKRIP" prod-sertifikat toko
   [ "$status" -eq 10 ]
   [ "$(cat "$S/hcerts/$DOM/fullchain.pem")" = "rantai-lama" ]
+  [ "$(cat "$S/hcerts/$DOM/privkey.pem")" = "kunci-lama" ]
   [ "$(grep -c '^\[reload\]\[nginx\]$' "$PALSU/systemctl.log")" -eq 2 ]
+  [ "$(grep -c '^\[-t\]$' "$PALSU/nginx.log")" -eq 2 ]
+}
+
+# Siapkan situs aktif dengan pasangan sertifikat lama (fullchain 0644,
+# privkey 0600) di PROD_CERT_DIR.
+sert_lama_aktif() {
+  aktifkan_hosting
+  tulis_state_prod toko aktif
+  mkdir -p "$S/hcerts/$DOM"
+  chmod 0700 "$S/hcerts/$DOM"
+  printf 'rantai-lama' > "$S/hcerts/$DOM/fullchain.pem"
+  printf 'kunci-lama' > "$S/hcerts/$DOM/privkey.pem"
+  chmod 0644 "$S/hcerts/$DOM/fullchain.pem"
+  chmod 0600 "$S/hcerts/$DOM/privkey.pem"
+}
+
+sert_masih_lama() {
+  [ "$(cat "$S/hcerts/$DOM/fullchain.pem")" = "rantai-lama" ]
+  [ "$(cat "$S/hcerts/$DOM/privkey.pem")" = "kunci-lama" ]
+  [ "$(stat -c %a:%u:%g "$S/hcerts/$DOM/fullchain.pem")" = "644:0:0" ]
+  [ "$(stat -c %a:%u:%g "$S/hcerts/$DOM/privkey.pem")" = "600:0:0" ]
+  [ -z "$(ls -A "$S/hcerts/$DOM" | grep '^\.' || true)" ]
+}
+
+@test "prod-sertifikat: kegagalan di antara dua rename memulihkan pasangan lama lewat jebakan EXIT (I1)" {
+  sert_lama_aktif
+  # rename fullchain berhasil, rename privkey gagal: tanpa pemulihan situs
+  # aktif tertinggal dengan fullchain baru + privkey lama.
+  printf '/privkey.pem' > "$PALSU/mv-gagal"
+  run "$SKRIP" prod-sertifikat toko
+  [ "$status" -eq 9 ]
+  sert_masih_lama
+  [ ! -e "$PALSU/systemctl.log" ]
+  # Penerbitan pertama yang terpotong tidak meninggalkan setengah pasangan,
+  # dan percobaan berikutnya tetap melaporkan `terbit`.
+  rm -rf "$S/hcerts/$DOM"
+  sed -i 's/^MODE=.*/MODE=pratinjau/' "$S/etc/prod/situs/toko"
+  printf '/privkey.pem' > "$PALSU/mv-gagal"
+  run "$SKRIP" prod-sertifikat toko
+  [ "$status" -eq 9 ]
+  [ ! -e "$S/hcerts/$DOM/fullchain.pem" ]
+  [ ! -e "$S/hcerts/$DOM/privkey.pem" ]
+  run "$SKRIP" prod-sertifikat toko
+  [ "$status" -eq 0 ]
+  [ "$output" = "terbit" ]
+}
+
+@test "prod-sertifikat: install berkas kedua gagal, pasangan lama tidak tersentuh (I1)" {
+  sert_lama_aktif
+  # Cocok dengan install privkey mana pun (langsung ke privkey.pem atau ke
+  # berkas sementaranya): install fullchain sudah berhasil lebih dulu.
+  printf 'privkey.pem' > "$PALSU/install-gagal-pola"
+  run "$SKRIP" prod-sertifikat toko
+  [ "$status" -ne 0 ]
+  sert_masih_lama
+}
+
+@test "prod-sertifikat: SIGTERM saat nginx -t memulihkan pasangan sertifikat lama (I1)" {
+  sert_lama_aktif
+  touch "$PALSU/nginx-t-tahan"
+  "$SKRIP" prod-sertifikat toko > "$BATS_TEST_TMPDIR/keluar" 2>&1 3>&- &
+  pid=$!
+  for _ in $(seq 1 100); do
+    [[ -s "$PALSU/nginx-t-tahan.pid" ]] && break
+    sleep 0.1
+  done
+  [ -s "$PALSU/nginx-t-tahan.pid" ]
+  # Sertifikat baru sudah terpasang saat nginx -t berjalan.
+  [ "$(cat "$S/hcerts/$DOM/fullchain.pem")" = "rantai" ]
+  mulai=$SECONDS
+  kill -TERM "$pid"
+  rc=0
+  wait "$pid" || rc=$?
+  # Sinyal diteruskan segera, bukan sesudah nginx -t selesai sendiri.
+  (( SECONDS - mulai < 30 ))
+  [ "$rc" -eq 9 ]
+  grep -q '^GALAT internal: dihentikan' "$BATS_TEST_TMPDIR/keluar"
+  sert_masih_lama
+  [ ! -e "$PALSU/systemctl.log" ]
 }
 
 @test "prod-sertifikat SERTIFIKAT_SENDIRI memakai openssl" {
@@ -2097,15 +2182,17 @@ siap_aktifkan() {
   [ "$(sed -n 2p "$PALSU/flock.log")" = '[-w][60][-x][9]' ]
 }
 
-@test "prod-aktifkan: kunci router sibuk keluar 3, kunci nginx sibuk keluar sebelum perubahan" {
+@test "prod-aktifkan: kunci router atau kunci nginx sibuk keluar 3 tanpa perubahan" {
   siap_aktifkan
   touch "$PALSU/flock-gagal"
   run "$SKRIP" prod-aktifkan toko
   [ "$status" -eq 3 ]
   rm -f "$PALSU/flock-gagal"
+  # Putusan L4: belum ada perubahan, jadi kunci nginx yang sibuk juga 3.
   touch "$PALSU/flock-gagal-9"
   run "$SKRIP" prod-aktifkan toko
-  [ "$status" -eq 10 ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"GALAT ditolak"* ]]
   [ "$(cat "$S/hosting/$ID/files/wp-config.php")" = "ASLI" ]
   grep -qxF 'MODE=pratinjau' "$S/etc/prod/situs/toko"
   [ ! -e "$PALSU/nginx.log" ]
@@ -2121,19 +2208,161 @@ siap_aktifkan() {
   [[ "$output" == *"GALAT internal"* ]]
   ! grep -q 'WPMGR_PRATINJAU' "$S/hosting/$ID/files/wp-config.php" || false
   [ "$(cat "$S/hosting/$ID/files/wp-config.php")" != "ASLI" ]
-  grep -qxF 'MODE=pratinjau' "$S/etc/prod/situs/toko"
+  # Putusan L5: MODE=aktif sudah ditulis lebih dulu (pagar satu arah).
+  grep -qxF 'MODE=aktif' "$S/etc/prod/situs/toko"
+  # Percobaan ulang menuntaskan langkah sisanya.
+  wadah_prod wpmgr-prod-router layanan:router
+  run "$SKRIP" prod-aktifkan toko
+  [ "$status" -eq 0 ]
+  grep -qxF "    server_name $DOM www.$DOM;" "$S/etc/prod/router/conf.d/prd-toko.conf"
+  grep -qxF "    ssl_certificate     $S/hcerts/$DOM/fullchain.pem;" "$(NGF)"
 }
 
-@test "prod-aktifkan: nginx gagal di langkah (3) memulihkan berkas pratinjau dan tidak menulis MODE=aktif" {
+@test "prod-aktifkan: nginx gagal di langkah (3) memulihkan berkas pratinjau, percobaan ulang menuntaskan" {
   siap_aktifkan
   printf 'PRATINJAU' > "$(NGF)"
+  chmod 0644 "$(NGF)"
   touch "$PALSU/nginx-t-gagal"
   run "$SKRIP" prod-aktifkan toko
   [ "$status" -eq 10 ]
   [ "$(cat "$(NGF)")" = "PRATINJAU" ]
-  grep -qxF 'MODE=pratinjau' "$S/etc/prod/situs/toko"
+  [ "$(stat -c %a "$(NGF)")" = 644 ]
+  grep -qxF 'MODE=aktif' "$S/etc/prod/situs/toko"
   [ ! -e "$PALSU/systemctl.log" ]
   [ -z "$(ls -A "$S/etc/prod/nginx-cadangan")" ]
+  rm -f "$PALSU/nginx-t-gagal"
+  run "$SKRIP" prod-aktifkan toko
+  [ "$status" -eq 0 ]
+  grep -qxF "    ssl_certificate     $S/hcerts/$DOM/fullchain.pem;" "$(NGF)"
+}
+
+@test "prod-aktifkan: MODE=aktif ditulis sebelum langkah (1); berhenti sesudahnya lalu diulang tuntas (L5)" {
+  siap_aktifkan
+  # Langkah (1) gagal (rename wp-config): state sudah aktif, wp-config lama.
+  printf '/wp-config.php' > "$PALSU/mv-gagal"
+  run "$SKRIP" prod-aktifkan toko
+  [ "$status" -eq 9 ]
+  grep -qxF 'MODE=aktif' "$S/etc/prod/situs/toko"
+  [ "$(cat "$S/hosting/$ID/files/wp-config.php")" = "ASLI" ]
+  [ ! -e "$S/etc/prod/router/conf.d/prd-toko.conf" ]
+  # Situs yang sudah aktif menolak impor/hapus selama aktivasi belum tuntas.
+  run bash -c "printf 'SELECT 1;' | \"\$0\" prod-db-impor toko" "$SKRIP"
+  [ "$status" -eq 3 ]
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 3 ]
+  # Percobaan ulang dengan MODE=aktif menuntaskan langkah (1)-(3).
+  run "$SKRIP" prod-aktifkan toko
+  [ "$status" -eq 0 ]
+  [ "$output" = "aktif" ]
+  grep -qF "define( 'DB_NAME', 'prd_toko' );" "$S/hosting/$ID/files/wp-config.php"
+  ! grep -q 'auth_basic' "$S/etc/prod/router/conf.d/prd-toko.conf" || false
+  grep -qxF "    ssl_certificate     $S/hcerts/$DOM/fullchain.pem;" "$(NGF)"
+}
+
+@test "prod-domain: SIGTERM saat nginx -t memulihkan berkas lama lewat jebakan EXIT" {
+  aktifkan_hosting
+  tulis_state_prod toko pratinjau
+  printf 'LAMA' > "$(NGF)"
+  chmod 0644 "$(NGF)"
+  touch "$PALSU/nginx-t-tahan"
+  "$SKRIP" prod-domain toko > "$BATS_TEST_TMPDIR/keluar" 2>&1 3>&- &
+  pid=$!
+  for _ in $(seq 1 100); do
+    [[ -s "$PALSU/nginx-t-tahan.pid" ]] && break
+    sleep 0.1
+  done
+  [ -s "$PALSU/nginx-t-tahan.pid" ]
+  [ "$(cat "$(NGF)")" != "LAMA" ]
+  mulai=$SECONDS
+  kill -TERM "$pid"
+  rc=0
+  wait "$pid" || rc=$?
+  # Sinyal diteruskan segera, bukan sesudah nginx -t selesai sendiri.
+  (( SECONDS - mulai < 30 ))
+  [ "$rc" -eq 9 ]
+  # Baris GALAT sampai ke stderr asli walau stderr nginx -t sedang dialihkan.
+  [ "$(grep -c '^GALAT internal: dihentikan' "$BATS_TEST_TMPDIR/keluar")" -eq 1 ]
+  [ "$(cat "$(NGF)")" = "LAMA" ]
+  [ "$(stat -c %a "$(NGF)")" = 644 ]
+  [ -z "$(ls -A "$S/nginx-hosting" | grep '^\.' || true)" ]
+  [ ! -e "$PALSU/systemctl.log" ]
+}
+
+@test "prod-domain: pra-cek menolak wildcard induk, wildcard akhir, dan regex yang memuat nama domain" {
+  aktifkan_hosting
+  tulis_state_prod toko pratinjau
+  for nama in "*.co.id" ".co.id" "*.id" "toko.*" "www.toko.co.*" '~^(www\.)?toko\.co\.id$' '~^TOKO\.'; do
+    printf '# configuration file /etc/nginx/sites-enabled/a.conf:\nserver {\n    server_name a.id %s;\n}\n' "$nama" > "$PALSU/nginx-T"
+    run "$SKRIP" prod-domain toko
+    [ "$status" -eq 3 ]
+    [ ! -e "$(NGF)" ]
+  done
+  # Bukan induk dan bukan regex yang memuat nama domain: diterima.
+  printf '# configuration file /etc/nginx/sites-enabled/a.conf:\nserver {\n    server_name *.lain.co.id lain.* ~^lain\\.id$ _;\n}\n' > "$PALSU/nginx-T"
+  run "$SKRIP" prod-domain toko
+  [ "$status" -eq 0 ]
+}
+
+@test "prod-domain: conflicting server name untuk host pratinjau vps-<nama> ditolak" {
+  aktifkan_hosting
+  tulis_state_prod toko pratinjau
+  printf 'nginx: [warn] conflicting server name "vps-toko.staging.contoh.id" on 0.0.0.0:443, ignored\n' > "$PALSU/nginx-t-peringatan"
+  run "$SKRIP" prod-domain toko
+  [ "$status" -eq 10 ]
+  [ ! -e "$(NGF)" ]
+}
+
+@test "direktori milik root yang bisa ditulis grup/pengguna lain ditolak" {
+  siap_aktifkan
+  chmod 0777 "$S/nginx-hosting"
+  run "$SKRIP" prod-domain toko
+  [ "$status" -eq 3 ]
+  [ ! -e "$(NGF)" ]
+  run "$SKRIP" prod-aktifkan toko
+  [ "$status" -eq 3 ]
+  chmod 0755 "$S/nginx-hosting"
+  chmod 0770 "$S/hcerts"
+  run "$SKRIP" prod-sertifikat toko
+  [ "$status" -eq 3 ]
+  run "$SKRIP" prod-aktifkan toko
+  [ "$status" -eq 3 ]
+  chmod 0700 "$S/hcerts"
+  chmod 0757 "$S/etc/prod"
+  run "$SKRIP" prod-domain toko
+  [ "$status" -eq 3 ]
+  run "$SKRIP" prod-aktifkan toko
+  [ "$status" -eq 3 ]
+  [ "$(cat "$S/hosting/$ID/files/wp-config.php")" = "ASLI" ]
+  grep -qxF 'MODE=pratinjau' "$S/etc/prod/situs/toko"
+  [ ! -e "$PALSU/systemctl.log" ]
+}
+
+@test "prod-hapus menghapus sertifikat domain dan lineage certbot-nya (L6)" {
+  siap_aktifkan
+  mkdir -p "$S/le/config/renewal"
+  printf 'x' > "$S/le/config/renewal/$DOM.conf"
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 0 ]
+  [ ! -e "$S/hcerts/$DOM" ]
+  grep -qxF "[delete][--non-interactive][--cert-name][$DOM][--config-dir][$S/le/config][--work-dir][$S/le/work][--logs-dir][$S/le/logs]" "$PALSU/certbot.log"
+}
+
+@test "prod-hapus: certbot delete gagal tetap sukses dengan peringatan; tanpa lineage tidak memanggil certbot (L6)" {
+  siap_aktifkan
+  mkdir -p "$S/le/config/renewal"
+  printf 'x' > "$S/le/config/renewal/$DOM.conf"
+  touch "$PALSU/certbot-gagal"
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PERINGATAN"* ]]
+  [ ! -e "$S/hcerts/$DOM" ]
+  [ ! -e "$S/etc/prod/situs/toko" ]
+  rm -f "$PALSU/certbot-gagal" "$PALSU/certbot.log" "$S/le/config/renewal/$DOM.conf"
+  siap_aktifkan
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 0 ]
+  [ ! -e "$PALSU/certbot.log" ]
+  [ ! -e "$S/hcerts/$DOM" ]
 }
 
 @test "prod-hapus menolak MODE=aktif" {

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# mv tiruan: meneruskan ke mv asli. Gagal SEKALI bila argumen terakhir
+# (tujuan) memuat isi $PALSU/mv-gagal; berkas pemicu lalu dihapus. Dipakai
+# untuk menguji kegagalan di antara dua rename (pasangan sertifikat domain).
+if [[ -n "${PALSU-}" && -s "$PALSU/mv-gagal" ]]; then
+  pola="$(cat "$PALSU/mv-gagal")"
+  if [[ "${*: -1}" == *"$pola"* ]]; then
+    rm -f "$PALSU/mv-gagal"
+    echo "mv: gagal (tiruan)" >&2
+    exit 1
+  fi
+fi
+for asli in /bin/mv /usr/bin/mv; do
+  [[ -x "$asli" ]] && exec "$asli" "$@"
+done
+exit 127
