@@ -54,6 +54,9 @@ class JobType(str, enum.Enum):
     staging_uji_update = "staging_uji_update"
     staging_dorong = "staging_dorong"
     staging_kembalikan = "staging_kembalikan"
+    pindah_tarik = "pindah_tarik"
+    pindah_aktifkan = "pindah_aktifkan"
+    backup_hosting = "backup_hosting"
 
 
 # Job staging diproses worker khusus (Koreksi #1). Tarik dan uji hanya
@@ -64,6 +67,13 @@ JOB_STAGING = frozenset({
     JobType.staging_dorong, JobType.staging_kembalikan,
 })
 JOB_STAGING_BACA = frozenset({JobType.staging_tarik, JobType.staging_uji_update})
+# Lapis 4. Job hosting juga diproses worker staging (spec §5.1): satu kelas
+# "runtime" yang diserialkan per site. pindah_tarik hanya membaca hosting
+# lama, jadi boleh berjalan bersama job non-runtime di site yang sama;
+# pindah_aktifkan dan backup_hosting eksklusif terhadap semuanya.
+JOB_HOSTING = frozenset({JobType.pindah_tarik, JobType.pindah_aktifkan, JobType.backup_hosting})
+JOB_RUNTIME = JOB_STAGING | JOB_HOSTING
+JOB_RUNTIME_BACA = JOB_STAGING_BACA | frozenset({JobType.pindah_tarik})
 
 
 class JobStatus(str, enum.Enum):
@@ -93,6 +103,15 @@ class StatusStaging(str, enum.Enum):
     berjalan_uji = "berjalan_uji"
     mendorong = "mendorong"
     dijeda = "dijeda"
+    gagal = "gagal"
+
+
+class StatusHosting(str, enum.Enum):
+    menyalin = "menyalin"
+    pratinjau = "pratinjau"
+    menunggu_dns = "menunggu_dns"
+    mengaktifkan = "mengaktifkan"
+    aktif = "aktif"
     gagal = "gagal"
 
 
@@ -194,6 +213,14 @@ class Job(Base):
             postgresql_where=text(
                 "tipe IN ('staging_tarik', 'staging_uji_update', 'staging_dorong', "
                 "'staging_kembalikan') AND status IN ('pending', 'running')"
+            ),
+        ),
+        # Lapis 4: paling banyak satu job hosting tertunda/berjalan per site.
+        Index(
+            "uq_jobs_hosting_aktif", "site_id", unique=True,
+            postgresql_where=text(
+                "tipe IN ('pindah_tarik', 'pindah_aktifkan', 'backup_hosting') "
+                "AND status IN ('pending', 'running')"
             ),
         ),
     )
@@ -474,4 +501,71 @@ class StagingUji(Base):
     paket: Mapped[list] = mapped_column(JSONB, nullable=False)
     hasil: Mapped[str] = mapped_column(Text, nullable=False)
     pemeriksaan: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    dibuat_pada: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class HostingVps(Base):
+    """Satu hosting VPS per site (spec Lapis 4 §5.1)."""
+
+    __tablename__ = "hosting_vps"
+    __table_args__ = (
+        CheckConstraint("gagal_asal IS NULL OR gagal_asal IN ('salinan', 'produksi')",
+                        name="ck_hosting_vps_gagal_asal"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    site_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    nama: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    domain: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    dengan_www: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    status: Mapped[StatusHosting] = mapped_column(
+        Enum(StatusHosting, name="status_hosting"), nullable=False,
+        default=StatusHosting.menyalin, server_default="menyalin",
+    )
+    # 'salinan' (salinan VPS setengah jadi; site lama tetap produksi) atau
+    # 'produksi' (sudah dilayani VPS). NULL bila tidak gagal.
+    gagal_asal: Mapped[str | None] = mapped_column(Text)
+    ip_lama: Mapped[str] = mapped_column(Text, nullable=False)
+    sandi_hash: Mapped[str | None] = mapped_column(Text)
+    versi_php: Mapped[str | None] = mapped_column(Text)
+    ukuran_file: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    ukuran_db: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    ditarik_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pratinjau_sertifikat_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dns_dicek_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dns_hasil: Mapped[dict | None] = mapped_column(JSONB)
+    sertifikat_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sertifikat_gagal_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sertifikat_gagal_kali: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Ditulis LEBIH DULU sebelum prod-aktifkan dikirim. Selama terisi, tarik
+    # dan batal pindah ditolak selamanya (batas satu arah, spec §4).
+    dilayani_vps_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    aktif_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    backup_terakhir_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    backup_gagal_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    galat: Mapped[str | None] = mapped_column(Text)
+    batal_diminta_pada: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dibuat_pada: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class HostingBackup(Base):
+    __tablename__ = "hosting_backup"
+    __table_args__ = (
+        Index("ix_hosting_backup_site_dibuat", "site_id", "dibuat_pada"),
+        UniqueConstraint("site_id", "tujuan", "stempel", name="uq_hosting_backup_stempel"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    site_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("jobs.id", ondelete="SET NULL"))
+    tujuan: Mapped[str] = mapped_column(Text, nullable=False)
+    stempel: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    manual: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    ukuran_db: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    ukuran_file: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    sha256_db: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256_file: Mapped[str] = mapped_column(Text, nullable=False)
     dibuat_pada: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -31,6 +31,14 @@ POLA_NAMA = re.compile(r"[a-z0-9-]{1,40}")
 POLA_ID_DORONG = re.compile(r"[0-9a-f]{32}")
 POLA_TABEL = re.compile(r"[A-Za-z0-9_$]{1,64}")
 POLA_SHA256 = re.compile(r"[0-9a-f]{64}")
+# Nama situs produksi: vps-<nama> (host pratinjau) tetap <= 40 karakter.
+POLA_NAMA_PROD = re.compile(r"[a-z0-9-]{1,36}")
+# Sama dengan cek_domain di skrip pembantu (spec §7.3.2): label huruf kecil
+# ASCII, TLD diawali huruf. Huruf besar, titik akhir, dan baris baru ditolak
+# (fullmatch), bukan dinormalkan diam-diam.
+POLA_DOMAIN_HOSTING = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]"
+)
 _POLA_ANGKA = re.compile(r"-?[0-9]{1,20}")
 _POLA_VERSI = re.compile(r"([0-9]{1,2})\.([0-9]{1,2})")
 _KENDALI = re.compile(r"[\x00-\x1f\x7f\\]")
@@ -103,6 +111,34 @@ def nama_dari_url(url: str) -> str:
     nama = re.sub(r"[^a-z0-9-]+", "-", host.replace(".", "-"))
     nama = re.sub(r"-{2,}", "-", nama).strip("-")[:40].strip("-")
     return nama or "situs"
+
+
+def domain_sah(domain, staging_domain: str | None = None) -> bool:
+    """Domain situs yang boleh dipindahkan (spec §7.3.2); cermin `cek_domain` di skrip."""
+    if not isinstance(domain, str) or len(domain) > 253 or not POLA_DOMAIN_HOSTING.fullmatch(domain):
+        return False
+    if domain.startswith("www."):
+        return False
+    return not (staging_domain and (domain == staging_domain or domain.endswith("." + staging_domain)))
+
+
+def host_dari_url(url) -> str | None:
+    """Host URL site dalam huruf kecil ASCII (IDN menjadi punycode), atau None."""
+    try:
+        host = urlsplit(url).hostname if isinstance(url, str) else None
+    except ValueError:
+        return None
+    if not host:
+        return None
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+
+
+def nama_prod_dari_url(url: str) -> str:
+    """Nama situs produksi (spec §5.1): nama staging dipotong 36 karakter."""
+    return nama_dari_url(url)[:36].strip("-") or "situs"
 
 
 def versi_php_staging(versi: str | None) -> tuple[str, bool]:

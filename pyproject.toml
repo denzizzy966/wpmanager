@@ -19,6 +19,7 @@ dependencies = [
     "google-auth>=2.30",
     "requests>=2.32",
     "bcrypt>=4.1",
+    "dnspython>=2.6",
 ]
 
 [project.optional-dependencies]

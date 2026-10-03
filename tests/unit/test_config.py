@@ -120,3 +120,78 @@ def test_angka_staging_dijepit_validasi(monkeypatch, nama, nilai):
     monkeypatch.setenv(nama, nilai)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_setelan_hosting_default_mati(monkeypatch):
+    from pathlib import Path
+
+    _env_wajib(monkeypatch)
+    for nama in ("WPMGR_HOSTING_IPV4", "WPMGR_HOSTING_IPV6", "WPMGR_HOSTING_DIR", "WPMGR_HOSTING_RESOLVER",
+                 "WPMGR_BACKUP_TUJUAN", "WPMGR_BACKUP_HARIAN", "WPMGR_BACKUP_MINGGUAN", "WPMGR_STAGING_DOMAIN"):
+        monkeypatch.delenv(nama, raising=False)
+    s = Settings(_env_file=None)
+    assert s.hosting_ipv4 is None and s.hosting_ipv6 is None
+    assert s.hosting_aktif is False
+    assert s.jalur_hosting == Path("/var/lib/wpmgr/hosting")
+    assert s.daftar_resolver == ["1.1.1.1", "8.8.8.8"]
+    assert (s.backup_tujuan, s.backup_harian, s.backup_mingguan) == ("lokal", 7, 4)
+
+
+def test_setelan_hosting_dari_env(monkeypatch, tmp_path):
+    _env_wajib(monkeypatch)
+    monkeypatch.setenv("WPMGR_STAGING_DOMAIN", "staging.halosocia.my.id")
+    monkeypatch.setenv("WPMGR_STAGING_DIR", str(tmp_path / "stg"))
+    monkeypatch.setenv("WPMGR_HOSTING_IPV4", " 169.58.91.181 ")
+    monkeypatch.setenv("WPMGR_HOSTING_IPV6", "2a02:c207:2347:2607:0:0:0:1")
+    monkeypatch.setenv("WPMGR_HOSTING_DIR", str(tmp_path / "hosting"))
+    monkeypatch.setenv("WPMGR_HOSTING_RESOLVER", "9.9.9.9, 1.0.0.1")
+    s = Settings(_env_file=None)
+    assert s.hosting_ipv4 == "169.58.91.181"
+    assert s.hosting_ipv6 == "2a02:c207:2347:2607::1"
+    assert s.hosting_aktif is True
+    assert s.daftar_resolver == ["9.9.9.9", "1.0.0.1"]
+
+
+def test_hosting_mati_tanpa_domain_staging(monkeypatch):
+    _env_wajib(monkeypatch)
+    monkeypatch.delenv("WPMGR_STAGING_DOMAIN", raising=False)
+    monkeypatch.setenv("WPMGR_HOSTING_IPV4", "169.58.91.181")
+    assert Settings(_env_file=None).hosting_aktif is False
+
+
+@pytest.mark.parametrize("nama,nilai", [
+    ("WPMGR_HOSTING_IPV4", "169.58.91"), ("WPMGR_HOSTING_IPV4", "2a02::1"), ("WPMGR_HOSTING_IPV6", "169.58.91.181"),
+    ("WPMGR_HOSTING_RESOLVER", "1.1.1.1,dns.google"), ("WPMGR_HOSTING_RESOLVER", " , "),
+    ("WPMGR_BACKUP_HARIAN", "0"), ("WPMGR_BACKUP_HARIAN", "61"), ("WPMGR_BACKUP_MINGGUAN", "53"),
+    ("WPMGR_BACKUP_TUJUAN", "S3!"),
+])
+def test_setelan_hosting_tidak_sah_ditolak(monkeypatch, nama, nilai):
+    from pydantic import ValidationError
+
+    _env_wajib(monkeypatch)
+    monkeypatch.setenv(nama, nilai)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("staging,hosting", [
+    ("/var/lib/wpmgr/staging", "/var/lib/wpmgr/staging"),
+    ("/var/lib/wpmgr/staging", "/var/lib/wpmgr/staging/hosting"),
+    ("/var/lib/wpmgr/staging", "/var/lib/wpmgr"),
+    ("/var/lib/wpmgr/staging", "/var/lib/wpmgr/staging/"),
+])
+def test_hosting_dir_berimpit_dengan_staging_dir_ditolak(monkeypatch, staging, hosting):
+    from pydantic import ValidationError
+
+    _env_wajib(monkeypatch)
+    monkeypatch.setenv("WPMGR_STAGING_DIR", staging)
+    monkeypatch.setenv("WPMGR_HOSTING_DIR", hosting)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_hosting_dir_berawalan_sama_tetapi_terpisah_diterima(monkeypatch):
+    _env_wajib(monkeypatch)
+    monkeypatch.setenv("WPMGR_STAGING_DIR", "/var/lib/wpmgr/staging")
+    monkeypatch.setenv("WPMGR_HOSTING_DIR", "/var/lib/wpmgr/staging-hosting")
+    assert Settings(_env_file=None).hosting_dir == "/var/lib/wpmgr/staging-hosting"
