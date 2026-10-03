@@ -61,6 +61,8 @@ ROUTER_CADANGAN=""
 # atau KONF_DIR/prod/router + awalan prd- (produksi).
 ROUTER_TUJUAN=""
 ROUTER_AWALAN="stg-"
+# Deskriptor kunci router produksi; terisi sesudah kunci_router berhasil.
+KUNCI_ROUTER_FD=""
 # Penanda "baris GALAT sudah dicetak". Berupa berkas, bukan variabel, karena
 # galat bisa terjadi di subshell substitusi perintah; tanpa penanda ini
 # jebakan ERR di induknya akan mencetak GALAT kedua dan menimpa kodenya.
@@ -1352,7 +1354,7 @@ pasang_iptables_prod() {
 # Batas PHP situs produksi (spec §7.1); bawaan image (upload 2 MB) tidak cukup.
 tulis_php_ini_prod() {
   printf '%s\n' "; Dibuat wpmgr-staging prod-siapkan. Jangan diedit; selalu ditimpa." \
-    "upload_max_filesize = 64M" "post_max_size = 64M" "memory_limit = 256M" \
+    "upload_max_filesize = 64M" "post_max_size = 68M" "memory_limit = 256M" \
     "max_execution_time = 120" "expose_php = Off" > "$KONF_PROD/php.ini"
   chmod 0644 "$KONF_PROD/php.ini"
 }
@@ -1485,12 +1487,39 @@ tulis_state() {
 # 0 bila domain $1 sudah tercatat di state situs selain $2.
 domain_dipakai_lain() {
   local f
+  local -
   shopt -s nullglob
   for f in "$KONF_PROD"/situs/*; do
     [[ "${f##*/}" == "$2" ]] && continue
     grep -qxF "DOMAIN=$1" "$f" && return 0
   done
   return 1
+}
+
+# 0 bila site_id $1 sudah tercatat di state situs selain $2. Tanpa ini nama
+# kedua untuk site_id yang sama (state MODE=pratinjau) menimpa htpasswd/router
+# dan melewati pagar satu arah situs yang sudah aktif.
+site_id_dipakai_lain() {
+  local f
+  local -
+  shopt -s nullglob
+  for f in "$KONF_PROD"/situs/*; do
+    [[ "${f##*/}" == "$2" ]] && continue
+    grep -qxF "SITE_ID=$1" "$f" && return 0
+  done
+  return 1
+}
+
+# Kunci router produksi per host (flock, tenggat tetap): render router,
+# pembuatan/impor database, dan aktivasi saling bergantian, bukan berebut.
+# Idempoten dalam satu proses (deskriptor dipegang sampai skrip keluar), jadi
+# pemanggil yang sudah memegangnya (prod-aktifkan langkah 2-4) aman memanggil
+# muat_router_prod lagi.
+kunci_router() {
+  [[ -z "$KUNCI_ROUTER_FD" ]] || return 0
+  ( umask 077; : >> "$KONF_PROD/router.lock" ) || galat konfigurasi "berkas kunci router tidak dapat dibuat"
+  exec {KUNCI_ROUTER_FD}>> "$KONF_PROD/router.lock" || galat konfigurasi "berkas kunci router tidak dapat dibuka"
+  dibatasi flock -w 30 -x "$KUNCI_ROUTER_FD" || galat ditolak "router hosting sedang dipakai proses lain"
 }
 
 nama_db_prod() { printf 'prd_%s' "${1//-/_}"; }
@@ -1552,7 +1581,7 @@ cmd_prod_buat() {
   cek_domain "${4-}"
   cek_www "${5-}"
   butuh_hosting
-  local nama="$1" versi="$2" wadah="wpp-$1" situs img sekarang pemakai d m_files m_log m_ini
+  local nama="$1" versi="$2" wadah="wpp-$1" situs img sekarang pemakai d m_files m_log m_ini tulis=0
   pastikan_siap_prod
   if muat_state "$nama"; then
     [[ "$S_SITE_ID" == "$3" && "$S_DOMAIN" == "$4" ]] \
@@ -1560,12 +1589,13 @@ cmd_prod_buat() {
     if [[ "$S_MODE" == pratinjau && ( "$S_WWW" != "$5" || "$S_PHP" != "$versi" ) ]]; then
       S_WWW="$5"
       S_PHP="$versi"
-      tulis_state "$nama"
+      tulis=1
     fi
   else
     ! domain_dipakai_lain "$4" "$nama" || galat ditolak "domain sudah dipakai situs lain"
+    ! site_id_dipakai_lain "$3" "$nama" || galat ditolak "site ini sudah tercatat dengan nama lain"
     S_SITE_ID="$3" S_DOMAIN="$4" S_WWW="$5" S_PREFIX="" S_PHP="$versi" S_MODE=pratinjau
-    tulis_state "$nama"
+    tulis=1
   fi
   # Situs aktif tetap memakai versi PHP saat diaktifkan; mengganti image
   # berarti membuat ulang container produksi, dan itu langkah manual.
@@ -1596,19 +1626,25 @@ cmd_prod_buat() {
       || galat docker "container tidak terbaca"
     if [[ "$sekarang" == "$img" && "$pemakai" == "$UID_W:$GID_W" && "$MOUNT_ID" == "$S_SITE_ID" ]]; then
       cek_mount_wadah_prod "$wadah" penuh
+      (( tulis == 0 )) || tulis_state "$nama"
       dk start "$wadah" >/dev/null || galat docker "container situs tidak dapat dijalankan"
       return 0
     fi
+    (( tulis == 0 )) || tulis_state "$nama"
     dk rm -f "$wadah" >/dev/null || galat docker "container lama tidak dapat dihapus"
   elif [[ "$S_MODE" == aktif ]]; then
     galat ditolak "situs aktif tanpa container; pulihkan manual (README)"
   fi
+  # State baru baru ditulis sesudah semua pemeriksaan lolos: prod-buat yang
+  # ditolak tidak meninggalkan state yang memblokir nama/domain/site itu.
+  (( tulis == 0 )) || tulis_state "$nama"
   # Opsi keamanan sama dengan staging (putusan R13): UID dashboard tanpa
   # capability, --mount (sumber hilang = galat), batas memori produksi.
   dk run -d --name "$wadah" --label "wpmgr.hosting=situs:$nama" --network "$JARINGAN_PROD" \
     --restart unless-stopped --memory 512m --memory-swap 512m --cpus 1 --pids-limit 256 \
     --user "$UID_W:$GID_W" --cap-drop ALL --sysctl net.ipv4.ip_unprivileged_port_start=0 \
     --security-opt no-new-privileges \
+    --log-opt max-size=10m --log-opt max-file=3 \
     --mount "type=bind,src=$m_files,dst=/var/www/html" \
     --mount "type=bind,src=$m_log,dst=/wpmgr-log" \
     --mount "type=bind,src=$m_ini,dst=/usr/local/etc/php/conf.d/zz-wpmgr.ini,readonly" \
@@ -1675,6 +1711,7 @@ cmd_prod_db_buat() {
   cek_prefix "${2-}"
   butuh_hosting
   local nama="$1" db pw
+  kunci_router
   muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
   [[ "$S_MODE" != aktif ]] || galat ditolak "situs sudah aktif; database tidak boleh dibuat ulang"
   db="$(nama_db_prod "$nama")"
@@ -1698,6 +1735,7 @@ cmd_prod_db_impor() {
   cek_nama_prod "${1-}"
   butuh_hosting
   local nama="$1" db sandi
+  kunci_router
   muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
   # Batas satu arah (spec §4): data situs yang sudah dilayani VPS tidak
   # pernah ditimpa salinan dari hosting lama, sekalipun dashboard meminta.
@@ -1762,8 +1800,10 @@ KONF
 # state setiap situs); pemanggil memuat ulang state-nya sendiri sesudahnya.
 muat_router_prod() {
   local nama_aktif="${1-}" tujuan="$KONF_PROD/router" baru cadangan f n mode baris
+  local -
   # shellcheck disable=SC2016 # `$` di sini literal regex (awalan bcrypt), bukan ekspansi.
   local pola_htpasswd='^pratinjau:\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$'
+  kunci_router
   pastikan_layanan_prod router
   baru="$(mktemp -d)"
   SEMENTARA+=("$baru")
@@ -1814,6 +1854,7 @@ muat_router_prod() {
 
 cmd_prod_router_muat() {
   butuh_hosting
+  kunci_router
   muat_router_prod
 }
 

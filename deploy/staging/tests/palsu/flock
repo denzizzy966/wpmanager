@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# flock tiruan: mencatat panggilan (kunci router produksi) ke $PALSU/flock.log.
+# Berkas $PALSU/flock-gagal membuat tenggat kunci habis (keluar 1).
+printf '[%s]' "$@" >> "$PALSU/flock.log"
+printf '\n' >> "$PALSU/flock.log"
+[[ ! -f "$PALSU/flock-gagal" ]]

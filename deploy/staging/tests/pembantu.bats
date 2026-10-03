@@ -1108,7 +1108,7 @@ KONF
   [ "$(stat -c %a "$S/etc/prod/nginx.lock")" = 600 ]
   [[ "$(cat "$S/etc/prod/db-root")" =~ ^[0-9a-f]{64}$ ]]
   [ "$(stat -c %a "$S/etc/prod/db-root")" = 600 ]
-  for baris in 'upload_max_filesize = 64M' 'post_max_size = 64M' 'memory_limit = 256M' \
+  for baris in 'upload_max_filesize = 64M' 'post_max_size = 68M' 'memory_limit = 256M' \
                'max_execution_time = 120' 'expose_php = Off'; do
     grep -qxF "$baris" "$S/etc/prod/php.ini"
   done
@@ -1385,7 +1385,7 @@ mounts_prod() {
   aktifkan_hosting
   run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
   [ "$status" -eq 0 ]
-  diharapkan="[run][-d][--name][wpp-toko][--label][wpmgr.hosting=situs:toko][--network][wpmgr-prod][--restart][unless-stopped][--memory][512m][--memory-swap][512m][--cpus][1][--pids-limit][256][--user][1000:1000][--cap-drop][ALL][--sysctl][net.ipv4.ip_unprivileged_port_start=0][--security-opt][no-new-privileges][--mount][type=bind,src=$S/hosting/$ID/files,dst=/var/www/html][--mount][type=bind,src=$S/hosting/$ID/log,dst=/wpmgr-log][--mount][type=bind,src=$S/etc/prod/php.ini,dst=/usr/local/etc/php/conf.d/zz-wpmgr.ini,readonly][wordpress@sha256:$D64]"
+  diharapkan="[run][-d][--name][wpp-toko][--label][wpmgr.hosting=situs:toko][--network][wpmgr-prod][--restart][unless-stopped][--memory][512m][--memory-swap][512m][--cpus][1][--pids-limit][256][--user][1000:1000][--cap-drop][ALL][--sysctl][net.ipv4.ip_unprivileged_port_start=0][--security-opt][no-new-privileges][--log-opt][max-size=10m][--log-opt][max-file=3][--mount][type=bind,src=$S/hosting/$ID/files,dst=/var/www/html][--mount][type=bind,src=$S/hosting/$ID/log,dst=/wpmgr-log][--mount][type=bind,src=$S/etc/prod/php.ini,dst=/usr/local/etc/php/conf.d/zz-wpmgr.ini,readonly][wordpress@sha256:$D64]"
   grep -qxF "$diharapkan" "$PALSU/docker.log"
   ! grep -q 'wpmgr-ekspor\|/usr/local/bin/wp\|wpmgr.staging=' "$PALSU/docker.log" || false
   [ "$(cat "$S/etc/prod/situs/toko")" = "$(printf 'SITE_ID=%s\nDOMAIN=%s\nWWW=1\nPREFIX=\nPHP=8.1\nMODE=pratinjau' "$ID" "$DOM")" ]
@@ -1417,6 +1417,8 @@ mounts_prod() {
   [ "$status" -eq 3 ]
   [[ "$output" == *"bukan milik hosting"* ]]
   ! grep -q '^\[run\]\|^\[rm\]\|^\[start\]' "$PALSU/docker.log" || false
+  # Penolakan tidak meninggalkan state (M1): nama, domain, dan site tetap bebas.
+  [ -z "$(ls -A "$S/etc/prod/situs")" ]
 }
 
 @test "prod-buat pada MODE=aktif hanya menjalankan container yang ada dan tidak pernah membuat ulang" {
@@ -1593,6 +1595,8 @@ mounts_prod() {
   aktifkan_hosting
   tulis_state_prod toko pratinjau
   printf 'lama' > "$S/etc/prod/router/conf.d/prd-lama.conf"
+  printf 'bawaan' > "$S/etc/prod/router/conf.d/00-bawaan.conf"
+  printf '%s\n' "$HTPASSWD" > "$S/etc/prod/router/htpasswd/lama"
   printf 'pratinjau:bukan-bcrypt\n' > "$S/hosting/router/toko.htpasswd"
   run "$SKRIP" prod-router-muat
   [ "$status" -eq 2 ]
@@ -1603,5 +1607,104 @@ mounts_prod() {
   [ "$status" -eq 4 ]
   [ "$(cat "$S/etc/prod/router/conf.d/prd-lama.conf")" = "lama" ]
   [ ! -e "$S/etc/prod/router/conf.d/prd-toko.conf" ]
+  # Pemulihan juga mengembalikan htpasswd lama dan konfigurasi bawaan (M5).
+  [ "$(cat "$S/etc/prod/router/conf.d/00-bawaan.conf")" = "bawaan" ]
+  [ "$(cat "$S/etc/prod/router/htpasswd/lama")" = "$HTPASSWD" ]
+  [ ! -e "$S/etc/prod/router/htpasswd/toko" ]
   ! grep -q 'reload' "$PALSU/docker.log" || false
+}
+
+@test "prod-router-muat membaca htpasswd dashboard lewat setpriv" {
+  aktifkan_hosting
+  tulis_state_prod toko pratinjau
+  printf '%s
+' "$HTPASSWD" > "$S/hosting/router/toko.htpasswd"
+  run "$SKRIP" prod-router-muat
+  [ "$status" -eq 0 ]
+  grep -qF "[--reuid=1000][--regid=1000][--clear-groups][--][head][-c][1024][$S/hosting/router/toko.htpasswd]" "$PALSU/setpriv.log"
+}
+
+@test "prod-buat menolak nama kedua untuk site_id yang sama dan tidak menulis apa pun" {
+  aktifkan_hosting
+  tulis_state_prod toko pratinjau
+  run "$SKRIP" prod-buat toko-dua 8.1 "$ID" baru.co.id 1
+  [ "$status" -eq 3 ]
+  [ "$(ls "$S/etc/prod/situs")" = "toko" ]
+  [ ! -e "$S/etc/prod/situs/toko-dua" ]
+  ! grep -q '^\[run\]\|^\[rm\]\|^\[start\]' "$PALSU/docker.log" || false
+  [ ! -e "$S/hosting/$ID/files" ]
+}
+
+@test "prod-buat pratinjau membuat ulang container bila image berubah dan hanya start bila sama" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  wadah_prod wpp-toko situs:toko
+  printf 'wordpress@sha256:lama' > "$PALSU/wadah/wpp-toko.image"
+  printf '1000:1000' > "$PALSU/wadah/wpp-toko.user"
+  mounts_prod "$ID"
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 0 ]
+  grep -qxF "[rm][-f][wpp-toko]" "$PALSU/docker.log"
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpp-toko\]' "$PALSU/docker.log"
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+  : > "$PALSU/docker.log"
+  printf 'wordpress@sha256:%s' "$D64" > "$PALSU/wadah/wpp-toko.image"
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 0 ]
+  grep -qxF "[start][wpp-toko]" "$PALSU/docker.log"
+  ! grep -q '^\[run\]\|^\[rm\]' "$PALSU/docker.log" || false
+}
+
+@test "prod-router-muat, prod-db-buat, dan prod-db-impor mengambil kunci router sebelum bekerja" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  printf '%s
+' "$HTPASSWD" > "$S/hosting/router/toko.htpasswd"
+  run "$SKRIP" prod-router-muat
+  [ "$status" -eq 0 ]
+  grep -qE '^\[-w\]\[30\]\[-x\]\[[0-9]+\]$' "$PALSU/flock.log"
+  [ "$(wc -l < "$PALSU/flock.log")" -eq 1 ]
+  [ -e "$S/etc/prod/router.lock" ]
+  rm -f "$PALSU/flock.log"
+  run "$SKRIP" prod-db-buat toko wp_
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$PALSU/flock.log")" -eq 1 ]
+  rm -f "$PALSU/flock.log"
+  run bash -c "printf 'SELECT 1;' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$PALSU/flock.log")" -eq 1 ]
+  # prod-jalan tidak menyentuh router, jadi tidak mengambil kunci.
+  rm -f "$PALSU/flock.log"
+  wadah_prod wpp-toko situs:toko
+  mounts_prod "$ID"
+  run "$SKRIP" prod-jalan toko
+  [ "$status" -eq 0 ]
+  [ ! -e "$PALSU/flock.log" ]
+}
+
+@test "kunci router yang tenggatnya habis menolak sebelum mengubah apa pun" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  touch "$PALSU/flock-gagal"
+  : > "$PALSU/docker.log"
+  run "$SKRIP" prod-router-muat
+  [ "$status" -eq 3 ]
+  run "$SKRIP" prod-db-buat toko wp_
+  [ "$status" -eq 3 ]
+  run bash -c "printf 'SELECT 1;' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 3 ]
+  [ -z "$(docker_log)" ]
+  [ ! -e "$S/hosting/$ID/files/wp-config.php" ]
+}
+
+@test "prod-db-buat dan prod-db-impor memeriksa MODE di bawah kunci router" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko aktif
+  run "$SKRIP" prod-db-buat toko wp_
+  [ "$status" -eq 3 ]
+  [ "$(wc -l < "$PALSU/flock.log")" -eq 1 ]
 }
