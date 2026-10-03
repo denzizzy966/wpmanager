@@ -122,6 +122,43 @@ def test_perpanjang_sertifikat_gagal_dicatat_dengan_pesan_tetap(sesi, site_hosti
     assert (log.pesan, log.level) == (cron.PESAN_SERTIFIKAT_GAGAL, "warning")
 
 
+def test_cek_dns_benturan_unik_saat_commit_tidak_crash(sesi, site_hosting, monkeypatch):
+    _status(sesi, site_hosting, StatusHosting.menunggu_dns)
+    buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+    # Pemeriksaan "ada job" dibuat buta; uq_jobs_hosting_aktif menolak saat commit.
+    monkeypatch.setattr(cron, "ada_job_hosting", lambda sesi_, site_id: False)
+    assert cron.cek_dns_semua(sesi, SEKARANG, penanya=PenanyaPalsu()) == {"diperiksa": 1, "diantrekan": 0}
+    assert sesi.query(Job).count() == 1
+
+
+def test_perpanjang_sertifikat_galat_satu_situs_tidak_menghentikan_yang_lain(sesi, site_hosting, hosting_aktif):
+    import uuid as _uuid
+
+    from wpmgr.models import Site, SiteStatus
+
+    lain = Site(id=_uuid.uuid4(), nama="Lain", url="https://lain.test", status=SiteStatus.active,
+                secret_terenkripsi=b"x")
+    sesi.add(lain)
+    sesi.commit()
+    sesi.add(HostingVps(site_id=lain.id, nama="b-co-id", domain="b.co.id", dengan_www=False,
+                        ip_lama="93.184.216.35", sandi_hash=site_hosting.sandi_hash,
+                        dilayani_vps_pada=SEKARANG, status=StatusHosting.aktif))
+    _status(sesi, site_hosting, StatusHosting.aktif, dilayani_vps_pada=SEKARANG)
+    pb = PembantuHostingPalsu(hosting_aktif)
+    pb.sertifikat_hasil = "diperbarui"
+    asli = pb.prod_sertifikat
+
+    def prod_sertifikat(nama):
+        if nama == "b-co-id":  # diproses lebih dulu (urut nama)
+            raise RuntimeError("rahasia /var/lib/wpmgr")
+        return asli(nama)
+
+    pb.prod_sertifikat = prod_sertifikat
+    hasil = cron.perpanjang_sertifikat_hosting(sesi, pb, SEKARANG)
+    assert hasil == {"berhasil": 1, "gagal": 0, "diperbarui": 1}
+    assert _h(sesi, site_hosting).sertifikat_pada == SEKARANG
+
+
 def test_sapu_nisan_hosting_tanpa_mengikuti_symlink(site_hosting, hosting_aktif, tmp_path):
     luar = tmp_path / "luar"
     luar.mkdir()
