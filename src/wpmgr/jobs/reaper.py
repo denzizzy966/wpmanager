@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select
 from sqlalchemy.orm import Session
 
 from wpmgr.errors import UNKNOWN
@@ -23,9 +23,31 @@ BATAS_MENIT_DEFAULT = 15
 PESAN_STAGING_TERHENTI = "Proses terhenti tak terduga; coba lagi."
 # Status yang hanya benar selama sebuah job staging sedang bekerja.
 STATUS_KERJA_STAGING = (StatusStaging.menyalin, StatusStaging.berjalan_uji, StatusStaging.mendorong)
+# Baris pemilik (staging/hosting_vps) sedang dikunci transaksi lain: job yatim dilewati putaran ini.
+_TERKUNCI = object()
 
 
-def _lepas_staging(sesi: Session, job: Job) -> None:
+def _kunci_atau_lewati(sesi: Session, kueri):
+    """Kunci baris pemilik tanpa menunggu (SKIP LOCKED); `_TERKUNCI` bila transaksi lain memegangnya.
+
+    Reaper sudah memegang kunci baris job. Menunggu kunci baris pemilik di
+    sini bisa membuat siklus dengan transaksi yang memegang baris pemilik
+    lalu menyentuh baris job yang sama (review Task 6 M4), jadi reaper tidak
+    pernah menunggu: job itu diproses lagi pada putaran berikutnya. Baris yang
+    tidak ada (atau tidak cocok) dibedakan dari yang terkunci lewat baca
+    biasa, yang tidak tertahan kunci baris.
+    """
+    baris = sesi.scalar(kueri.with_for_update(skip_locked=True))
+    if baris is None and sesi.scalar(kueri.with_only_columns(literal(1), maintain_column_froms=True).limit(1)) is not None:
+        return _TERKUNCI
+    return baris
+
+
+def _kueri_staging(job: Job):
+    return select(Staging).where(Staging.site_id == job.site_id, Staging.status.in_(STATUS_KERJA_STAGING))
+
+
+def _lepas_staging(sesi: Session, job: Job, st: Staging | None) -> None:
     """Staging milik job yatim yang tidak akan diulang tidak boleh tertahan di status kerja.
 
     Tanpa ini baris staging tetap `menyalin`/`mendorong` selamanya: tidak
@@ -40,8 +62,6 @@ def _lepas_staging(sesi: Session, job: Job) -> None:
     salinan yang utuh, selain itu status staging sebelum job itu dikembalikan
     (salinan yang belum utuh tetap dengan galatnya).
     """
-    st = sesi.scalar(select(Staging).where(Staging.site_id == job.site_id,
-                                           Staging.status.in_(STATUS_KERJA_STAGING)).with_for_update())
     if st is None:
         return
     status, asal, galat = umum.status_gagal_final(job, st, PESAN_STAGING_TERHENTI)
@@ -55,14 +75,18 @@ def _lepas_staging(sesi: Session, job: Job) -> None:
         st.dorong_gagal_pada = umum.sekarang()
 
 
-def _lepas_hosting(sesi: Session, job: Job) -> None:
+def _kueri_hosting(job: Job):
+    return select(HostingVps).where(HostingVps.site_id == job.site_id)
+
+
+def _lepas_hosting(sesi: Session, job: Job, h: HostingVps | None) -> None:
     """Hosting milik job yatim yang tidak akan diulang (pola `_lepas_staging`, spec §10.6).
 
     Aturan status sama dengan pembungkus (`hosting.umum.status_gagal_final`).
     Backup tidak pernah mengubah status; kegagalannya ditandai
-    `backup_gagal_pada`. Urutan kunci: jobs lalu hosting_vps.
+    `backup_gagal_pada`. Urutan kunci: jobs lalu hosting_vps (tanpa menunggu,
+    `_kunci_atau_lewati`).
     """
-    h = sesi.scalar(select(HostingVps).where(HostingVps.site_id == job.site_id).with_for_update())
     if h is None:
         return
     if job.tipe == JobType.backup_hosting:
@@ -81,7 +105,9 @@ def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) ->
     """Kembalikan job `running` yang kuncinya basi ke `pending`, atau tandai `unknown` bila jatah habis.
 
     Urutan kunci: baris `jobs` yatim (FOR UPDATE SKIP LOCKED), lalu baris
-    `staging` (FOR UPDATE, lewat `_lepas_staging`). Reaper TIDAK mengambil kunci
+    `staging`/`hosting_vps` (FOR UPDATE SKIP LOCKED, `_kunci_atau_lewati`; job
+    yang baris pemiliknya terkunci dilewati putaran ini). Mengembalikan jumlah
+    job yang diproses. Reaper TIDAK mengambil kunci
     `sites`, jadi urutannya berbeda dari kontrak route/cron di
     `wpmgr.staging.cron` (sites -> staging). Itu aman: jalur sites -> staging
     hanya MENYISIPKAN baris job baru atau membaca job, tidak pernah mengunci
@@ -97,14 +123,25 @@ def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) ->
         .with_for_update(skip_locked=True)
     ).all()
 
+    diproses = 0
     for job in yatim:
+        # Produksi yang sudah ditukar dipulihkan terus sampai batas 24 jam (R26),
+        # bukan sampai max_attempts: pemulihan tidak boleh bergantung pada WP-Cron.
+        diulang = job.attempts < job.max_attempts or dalam_batas_pemulihan(job)
+        pemilik = None
+        if not diulang and job.tipe in JOB_STAGING:
+            pemilik = _kunci_atau_lewati(sesi, _kueri_staging(job))
+        elif not diulang and job.tipe in JOB_HOSTING:
+            pemilik = _kunci_atau_lewati(sesi, _kueri_hosting(job))
+        if pemilik is _TERKUNCI:
+            # Job belum disentuh sama sekali; diambil lagi putaran berikutnya.
+            continue
+        diproses += 1
         pemegang = job.locked_by
         job.locked_at = None
         job.locked_by = None
         job.started_at = None
-        # Produksi yang sudah ditukar dipulihkan terus sampai batas 24 jam (R26),
-        # bukan sampai max_attempts: pemulihan tidak boleh bergantung pada WP-Cron.
-        if job.attempts < job.max_attempts or dalam_batas_pemulihan(job):
+        if diulang:
             job.status = JobStatus.pending
             pesan = f"Job dipulihkan dari worker yang mati ({pemegang}); dijadwalkan ulang"
         else:
@@ -113,9 +150,9 @@ def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) ->
             job.error = f"Worker {pemegang} berhenti dan jatah percobaan habis"
             pesan = f"Job ditinggalkan worker {pemegang} tanpa sisa percobaan"
             if job.tipe in JOB_STAGING:
-                _lepas_staging(sesi, job)
+                _lepas_staging(sesi, job, pemilik)
             elif job.tipe in JOB_HOSTING:
-                _lepas_hosting(sesi, job)
+                _lepas_hosting(sesi, job, pemilik)
         sesi.add(
             ActivityLog(
                 site_id=job.site_id, job_id=job.id, level="warning", pesan=pesan,
@@ -124,4 +161,4 @@ def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) ->
         )
 
     sesi.commit()
-    return len(yatim)
+    return diproses

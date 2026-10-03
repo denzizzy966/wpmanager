@@ -480,7 +480,7 @@ def test_pembantu_sibuk_dijadwalkan_ulang_tanpa_menghabiskan_jatah(sesi, site_ho
     assert j.scheduled_for - datetime.now(timezone.utc) > timedelta(minutes=1)
     h = _h(sesi, site_hosting)
     assert (h.status, h.gagal_asal) == (status_kerja, None)
-    assert h.galat == f"Terputus, dilanjutkan otomatis: {SIBUK}"
+    assert h.galat == hu.PESAN_MENUNGGU_SIBUK
     site = sesi.get(Site, site_hosting.site_id)
     assert site.status == SiteStatus.active and site.last_error is None
 
@@ -498,7 +498,7 @@ def test_pembantu_sibuk_lewat_batas_kembali_ke_status_sebelum(sesi, site_hosting
     site_hosting.status = StatusHosting.pratinjau
     sesi.commit()
     job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik, {"kemajuan": {
-        "sibuk_sejak": (SEKARANG - timedelta(hours=5)).isoformat(), "sibuk_kali": 20}})
+        "sibuk_sejak": (SEKARANG - timedelta(hours=5)).isoformat(), "sibuk_kali": 20, "sibuk_langkah": "-/-"}})
 
     def inti(sesi, job, site, h):
         raise _sibuk()
@@ -514,7 +514,7 @@ def test_pembantu_sibuk_lewat_batas_sesudah_salinan_disentuh_gagal_salinan(sesi,
     site_hosting.status = StatusHosting.pratinjau
     sesi.commit()
     job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik, {"kemajuan": {
-        "sibuk_sejak": (SEKARANG - timedelta(hours=5)).isoformat(), "sibuk_kali": 20}})
+        "sibuk_sejak": (SEKARANG - timedelta(hours=5)).isoformat(), "sibuk_kali": 20, "sibuk_langkah": "-/impor"}})
 
     def inti(sesi, job, site, h):
         stg.simpan_kemajuan(sesi, job, tahap="impor")
@@ -588,4 +588,358 @@ def test_batal_menang_atas_pembantu_sibuk(sesi, site_hosting):
         hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
     h = _h(sesi, site_hosting)
     assert (h.status, h.batal_diminta_pada) == (StatusHosting.pratinjau, None)
+
+
+# ---- fix round 1: job tertunda setengah jalan menahan keluarga runtime lain (I1/L11) --
+
+
+def _tertunda(sesi, site, tipe, **kemajuan):
+    job = buat_job(sesi, site.id, tipe, {"kemajuan": kemajuan})
+    job.attempts = 1
+    job.scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=10)
+    sesi.commit()
+    return job
+
+
+@pytest.mark.parametrize("menahan,kemajuan,kandidat", [
+    (JobType.staging_dorong, {"langkah_terapkan": "tukar"}, JobType.pindah_tarik),
+    (JobType.staging_dorong, {"unggah_mulai": True}, JobType.pindah_aktifkan),
+    (JobType.staging_kembalikan, {"langkah_terapkan": "pulihkan"}, JobType.backup_hosting),
+    (JobType.pindah_aktifkan, {"langkah_aktifkan": "tukar"}, JobType.staging_tarik),
+    (JobType.pindah_aktifkan, {"langkah_aktifkan": "verifikasi"}, JobType.staging_dorong),
+    (JobType.pindah_aktifkan, {"langkah_aktifkan": "beres"}, JobType.staging_uji_update),
+])
+def test_tertunda_sesudah_tukar_menahan_keluarga_runtime_lain(sesi, site, menahan, kemajuan, kandidat):
+    _tertunda(sesi, site, menahan, **kemajuan)
+    j = buat_job(sesi, site.id, kandidat)
+    assert ambil_job(sesi, "w1", "staging") is None
+    assert _masih_eksklusif(sesi, j.id, site.id) is False
+    sesi.rollback()
+
+
+@pytest.mark.parametrize("menahan,kemajuan,kandidat", [
+    (JobType.staging_dorong, {"tahap_dorong": "rencana"}, JobType.pindah_tarik),
+    (JobType.pindah_aktifkan, {"langkah_aktifkan": "tarik"}, JobType.staging_tarik),
+])
+def test_tertunda_sebelum_tukar_tidak_menahan_keluarga_lain(sesi, site, menahan, kemajuan, kandidat):
+    _tertunda(sesi, site, menahan, **kemajuan)
+    j = buat_job(sesi, site.id, kandidat)
+    assert ambil_job(sesi, "w1", "staging").id == j.id
+
+
+def test_klaim_lintas_keluarga_diserialkan_lintas_sesi(engine, sesi, site):
+    """Dua sesi: B (dorong staging) memeriksa ulang sesudah klaim A (aktivasi hosting) di-commit, dan melihatnya."""
+    import threading
+    import time
+
+    from sqlalchemy import text
+    from sqlalchemy.orm import sessionmaker
+
+    aktifkan = buat_job(sesi, site.id, JobType.pindah_aktifkan)
+    dorong = buat_job(sesi, site.id, JobType.staging_dorong)
+    buat = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    a, b = buat(), buat()
+    hasil = {}
+    try:
+        a.execute(text("UPDATE jobs SET status = 'running', locked_by = 'A' WHERE id = :i"), {"i": aktifkan.id})
+        assert _masih_eksklusif(a, aktifkan.id, site.id)
+
+        def klaim_b():
+            b.execute(text("UPDATE jobs SET status = 'running', locked_by = 'B' WHERE id = :i"), {"i": dorong.id})
+            hasil["b"] = _masih_eksklusif(b, dorong.id, site.id)
+
+        utas = threading.Thread(target=klaim_b)
+        utas.start()
+        time.sleep(0.5)
+        assert utas.is_alive(), "B harus menunggu lock site yang dipegang A"
+        a.commit()
+        utas.join(5)
+        assert hasil["b"] is False
+    finally:
+        b.rollback()
+        a.rollback()
+        a.close()
+        b.close()
+
+
+# ---- fix round 1: tes antrean tambahan (M5) ----------------------------------------
+
+
+@pytest.mark.parametrize("tipe", [JobType.pindah_aktifkan, JobType.backup_hosting])
+def test_job_hosting_berjalan_menahan_job_lapis1(sesi, site, tipe):
+    _berjalan(sesi, site, tipe)
+    scan = buat_job(sesi, site.id, JobType.scan_site)
+    assert ambil_job(sesi, "w1", "umum") is None
+    assert _masih_eksklusif(sesi, scan.id, site.id) is False
+    sesi.rollback()
+
+
+def test_aktifkan_tertunda_sesudah_tukar_menahan_di_pemeriksaan_ulang(sesi, site):
+    _tertunda(sesi, site, JobType.pindah_aktifkan, langkah_aktifkan="tukar")
+    scan = buat_job(sesi, site.id, JobType.scan_site)
+    assert _masih_eksklusif(sesi, scan.id, site.id) is False
+    sesi.rollback()
+
+
+def test_reaper_aktifkan_sebelum_tukar_gagal_salinan(sesi, site_hosting):
+    site_hosting.status = StatusHosting.mengaktifkan
+    sesi.commit()
+    job = _yatim(sesi, site_hosting, JobType.pindah_aktifkan, {"kemajuan": {"langkah_aktifkan": "tarik"}})
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.unknown
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "salinan", hu.PESAN_TERHENTI)
+
+
+def test_reaper_tidak_menyentuh_hosting_di_luar_status_kerja(sesi, site_hosting):
+    site_hosting.status = StatusHosting.pratinjau
+    site_hosting.galat = "lama"
+    sesi.commit()
+    job = _yatim(sesi, site_hosting, JobType.pindah_tarik)
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.unknown
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.pratinjau, None, "lama")
+
+
+# ---- fix round 1: reaper tidak menunggu kunci baris pemilik (M4) ---------------------
+
+
+def test_reaper_melewati_job_bila_baris_hosting_terkunci(engine, sesi, site_hosting):
+    from sqlalchemy import text
+    from sqlalchemy.orm import sessionmaker
+
+    site_hosting.status = StatusHosting.menyalin
+    sesi.commit()
+    job = _yatim(sesi, site_hosting, JobType.pindah_tarik)
+    lain = sessionmaker(bind=engine, future=True)()
+    try:
+        lain.execute(text("SELECT 1 FROM hosting_vps WHERE id = :i FOR UPDATE"), {"i": site_hosting.id})
+        # Reaper lama menunggu kunci itu tanpa batas; di sini menunggu paling lama 3 detik.
+        sesi.execute(text("SET LOCAL lock_timeout = '3s'"))
+        assert pulihkan_job_yatim(sesi) == 0
+        sesi.expire_all()
+        assert sesi.get(Job, job.id).status == JobStatus.running
+    finally:
+        lain.rollback()
+        lain.close()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.unknown
+    assert _h(sesi, site_hosting).status == StatusHosting.gagal
+
+
+def test_reaper_melewati_job_bila_baris_staging_terkunci(engine, sesi, site_staging):
+    from sqlalchemy import text
+    from sqlalchemy.orm import sessionmaker
+
+    from wpmgr.models import Staging, StatusStaging
+
+    site_staging.status = StatusStaging.menyalin
+    sesi.commit()
+    buat_job(sesi, site_staging.site_id, JobType.staging_tarik)
+    job = ambil_job(sesi, "w-mati", "staging")
+    job.attempts = job.max_attempts
+    job.locked_at = SEKARANG - timedelta(minutes=30)
+    sesi.commit()
+    lain = sessionmaker(bind=engine, future=True)()
+    try:
+        lain.execute(text("SELECT 1 FROM staging WHERE id = :i FOR UPDATE"), {"i": site_staging.id})
+        # Reaper lama menunggu kunci itu tanpa batas; di sini menunggu paling lama 3 detik.
+        sesi.execute(text("SET LOCAL lock_timeout = '3s'"))
+        assert pulihkan_job_yatim(sesi) == 0
+    finally:
+        lain.rollback()
+        lain.close()
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Staging, site_staging.id).status == StatusStaging.gagal
+
+
+# ---- fix round 1: R26 di pembungkus sesudah tukar (M1/L12) ---------------------------
+
+
+def test_penolakan_tanpa_ubah_sesudah_tukar_diulang(sesi, site_hosting):
+    job = _sesudah_tukar(sesi, site_hosting)
+
+    def inti(sesi, job, site, h):
+        raise stg.GalatDitolakTanpaUbah("Ditolak.")
+
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, inti, "Aktivasi hosting VPS")
+    assert e.value.error_class == TRANSIENT and not isinstance(e.value, stg.GalatDitolakTanpaUbah)
+    h = _h(sesi, site_hosting)
+    assert h.status == StatusHosting.mengaktifkan
+    assert akan_diulang(sesi.get(Job, job.id, populate_existing=True), TRANSIENT)
+
+
+@pytest.mark.parametrize("galat,pesan", [
+    (OSError(28, "No space left on device: /var/lib/wpmgr/hosting/x"), None),
+    (KeyError("rahasia"), stg.PESAN_TAK_TERDUGA),
+])
+def test_galat_berkas_dan_tak_terduga_sesudah_tukar_diulang(sesi, site_hosting, galat, pesan):
+    job = _sesudah_tukar(sesi, site_hosting)
+
+    def inti(sesi, job, site, h):
+        raise galat
+
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, inti, "Aktivasi hosting VPS")
+    assert e.value.error_class == TRANSIENT
+    assert "/var/lib" not in e.value.pesan and "rahasia" not in e.value.pesan
+    if pesan is not None:
+        assert e.value.pesan == pesan
+    assert _h(sesi, site_hosting).status == StatusHosting.mengaktifkan
+
+
+def test_batal_diabaikan_sesudah_tukar(sesi, site_hosting):
+    job = _sesudah_tukar(sesi, site_hosting)
+    site_hosting.batal_diminta_pada = SEKARANG
+    sesi.commit()
+    dipanggil = []
+
+    def inti(sesi, job, site, h):
+        dipanggil.append(1)
+        raise SiteError(TRANSIENT, "Situs belum menjawab HTTPS dengan benar.")
+
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, inti, "Aktivasi hosting VPS")
+    assert dipanggil and not isinstance(e.value, stg.GalatDibatalkan)
+    h = _h(sesi, site_hosting)
+    assert h.status == StatusHosting.mengaktifkan and h.batal_diminta_pada is not None
+
+
+def test_dibatalkan_dari_inti_sesudah_tukar_diabaikan_dan_diulang(sesi, site_hosting):
+    job = _sesudah_tukar(sesi, site_hosting)
+
+    def inti(sesi, job, site, h):
+        raise stg.Dibatalkan()
+
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, inti, "Aktivasi hosting VPS")
+    assert e.value.error_class == TRANSIENT and e.value.pesan == hu.PESAN_BATAL_DIABAIKAN
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.batal_diminta_pada) == (StatusHosting.mengaktifkan, None)
+
+
+# ---- fix round 1: salinan yang sudah utuh tidak ditandai rusak (M2) ------------------
+
+
+@pytest.mark.parametrize("tipe,status_siap", [
+    (JobType.pindah_tarik, StatusHosting.pratinjau),
+    (JobType.pindah_aktifkan, StatusHosting.menunggu_dns),
+])
+def test_batal_sesudah_tarik_utuh_tidak_menandai_salinan_rusak(sesi, site_hosting, tipe, status_siap):
+    site_hosting.status = StatusHosting.gagal
+    site_hosting.gagal_asal = "salinan"
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, tipe)
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, tahap="pratinjau", langkah_aktifkan="tarik")
+        raise stg.Dibatalkan()
+
+    with pytest.raises(stg.GalatDibatalkan):
+        hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (status_siap, None, stg.PESAN_DIBATALKAN)
+
+
+def test_sibuk_lewat_batas_sesudah_tarik_utuh_status_sebelum(sesi, site_hosting):
+    site_hosting.status = StatusHosting.pratinjau
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik, {"kemajuan": {
+        "sibuk_sejak": (SEKARANG - timedelta(hours=5)).isoformat(), "sibuk_kali": 20,
+        "sibuk_langkah": "-/pratinjau"}})
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, tahap="pratinjau")
+        raise _sibuk()
+
+    with pytest.raises(stg.GalatDitolakTanpaUbah):
+        hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.pratinjau, None, SIBUK)
+
+
+# ---- fix round 1: jendela sibuk dimulai ulang di langkah baru (M3) -------------------
+
+
+def test_jendela_sibuk_dimulai_ulang_bila_job_maju_ke_langkah_baru(sesi, site_hosting):
+    site_hosting.status = StatusHosting.pratinjau
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik, {"kemajuan": {
+        "sibuk_sejak": (SEKARANG - timedelta(hours=5)).isoformat(), "sibuk_kali": 20,
+        "sibuk_langkah": "-/db"}})
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, tahap="impor")
+        raise _sibuk()
+
+    with pytest.raises(hu.GalatSibuk):
+        hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
+    j = sesi.get(Job, job.id, populate_existing=True)
+    k = stg.kemajuan(j)
+    assert (k["sibuk_kali"], k["sibuk_langkah"]) == (1, "-/impor")
+    assert dalam_batas_sibuk(j) is True
+    assert _h(sesi, site_hosting).status == StatusHosting.menyalin
+
+
+# ---- fix round 1: sibuk tidak tampil sebagai kegagalan (M6) --------------------------
+
+
+def test_sibuk_berulang_hanya_satu_baris_aktivitas_info(sesi, site_hosting, monkeypatch):
+    from sqlalchemy import text
+
+    site_hosting.status = StatusHosting.pratinjau
+    sesi.commit()
+
+    def inti(sesi, job, site, h):
+        raise _sibuk()
+
+    _lewat_worker(monkeypatch, JobType.pindah_tarik, inti)
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+    for _ in range(3):
+        assert proses_satu(sesi, "w1", buat_klien_fn=lambda s: None, jenis="staging")
+        sesi.execute(text("UPDATE jobs SET scheduled_for = now() WHERE id = :i"), {"i": job.id})
+        sesi.commit()
+    sesi.expire_all()
+    log = sesi.scalars(select(ActivityLog).where(ActivityLog.job_id == job.id)).all()
+    assert [r.level for r in log] == ["info"]
+    j = sesi.get(Job, job.id)
+    assert j.status == JobStatus.pending and j.error == hu.PESAN_MENUNGGU_SIBUK
+    assert stg.kemajuan(j)["sibuk_kali"] == 3
+    assert _h(sesi, site_hosting).galat == hu.PESAN_MENUNGGU_SIBUK
+
+
+# ---- fix round 1: kemajuan tanpa galat_hosting_awal (M7) ------------------------------
+
+
+def test_status_awal_tidak_mencatat_galat(sesi, site_hosting):
+    site_hosting.galat = "lama"
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+    hu.jalankan_hosting(sesi, job, lambda *a: {}, "Salin ke VPS")
+    assert "galat_hosting_awal" not in stg.kemajuan(sesi.get(Job, job.id, populate_existing=True))
+
+
+# ---- fix round 1: fitur mati selagi job menunggu (M9) ---------------------------------
+
+
+def test_fitur_mati_selagi_menunggu_tidak_meninggalkan_status_kerja(sesi, site_hosting, monkeypatch):
+    from wpmgr.config import get_settings
+
+    site_hosting.status = StatusHosting.mengaktifkan
+    site_hosting.galat = "Terputus, dilanjutkan otomatis: x"
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_aktifkan)
+    monkeypatch.delenv("WPMGR_HOSTING_IPV4")
+    get_settings.cache_clear()
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, lambda *a: pytest.fail("inti tidak boleh berjalan"), "Aktivasi hosting VPS")
+    assert e.value.error_class == STAGING_DITOLAK
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "salinan", hu.PESAN_FITUR_MATI)
 

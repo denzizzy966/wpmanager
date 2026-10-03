@@ -247,11 +247,37 @@ def kelas_pembantu(job: Job) -> str:
     return STAGING_GAGAL
 
 
+# ---- pembungkus job hosting (spec §10.6) ------------------------------------------
+
+# Skrip pembantu sibuk (keluar 3) bukan kegagalan: teks netral untuk UI.
+PESAN_MENUNGGU_SIBUK = "Menunggu proses lain di server selesai; dilanjutkan otomatis."
+PESAN_BATAL_DIABAIKAN = "Pembatalan diabaikan: situs sudah mulai dilayani VPS; aktivasi dilanjutkan otomatis."
+# Tahap tarik (kemajuan.tahap) sesudah salinan VPS lengkap: berkas, database,
+# dan runtime sudah siap (`tarik_inti` menyimpan `tahap_akhir` "pratinjau";
+# pindah_tarik menulis "selesai" sesudah tahap pratinjau).
+TAHAP_SALINAN_UTUH = frozenset({"pratinjau", "selesai"})
+
+
+class GalatSibuk(SiteError):
+    """Skrip pembantu sibuk/menolak tanpa perubahan; job dijadwalkan ulang (bukan kegagalan).
+
+    Worker mencatat baris aktivitas level info hanya untuk penolakan
+    pertama sebuah rentetan (`sudah_dicatat` untuk sisanya); akhir rentetan
+    tercatat oleh hasil job berikutnya (sukses, gagal, atau penolakan final).
+    """
+
+    level_aktivitas = "info"
+    ringkasan_aktivitas = "menunggu proses lain di server; dilanjutkan otomatis"
+
+    def __init__(self, pertama: bool) -> None:
+        super().__init__(TRANSIENT, PESAN_MENUNGGU_SIBUK)
+        self.sudah_dicatat = not pertama
+
+
 def catat_status_awal(sesi: Session, job: Job, h: HostingVps) -> None:
-    """Status, asal, dan galat hosting sebelum job ini, dicatat SEKALI (percobaan ulang melihat status kerja)."""
+    """Status dan asal hosting sebelum job ini, dicatat SEKALI (percobaan ulang melihat status kerja)."""
     if "status_hosting_awal" not in stg.kemajuan(job):
-        stg.simpan_kemajuan(sesi, job, status_hosting_awal=h.status.value, gagal_asal_awal=h.gagal_asal,
-                            galat_hosting_awal=h.galat)
+        stg.simpan_kemajuan(sesi, job, status_hosting_awal=h.status.value, gagal_asal_awal=h.gagal_asal)
 
 
 def status_sebelum(job: Job, h: HostingVps) -> tuple[StatusHosting, str | None]:
@@ -270,6 +296,29 @@ def status_sebelum(job: Job, h: HostingVps) -> tuple[StatusHosting, str | None]:
     if h.ditarik_pada is not None:
         return StatusHosting.pratinjau, None
     return StatusHosting.gagal, ASAL_SALINAN
+
+
+def salinan_utuh(job: Job) -> bool:
+    """Tarik job ini sudah menyelesaikan salinan VPS (berkas, database, runtime)."""
+    return stg.kemajuan(job).get("tahap") in TAHAP_SALINAN_UTUH
+
+
+def status_tanpa_salinan_rusak(job: Job, h: HostingVps) -> tuple[StatusHosting, str | None] | None:
+    """(status, asal) bila job berhenti tanpa meninggalkan salinan setengah jadi; None bila salinan belum utuh.
+
+    Belum disentuh: status sebelum job. Sudah disalin utuh oleh job ini:
+    status sebelum job, kecuali `gagal` 'salinan' -- salinan itu kini utuh,
+    jadi kembali ke status siapnya (pratinjau; aktivasi: menunggu_dns).
+    """
+    if job.tipe not in STATUS_KERJA or stg.salinan_belum_disentuh(job):
+        return status_sebelum(job, h)
+    if not salinan_utuh(job):
+        return None
+    status, asal = status_sebelum(job, h)
+    if status == StatusHosting.gagal and asal == ASAL_SALINAN:
+        siap = StatusHosting.menunggu_dns if job.tipe == JobType.pindah_aktifkan else StatusHosting.pratinjau
+        return siap, None
+    return status, asal
 
 
 def status_gagal_final(job: Job, h: HostingVps, pesan: str) -> tuple[StatusHosting, str, str]:
@@ -336,13 +385,14 @@ def _kembali_tanpa_ubah(sesi: Session, job: Job, hosting_id, pesan: str) -> None
 def _batalkan(sesi: Session, job: Job, site_id, hosting_id, nama: str) -> stg.GalatDibatalkan:
     sesi.rollback()
     h = sesi.get(HostingVps, hosting_id, populate_existing=True)
-    if job.tipe in (JobType.pindah_tarik, JobType.pindah_aktifkan) and not stg.salinan_belum_disentuh(job):
-        # Salinan VPS sudah mulai ditulis: belum utuh sampai disalin ulang.
-        status, asal, galat = StatusHosting.gagal, ASAL_SALINAN, PESAN_BATAL_TENGAH
-    else:
-        status, asal = status_sebelum(job, h)
-        galat = stg.PESAN_DIBATALKAN
-    _tandai(sesi, hosting_id, status, galat, asal=asal)
+    if h is not None:
+        hasil = status_tanpa_salinan_rusak(job, h)
+        if hasil is None:
+            # Salinan VPS sudah mulai ditulis dan belum lengkap: salin ulang.
+            status, asal, galat = StatusHosting.gagal, ASAL_SALINAN, PESAN_BATAL_TENGAH
+        else:
+            (status, asal), galat = hasil, stg.PESAN_DIBATALKAN
+        _tandai(sesi, hosting_id, status, galat, asal=asal)
     stg.catat_aktivitas(sesi, site_id, job, f"{nama} dibatalkan", level="warning")
     sesi.commit()
     return stg.GalatDibatalkan()
@@ -351,7 +401,7 @@ def _batalkan(sesi: Session, job: Job, site_id, hosting_id, nama: str) -> stg.Ga
 def _akhiri_rentetan_sibuk(sesi: Session, job: Job) -> None:
     """Kegagalan lain sesudah penolakan sibuk: rentetan selesai, jendela berikutnya mulai dari awal."""
     if sibuk_kali(job):
-        stg.simpan_kemajuan(sesi, job, sibuk_kali=0, sibuk_sejak=None)
+        stg.simpan_kemajuan(sesi, job, sibuk_kali=0, sibuk_sejak=None, sibuk_langkah=None)
 
 
 def _putuskan(sesi: Session, job: Job, hosting_id, site_id, exc: SiteError, status_kerja, batal_berlaku,
@@ -370,51 +420,97 @@ def _putuskan(sesi: Session, job: Job, hosting_id, site_id, exc: SiteError, stat
         _gagal_final(sesi, job, hosting_id, exc.pesan)
 
 
+def _ulang_sesudah_tukar(sesi: Session, job: Job, hosting_id, site_id, pesan: str, status_kerja, batal_berlaku,
+                         nama: str) -> SiteError:
+    """Produksi sudah tersentuh (R26, putusan L12): apa pun galatnya diulang sampai 24 jam, lalu `gagal` 'produksi'."""
+    galat = SiteError(TRANSIENT, pesan)
+    _putuskan(sesi, job, hosting_id, site_id, galat, status_kerja, batal_berlaku, nama)
+    return galat
+
+
+def _langkah_sekarang(job: Job) -> str:
+    """Penanda langkah job (langkah aktivasi + tahap tarik): rentetan sibuk dimulai ulang bila berubah."""
+    k = stg.kemajuan(job)
+    return f"{k.get('langkah_aktifkan') or '-'}/{k.get('tahap') or '-'}"
+
+
 def _tangani_sibuk(sesi: Session, job: Job, hosting_id, site_id, exc: GalatPembantu, status_kerja,
                    batal_berlaku, nama: str) -> SiteError:
     """Skrip pembantu menolak tanpa perubahan (keluar 3): dijadwalkan ulang, bukan gagal.
 
     Kunci router dipegang selama `prod-db-impor` situs lain (sampai 3 jam),
     dan kunci nginx yang sibuk juga keluar 3. Selama `queue.BATAS_SIBUK`
-    sejak penolakan pertama rentetan ini, job diulang dengan jeda yang
-    bertambah (queue.selesai_gagal), jatah percobaannya dikembalikan (pola
-    GalatBerhenti), dan baris hosting tetap di status kerjanya. Sesudah
-    jendela itu: berakhir seperti penolakan tanpa ubah (status sebelum job),
-    kecuali salinan VPS sudah mulai ditulis job ini -- salinan setengah jadi
-    tidak boleh tersembunyi di balik `pratinjau` (spec §10.3), jadi `gagal`
-    asal `salinan`.
+    sejak penolakan pertama rentetan ini (rentetan dimulai ulang bila job
+    sudah maju ke langkah lain), job diulang dengan jeda yang bertambah
+    (queue.selesai_gagal), jatah percobaannya dikembalikan (pola
+    GalatBerhenti), dan baris hosting tetap di status kerjanya dengan pesan
+    netral. Sesudah jendela itu: berakhir seperti penolakan tanpa ubah
+    (status sebelum job; salinan yang sudah disalin utuh tidak ditandai
+    rusak), kecuali salinan VPS sudah mulai ditulis job ini dan belum lengkap
+    -- salinan setengah jadi tidak boleh tersembunyi di balik `pratinjau`
+    (spec §10.3), jadi `gagal` asal `salinan`.
     """
     sesi.rollback()
     if batal_berlaku() and stg._batal_diminta(sesi, hosting_id, HostingVps):
         return _batalkan(sesi, job, site_id, hosting_id, nama)
-    kali = sibuk_kali(job)
-    sejak = stg.kemajuan(job).get("sibuk_sejak") if kali else None
-    stg.simpan_kemajuan(sesi, job, sibuk_sejak=sejak or sekarang().isoformat(), sibuk_kali=kali + 1)
+    k = stg.kemajuan(job)
+    langkah = _langkah_sekarang(job)
+    kali = sibuk_kali(job) if k.get("sibuk_langkah") == langkah else 0
+    sejak = k.get("sibuk_sejak") if kali else None
+    stg.simpan_kemajuan(sesi, job, sibuk_sejak=sejak or sekarang().isoformat(), sibuk_kali=kali + 1,
+                        sibuk_langkah=langkah)
     if dalam_batas_sibuk(job):
         job.attempts = max(0, job.attempts - 1)
         sesi.commit()
         if akan_diulang(job, TRANSIENT):
+            log.info("Job hosting %s (%s): skrip pembantu sibuk (%s, ke-%s); dijadwalkan ulang",
+                     job.id, nama, exc.pesan, kali + 1)
             if status_kerja is not None:
-                _tandai(sesi, hosting_id, status_kerja, f"Terputus, dilanjutkan otomatis: {exc.pesan}",
-                        bersihkan_batal=False)
-            return SiteError(TRANSIENT, exc.pesan)
+                _tandai(sesi, hosting_id, status_kerja, PESAN_MENUNGGU_SIBUK, bersihkan_batal=False)
+            return GalatSibuk(pertama=kali == 0)
     log.warning("Job hosting %s (%s): skrip pembantu terus menolak sejak %s; diakhiri",
                 job.id, nama, stg.kemajuan(job).get("sibuk_sejak"))
-    if job.tipe in STATUS_KERJA and not stg.salinan_belum_disentuh(job):
+    if job.tipe == JobType.backup_hosting:
+        _tandai_backup_gagal(sesi, hosting_id)
+        return stg.GalatDitolakTanpaUbah(exc.pesan)
+    h = sesi.get(HostingVps, hosting_id, populate_existing=True)
+    hasil = status_tanpa_salinan_rusak(job, h) if h is not None else None
+    if hasil is None:
         _gagal_final(sesi, job, hosting_id, exc.pesan)
         return stg.galat_gagal(exc.pesan)
-    _kembali_tanpa_ubah(sesi, job, hosting_id, exc.pesan)
+    status, asal = hasil
+    _tandai(sesi, hosting_id, status, exc.pesan, asal=asal)
     return stg.GalatDitolakTanpaUbah(exc.pesan)
+
+
+def _muat_atau_lepas(sesi: Session, job: Job) -> tuple[Site, HostingVps]:
+    """`muat_hosting`; bila ditolak (fitur dimatikan sementara job menunggu), status kerja tidak ditinggal.
+
+    Percobaan sebelumnya job ini bisa meninggalkan baris di `menyalin`/
+    `mengaktifkan` ("dilanjutkan otomatis"). Job berakhir di sini, jadi baris
+    itu ditutup seperti kegagalan final (aturan `status_gagal_final`).
+    Baris yang sudah hilang tidak meninggalkan apa pun.
+    """
+    try:
+        return muat_hosting(sesi, job)
+    except SiteError as exc:
+        sesi.rollback()
+        h = sesi.scalar(select(HostingVps).where(HostingVps.site_id == job.site_id))
+        if h is not None and h.status in STATUS_KERJA_SEMUA:
+            _gagal_final(sesi, job, h.id, exc.pesan)
+        raise
 
 
 def jalankan_hosting(sesi: Session, job: Job, inti, nama: str, boleh_batal=None) -> dict:
     """Pembungkus bersama job hosting (spec §10.6).
 
     `inti(sesi, job, site, hosting) -> dict`. `boleh_batal(job) -> bool`
-    (opsional): False berarti permintaan batal tidak lagi berlaku (aktivasi
-    sesudah tukar). Backup tidak bisa dibatalkan dan tidak mengubah status.
+    (opsional): False berarti permintaan batal tidak lagi berlaku. Sesudah
+    tukar (`queue.menyentuh_produksi`) batal tidak pernah berlaku dan setiap
+    galat diulang menurut R26 (putusan L12). Backup tidak bisa dibatalkan
+    dan tidak mengubah status.
     """
-    site, h = muat_hosting(sesi, job)
+    site, h = _muat_atau_lepas(sesi, job)
     hosting_id, site_id, job_id = h.id, site.id, job.id
     backup = job.tipe == JobType.backup_hosting
     status_kerja = STATUS_KERJA.get(job.tipe)
@@ -425,18 +521,31 @@ def jalankan_hosting(sesi: Session, job: Job, inti, nama: str, boleh_batal=None)
     sesi.commit()
 
     def batal_berlaku() -> bool:
-        return not backup and (boleh_batal is None or boleh_batal(job))
+        # Dibaca dari kemajuan yang ter-commit (pemanggil rollback lebih dulu).
+        return not backup and not menyentuh_produksi(job) and (boleh_batal is None or boleh_batal(job))
+
+    def ulang(pesan: str) -> SiteError:
+        return _ulang_sesudah_tukar(sesi, job, hosting_id, site_id, pesan, status_kerja, batal_berlaku, nama)
 
     try:
         if batal_berlaku():
             stg.periksa_batal(sesi, h)
         hasil = inti(sesi, job, site, h)
     except stg.Dibatalkan:
+        sesi.rollback()
+        if menyentuh_produksi(job):
+            # Batal tidak berlaku lagi; permintaannya dihapus supaya putaran
+            # berikutnya tidak berhenti di titik potongan yang sama.
+            _tandai_batal_diabaikan(sesi, hosting_id)
+            raise ulang(PESAN_BATAL_DIABAIKAN) from None
         raise _batalkan(sesi, job, site_id, hosting_id, nama) from None
     except stg.KlaimHilang:
         raise
     except stg.GalatDitolakTanpaUbah as exc:
         _pakai_pesan_ui(exc, job_id, nama)
+        sesi.rollback()
+        if menyentuh_produksi(job):
+            raise ulang(exc.pesan) from None
         _kembali_tanpa_ubah(sesi, job, hosting_id, exc.pesan)
         raise
     except GalatPembantu as exc:
@@ -454,11 +563,17 @@ def jalankan_hosting(sesi: Session, job: Job, inti, nama: str, boleh_batal=None)
         raise
     except OSError as exc:
         pesan = stg.pesan_os(exc)
+        sesi.rollback()
+        if menyentuh_produksi(job):
+            raise ulang(pesan) from None
         _gagal_final(sesi, job, hosting_id, pesan)
         raise stg.galat_gagal(pesan) from None
     except Exception:
         # Bug dashboard (F12): teks pengecualian hanya ke log server.
         log.exception("Galat tak terduga pada %s (job %s)", nama, job_id)
+        sesi.rollback()
+        if menyentuh_produksi(job):
+            raise ulang(stg.PESAN_TAK_TERDUGA) from None
         _gagal_final(sesi, job, hosting_id, stg.PESAN_TAK_TERDUGA)
         raise
     h = sesi.get(HostingVps, hosting_id, populate_existing=True)
@@ -469,3 +584,10 @@ def jalankan_hosting(sesi: Session, job: Job, inti, nama: str, boleh_batal=None)
         h.batal_diminta_pada = None
     sesi.commit()
     return hasil
+
+
+def _tandai_batal_diabaikan(sesi: Session, hosting_id) -> None:
+    h = sesi.get(HostingVps, hosting_id, populate_existing=True)
+    if h is not None:
+        h.batal_diminta_pada = None
+        sesi.commit()

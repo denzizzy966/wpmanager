@@ -37,16 +37,18 @@ _BENTROK = (
 # job TERTUNDA yang sudah menyentuh produksi -- dorong/kembalikan dengan
 # `unggah_mulai` atau `langkah_terapkan` di kemajuan, atau pindah_aktifkan
 # yang sudah memulai tukar (`langkah_aktifkan` tukar/verifikasi/beres).
-# Produksi bisa setengah diterapkan/beralih, jadi job Lapis 1 (update, scan,
-# ...) tidak boleh berjalan di atasnya. Hanya berlaku bagi kandidat
-# non-runtime (`:kand` = alias tabel kandidat), seperti spec §10.4; job
-# runtime lain tetap diserialkan terhadap job yang sedang BERJALAN lewat
-# _BENTROK.
-def _menahan(kand: str) -> str:
+# Produksi bisa setengah diterapkan/beralih, jadi tidak ada job lain di site
+# itu yang boleh berjalan di atasnya: job Lapis 1 (update, scan, ...), dan
+# juga job runtime keluarga LAIN (putusan L11) -- dorong/kembalikan tertunda
+# sesudah tukar menahan pindah_*/backup_hosting, dan pindah_aktifkan
+# tertunda sesudah tukar menahan job staging. Indeks unik staging dan
+# hosting terpisah, jadi hanya aturan ini yang menahannya. Di keluarga yang
+# sama tidak ada job lain yang bisa tertunda bersamanya (indeks unik per
+# keluarga), dan job itu sendiri dikecualikan lewat `j2.id <> j.id`.
+def _menahan() -> str:
     return (
         "(j2.status = 'running'"
         " OR (j2.status = 'pending'"
-        f" AND {kand}.tipe NOT IN {_RUNTIME}"
         " AND ((j2.tipe IN ('staging_dorong', 'staging_kembalikan')"
         " AND (j2.payload #> '{kemajuan,langkah_terapkan}' IS NOT NULL"
         " OR (j2.payload #>> '{kemajuan,unggah_mulai}') = 'true'))"
@@ -86,7 +88,7 @@ SQL_AMBIL = text(
                     SELECT 1 FROM jobs j2
                      WHERE j2.site_id = j.site_id
                        AND j2.id <> j.id
-                       AND {_menahan('j')}
+                       AND {_menahan()}
                        AND {_BENTROK})
             ORDER BY j.scheduled_for
               FOR UPDATE OF j, s SKIP LOCKED
@@ -109,7 +111,7 @@ SQL_BENTROK = text(
       FROM jobs j
       JOIN jobs j2 ON j2.site_id = j.site_id AND j2.id <> j.id
      WHERE j.id = :id
-       AND {_menahan('j')}
+       AND {_menahan()}
        AND {_BENTROK}
      LIMIT 1
     """
