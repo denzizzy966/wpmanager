@@ -259,6 +259,30 @@ def test_instruksi_tanpa_cek_dan_nilai_rusak_dibuang(setelan):
     assert nilai == [LAMA6]
 
 
+@pytest.mark.parametrize("ipv6", [None, VPS6])
+def test_instruksi_www_cname_apex_aaaa_ikut_apex(setelan, ipv6):
+    h = _h()
+    h.dns_hasil = {"ok": False, "dicek": "x", "nama": [
+        {"nama": "www", "jenis": "A", "ok": False, "kode": "beda", "cname_apex": True}]}
+    daftar = instruksi(h, VPS, ipv6)
+    www = [x for x in daftar if x["nama"] == "www"]
+    assert [(x["jenis"], x["aksi"], x["nilai"]) for x in www if x["jenis"] == "AAAA"] == [("AAAA", "ikut_apex", "")]
+    assert next(x for x in www if x["jenis"] == "A")["aksi"] == "ikut_apex"
+    apex_aaaa = next(x for x in daftar if x["nama"] == "@" and x["jenis"] == "AAAA")
+    assert apex_aaaa["nilai"] == (ipv6 or "")
+
+
+def test_instruksi_www_cname_cdn_aaaa_setelah_cname(setelan):
+    h = _h()
+    h.dns_hasil = {"ok": False, "dicek": "x", "nama": [
+        {"nama": "www", "jenis": "A", "ok": False, "kode": "cname"}]}
+    daftar = instruksi(h, VPS, VPS6)
+    www_a = next(x for x in daftar if x["nama"] == "www" and x["jenis"] == "A")
+    assert www_a["cname"] is True
+    www_aaaa = [x for x in daftar if x["nama"] == "www" and x["jenis"] == "AAAA"]
+    assert [(x["aksi"], x["nilai"]) for x in www_aaaa] == [("setelah_cname", "")]
+
+
 # ---- backoff sertifikat -------------------------------------------------------------------
 
 T0 = datetime(2026, 10, 3, 10, 0, tzinfo=timezone.utc)

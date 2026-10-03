@@ -66,6 +66,14 @@ def test_script_hosting_memakai_x_text_dan_tanpa_innerhtml():
         assert kata in tpl, kata
 
 
+def test_polling_dns_30_detik_dipatok():
+    js = (AKAR / "static" / "app" / "hosting.js").read_text(encoding="utf-8")
+    assert "const JEDA_POLLING_DNS = 30000;" in js
+    assert "status === 'menunggu_dns' ? JEDA_POLLING_DNS : null" in js
+    assert "const JEDA_POLLING_HOSTING = 3000;" in js
+    assert "ikut_apex" in js and "setelah_cname" in js
+
+
 def test_hosting_tanpa_storage_dan_innerhtml():
     # Kata sandi pratinjau tidak boleh menyentuh storage browser; teks server hanya lewat x-text.
     js = (AKAR / "static" / "app" / "hosting.js").read_text(encoding="utf-8")

@@ -84,8 +84,8 @@
              (<code x-text="data.ipv6"></code>); jangan biarkan AAAA lama.</p>
           <p class="redup">Record AAAA lama wajib dihapus (atau diarahkan ke IPv6 VPS bila tabel memintanya):
              Let's Encrypt mendahulukan IPv6, dan pengunjung IPv6 akan tetap ke hosting lama.</p>
-          <p class="galat" x-show="adaCdn()">Domain memakai CDN Hostinger: matikan CDN di hPanel, lalu ganti CNAME www
-             (...hstgr.net) dengan record A ke VPS.</p>
+          <p class="galat" x-show="adaCdn()">Record www adalah CNAME ke nama lain (mis. CDN Hostinger) — matikan CDN di
+             hPanel / ganti dengan record A ke VPS.</p>
           <p class="redup">Turunkan TTL record ke 300 detik sehari sebelumnya bila memungkinkan.</p>
           <p>Cek terakhir: <span x-text="waktu(data.hosting.dns_dicek_pada)"></span> —
              <span x-text="teksDns()"></span></p>

@@ -314,6 +314,13 @@ def instruksi(hosting, ipv4: str, ipv6: str | None) -> list[dict]:
             daftar.append({"jenis": "A", "nama": label, "aksi": "ubah", "nilai": ipv4, "ok": a.get("ok") is True,
                            "cname": a.get("kode") == "cname"})
         aaaa = hasil.get((label, "AAAA")) or {}
+        if label == "www" and (a.get("cname_apex") is True or a.get("kode") == "cname"):
+            # www masih CNAME: AAAA-nya tidak terpisah dari record A (ikut apex) atau baru
+            # bermakna sesudah CNAME diganti A; nilai tidak ditampilkan supaya tidak menyesatkan.
+            aksi = "ikut_apex" if a.get("cname_apex") is True else "setelah_cname"
+            daftar.append({"jenis": "AAAA", "nama": label, "aksi": aksi, "nilai": "",
+                           "ok": aaaa.get("ok") is True})
+            continue
         if ipv6:
             daftar.append({"jenis": "AAAA", "nama": label, "aksi": "ubah", "nilai": ipv6, "ok": aaaa.get("ok") is True})
             continue

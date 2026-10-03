@@ -228,7 +228,8 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
     return _tpl().TemplateResponse(
         request, "site_detail.html",
         {"pengguna": pengguna, "site": site, "paket": paket, "riwayat": riwayat,
-         "tab": tab, "tab_detail": tab_detail, "staging_aktif": staging_aktif, "hosting_aktif": hosting_aktif, "lencana": lencana,
+         "tab": tab, "tab_detail": tab_detail, "staging_aktif": staging_aktif,
+         "hosting_aktif": hosting_aktif, "lencana": lencana,
          "bulan_lalu": _bulan_lalu(sekarang.date()),
          "ga4_aktif": bool(get_settings().ga4_credentials),
          "pesan_diubah_segarkan": PESAN_DIUBAH_SEGARKAN},

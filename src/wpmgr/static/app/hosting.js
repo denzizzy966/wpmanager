@@ -5,6 +5,7 @@ const TEKS_JOB_HOSTING = {
 // (cermin LANGKAH_AKTIFKAN_SESUDAH_TUKAR di wpmgr.jobs.queue).
 const LANGKAH_SESUDAH_TUKAR = ['tukar', 'verifikasi', 'beres'];
 const JEDA_POLLING_HOSTING = 3000;
+const JEDA_POLLING_DNS = 30000;
 const STATUS_BERHENTI_HOSTING = [401, 404];
 const MAKS_GAGAL_HOSTING = 5;
 const TEKS_SIBUK_HOSTING = 'Menunggu pekerjaan hosting yang sedang berjalan selesai.';
@@ -50,12 +51,14 @@ function tabHosting(siteId) {
 
     dasar() { return `/api/sites/${this.siteId}/hosting`; },
 
-    // Polling hanya selama ada job aktif (atau status yang pasti berarti ada job).
+    // 3 detik selama ada job aktif (atau status yang pasti berarti ada job); 30 detik saat menunggu DNS
+    // tanpa job, supaya aktivasi otomatis cron terlihat (putusan L20).
     jedaPolling() {
       if (!this.data) return null;
       if (this.data.job) return JEDA_POLLING_HOSTING;
       const status = this.data.hosting ? this.data.hosting.status : null;
-      return status === 'menyalin' || status === 'mengaktifkan' ? JEDA_POLLING_HOSTING : null;
+      if (status === 'menyalin' || status === 'mengaktifkan') return JEDA_POLLING_HOSTING;
+      return status === 'menunggu_dns' ? JEDA_POLLING_DNS : null;
     },
 
     async muat() {
@@ -80,7 +83,7 @@ function tabHosting(siteId) {
         this._gagalBeruntun += 1;
         if (this._gagalBeruntun >= MAKS_GAGAL_HOSTING) lanjut = false;
         this.galat = `Data hosting tidak dapat dimuat. ${e.message}`
-          + (lanjut ? '' : ' Pembaruan otomatis dihentikan; muat ulang halaman untuk mencoba lagi.');
+          + (lanjut ? '' : ' Pembaruan otomatis dijeda; buka ulang tab atau muat ulang halaman.');
         this._galatMuat = this.galat;
       } finally {
         this._memuat = false;
@@ -213,7 +216,11 @@ function tabHosting(siteId) {
     },
 
     teksAksi(r) {
-      if (r.aksi === 'ikut_apex') return 'Tidak perlu diubah: www adalah CNAME ke domain utama, ikut record @';
+      if (r.aksi === 'ikut_apex') {
+        return r.jenis === 'A' ? 'Tidak perlu diubah: www adalah CNAME ke domain utama, ikut record @'
+          : 'Ikut record @';
+      }
+      if (r.aksi === 'setelah_cname') return 'Selesai sesudah CNAME diganti A';
       if (r.jenis === 'CAA') return 'Tambahkan agar Let\'s Encrypt boleh menerbitkan sertifikat';
       if (r.aksi === 'hapus') return r.nilai ? 'Hapus record ini' : 'Pastikan tidak ada';
       if (r.jenis === 'AAAA') return 'Ubah atau buat (IPv6 VPS)';
@@ -245,8 +252,13 @@ function tabHosting(siteId) {
       return Number.isFinite(p) ? Math.max(0, Math.min(100, p)) : 0;
     },
 
-    salin(teks) {
-      if (navigator.clipboard) navigator.clipboard.writeText(teks);
+    async salin(teks) {
+      try {
+        await navigator.clipboard.writeText(teks);
+        this.info = 'Tersalin.';
+      } catch (e) {
+        this.info = 'Tidak dapat menyalin otomatis; salin manual.';
+      }
     },
 
     aman(url) { return typeof url === 'string' && url.startsWith('https://') ? url : '#'; },
