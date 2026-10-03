@@ -14,3 +14,17 @@ ACME_EMAIL=admin@halosocia.my.id
 ROUTER_PORT=127.0.0.1:8090
 MAIL_PORT=127.0.0.1:8025
 SUBNET=172.31.250.0/24
+
+# ---- Hosting VPS (Lapis 4). Kosongkan HOSTING_DIR untuk mematikan prod-*.
+# HOSTING_DIR dibuat operator: install -d -o wpmgr -g wpmgr -m 0700 /var/lib/wpmgr/hosting
+# Tidak boleh sama dengan, di dalam, atau memuat STAGING_DIR.
+HOSTING_DIR=/var/lib/wpmgr/hosting
+# Tidak boleh beririsan dengan SUBNET staging.
+PROD_SUBNET=172.31.251.0/24
+PROD_ROUTER_PORT=127.0.0.1:8091
+PROD_CERT_DIR=/var/lib/wpmgr/hosting-certs
+NGINX_HOSTING_DIR=/etc/nginx/wpmgr-hosting
+BACKUP_DIR=/var/lib/wpmgr/backup
+# IPv4 publik VPS: tujuan satu-satunya yang boleh dibuka container produksi
+# di host (port 80/443, panggilan situs ke URL-nya sendiri).
+IP_PUBLIK=169.58.91.181

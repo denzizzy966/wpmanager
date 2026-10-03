@@ -133,3 +133,58 @@ def test_crontab_backup_hosting_zona_vps():
 def test_crontab_berakhiran_baris_lf():
     assert b"\r" not in (AKAR / "deploy" / "crontab").read_bytes()
     assert "deploy/crontab text eol=lf" in (AKAR / ".gitattributes").read_text(encoding="utf-8").splitlines()
+
+
+def test_nginx_hosting_hanya_include_direktori_domain():
+    baris = [b.strip() for b in _teks("nginx-wpmgr-hosting.conf").splitlines()
+             if b.strip() and not b.strip().startswith("#")]
+    assert baris == ["include /etc/nginx/wpmgr-hosting/*.conf;"]
+
+
+def test_unit_siapkan_juga_menyiapkan_produksi():
+    t = _teks("wpmgr-staging-siapkan.service")
+    assert t.index("ExecStart=/usr/local/sbin/wpmgr-staging siapkan") \
+        < t.index("ExecStart=/usr/local/sbin/wpmgr-staging prod-siapkan")
+
+
+def test_unit_siapkan_berurutan_sesudah_docker():
+    """siapkan/prod-siapkan memanggil docker, jadi unit WAJIB sesudah Docker (tidak mungkin Before=).
+    Jendela reboot (container hidup sebelum iptables) didokumentasikan, bukan ditutup."""
+    t = _teks("wpmgr-staging-siapkan.service")
+    baris = [b.strip() for b in t.splitlines() if b.strip() and not b.strip().startswith("#")]
+    assert "After=docker.service network-online.target" in baris
+    assert "Requires=docker.service" in baris
+    assert not any(b.startswith("Before=") and "docker" in b for b in baris)
+    assert "JENDELA SESUDAH REBOOT" in t
+    assert "docker" in (STAGING / "wpmgr-staging").read_text(encoding="utf-8")
+
+
+def test_contoh_konfigurasi_memuat_kunci_hosting():
+    t = _teks("staging.conf.contoh")
+    for kunci in ("HOSTING_DIR=/var/lib/wpmgr/hosting", "PROD_SUBNET=172.31.251.0/24",
+                  "PROD_ROUTER_PORT=127.0.0.1:8091", "PROD_CERT_DIR=/var/lib/wpmgr/hosting-certs",
+                  "NGINX_HOSTING_DIR=/etc/nginx/wpmgr-hosting", "BACKUP_DIR=/var/lib/wpmgr/backup",
+                  "IP_PUBLIK=169.58.91.181"):
+        assert kunci in t, kunci
+    assert "NGINX_UJI_SAJA=1" not in t and "SERTIFIKAT_SENDIRI=1" not in t
+
+
+def test_readme_menjelaskan_pindah_hosting():
+    readme = (AKAR / "README.md").read_text(encoding="utf-8")
+    assert readme.index("## Staging (Lapis 3)") < readme.index("## Pindah hosting (Lapis 4)") \
+        < readme.index("## Keterbatasan yang diketahui")
+    for wajib in ("wpmgr-staging prod-siapkan", "install -d -o wpmgr -g wpmgr -m 0700 /var/lib/wpmgr/hosting",
+                  "/etc/nginx/sites-enabled/wpmgr-hosting.conf", "install -d -m 0755 /etc/nginx/wpmgr-hosting",
+                  "nginx -T | grep -n server_name", "grep -rn 'allow\\|deny' /etc/nginx/sites-enabled",
+                  'grep -rn "set_real_ip_from\\|allow 172\\|allow 10\\.\\|allow 192\\.168" /etc/nginx/',
+                  "WPMGR_HOSTING_IPV4", "WPMGR_HOSTING_IPV6", "2a02:c207:2347:2607::1",
+                  "tanpa `CRON_TZ`", "02:30 WIB", "03:30 WIB", "21:50 Berlin", "deploy/crontab",
+                  "wpmgr-worker@staging", "Izinkan staging", "AAAA", "cdn.hstgr.net", "TTL",
+                  "matikan CDN di hPanel", "rizkycahayaraya.com", "Sesudah reboot VPS",
+                  "### Pemulihan backup manual", "docker exec wpmgr-prod-db", "wpmgr-staging prod-jalan",
+                  "db.sql.gz", "files.tar.gz", "files.sebelum-pulih-", "off-site belum dibuat",
+                  "### Melepas site aktif secara manual", "DELETE FROM hosting_vps",
+                  "rsync", "mail()", "src/wpmgr/hosting/", "ESTABLISHED,RELATED"):
+        assert wajib in readme, wajib
+    assert "CRON_TZ=Asia/Jakarta" not in readme
+

@@ -33,6 +33,13 @@ After=docker.service network-online.target
 # keduanya menimpa seluruh tabel, bukan cuma milik Docker. Sesudah salah
 # satu dari itu, jalankan `systemctl restart wpmgr-staging-siapkan` secara
 # manual untuk memasang ulang isolasi jaringan staging.
+#
+# JENDELA SESUDAH REBOOT (Lapis 4): container produksi berkebijakan restart, jadi
+# dockerd menjalankannya ulang SEBELUM unit ini memasang rantai iptables isolasi
+# (WPMGR-PROD-*). Jendela itu tidak bisa ditutup dengan Before=docker.service:
+# siapkan dan prod-siapkan memanggil `docker` (membuat jaringan, menjalankan
+# layanan) dan rantai DOCKER-USER baru ada setelah dockerd hidup. Karena itu
+# urutan After=docker.service dipertahankan dan risikonya didokumentasikan di README.
 Requires=docker.service
 PartOf=docker.service
 Wants=network-online.target
@@ -40,6 +47,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/wpmgr-staging siapkan
+# Lapis 4: jaringan, isolasi, dan layanan produksi (keluar 0 bila HOSTING_DIR kosong).
+ExecStart=/usr/local/sbin/wpmgr-staging prod-siapkan
 RemainAfterExit=yes
 
 [Install]

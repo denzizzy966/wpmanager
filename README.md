@@ -656,6 +656,189 @@ Keterbatasan staging:
   itu disimpan untuk pemulihan manual.
 - Multisite dan site dengan `wp-content` di luar folder WordPress belum didukung.
 
+## Pindah hosting (Lapis 4)
+
+Memindahkan site dari shared hosting (tanpa SSH) ke VPS dashboard dan menjalankannya di sana sebagai
+produksi, di container Docker. Data diambil lewat connector 3.0 (endpoint baca `/staging/*` Lapis 3) dari IP
+hosting lama; site lama **tidak pernah diubah**. Spesifikasi: `docs/superpowers/specs/2026-10-03-wp-manager-lapis4-design.md`.
+Semua langkah root di bawah dijalankan operator dengan `sudo` (atau sebagai root). Tidak ada kata sandi
+atau kredensial FTP yang perlu ditulis di berkas mana pun di repo ini.
+
+### Prasyarat
+
+- Lapis 3 sudah terpasang di VPS dan `wpmgr-staging siapkan` sukses (domain staging
+  `staging.halosocia.my.id` dengan wildcard DNS dan nginx `wpmgr-staging.conf`).
+- Site lama terdaftar di dashboard, connector 3.0 terpasang lewat wp-admin, pairing sukses, dan
+  **Izinkan staging** menyala di *Pengaturan → WP Manager*.
+- `home`/`siteurl` site lama memakai `https://` tanpa subfolder.
+- RAM tersedia VPS ≥ 2 GB dan sisa disk sesudah salin ≥ 15%.
+- `/etc/letsencrypt/options-ssl-nginx.conf` ada (sama dengan Lapis 3).
+
+### Pemasangan (sekali)
+
+1. Merge, lalu `alembic upgrade head` dan `pip install -e .` (dependensi baru `dnspython`).
+2. Pasang ulang skrip pembantu: `sudo install -o root -g root -m 0755 deploy/staging/wpmgr-staging /usr/local/sbin/wpmgr-staging`.
+   Sudoers tidak berubah (satu entri untuk seluruh skrip, termasuk subperintah `prod-*`).
+3. Tambahkan kunci hosting dari `deploy/staging/staging.conf.contoh` ke `/etc/wpmgr-staging/staging.conf`
+   (`HOSTING_DIR`, `PROD_SUBNET`, `PROD_ROUTER_PORT`, `PROD_CERT_DIR`, `NGINX_HOSTING_DIR`, `BACKUP_DIR`,
+   `IP_PUBLIK`), lalu siapkan direktori data:
+   `sudo install -d -o wpmgr -g wpmgr -m 0700 /var/lib/wpmgr/hosting`.
+4. **Pra-cek nginx host** (jangan dilewati). Container produksi tinggal di `172.31.251.0/24` dan boleh
+   membuka port 80/443 IP publik VPS. Vhost lain di VPS (sekitar 19 situs) tidak boleh memercayai rentang
+   privat, atau container yang diretas diperlakukan sebagai proxy tepercaya. Periksa semuanya:
+
+   ```bash
+   sudo grep -rn "set_real_ip_from\|allow 172\|allow 10\.\|allow 192\.168" /etc/nginx/
+   sudo grep -rn 'allow\|deny' /etc/nginx/sites-enabled
+   sudo nginx -T | grep -n server_name
+   ```
+
+   Tinjau setiap temuan dua `grep` pertama: tidak boleh ada `set_real_ip_from` atau `allow` yang mencakup
+   rentang privat (RFC1918: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) sehingga `172.31.251.0/24`
+   ikut terpercaya. Perbaiki dulu bila ada. Dari `server_name`, pastikan tidak ada nama untuk domain yang akan
+   dipindah.
+5. Jalankan `sudo wpmgr-staging prod-siapkan` (membuat `KONF_DIR/prod`, `php.ini`, jaringan `wpmgr-prod`,
+   aturan iptables, `wpmgr-prod-db`, `wpmgr-prod-router`). Pasang ulang
+   `deploy/staging/wpmgr-staging-siapkan.service` (kini punya `ExecStart` kedua `prod-siapkan`), lalu
+   `sudo systemctl daemon-reload`. Lapis 4 juga memperbaiki aturan INPUT staging dengan
+   `ESTABLISHED,RELATED` di atas `DROP`, supaya balasan router ke nginx host tidak dibuang; jalankan
+   `sudo wpmgr-staging siapkan` sekali lagi sesudah memasang skrip baru.
+6. Pasang include nginx hosting: salin `deploy/staging/nginx-wpmgr-hosting.conf` ke
+   `/etc/nginx/sites-enabled/wpmgr-hosting.conf`, jalankan `sudo install -d -m 0755 /etc/nginx/wpmgr-hosting`,
+   lalu `sudo nginx -t && sudo systemctl reload nginx`.
+7. Isi variabel di `.env`:
+
+   | Variabel | Nilai di VPS ini |
+   |---|---|
+   | `WPMGR_HOSTING_IPV4` | `169.58.91.181` (kosong = fitur hosting mati) |
+   | `WPMGR_HOSTING_IPV6` | `2a02:c207:2347:2607::1` (kosong = AAAA wajib dihapus) |
+   | `WPMGR_HOSTING_DIR` | `/var/lib/wpmgr/hosting` (sama dengan `HOSTING_DIR`) |
+   | `WPMGR_HOSTING_RESOLVER` | `1.1.1.1,8.8.8.8` |
+   | `WPMGR_BACKUP_TUJUAN` / `_HARIAN` / `_MINGGUAN` | `lokal` / `7` / `4` |
+
+8. Pasang ulang `deploy/crontab` (`crontab -u wpmgr deploy/crontab`; berkas ini wajib berakhiran baris LF,
+   dijaga `.gitattributes`, karena cron menolak CRLF). **Jadwal hosting memakai zona VPS `Europe/Berlin`,
+   tanpa `CRON_TZ`** (cron Debian mengabaikannya): `hosting-cek-dns` tiap 10 menit; `backup-hosting`
+   `30 21 * * *` = 02:30 WIB di musim panas (CEST) dan 03:30 WIB di musim dingin (CET);
+   `renew-hosting-certs` `50 21 * * *` = 21:50 Berlin (02:50 WIB musim panas, 03:50 WIB musim dingin).
+9. Restart `wpmgr-web`, `wpmgr-worker@1`, `wpmgr-worker@2`, dan `wpmgr-worker@staging` (job hosting
+   diproses worker staging).
+
+**Sesudah reboot VPS:** Docker menjalankan ulang container produksi (kebijakan restart) sebelum
+`wpmgr-staging-siapkan.service` memasang ulang aturan iptables isolasi. Unit itu memerlukan Docker berjalan
+(`siapkan` dan `prod-siapkan` memanggil `docker`, dan rantai `DOCKER-USER` baru ada sesudah dockerd hidup),
+jadi urutannya tidak bisa dibalik dengan `Before=docker.service`. Akibatnya ada jendela beberapa detik saat
+boot ketika isolasi container produksi belum terpasang. Risiko ini diterima dan didokumentasikan. Sesudah
+reboot, pastikan unit sukses: `systemctl status wpmgr-staging-siapkan` dan `sudo iptables -S WPMGR-PROD-MASUK`.
+
+### Alur pengguna
+
+1. Tab **Hosting VPS** → **Pindahkan ke VPS**. Dashboard menurunkan domain dari URL site, mencari IP
+   hosting lama lewat DNS publik, dan menampilkan kata sandi pratinjau **sekali**.
+   **Bila site lama berada di balik CDN hPanel** (mis. `rizkycahayaraya.com`, record CNAME ke
+   `*.cdn.hstgr.net` atau IP CDN), matikan CDN di hPanel **sebelum** menekan *Pindahkan ke VPS*, dan tunggu
+   DNS menampilkan IP hosting asli. Selama CDN aktif, IP hosting lama tidak terlihat dan dashboard menolak
+   dengan pesan CDN.
+2. Penyalinan berjalan di latar (bisa dilanjutkan bila terputus). Hasilnya dibuka di
+   `https://vps-<nama>.staging.halosocia.my.id` (pengguna `pratinjau`), dengan email diblokir, WP-Cron mati,
+   dan noindex. Cara kedua: baris `169.58.91.181 <domain> www.<domain>` di berkas hosts komputer Anda
+   (browser memperingatkan sertifikat; lanjutkan). **Salin ulang** tersedia selama belum aktif.
+3. **Pratinjau sudah benar, lanjut ke DNS** → tabel record DNS. Ubah di hPanel, lalu tunggu: cron
+   memeriksa tiap 10 menit (atau tombol **Periksa DNS & aktifkan sekarang**).
+4. Begitu DNS lolos, aktivasi berjalan otomatis: sertifikat domain + `www`, salin terakhir dari IP hosting
+   lama, tukar (wp-config, router, dan nginx mode aktif), verifikasi HTTPS. Status menjadi
+   **Dihosting di VPS**, lalu backup pertama diantrekan dalam 10 menit.
+5. Hosting lama boleh dimatikan sesudahnya. Sebelum itu periksa entri form/komentar yang mungkin masuk ke
+   hosting lama sejak salinan terakhir, dan bandingkan konstanta khusus `wp-config.php` lama (File Manager
+   hPanel) karena berkas itu tidak pernah disalin.
+
+### Record DNS
+
+| Record | Tindakan |
+|---|---|
+| `A @` | ubah ke `169.58.91.181` |
+| `A www` | ubah ke `169.58.91.181` (bila www dipakai). Bila `www` berupa CNAME ke `*.cdn.hstgr.net` (CDN Hostinger), matikan CDN di hPanel dan ganti CNAME itu dengan A |
+| `AAAA @`, `AAAA www` | bila `WPMGR_HOSTING_IPV6` diisi (`2a02:c207:2347:2607::1`): ubah ke nilai itu. Bila kosong: **hapus** |
+
+AAAA lama ke IPv6 shared hosting Hostinger wajib diubah atau dihapus: Let's Encrypt mendahulukan IPv6 saat
+validasi HTTP-01 (sertifikat tidak akan terbit), dan pengunjung IPv6 akan tetap ke hosting lama sehingga
+isian form tersebar di dua tempat. Cek DNS menahan aktivasi sampai semua resolver (`1.1.1.1`, `8.8.8.8`)
+sepakat. CAA yang ada wajib mengizinkan `letsencrypt.org`.
+
+**TTL:** turunkan TTL record ke 300 detik sehari sebelum mengubah DNS bila memungkinkan, supaya jendela
+"sebagian pengunjung masih ke hosting lama" sependek mungkin.
+
+**Rollback:** sampai hosting lama dimatikan, kembalikan DNS ke nilai lama. Data yang masuk di VPS sesudah
+aktivasi tidak ikut kembali.
+
+### Pemulihan backup manual
+
+Backup harian (tujuan `lokal`) ada di `/var/lib/wpmgr/backup/<site_id>/<stempel>/` (root-only):
+`db.sql.gz`, `files.tar.gz` (berisi direktori `files/`), dan `manifest.json` (memuat `sha256_db`,
+`sha256_file`, `prefix`, `versi_php`). Retensi: 7 harian + 4 mingguan (`WPMGR_BACKUP_HARIAN` /
+`WPMGR_BACKUP_MINGGUAN`). **Backup hanya ada di disk VPS ini; backup off-site belum dibuat.** Pemulihan
+**manual** (tidak ada tombol di dashboard). `prod-db-impor` tidak dipakai di sini karena menolak situs yang
+sudah aktif (batas satu arah) dan hanya membaca dump dari stdin; karena itu database dipulihkan dengan
+`docker exec` ke `wpmgr-prod-db` memakai kredensial root database.
+
+Cari nama situs, `site_id`, dan domain dari state root: `sudo ls /etc/wpmgr-staging/prod/situs/` dan
+`sudo cat /etc/wpmgr-staging/prod/situs/<nama>` (`SITE_ID=`, `DOMAIN=`). Lalu sebagai root dengan
+`S=<site_id> N=<nama> T=<stempel> D=prd_<nama dengan - menjadi _>`:
+
+```bash
+B=/var/lib/wpmgr/backup/$S/$T
+cd "$B" && cat manifest.json && sha256sum db.sql.gz files.tar.gz   # cocokkan dengan manifest
+docker stop wpp-$N
+# Berkas: yang sekarang disisihkan, bukan dihapus
+mv /var/lib/wpmgr/hosting/$S/files /var/lib/wpmgr/hosting/$S/files.sebelum-pulih-$(date +%s)
+cat "$B/files.tar.gz" | sudo -u wpmgr tar -xzf - -C /var/lib/wpmgr/hosting/$S
+# Database
+printf '[client]\nuser=root\npassword=%s\n' "$(cat /etc/wpmgr-staging/prod/db-root)" \
+  | docker exec -i wpmgr-prod-db sh -c 'umask 077; cat > /run/pulih.cnf'
+docker exec wpmgr-prod-db mariadb --defaults-extra-file=/run/pulih.cnf \
+  -e "DROP DATABASE \`$D\`; CREATE DATABASE \`$D\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+gunzip -c "$B/db.sql.gz" | docker exec -i wpmgr-prod-db mariadb --defaults-extra-file=/run/pulih.cnf "$D"
+docker exec wpmgr-prod-db rm -f /run/pulih.cnf
+wpmgr-staging prod-jalan $N
+```
+
+`tar` diekstrak sebagai `wpmgr`, sehingga kepemilikan sesuai pemeriksaan skrip. Hak user database situs
+tetap ada sesudah `DROP DATABASE`, jadi tidak perlu dibuat ulang. Hapus direktori `files.sebelum-pulih-*`
+manual sesudah situs diperiksa. Bila `sha256sum` tidak cocok dengan manifest, jangan pulihkan dari backup
+itu; pakai stempel lain. Lakukan satu kali latihan pemulihan pada situs pertama sebelum hosting lamanya
+dimatikan.
+
+Karena backup berada di disk yang sama dengan situs, salin keluar VPS secara berkala, mis.
+`rsync -a /var/lib/wpmgr/backup/ <tujuan-lain>:/backup-wpmgr/` dari crontab root.
+
+### Melepas site aktif secara manual
+
+Dashboard tidak bisa menghapus situs yang sudah dilayani VPS (dan site-nya tidak bisa dicabut selama ada
+baris hosting). Sebagai root, dengan `N`, `S`, `D` seperti di atas dan domain `DOM`:
+
+```bash
+rm /etc/nginx/wpmgr-hosting/$DOM.conf && nginx -t && systemctl reload nginx
+docker rm -f wpp-$N
+# DROP DATABASE `$D`; DROP USER '$D'@'%';  (lewat berkas opsi root seperti pemulihan di atas)
+rm -f /etc/wpmgr-staging/prod/situs/$N /etc/wpmgr-staging/prod/db/$N
+rm -f /etc/wpmgr-staging/prod/router/conf.d/prd-$N.conf && wpmgr-staging prod-router-muat
+psql "$DATABASE_URL" -c "DELETE FROM hosting_vps WHERE site_id = '$S';"
+```
+
+Sertifikat domain di `/var/lib/wpmgr/hosting-certs/` dan direktori data `/var/lib/wpmgr/hosting/$S`
+dibiarkan; hapus manual bila sudah tidak diperlukan.
+
+### Batas Lapis 4
+
+- `mail()` PHP tidak berfungsi di container (image WordPress tanpa MTA): pakai plugin SMTP ke penyedia
+  luar untuk form/notifikasi.
+- Salt `wp-config.php` dibuat baru: semua pengguna login ulang sesudah pindah.
+- Plugin cache LiteSpeed (Hostinger) tidak aktif di Apache; aman, dan boleh dinonaktifkan sesudah pindah.
+- Jangan menjalankan `certbot --nginx` untuk domain yang dihosting dashboard: berkas di
+  `/etc/nginx/wpmgr-hosting/` selalu ditimpa `prod-domain`.
+- Sertifikat host pratinjau tidak diperpanjang otomatis; **Salin ulang** menerbitkannya lagi.
+- Pindah balik (VPS ke hosting lain), multisite, dan WordPress di subfolder tidak didukung.
+
 ## Keterbatasan yang diketahui
 
 Reaper memulihkan job berstatus `running` yang sudah terkunci lebih lama
@@ -697,6 +880,12 @@ Keterbatasan pemantauan (Lapis 2):
   serangan, jendela waktu tembusnya brute force, dst.) adalah konstanta di
   `src/wpmgr/keamanan.py`, bukan setelan yang bisa diubah lewat UI.
 
+Keterbatasan hosting VPS (Lapis 4): pemulihan backup hanya manual (lihat "Pemulihan backup manual"),
+backup hanya ke disk VPS sendiri (off-site belum dibuat), jendela beberapa detik saat reboot sebelum isolasi
+iptables produksi terpasang (lihat "Sesudah reboot VPS"), dan pra-cek `nginx -T` membaca `server_name` per
+baris (direktif yang dipecah ke beberapa baris di berkas milik site lain hanya terbaca baris pertamanya;
+deteksi `conflicting server name` saat `nginx -t` tetap menjadi lapis kedua).
+
 ## Struktur repo (ringkas)
 
 | Path | Isi |
@@ -712,4 +901,6 @@ Keterbatasan pemantauan (Lapis 2):
 | `deploy/` | Berkas siap salin ke VPS: unit systemd, crontab, konfigurasi nginx |
 | `src/wpmgr/staging/` | Lapis 3: validasi, skrip pembantu, paket biner, rencana, job tarik/uji/dorong/kembalikan, cron |
 | `deploy/staging/` | Skrip pembantu root, sudoers, nginx host staging, unit systemd, test bats |
+| `src/wpmgr/hosting/` | Lapis 4: klien hosting lama baca-saja, pindah_tarik/pindah_aktifkan, cek DNS, backup, cron |
+| `src/wpmgr/web/routes_hosting.py` | API JSON tab Hosting VPS |
 | `docs/superpowers/` | Spesifikasi desain dan rencana implementasi lapis ini |
