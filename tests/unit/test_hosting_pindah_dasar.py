@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from wpmgr.errors import STAGING_DITOLAK, SiteError
 from wpmgr.hosting.pindah import (
     DILINDUNGI_HOSTING,
     MU_PLUGIN_PRATINJAU,
@@ -92,7 +93,8 @@ def test_teks_penolakan_mesin_tarik_bersama_netral(ubah):
 
     info = {"table_prefix": "wp_", "home": "https://toko.co.id", "siteurl": "https://toko.co.id",
             "tabel": [{"nama": "wp_options", "baris": 1, "ukuran": 1, "pk": []}], **ubah}
-    with pytest.raises(Exception) as e:
+    with pytest.raises(SiteError) as e:
         tarik.urai_info(info)
+    assert e.value.error_class == STAGING_DITOLAK
     assert "staging" not in e.value.pesan.lower()
     assert "belum didukung" in e.value.pesan

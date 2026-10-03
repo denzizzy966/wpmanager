@@ -13,8 +13,19 @@ if ( ! defined( 'WPMGR_PRATINJAU' ) || ! WPMGR_PRATINJAU ) {
     return;
 }
 
-// Email tidak pernah keluar dari salinan pratinjau. WordPress >= 5.7:
-// pre_wp_mail menghentikan wp_mail() sebelum PHPMailer disentuh.
+// Email tidak pernah keluar dari salinan pratinjau. Lapis pertama: wp_mail()
+// pluggable didefinisikan di sini. Mu-plugin dimuat sebelum plugin biasa
+// dan sebelum pluggable.php, jadi definisi ini menang atas plugin SMTP yang
+// mengganti wp_mail() sendiri (dan melewati kait di bawah). Bila sesuatu
+// yang dimuat lebih dulu sudah mendefinisikannya, kait di bawah tetap berlaku.
+if ( ! function_exists( 'wp_mail' ) ) {
+    function wp_mail( ...$argumen ) {
+        return false;
+    }
+}
+
+// Lapis kedua (WordPress >= 5.7): pre_wp_mail menghentikan wp_mail() bawaan
+// sebelum PHPMailer disentuh.
 add_filter( 'pre_wp_mail', function () {
     return false;
 }, PHP_INT_MAX );
@@ -58,24 +69,46 @@ add_action( 'admin_bar_menu', function ( $bar ) {
 }, 1 );
 
 // Hanya untuk request ke host pratinjau: URL domain asli di keluaran
-// (termasuk bentuk ber-escape JSON) diganti host pratinjau. Database tidak
-// diubah; tanpa ini gambar dan tautan di konten mengarah ke hosting lama.
-// Header Host datang dari klien, jadi hanya dibandingkan persis (bentuk
-// lain tidak memicu apa pun), dan penggantinya hanya dua konstanta dari
-// wp-config: konten situs tidak bisa menyisipkan apa pun lewat sini.
+// (https, http, dan tanpa skema `//`, termasuk bentuk ber-escape JSON)
+// diganti host pratinjau. Database tidak diubah; tanpa ini gambar dan
+// tautan di konten mengarah ke hosting lama. Header Host datang dari klien,
+// jadi hanya dibandingkan persis (bentuk lain tidak memicu apa pun), dan
+// penggantinya hanya dua konstanta dari wp-config: konten situs tidak bisa
+// menyisipkan apa pun lewat sini.
 if ( defined( 'WPMGR_PRATINJAU_HOST' ) && defined( 'WPMGR_DOMAIN' )
     && isset( $_SERVER['HTTP_HOST'] ) && WPMGR_PRATINJAU_HOST === $_SERVER['HTTP_HOST'] ) {
     ob_start( function ( $html ) {
         if ( ! is_string( $html ) ) {
             return $html;
         }
+        // Hanya HTML dan JSON: berkas biner, gambar, atau ekspor yang
+        // dilayani PHP (mis. unduhan plugin) tidak boleh diubah byte-nya.
+        $jenis = '';
+        foreach ( headers_list() as $baris ) {
+            if ( 0 === stripos( $baris, 'content-type:' ) ) {
+                $jenis = substr( $baris, 13 );
+            }
+        }
+        if ( '' === trim( $jenis ) ) {
+            // Tanpa header eksplisit, PHP mengirim default_mimetype (biasanya text/html).
+            $jenis = (string) ini_get( 'default_mimetype' );
+        }
+        $bagian = explode( ';', strtolower( $jenis ) );
+        $jenis  = trim( $bagian[0] );
+        if ( 'text/html' !== $jenis && 'application/json' !== $jenis && '+json' !== substr( $jenis, -5 ) ) {
+            return $html;
+        }
         $ke    = 'https://' . WPMGR_PRATINJAU_HOST;
         $ganti = array();
-        foreach ( array( 'https://www.' . WPMGR_DOMAIN, 'https://' . WPMGR_DOMAIN ) as $asal ) {
-            $ganti[ $asal ] = $ke;
-            $ganti[ str_replace( '/', '\\/', $asal ) ] = str_replace( '/', '\\/', $ke );
+        foreach ( array( 'www.' . WPMGR_DOMAIN, WPMGR_DOMAIN ) as $nama ) {
+            foreach ( array( 'https://' . $nama => $ke, 'http://' . $nama => $ke,
+                '//' . $nama => '//' . WPMGR_PRATINJAU_HOST ) as $asal => $tujuan ) {
+                $ganti[ $asal ] = $tujuan;
+                $ganti[ str_replace( '/', '\\/', $asal ) ] = str_replace( '/', '\\/', $tujuan );
+            }
         }
-        // strtr mendahulukan kunci terpanjang, jadi www.<domain> tidak terpotong.
+        // strtr mendahulukan kunci terpanjang di setiap posisi dan tidak
+        // mengganti hasil penggantian lagi, jadi www.<domain> dan skema tidak terpotong.
         return strtr( $html, $ganti );
     } );
 }

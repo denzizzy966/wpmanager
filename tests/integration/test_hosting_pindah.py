@@ -18,6 +18,9 @@ pytestmark = pytest.mark.integration
 
 MTIME = 1_700_000_000
 IP_LAMA = "93.184.216.34"
+# Secret connector produksi di wp_options hosting lama (review M3).
+BARIS_SECRET = (b"INSERT INTO `wp_options` (`option_name`, `option_value`, `autoload`) VALUES "
+                b"('wpmgr_secret', '" + b"c0ffee" * 10 + b"abcd', 'no');\n")
 
 
 @pytest.fixture(autouse=True)
@@ -39,7 +42,8 @@ def prod():
     p.tabel = {
         "wp_posts": [b"DROP TABLE IF EXISTS `wp_posts`;\nCREATE TABLE `wp_posts` (`id` int);\n",
                      b"INSERT INTO `wp_posts` (`id`) VALUES ('1');\n"],
-        "wp_options": [b"DROP TABLE IF EXISTS `wp_options`;\nCREATE TABLE `wp_options` (`a` text);\n"],
+        "wp_options": [(b"DROP TABLE IF EXISTS `wp_options`;\nCREATE TABLE `wp_options` (`option_name` varchar(191), "
+                        b"`option_value` longtext, `autoload` varchar(20));\n"), BARIS_SECRET],
     }
     return p
 
@@ -101,7 +105,10 @@ def test_pindah_tarik_penuh(sesi, site_hosting, hosting_aktif, prod, pb, lama):
     assert ("prod_domain", "toko-co-id") in pb.panggilan
     assert pb.sql.startswith(b"SET NAMES utf8mb4;")
     # Putusan R25 tidak berlaku: secret connector produksi dibiarkan apa adanya (spec §4.1).
-    assert b"wpmgr_secret" not in pb.sql
+    # Baris secret produksi sampai ke impor byte demi byte, dan tidak ada
+    # pernyataan lain yang menyentuhnya (penggantian R25 staging tidak ikut).
+    assert BARIS_SECRET in pb.sql
+    assert pb.sql.count(b"wpmgr_secret") == 1
     assert lama and all(x == (IP_LAMA, "toko.co.id") for x in lama)
     akar = hosting_aktif / sid
     assert not (akar / "tarik").exists() and not (akar / "ekspor").exists()
@@ -285,21 +292,45 @@ def test_hosting_lama_hanya_lewat_klien_lama(sesi, site_hosting, prod, pb, lama)
     assert _h(sesi, site_hosting).status == StatusHosting.pratinjau
 
 
-def test_sertifikat_sibuk_diserahkan_ke_pembungkus(sesi, site_hosting, prod, pb, lama):
-    """Keluar 3 (sibuk, tanpa ubah) bukan peringatan sertifikat: pembungkus menjadwalkan ulang."""
-    pb.gagal["sertifikat"] = GalatPembantu("ditolak", "Menerbitkan sertifikat staging gagal. Skrip pembantu "
-                                                      "menolak permintaan ini.")
+PESAN_SERT_DITOLAK = "Menerbitkan sertifikat staging gagal. Skrip pembantu menolak permintaan ini."
+
+
+def test_sertifikat_pratinjau_keluar_3_menjadi_peringatan(sesi, site_hosting, prod, pb, lama):
+    """`cmd_sertifikat` tanpa kunci: keluar 3 berarti nama/direktori ditolak, bukan sibuk (review I1, spec §8.4)."""
+    pb.gagal["sertifikat"] = GalatPembantu("ditolak", PESAN_SERT_DITOLAK)
+    _, hasil = _jalankan(sesi, site_hosting)
+    assert hasil["peringatan"] == [f"Sertifikat pratinjau belum terbit: {PESAN_SERT_DITOLAK}"]
+    assert pb.nama_panggilan()[-2:] == ["sertifikat", "prod_domain"]
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.galat, h.pratinjau_sertifikat_pada) == (StatusHosting.pratinjau, None, None)
+
+
+@pytest.mark.parametrize("sertifikat_gagal", [False, True])
+def test_prod_domain_sibuk_tidak_mengulang_sertifikat(sesi, site_hosting, prod, pb, lama, sertifikat_gagal):
+    """Review M1: hasil sertifikat pratinjau tersimpan di kemajuan; percobaan ulang tidak memanggil certbot lagi.
+
+    Setiap validasi gagal memakan batas Let's Encrypt (5 per jam per nama),
+    dan prod-domain bisa sibuk (keluar 3) berkali-kali selama kunci nginx dipegang.
+    """
+    if sertifikat_gagal:
+        pb.gagal["sertifikat"] = GalatPembantu("sertifikat", "Menerbitkan sertifikat staging gagal. Sertifikat "
+                                                             "staging belum dapat diterbitkan.")
+    pb.gagal["prod_domain"] = GalatPembantu("ditolak", "Memasang konfigurasi nginx domain gagal. Skrip pembantu "
+                                                       "menolak permintaan ini.")
     job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
-    with pytest.raises(hu.GalatSibuk):
-        pindah.tangani_pindah_tarik(sesi, job, None)
-    h = _h(sesi, site_hosting)
-    assert (h.status, h.galat) == (StatusHosting.menyalin, hu.PESAN_MENUNGGU_SIBUK)
-    assert "prod_domain" not in pb.nama_panggilan()
-    del pb.gagal["sertifikat"]
-    pb.panggilan.clear()
+    for _ in range(2):
+        with pytest.raises(hu.GalatSibuk):
+            pindah.tangani_pindah_tarik(sesi, job, None)
+    assert _h(sesi, site_hosting).status == StatusHosting.menyalin
+    del pb.gagal["prod_domain"]
+    pb.gagal.pop("sertifikat", None)
     _, hasil = _jalankan(sesi, site_hosting, job)
-    # Dilanjutkan dari tahap pratinjau: salinan tidak diulang.
-    assert pb.nama_panggilan() == ["prod_status", "sertifikat", "prod_domain"]
-    assert hasil["peringatan"] == []
+    nama = pb.nama_panggilan()
+    assert nama.count("sertifikat") == 1 and nama.count("prod_domain") == 3
     h = _h(sesi, site_hosting)
-    assert h.status == StatusHosting.pratinjau and h.pratinjau_sertifikat_pada is not None
+    assert h.status == StatusHosting.pratinjau
+    if sertifikat_gagal:
+        assert h.pratinjau_sertifikat_pada is None
+        assert [p for p in hasil["peringatan"] if p.startswith("Sertifikat pratinjau belum terbit")]
+    else:
+        assert h.pratinjau_sertifikat_pada is not None and hasil["peringatan"] == []

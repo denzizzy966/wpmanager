@@ -43,6 +43,8 @@ PESAN_WWW = ("Site lama memakai www di home/siteurl, tetapi www tidak terdaftar 
              "batalkan pindah lalu mulai lagi.")
 PESAN_MU_PLUGIN = "Folder mu-plugins salinan VPS tidak aman (berupa symlink); salin ulang untuk memulihkannya."
 STATUS_BOLEH_TARIK = ("menyalin", "pratinjau", "menunggu_dns")
+# Kunci kemajuan job: hasil sertifikat pratinjau ("terbit" | "gagal") job ini.
+KUNCI_SERTIFIKAT = "sertifikat_pratinjau"
 
 
 def cek_ram_hosting(status) -> str | None:
@@ -156,6 +158,27 @@ def rampungkan_salinan(sesi, job, site, h: HostingVps, k: dict, sertifikat_ok: b
             "peringatan": list(k.get("peringatan") or [])}
 
 
+def _sertifikat_pratinjau(sesi, job, h: HostingVps, pb, k: dict) -> dict:
+    """Sertifikat host pratinjau, dicoba SEKALI per job; hasilnya disimpan di kemajuan (review M1).
+
+    Percobaan ulang job (mis. prod-domain sibuk) tidak menjalankan certbot
+    lagi: setiap validasi yang gagal memakan batas Let's Encrypt. Apa pun
+    galat pembantunya, termasuk keluar 3 (`cmd_sertifikat` tidak memakai
+    kunci, jadi 3 berarti nama atau direktori sertifikat ditolak, bukan
+    sibuk; review I1), pratinjau tetap jadi tanpa HTTPS dengan peringatan
+    (spec §8.4, §10.2); Salin ulang mencoba lagi.
+    """
+    hasil = "terbit"
+    try:
+        with stg.detak_latar(sesi, job):
+            # Host pratinjau lewat server port 80 wildcard staging (spec §8.4).
+            pb.sertifikat(f"vps-{h.nama}")
+    except GalatPembantu as exc:
+        hasil = "gagal"
+        tarik._tambah_peringatan(k, f"Sertifikat pratinjau belum terbit: {exc.pesan}")
+    return stg.simpan_kemajuan(sesi, job, **{KUNCI_SERTIFIKAT: hasil}, peringatan=list(k.get("peringatan") or []))
+
+
 def pindah_tarik(sesi, job, site, h: HostingVps, klien, pb) -> dict:
     if h.dilayani_vps_pada is not None:
         raise stg.GalatDitolakTanpaUbah(PESAN_SUDAH_DILAYANI)
@@ -165,24 +188,17 @@ def pindah_tarik(sesi, job, site, h: HostingVps, klien, pb) -> dict:
         raise stg.GalatDitolakTanpaUbah(PESAN_STATUS_TARIK)
     pertama = h.ditarik_pada is None
     k = salin(sesi, job, site, h, klien, pb)
-    sertifikat_ok = None
     if k.get("tahap") == "pratinjau":
         stg.titik_potongan(sesi, job, h)
-        sertifikat_ok = True
+        if k.get(KUNCI_SERTIFIKAT) is None:
+            k = _sertifikat_pratinjau(sesi, job, h, pb, k)
         with stg.detak_latar(sesi, job):
-            try:
-                # Host pratinjau lewat server port 80 wildcard staging (spec §8.4).
-                pb.sertifikat(f"vps-{h.nama}")
-            except GalatPembantu as exc:
-                if exc.tanpa_ubah:
-                    # Keluar 3 (kunci sibuk, tanpa perubahan) bukan sertifikat
-                    # yang ditolak: pembungkus menjadwalkan ulang dari tahap ini.
-                    raise
-                # Pratinjau HTTPS belum tersedia; dicoba lagi pada Salin ulang.
-                sertifikat_ok = False
-                tarik._tambah_peringatan(k, f"Sertifikat pratinjau belum terbit: {exc.pesan}")
             pb.prod_domain(h.nama)
         k = stg.simpan_kemajuan(sesi, job, tahap="selesai", peringatan=list(k.get("peringatan") or []))
+    # Dari kemajuan, bukan variabel lokal: percobaan ulang sesudah prod-domain
+    # (atau sesudah tahap "selesai") tetap mencatat hasil sertifikat yang benar.
+    hasil_sert = k.get(KUNCI_SERTIFIKAT)
+    sertifikat_ok = None if hasil_sert is None else hasil_sert == "terbit"
     hasil = rampungkan_salinan(sesi, job, site, h, k, sertifikat_ok)
     baris = sesi.get(HostingVps, h.id, populate_existing=True)
     baris.status = StatusHosting.pratinjau

@@ -12,8 +12,7 @@ final class PratinjauTest extends TestCase {
         return __DIR__ . '/../wp-manager-connector/templates/wpmgr-pratinjau.php.tpl';
     }
 
-    private function jalankan( string $awal, string $akhir ): array {
-        $skrip  = sys_get_temp_dir() . '/wpmgr-pratinjau-' . getmypid() . '-' . mt_rand() . '.php';
+    private function skrip( string $awal, string $akhir ): string {
         $kepala = <<<'PHP'
 <?php
 define( 'ABSPATH', '/tmp/' );
@@ -32,8 +31,12 @@ function wpmgr_kait( $nama ) {
     return $GLOBALS['wpmgr_kait'][ $nama ][0];
 }
 PHP;
-        file_put_contents( $skrip, $kepala . "\n" . $awal . "\ninclude " . var_export( $this->templat(), true )
-            . ";\n" . $akhir . "\n" );
+        return $kepala . "\n" . $awal . "\ninclude " . var_export( $this->templat(), true ) . ";\n" . $akhir . "\n";
+    }
+
+    private function jalankan( string $awal, string $akhir ): array {
+        $skrip = sys_get_temp_dir() . '/wpmgr-pratinjau-' . getmypid() . '-' . mt_rand() . '.php';
+        file_put_contents( $skrip, $this->skrip( $awal, $akhir ) );
         exec( escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( $skrip ) . ' 2>&1', $keluar, $kode );
         unlink( $skrip );
         $this->assertSame( 0, $kode, implode( "\n", $keluar ) );
@@ -143,5 +146,109 @@ PHP;
         $keluar = $this->jalankan( $this->konstanta( 'vps-toko.staging.contoh.id' ), $akhir );
         $this->assertSame( explode( "\n", strtr( $html, array(
             'https://toko.co.id' => 'https://vps-toko.staging.contoh.id' ) ) ), $keluar );
+    }
+
+    // ---- fix round 1: wp_mail pluggable (I2), jenis konten dan skema (M4) ----------
+
+    public function test_wp_mail_pluggable_didefinisikan_dan_menolak(): void {
+        // Plugin SMTP yang mengganti wp_mail() pluggable melewati kait
+        // pre_wp_mail/phpmailer_init; mu-plugin dimuat lebih dulu, jadi
+        // definisinya yang menang dan tidak ada email yang terkirim.
+        $keluar = $this->jalankan( $this->konstanta( 'toko.co.id' ),
+            "echo json_encode( array( function_exists( 'wp_mail' ), "
+            . "wp_mail( 'a@contoh.id', 'subjek', 'isi', array(), array() ), wp_mail( 'a@contoh.id', 's', 'i' ) ) );" );
+        $this->assertSame( array( '[true,false,false]' ), $keluar );
+    }
+
+    public function test_wp_mail_tidak_didefinisikan_tanpa_konstanta(): void {
+        $keluar = $this->jalankan( "\$_SERVER['HTTP_HOST'] = 'toko.co.id';",
+            "echo json_encode( function_exists( 'wp_mail' ) );" );
+        $this->assertSame( array( 'false' ), $keluar );
+    }
+
+    public function test_wp_mail_yang_sudah_ada_tidak_didefinisikan_ulang(): void {
+        // Definisi ganda adalah fatal error; kait cadangan tetap terpasang.
+        $keluar = $this->jalankan( "function wp_mail() { return 'lama'; }\n" . $this->konstanta( 'toko.co.id' ),
+            "\$k = wpmgr_kait( 'pre_wp_mail' ); echo json_encode( array( wp_mail(), \$k[0]( null, array() ) ) );" );
+        $this->assertSame( array( '["lama",false]' ), $keluar );
+    }
+
+    public function test_url_http_dan_tanpa_skema_ikut_diganti(): void {
+        $html  = 'a http://toko.co.id/x b //www.toko.co.id/y c http:\\/\\/www.toko.co.id\\/z d \\/\\/toko.co.id\\/w '
+            . 'e mailto:info@toko.co.id f https://lain.id/toko.co.id';
+        $akhir = 'echo ' . var_export( $html, true ) . '; while ( ob_get_level() > 0 ) { ob_end_flush(); }';
+        $this->assertSame(
+            array( 'a https://vps-toko.staging.contoh.id/x b //vps-toko.staging.contoh.id/y '
+                . 'c https:\\/\\/vps-toko.staging.contoh.id\\/z d \\/\\/vps-toko.staging.contoh.id\\/w '
+                . 'e mailto:info@toko.co.id f https://lain.id/toko.co.id' ),
+            $this->jalankan( $this->konstanta( 'vps-toko.staging.contoh.id' ), $akhir )
+        );
+    }
+
+    /**
+     * Satu request lewat server bawaan PHP (SAPI cli-server): header
+     * Content-Type hanya tercatat di SAPI web, tidak di CLI.
+     */
+    private function layani( string $tubuh ): string {
+        $dir = sys_get_temp_dir() . '/wpmgr-layani-' . getmypid() . '-' . mt_rand();
+        mkdir( $dir );
+        $awal = "define( 'WPMGR_PRATINJAU', true );\n"
+            . "define( 'WPMGR_PRATINJAU_HOST', 'vps-toko.staging.contoh.id' );\n"
+            . "define( 'WPMGR_DOMAIN', 'toko.co.id' );";
+        file_put_contents( $dir . '/index.php', $this->skrip( $awal, $tubuh ) );
+        $hasil = null;
+        for ( $coba = 0; $coba < 5 && null === $hasil; $coba++ ) {
+            $port   = mt_rand( 20000, 45000 );
+            $log    = $dir . '/server-' . $coba . '.log';
+            $proses = proc_open( array( PHP_BINARY, '-S', '127.0.0.1:' . $port, '-t', $dir ),
+                array( 0 => array( 'pipe', 'r' ), 1 => array( 'file', $log, 'a' ), 2 => array( 'file', $log, 'a' ) ),
+                $pipa );
+            $siap = false;
+            for ( $i = 0; $i < 50 && ! $siap; $i++ ) {
+                $soket = @fsockopen( '127.0.0.1', $port, $errno, $errstr, 0.2 );
+                if ( $soket ) {
+                    fclose( $soket );
+                    $siap = true;
+                } elseif ( ! proc_get_status( $proses )['running'] ) {
+                    break;
+                } else {
+                    usleep( 100000 );
+                }
+            }
+            if ( $siap ) {
+                $konteks = stream_context_create( array( 'http' => array(
+                    'header' => "Host: vps-toko.staging.contoh.id\r\nConnection: close\r\n", 'ignore_errors' => true,
+                    'timeout' => 10 ) ) );
+                $badan = file_get_contents( 'http://127.0.0.1:' . $port . '/index.php', false, $konteks );
+                $hasil = false === $badan ? '' : $badan;
+            }
+            fclose( $pipa[0] );
+            proc_terminate( $proses );
+            proc_close( $proses );
+        }
+        array_map( 'unlink', glob( $dir . '/*' ) );
+        rmdir( $dir );
+        $this->assertNotNull( $hasil, 'server bawaan PHP tidak dapat dijalankan' );
+        return $hasil;
+    }
+
+    public function test_penggantian_hanya_untuk_html_dan_json(): void {
+        $isi = 'x https://toko.co.id/a';
+        $ganti = 'x https://vps-toko.staging.contoh.id/a';
+        foreach ( array(
+            '' => $ganti,  // tanpa header: default_mimetype text/html
+            'text/html; charset=UTF-8' => $ganti,
+            'application/json; charset=UTF-8' => $ganti,
+            'application/ld+json' => $ganti,
+            'TEXT/HTML' => $ganti,
+            'application/octet-stream' => $isi,
+            'text/plain' => $isi,
+            'image/svg+xml' => $isi,
+            'text/css' => $isi,
+        ) as $jenis => $harapan ) {
+            $kepala = '' === $jenis ? '' : 'header( ' . var_export( 'Content-Type: ' . $jenis, true ) . ' ); ';
+            $this->assertSame( $harapan, $this->layani( $kepala . 'echo ' . var_export( $isi, true ) . ';' ),
+                $jenis );
+        }
     }
 }
