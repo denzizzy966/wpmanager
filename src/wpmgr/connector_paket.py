@@ -16,6 +16,7 @@ NAMA_DIREKTORI = "wp-manager-connector"
 NAMA_ZIP = "wp-manager-connector.zip"
 NAMA_MANIFEST = "manifest.json"
 NAMA_TEMPLATE_STAGING = "templates/wpmgr-staging.php.tpl"
+NAMA_TEMPLATE_PRATINJAU = "templates/wpmgr-pratinjau.php.tpl"
 _PLACEHOLDER_NAMA = "__WPMGR_NAMA__"
 # Sama dengan wpmgr.staging.aman.POLA_NAMA; diulang di sini supaya modul
 # paket connector tidak bergantung pada paket staging.
@@ -95,3 +96,13 @@ def isi_mu_plugin_staging(nama: str, sumber: Path | None = None) -> str:
     if not isinstance(nama, str) or not _POLA_NAMA_STAGING.fullmatch(nama):
         raise ValueError("Nama staging tidak sah")
     return baca_template_staging(sumber).replace(_PLACEHOLDER_NAMA, nama)
+
+
+def isi_mu_plugin_pratinjau(sumber: Path | None = None) -> str:
+    """Isi wp-content/mu-plugins/wpmgr-pratinjau.php (spec Lapis 4 §7.6).
+
+    Tanpa placeholder: semua nilai (host pratinjau, domain) dibaca dari
+    konstanta yang ditulis skrip pembantu di wp-config.php, jadi tidak ada
+    masukan yang disisipkan ke kode PHP.
+    """
+    return ((sumber or sumber_bawaan()) / NAMA_TEMPLATE_PRATINJAU).read_text(encoding="utf-8")

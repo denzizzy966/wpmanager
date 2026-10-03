@@ -184,6 +184,7 @@ def test_tanda_air_rusak_dan_tidak_ada():
 def test_cek_sumber_daya_dengan_angka_jelas():
     st = StatusPembantu(mem_tersedia=int(1.5 * GB), disk_total=100 * GB, disk_bebas=20 * GB, container={}, akses={})
     assert cek_ram(st) == "RAM tersedia di VPS 1,5 GB; minimal 2,0 GB untuk menjalankan staging."
+    assert cek_ram(st, "situs") == "RAM tersedia di VPS 1,5 GB; minimal 2,0 GB untuk menjalankan situs."
     assert cek_disk(st, 6 * GB) == "Sisa disk sesudah tarik akan 14,0 GB (14% dari 100,0 GB); minimal 15%."
     assert cek_disk(st, 4 * GB) is None
     assert cek_ram(StatusPembantu(3 * GB, 1, 1, {}, {})) is None

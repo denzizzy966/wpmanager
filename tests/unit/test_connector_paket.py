@@ -92,3 +92,14 @@ def test_isi_mu_plugin_staging_menolak_nama_tidak_sah(nama):
 
     with pytest.raises(ValueError):
         isi_mu_plugin_staging(nama)
+
+
+def test_isi_mu_plugin_pratinjau_tanpa_placeholder():
+    from wpmgr.connector_paket import isi_mu_plugin_pratinjau
+
+    isi = isi_mu_plugin_pratinjau()
+    assert isi.startswith("<?php")
+    for harus in ("WPMGR_PRATINJAU", "pre_wp_mail", "phpmailer_init", "pre_option_blog_public", "wp_robots",
+                  "WPMGR_PRATINJAU_HOST", "ob_start"):
+        assert harus in isi, harus
+    assert "__WPMGR_" not in isi

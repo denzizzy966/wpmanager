@@ -187,9 +187,9 @@ def urai_info(info) -> dict:
     if not isinstance(info, dict):
         raise umum.galat_gagal("Manifest produksi tidak membawa info site.")
     if info.get("multisite"):
-        raise umum.galat_ditolak("Site multisite belum didukung staging.")
+        raise umum.galat_ditolak("Site multisite belum didukung.")
     if info.get("konten_di_luar"):
-        raise umum.galat_ditolak("Folder wp-content site ini berada di luar folder WordPress; belum didukung staging.")
+        raise umum.galat_ditolak("Folder wp-content site ini berada di luar folder WordPress; belum didukung.")
     prefix = info.get("table_prefix")
     if not isinstance(prefix, str) or not POLA_PREFIX.fullmatch(prefix):
         raise umum.galat_gagal("Table prefix produksi tidak sah.")
@@ -260,11 +260,14 @@ def ambil_manifest(sesi, job, staging, klien, dir_kerja: Path, k: dict) -> dict:
     berkas = dir_kerja / "manifest.jsonl"
     kursor = k.get("manifest_kursor")
     halaman = k.get("manifest_halaman") or 0
-    if kursor is None:
+    if kursor is None or not berkas.exists():
         # Belum ada halaman yang tercatat (atau pengulangan setelah halaman
-        # terakhir tanpa pindah tahap): mulai dari berkas kosong.
+        # terakhir tanpa pindah tahap): mulai dari berkas kosong. Juga bila
+        # berkasnya sudah dibuang (mis. sesudah penolakan tanpa ubah): kursor
+        # tanpa halaman-halaman sebelumnya akan menghasilkan manifest yang
+        # kurang, dan berkas lokal di luar manifest itu terhapus.
         berkas.unlink(missing_ok=True)
-        halaman = 0
+        kursor, halaman = None, 0
         k = _simpan(sesi, job, k, berkas_dilewati=0, manifest_entri=0, manifest_byte=0)
     while True:
         umum.titik_potongan(sesi, job, staging)
@@ -284,7 +287,7 @@ def ambil_manifest(sesi, job, staging, klien, dir_kerja: Path, k: dict) -> dict:
         byte = (k.get("manifest_byte") or 0) + sum(len(b.encode("utf-8")) for b in baris)
         if entri > MAKS_ENTRI_MANIFEST or byte > MAKS_BYTE_MANIFEST:
             raise umum.galat_gagal(f"Manifest produksi melebihi batas {MAKS_ENTRI_MANIFEST} berkas "
-                                   f"atau {format_byte(MAKS_BYTE_MANIFEST)}; site ini terlalu besar untuk staging.")
+                                   f"atau {format_byte(MAKS_BYTE_MANIFEST)}; site ini terlalu besar untuk disalin.")
         if baris:
             with open(berkas, "a", encoding="utf-8", newline="\n") as f:
                 f.writelines(baris)
@@ -635,7 +638,7 @@ def _bangun_ulang_indeks(sesi, job, akar: Path, peringatan: list[str],
         try:
             hapus_tautan(akar / "files", p)
         except (PathTidakAman, OSError):
-            peringatan.append(bersih_teks(f"Symlink staging {p} tidak dapat dihapus.", 300))
+            peringatan.append(bersih_teks(f"Symlink {p} di salinan tidak dapat dihapus.", 300))
     # Berkas milik tujuan sendiri tidak pernah menjadi bagian salinan.
     indeks.padatkan({p: e for p, e in lokal.items() if p not in dilindungi})
 
@@ -715,6 +718,20 @@ class TujuanSalinan:
     dilindungi: frozenset = DILINDUNGI_STAGING
     subdir: tuple = ("files", "log", "ekspor")
     tahap_akhir: str = "sertifikat"
+
+
+def _buang_area_kerja_ditolak(job, tarik_dir: Path) -> None:
+    """Area kerja tarik/ (manifest.jsonl) dibuang bila tarik ditolak sebelum salinan disentuh.
+
+    Penolakan tanpa ubah (info site, disk, RAM, connector menolak) final dan
+    tidak diulang (R15, STAGING_DITOLAK tidak pernah dijadwalkan ulang);
+    tarik berikutnya adalah job baru yang mulai dari manifest kosong. Tanpa
+    ini manifest site tertinggal di disk sampai tarik berikutnya, termasuk
+    bila pembungkus tidak menjalankan `bersihkan_bila_final` (carry review
+    Task 7).
+    """
+    if salinan_belum_disentuh(job):
+        shutil.rmtree(tarik_dir, ignore_errors=True)
 
 
 def tarik_inti(sesi, job, site, klien, tujuan: TujuanSalinan, k: dict) -> dict:
@@ -810,6 +827,7 @@ def tarik_inti(sesi, job, site, klien, tujuan: TujuanSalinan, k: dict) -> dict:
         shutil.rmtree(tarik_dir, ignore_errors=True)
         raise
     except umum.GalatDitolakTanpaUbah:
+        _buang_area_kerja_ditolak(job, tarik_dir)
         raise
     except SiteError as exc:
         # Penolakan dari tahap manifest (multisite, wp-content di luar
@@ -819,6 +837,7 @@ def tarik_inti(sesi, job, site, klien, tujuan: TujuanSalinan, k: dict) -> dict:
             # Preflight M5: `kode` connector ikut terbawa, supaya pembungkus
             # hosting tahu teksnya milik connector dan memakai pesan tetap.
             g.kode = exc.kode
+            _buang_area_kerja_ditolak(job, tarik_dir)
             raise g from None
         raise
     except PathTidakAman:

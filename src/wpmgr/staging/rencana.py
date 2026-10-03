@@ -526,10 +526,11 @@ def format_byte(n: int) -> str:
     return f"{n} B"
 
 
-def cek_ram(status) -> str | None:
+def cek_ram(status, tujuan: str = "staging") -> str | None:
+    """RAM minimum sebelum menyalin; `tujuan` hanya kata di pesan (staging atau situs hosting VPS)."""
     if status.mem_tersedia < RAM_MINIMUM:
         return (f"RAM tersedia di VPS {format_byte(status.mem_tersedia)}; "
-                f"minimal {format_byte(RAM_MINIMUM)} untuk menjalankan staging.")
+                f"minimal {format_byte(RAM_MINIMUM)} untuk menjalankan {tujuan}.")
     return None
 
 

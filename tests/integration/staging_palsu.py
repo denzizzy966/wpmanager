@@ -20,7 +20,7 @@ import httpx
 from wpmgr.signing import verify
 from wpmgr.site_client import SiteClient
 from wpmgr.staging import paket
-from wpmgr.staging.pembantu import StatusPembantu
+from wpmgr.staging.pembantu import GalatPembantu, StatusPembantu, StatusProd
 
 GB = 1024**3
 SECRET = "f" * 64
@@ -529,3 +529,84 @@ class PembantuPalsu:
     def status(self):
         self._catat("status")
         return self.status_palsu
+
+
+class PembantuHostingPalsu(PembantuPalsu):
+    """Subperintah prod-* tiruan (Lapis 4) yang meniru aturan state skrip asli.
+
+    `state[nama]` dibuat `prod_buat`; `prod_db_buat` tanpa state ditolak
+    seperti skrip (Koreksi #1), dan impor/hapus ditolak sesudah `mode` aktif.
+    """
+
+    def __init__(self, dir_hosting: Path) -> None:
+        super().__init__(dir_hosting)
+        self.status_prod = StatusProd(8 * GB, 200 * GB, 150 * GB, 200 * GB, 150 * GB, {})
+        self.state: dict[str, dict] = {}
+        self.sertifikat_hasil = "terbit"
+
+    def _tolak(self, aksi: str) -> GalatPembantu:
+        return GalatPembantu("ditolak", f"{aksi} gagal. Skrip pembantu menolak permintaan ini.")
+
+    def _wp_config(self, nama: str, isi: bytes) -> None:
+        berkas = self.dir / self.state[nama]["site_id"] / "files" / "wp-config.php"
+        berkas.parent.mkdir(parents=True, exist_ok=True)
+        berkas.write_bytes(isi)
+
+    def prod_status(self):
+        self._catat("prod_status")
+        return self.status_prod
+
+    def prod_buat(self, nama, versi, site_id, domain, www):
+        self._catat("prod_buat", nama, versi, str(site_id), domain, www)
+        st = self.state.setdefault(nama, {"site_id": str(site_id), "domain": domain, "mode": "pratinjau",
+                                          "prefix": "", "php": versi})
+        if st["site_id"] != str(site_id) or st["domain"] != domain:
+            raise self._tolak("Membuat container situs")
+
+    def prod_db_buat(self, nama, prefix):
+        self._catat("prod_db_buat", nama, prefix)
+        st = self.state.get(nama)
+        if st is None or st["mode"] == "aktif":
+            raise self._tolak("Membuat database situs")
+        st["prefix"] = prefix
+        self._wp_config(nama, b"<?php define( 'WPMGR_PRATINJAU', true ); // pratinjau")
+
+    def prod_db_impor(self, nama, berkas):
+        self._catat("prod_db_impor", nama, len(berkas))
+        st = self.state.get(nama)
+        if st is None or st["mode"] == "aktif":
+            raise self._tolak("Mengimpor database situs")
+        self.sql = b"".join(Path(b).read_bytes() for b in berkas)
+
+    def prod_router_muat(self):
+        self._catat("prod_router_muat")
+
+    def prod_domain(self, nama):
+        self._catat("prod_domain", nama)
+
+    def prod_sertifikat(self, nama):
+        self._catat("prod_sertifikat", nama)
+        return self.sertifikat_hasil
+
+    def prod_aktifkan(self, nama):
+        self._catat("prod_aktifkan", nama)
+        self.state[nama]["mode"] = "aktif"
+        self._wp_config(nama, b"<?php // aktif")
+        return "aktif"
+
+    def prod_hapus(self, nama):
+        self._catat("prod_hapus", nama)
+        if self.state.get(nama, {}).get("mode") == "aktif":
+            raise self._tolak("Menghapus situs hosting")
+        self.state.pop(nama, None)
+
+    def prod_backup(self, nama, stempel):
+        self._catat("prod_backup", nama, stempel)
+        st = self.state[nama]
+        return json.dumps({"versi": 1, "site_id": st["site_id"], "nama": nama, "domain": st["domain"],
+                           "stempel": stempel, "versi_php": st["php"], "prefix": st["prefix"],
+                           "ukuran_db": 100, "ukuran_file": 200, "sha256_db": "a" * 64,
+                           "sha256_file": "b" * 64}) + "\n"
+
+    def prod_backup_hapus(self, nama, stempel):
+        self._catat("prod_backup_hapus", nama, stempel)

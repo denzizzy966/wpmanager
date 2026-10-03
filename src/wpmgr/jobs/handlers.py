@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from wpmgr.crypto import dekripsi_secret
 from wpmgr.errors import SiteError
+from wpmgr.hosting.pindah import tangani_pindah_tarik
 from wpmgr.jobs.monitoring import (
     tangani_collect_events,
     tangani_collect_traffic,
@@ -335,4 +336,5 @@ HANDLER = {
     JobType.staging_uji_update: tangani_staging_uji_update,
     JobType.staging_dorong: tangani_staging_dorong,
     JobType.staging_kembalikan: tangani_staging_kembalikan,
+    JobType.pindah_tarik: tangani_pindah_tarik,
 }

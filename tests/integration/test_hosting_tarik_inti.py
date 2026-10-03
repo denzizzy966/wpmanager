@@ -142,3 +142,70 @@ def test_penolakan_connector_di_job_hosting_tidak_menampilkan_teks_connector(ses
     assert e.value.pesan == hu.PESAN_KODE[STAGING_DITOLAK]
     h = sesi.get(HostingVps, site_hosting.id, populate_existing=True)
     assert h.galat == hu.PESAN_KODE[STAGING_DITOLAK]
+
+
+# ---- carry review Task 7 (c): area kerja tarik/ dibersihkan saat ditolak ----------------
+
+
+def test_penolakan_info_membersihkan_manifest(sesi, site_staging, prod, tmp_path):
+    akar = tmp_path / "tujuan" / str(site_staging.site_id)
+    site = sesi.get(Site, site_staging.site_id)
+    job = buat_job(sesi, site.id, JobType.staging_tarik)
+    terlihat = []
+
+    def tolak(info):
+        terlihat.append((akar / "tarik" / "manifest.jsonl").exists())
+        raise umum.GalatDitolakTanpaUbah("Site lama memakai http.")
+
+    with pytest.raises(umum.GalatDitolakTanpaUbah):
+        tarik.tarik_inti(sesi, job, site, prod.klien(site), _tujuan(akar, site_staging, [], periksa_info=tolak),
+                         umum.kemajuan(job))
+    assert terlihat == [True]
+    assert not (akar / "tarik").exists()
+
+
+def test_penolakan_disk_membersihkan_manifest(sesi, site_staging, prod, tmp_path):
+    akar = tmp_path / "tujuan" / str(site_staging.site_id)
+    site = sesi.get(Site, site_staging.site_id)
+    job = buat_job(sesi, site.id, JobType.staging_tarik)
+    penuh = StatusPembantu(8 * GB, 100 * GB, 1 * GB, {}, {})
+    with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
+        tarik.tarik_inti(sesi, job, site, prod.klien(site),
+                         _tujuan(akar, site_staging, [], status_sumber=lambda: penuh), umum.kemajuan(job))
+    assert "minimal 15%" in e.value.pesan
+    assert any(route == "/staging/manifest" for route, _ in prod.diminta)
+    assert not (akar / "tarik").exists()
+
+
+def test_penolakan_connector_membersihkan_manifest(sesi, site_staging, prod, tmp_path):
+    akar = tmp_path / "tujuan" / str(site_staging.site_id)
+    site = sesi.get(Site, site_staging.site_id)
+    job = buat_job(sesi, site.id, JobType.staging_tarik)
+    prod.halaman = 1
+    asli = prod._manifest
+
+    def kedua_ditolak(r, badan):
+        # Halaman pertama tertulis ke manifest.jsonl, halaman kedua ditolak connector.
+        return asli(r, badan) if r.url.params.get("kursor") is None else _manifest_ditahan(r, badan)
+
+    prod._manifest = kedua_ditolak
+    with pytest.raises(umum.GalatDitolakTanpaUbah):
+        tarik.tarik_inti(sesi, job, site, prod.klien(site), _tujuan(akar, site_staging, []), umum.kemajuan(job))
+    assert umum.kemajuan(job).get("manifest_halaman") == 1
+    assert not (akar / "tarik").exists()
+
+
+def test_manifest_yang_dibuang_tidak_dilanjutkan_dari_kursor(sesi, site_staging, prod, tmp_path):
+    """Kursor tercatat tetapi manifest.jsonl sudah dibuang: ambil ulang dari awal, bukan manifest yang kurang."""
+    dir_kerja = tmp_path / "tarik"
+    dir_kerja.mkdir()
+    site = sesi.get(Site, site_staging.site_id)
+    job = buat_job(sesi, site.id, JobType.staging_tarik)
+    prod.halaman = 1
+    k = umum.simpan_kemajuan(sesi, job, tahap="manifest", manifest_kursor="index.php", manifest_halaman=1,
+                             manifest_entri=1, manifest_byte=10)
+    k = tarik.ambil_manifest(sesi, job, site_staging, prod.klien(site), dir_kerja, k)
+    kursor = [b.get("kursor") for route, b in prod.diminta if route == "/staging/manifest"]
+    assert kursor[0] is None
+    assert set(tarik._muat_manifest(dir_kerja)) == set(prod.berkas)
+    assert k["manifest_entri"] == len(prod.berkas)
