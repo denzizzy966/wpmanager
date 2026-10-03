@@ -635,8 +635,10 @@ hosting Hostinger secara bawaan (lihat §2). Bila pengguna hanya mengganti A:
 
 Karena itu AAAA lama **wajib dihapus** dan cek DNS menahan aktivasi sampai AAAA bersih. UI
 menampilkan baris "Hapus AAAA `@` = `<nilai yang terlihat>`" per record. Bila VPS punya IPv6
-publik dan operator mengisi `WPMGR_HOSTING_IPV6`, instruksinya menjadi "ubah AAAA ke `<IPv6 VPS>`".
-Default kosong (asumsi A10). `ip_lama` hanya IPv4, karena koneksi ke hosting lama cukup lewat IPv4.
+publik dan operator mengisi `WPMGR_HOSTING_IPV6`, instruksinya menjadi "ubah AAAA ke `<IPv6 VPS>`",
+dan cek DNS menerima AAAA yang menunjuk ke IPv6 VPS itu. VPS sasaran **punya** IPv6 publik
+`2a02:c207:2347:2607::1`, dan nginx host sudah mendengarkan `[::]`. Deploy di VPS ini mengisi
+`WPMGR_HOSTING_IPV6` dengan nilai itu, jadi AAAA diubah, tidak dihapus (A10 sudah diverifikasi). `ip_lama` hanya IPv4, karena koneksi ke hosting lama cukup lewat IPv4.
 
 ### 8.3 Penyimpanan hasil
 
@@ -1034,7 +1036,8 @@ yang dihosting.
 | `renew-hosting-certs` | `50 3 * * *` | `prod_sertifikat` per baris yang dilayani VPS; isi `sertifikat_pada` bila `terbit`/`diperbarui`; kegagalan → log + aktivitas `warning` |
 
 Setiap perintah memakai kunci advisory cron (`wpmgr.kunci`) seperti perintah staging, dan keluar
-diam-diam bila fitur mati. Jadwal mengikuti zona waktu sistem VPS (asumsi A15). Jendela retensi
+diam-diam bila fitur mati. Zona waktu sistem VPS adalah `Europe/Berlin`. Karena itu `deploy/crontab` memakai
+`CRON_TZ=Asia/Jakarta` untuk baris hosting, sehingga jadwal di tabel ini adalah WIB (A15 terverifikasi). Jendela retensi
 dihitung dalam UTC.
 
 ---
@@ -1318,12 +1321,12 @@ Setelah itu dua site lainnya.
 | A7 | Hostinger menerima koneksi langsung ke IP A-record dengan SNI domain (tanpa CDN yang menolak) | `curl --resolve <domain>:443:<ip> https://<domain>/wp-json/` sebelum Pindahkan |
 | A8 | Connector 3.0 dengan "Izinkan staging" berjalan di ketiga hosting lama (batas PHP Hostinger) | pairing + tarik pertama |
 | A9 | `/etc/letsencrypt/options-ssl-nginx.conf` ada di VPS (sudah dicatat README Lapis 3) | `ls` |
-| A10 | VPS tidak punya IPv6 publik yang ingin dipakai, jadi AAAA dihapus | konfirmasi pengguna |
+| A10 | ~~VPS tidak punya IPv6 publik~~ **Terverifikasi 2026-10-03:** VPS punya `2a02:c207:2347:2607::1`. AAAA diubah ke IPv6 itu (lihat §8.2). | `ip -6 addr` |
 | A11 | `wp-config.php` lama tidak memuat konstanta penting | dicek manual per site |
-| A12 | `www` di ketiga zona adalah A/CNAME biasa (di zona `halosocia.my.id`, `www` adalah record A) | hPanel |
+| A12 | **Terverifikasi sebagian 2026-10-03.**<br>• `dutamakmurabadi.com` dan `scaffoldingsurabayamurah.com`: `www` adalah CNAME ke apex; A dan AAAA mengarah ke shared hosting Hostinger.<br>• `rizkycahayaraya.com` memakai **CDN Hostinger**: `www` adalah CNAME ke `*.cdn.hstgr.net`, dan A di apex berisi IP CDN.<br>CDN harus dimatikan di hPanel sebelum pindah DNS. Instruksi DNS harus mencakup penggantian CNAME CDN itu. Cek DNS menolak CNAME yang masih ke `hstgr.net`. | hPanel / `dns.google` |
 | A13 | Wildcard `*.staging.halosocia.my.id` melayani label `vps-<nama>` (satu label, tidak butuh wildcard bertingkat) | sudah terverifikasi untuk staging; sama |
 | A14 | Let's Encrypt mendahulukan IPv6 saat validasi HTTP-01 bila ada AAAA | dokumentasi LE; desain tidak bergantung padanya karena AAAA wajib bersih |
-| A15 | Zona waktu sistem VPS (jadwal cron 02:30) | `timedatectl` |
+| A15 | **Terverifikasi 2026-10-03:** zona waktu VPS adalah `Europe/Berlin`. Crontab backup memakai `CRON_TZ=Asia/Jakarta`, sehingga backup berjalan pukul 02:30 WIB. | `timedatectl` |
 
 ---
 

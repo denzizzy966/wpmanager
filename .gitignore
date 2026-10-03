@@ -35,3 +35,6 @@ var/
 # PHP (connector)
 connector/vendor/
 connector/.phpunit.result.cache
+
+# hasil build connector lokal
+dist/
