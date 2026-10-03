@@ -2400,6 +2400,22 @@ sert_masih_lama() {
   [ "$(sed -n 2p "$PALSU/flock.log")" = '[-w][60][-x][9]' ]
 }
 
+@test "prod-domain dan prod-hapus bertenggat 360 s (TIMEOUT Python 300 + 60): kunci bisa menunggu 90 s" {
+  siap_aktifkan
+  run "$SKRIP" prod-domain toko
+  [ "$status" -eq 0 ]
+  baris="$(grep -F '[flock][-w][60][-x][9]' "$PALSU/timeout.log")"
+  [[ "$baris" =~ ^\[-k\]\[10\]\[([0-9]+)\]\[flock\] ]]
+  (( BASH_REMATCH[1] > 300 && BASH_REMATCH[1] <= 360 ))
+
+  rm -f "$PALSU/timeout.log"
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 0 ]
+  baris="$(grep -F '[flock][-w][30][-x]' "$PALSU/timeout.log")"
+  [[ "$baris" =~ ^\[-k\]\[10\]\[([0-9]+)\]\[flock\] ]]
+  (( BASH_REMATCH[1] > 300 && BASH_REMATCH[1] <= 360 ))
+}
+
 @test "prod-hapus: reload gagal memulihkan berkas domain, menguji ulang, lalu reload lagi (M10)" {
   siap_aktifkan
   printf 'PRATINJAU' > "$(NGF)"

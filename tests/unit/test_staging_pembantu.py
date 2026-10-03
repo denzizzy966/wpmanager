@@ -15,18 +15,24 @@ import pytest
 from wpmgr.config import Settings
 from wpmgr.staging import pembantu as modul_pembantu
 from wpmgr.staging.pembantu import (
+    AKSI,
     BATAS_KELUARAN,
+    HASIL_SERTIFIKAT,
     KODE_KELUAR,
     PESAN_UMUM,
     GalatPembantu,
     Pembantu,
+    StatusProd,
     cookie_akses,
     hapus_akses_router,
+    hapus_htpasswd_pratinjau,
     hash_sandi,
     sandi_baru,
     tautan_masuk,
     tulis_akses_router,
+    tulis_htpasswd_pratinjau,
     urai_status,
+    urai_status_prod,
 )
 
 PALSU = Path(__file__).with_name("pembantu_palsu.py")
@@ -93,7 +99,7 @@ def test_validasi_sebelum_subprocess(pembantu, catatan, panggil):
 
 def test_kode_keluar_cermin_skrip_pembantu():
     assert KODE_KELUAR == {2: "argumen", 3: "ditolak", 4: "docker", 5: "sertifikat", 6: "impor",
-                           7: "konfigurasi", 8: "wpcli", 9: "internal"}
+                           7: "konfigurasi", 8: "wpcli", 9: "internal", 10: "nginx", 11: "backup"}
     assert set(KODE_KELUAR.values()) | {"lain"} <= set(PESAN_UMUM)
 
 
@@ -401,3 +407,233 @@ def test_mail_kredensial_hanya_menerima_bentuk_tetap(monkeypatch):
         monkeypatch.setattr(p, "jalankan", lambda *a, _s=salah, **k: _s)
         with pytest.raises(GalatPembantu):
             p.mail_kredensial()
+
+
+# ---- Lapis 4: subperintah prod-* -------------------------------------------------
+
+HASH = "$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ01234"
+
+
+def test_kode_keluar_dan_aksi_hosting():
+    assert KODE_KELUAR[10] == "nginx" and KODE_KELUAR[11] == "backup"
+    assert PESAN_UMUM["nginx"] == "Konfigurasi nginx domain ditolak; site lain tidak terpengaruh."
+    assert PESAN_UMUM["backup"] == "Backup situs gagal dibuat."
+    for sub in ("prod-siapkan", "prod-buat", "prod-jalan", "prod-hapus", "prod-db-buat", "prod-db-impor",
+                "prod-router-muat", "prod-domain", "prod-sertifikat", "prod-aktifkan", "prod-backup",
+                "prod-backup-hapus", "prod-status"):
+        assert sub in AKSI
+    assert HASIL_SERTIFIKAT == {"terbit", "tetap", "diperbarui"}
+
+
+def test_prod_argumen_diteruskan_persis(pembantu, catatan, tmp_path):
+    sql = tmp_path / "a.sql"
+    sql.write_bytes(b"SELECT 1;")
+    pembantu.prod_siapkan()
+    pembantu.prod_buat("toko-co-id", "8.1", ID, "toko.co.id", True)
+    pembantu.prod_buat("toko-co-id", "7.4", ID, "toko.co.id", False)
+    pembantu.prod_jalan("toko-co-id")
+    pembantu.prod_hapus("toko-co-id")
+    pembantu.prod_db_buat("toko-co-id", "wp_")
+    pembantu.prod_db_impor("toko-co-id", [sql])
+    pembantu.prod_router_muat()
+    pembantu.prod_domain("toko-co-id")
+    pembantu.prod_aktifkan("toko-co-id")
+    pembantu.prod_backup("toko-co-id", "20261003T023000Z")
+    pembantu.prod_backup_hapus("toko-co-id", "20261003T023000Z")
+    argv = [c["argv"] for c in catatan()]
+    assert argv == [
+        ["prod-siapkan"],
+        ["prod-buat", "toko-co-id", "8.1", ID, "toko.co.id", "1"],
+        ["prod-buat", "toko-co-id", "7.4", ID, "toko.co.id", "0"],
+        ["prod-jalan", "toko-co-id"],
+        ["prod-hapus", "toko-co-id"],
+        ["prod-db-buat", "toko-co-id", "wp_"],
+        ["prod-db-impor", "toko-co-id"],
+        ["prod-router-muat"],
+        ["prod-domain", "toko-co-id"],
+        ["prod-aktifkan", "toko-co-id"],
+        ["prod-backup", "toko-co-id", "20261003T023000Z"],
+        ["prod-backup-hapus", "toko-co-id", "20261003T023000Z"],
+    ]
+    assert catatan()[6]["stdin"] == "SELECT 1;"
+
+
+@pytest.mark.parametrize("panggil", [
+    lambda p: p.prod_buat("Toko", "8.1", ID, "toko.co.id", True),
+    lambda p: p.prod_buat("a" * 37, "8.1", ID, "toko.co.id", True),
+    lambda p: p.prod_buat("toko", "9.9", ID, "toko.co.id", True),
+    lambda p: p.prod_buat("toko", "8.1", "bukan-uuid", "toko.co.id", True),
+    lambda p: p.prod_buat("toko", "8.1", ID, "www.toko.co.id", True),
+    lambda p: p.prod_buat("toko", "8.1", ID, "Toko.co.id", True),
+    lambda p: p.prod_buat("toko", "8.1", ID, "toko.co.id\n", True),
+    lambda p: p.prod_buat("toko", "8.1", ID, "toko.co.id", "1"),
+    lambda p: p.prod_db_buat("toko", "wp_'; x"),
+    lambda p: p.prod_backup("toko", "2026-10-03"),
+    lambda p: p.prod_backup_hapus("toko", "20261003T023000Z\n"),
+    lambda p: p.prod_domain("../x"),
+    lambda p: p.prod_sertifikat(""),
+    lambda p: p.prod_aktifkan(None),
+])
+def test_prod_validasi_sebelum_subprocess(pembantu, catatan, panggil):
+    with pytest.raises(ValueError):
+        panggil(pembantu)
+    assert catatan() == []
+
+
+def test_prod_domain_di_bawah_domain_staging_ditolak(pembantu, catatan, monkeypatch):
+    from wpmgr.config import get_settings
+
+    monkeypatch.setenv("WPMGR_STAGING_DOMAIN", "staging.halosocia.my.id")
+    get_settings.cache_clear()
+    with pytest.raises(ValueError):
+        pembantu.prod_buat("toko", "8.1", ID, "vps-x.staging.halosocia.my.id", True)
+    assert catatan() == []
+
+
+@pytest.mark.parametrize("kode_keluar,kode,pesan", [
+    (10, "nginx", ("Memasang konfigurasi nginx domain gagal. Konfigurasi nginx domain ditolak; site lain tidak "
+                   "terpengaruh.")),
+    (11, "backup", "Membuat backup situs gagal. Backup situs gagal dibuat."),
+    (3, "ditolak", "Mengaktifkan situs gagal. Skrip pembantu menolak permintaan ini."),
+])
+def test_prod_kode_keluar_menjadi_pesan_tetap(pembantu, catatan, monkeypatch, kode_keluar, kode, pesan):
+    monkeypatch.setenv("PALSU_KELUAR", str(kode_keluar))
+    monkeypatch.setenv("PALSU_STDERR", "GALAT x: /etc/nginx/wpmgr-hosting/rahasia.conf sandi=abc")
+    panggil = {"nginx": lambda: pembantu.prod_domain("toko"), "backup": lambda: pembantu.prod_backup(
+        "toko", "20261003T023000Z"), "ditolak": lambda: pembantu.prod_aktifkan("toko")}[kode]
+    with pytest.raises(GalatPembantu) as e:
+        panggil()
+    assert e.value.kode == kode
+    assert e.value.pesan == pesan
+    assert "/etc/nginx" not in e.value.pesan and "sandi" not in e.value.pesan
+
+
+@pytest.mark.parametrize("keluaran,hasil", [("terbit\n", "terbit"), ("tetap", "tetap"), ("diperbarui\n", "diperbarui")])
+def test_prod_sertifikat_hasil_tetap(pembantu, catatan, monkeypatch, keluaran, hasil):
+    monkeypatch.setenv("PALSU_STDOUT", keluaran)
+    assert pembantu.prod_sertifikat("toko") == hasil
+
+
+@pytest.mark.parametrize("keluaran", ["TERBIT", "terbit\nlagi", "", "ok"])
+def test_prod_sertifikat_keluaran_lain_ditolak(pembantu, catatan, monkeypatch, keluaran):
+    monkeypatch.setenv("PALSU_STDOUT", keluaran)
+    with pytest.raises(GalatPembantu):
+        pembantu.prod_sertifikat("toko")
+
+
+def test_status_prod_diurai_dan_disaring(pembantu, monkeypatch):
+    monkeypatch.setenv("PALSU_STDOUT", json.dumps({
+        "mem_tersedia": 4294967296, "disk_total": 200, "disk_bebas": 60, "backup_total": 300, "backup_bebas": 90,
+        "container": {"toko": {"berjalan": True}, "lain": {"berjalan": False}, "JAHAT": {"berjalan": True},
+                      "a_b": {"berjalan": True}, "b": "ya"}}))
+    st = pembantu.prod_status()
+    assert st == StatusProd(4294967296, 200, 60, 300, 90, {"toko": True, "lain": False})
+
+
+@pytest.mark.parametrize("teks", [
+    "bukan json", "[]",
+    json.dumps({"mem_tersedia": 1, "disk_total": 2, "disk_bebas": 3, "backup_total": 4, "container": {}}),
+    json.dumps({"mem_tersedia": -1, "disk_total": 2, "disk_bebas": 3, "backup_total": 4, "backup_bebas": 5}),
+    json.dumps({"mem_tersedia": "1", "disk_total": 2, "disk_bebas": 3, "backup_total": 4, "backup_bebas": 5}),
+])
+def test_status_prod_rusak_ditolak(teks):
+    with pytest.raises(GalatPembantu):
+        urai_status_prod(teks)
+
+
+def test_htpasswd_pratinjau(tmp_path):
+    tulis_htpasswd_pratinjau(tmp_path, "toko-co-id", HASH)
+    berkas = tmp_path / "router" / "toko-co-id.htpasswd"
+    assert berkas.read_bytes() == f"pratinjau:{HASH}\n".encode()
+    for nama, h in (("Toko", HASH), ("toko", "bukan-bcrypt"), ("toko", HASH + "\n"), ("a" * 37, HASH)):
+        with pytest.raises(ValueError):
+            tulis_htpasswd_pratinjau(tmp_path, nama, h)
+    hapus_htpasswd_pratinjau(tmp_path, "toko-co-id")
+    assert not berkas.exists()
+    hapus_htpasswd_pratinjau(tmp_path, "toko-co-id")
+
+
+# ---- Lapis 4: bawaan review Task 2-3 (di luar brief) -------------------------------
+
+
+def test_prod_tenggat_python_per_subperintah(monkeypatch, tmp_path):
+    # prod-hapus dan prod-domain bisa menunggu kunci router 30 s + kunci nginx
+    # 60 s sebelum mulai bekerja: TIMEOUT 300 (skrip 360), bukan bawaan 120.
+    p = Pembantu(["x"])
+    dipanggil = []
+
+    def catat(*argumen, timeout=modul_pembantu.TIMEOUT_BAWAAN, **_):
+        dipanggil.append((argumen[0], timeout))
+        return "terbit"
+
+    monkeypatch.setattr(p, "jalankan", catat)
+    p.prod_hapus("toko")
+    p.prod_domain("toko")
+    p.prod_aktifkan("toko")
+    p.prod_sertifikat("toko")
+    p.prod_db_impor("toko", [tmp_path / "a.sql"])
+    p.prod_backup("toko", "20261003T023000Z")
+    tenggat = dict(dipanggil)
+    assert tenggat["prod-hapus"] == tenggat["prod-domain"] == modul_pembantu.TIMEOUT_NGINX == 300
+    assert tenggat["prod-aktifkan"] == modul_pembantu.TIMEOUT_AKTIFKAN == 300
+    assert tenggat["prod-sertifikat"] == 300
+    assert tenggat["prod-db-impor"] == 3 * 3600
+    assert tenggat["prod-backup"] == modul_pembantu.TIMEOUT_BACKUP == 3 * 3600
+
+
+def test_tenggat_python_cocok_dengan_tenggat_skrip():
+    # Skrip memberi subperintah tenggat sendiri = TIMEOUT Python + 60, supaya
+    # dalam keadaan normal pembungkus Python yang lebih dulu menyerah.
+    skrip = (Path(__file__).parents[2] / "deploy" / "staging" / "wpmgr-staging").read_text(encoding="utf-8")
+    waktu = {m.group(1): int(m.group(2)) for m in re.finditer(r"^WAKTU_([A-Z]+)=([0-9]+)", skrip, re.MULTILINE)}
+    assert waktu["NGINX"] == modul_pembantu.TIMEOUT_NGINX + 60
+    assert waktu["AKTIFKAN"] == modul_pembantu.TIMEOUT_AKTIFKAN + 60
+    assert re.search(r'^ +prod-domain\|prod-hapus\) atur_tenggat "\$WAKTU_NGINX" ;;$', skrip, re.MULTILINE)
+
+
+def test_prod_kode_keluar_3_berarti_tanpa_ubah(pembantu, catatan, monkeypatch):
+    # Keluar 3 = ditolak tanpa perubahan atau kunci sibuk (kunci router 30 s;
+    # kunci nginx di prod-aktifkan, putusan L4): pemanggil boleh mengulang nanti.
+    monkeypatch.setenv("PALSU_KELUAR", "3")
+    monkeypatch.setenv("PALSU_STDERR", "GALAT ditolak: router hosting sedang dipakai proses lain\n")
+    with pytest.raises(GalatPembantu) as e:
+        pembantu.prod_db_buat("toko", "wp_")
+    assert e.value.kode == "ditolak" and e.value.tanpa_ubah is True
+    for kode_keluar in (2, 9, 10, 11, 1):
+        monkeypatch.setenv("PALSU_KELUAR", str(kode_keluar))
+        with pytest.raises(GalatPembantu) as e:
+            pembantu.prod_domain("toko")
+        assert e.value.tanpa_ubah is False
+
+
+def test_prod_kode_keluar_3_dengan_dua_baris_galat_tetap_ditolak(pembantu, catatan, monkeypatch):
+    # galat() menulis ke stderr asli; saat tenggat bisa tercetak dua baris
+    # GALAT. Kategori hanya dari kode keluar.
+    monkeypatch.setenv("PALSU_KELUAR", "3")
+    monkeypatch.setenv("PALSU_STDERR", "GALAT internal: dihentikan\nGALAT ditolak: router hosting sedang dipakai\n")
+    with pytest.raises(GalatPembantu) as e:
+        pembantu.prod_hapus("toko")
+    assert e.value.kode == "ditolak" and e.value.tanpa_ubah is True
+    assert e.value.pesan == "Menghapus situs hosting gagal. Skrip pembantu menolak permintaan ini."
+
+
+def test_prod_hapus_sukses_mencatat_stderr_ke_log(pembantu, catatan, monkeypatch, caplog):
+    # Putusan L6: certbot delete yang gagal hanya PERINGATAN di stderr dengan
+    # keluar 0; tanpa log ini peringatannya hilang.
+    caplog.set_level(logging.WARNING, logger="wpmgr.staging.pembantu")
+    monkeypatch.setenv("PALSU_KELUAR", "0")
+    monkeypatch.setenv("PALSU_STDERR", "PERINGATAN: lineage certbot domain tidak dapat dihapus; hapus manual "
+                       "(README)\r\nWARNING palsu: disuntikkan\n" + "z" * (modul_pembantu.BATAS_STDERR_LOG + 500))
+    assert pembantu.prod_hapus("toko") == ""
+    pesan = [r.getMessage() for r in caplog.records if "prod-hapus" in r.getMessage()]
+    assert len(pesan) == 1
+    assert "PERINGATAN: lineage certbot domain tidak dapat dihapus" in pesan[0]
+    assert "\n" not in pesan[0] and "\r" not in pesan[0]
+    assert "(README)\\r\\nWARNING palsu" in pesan[0]
+    assert "z" * (modul_pembantu.BATAS_STDERR_LOG + 1) not in pesan[0]
+
+
+def test_prod_hapus_sukses_tanpa_stderr_tidak_mencatat(pembantu, catatan, caplog):
+    caplog.set_level(logging.WARNING, logger="wpmgr.staging.pembantu")
+    pembantu.prod_hapus("toko")
+    assert not [r for r in caplog.records if "prod-hapus" in r.getMessage()]

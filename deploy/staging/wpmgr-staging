@@ -55,6 +55,7 @@ WAKTU_IMPOR=11100      # TIMEOUT_IMPOR 3 jam + 300
 WAKTU_WPCLI=960        # TIMEOUT_WPCLI 900 + 60
 WAKTU_SERTIFIKAT=360   # TIMEOUT_SERTIFIKAT 300 + 60
 WAKTU_AKTIFKAN=360     # TIMEOUT_AKTIFKAN 300 + 60
+WAKTU_NGINX=360        # TIMEOUT_NGINX 300 + 60 (prod-domain, prod-hapus: kunci bisa menunggu 90 s)
 TENGGAT=$(( SECONDS + WAKTU_BAWAAN ))
 
 ROUTER_CADANGAN=""
@@ -1905,9 +1906,10 @@ cmd_prod_router_muat() {
 
 # Kunci nginx host (flock pada fd 9, dilepas saat skrip keluar): perubahan
 # berkas di NGINX_HOSTING_DIR, pemasangan sertifikat domain, dan reload nginx
-# host diserialkan. Tenggat 60 s, bukan 120 (preflight M13): prod-domain dan
-# prod-hapus dibatasi TIMEOUT Python 120 s, jadi menunggu kunci tidak boleh
-# menghabiskan seluruh anggaran itu. Idempoten dalam satu proses: membuka
+# host diserialkan. Tenggat 60 s, bukan 120 (preflight M13): menunggu kunci
+# tidak boleh menghabiskan seluruh anggaran subperintah; prod-domain dan
+# prod-hapus (kunci router 30 s + kunci nginx 60 s) bertenggat WAKTU_NGINX
+# 360 s = TIMEOUT_NGINX Python 300 + 60. Idempoten dalam satu proses: membuka
 # ulang fd 9 akan menutup deskriptor lama dan diam-diam melepas kuncinya.
 #
 # URUTAN KUNCI (wajib di setiap subperintah): kunci_router lebih dulu, baru
@@ -2523,6 +2525,7 @@ utama() {
     wpcli) atur_tenggat "$WAKTU_WPCLI" ;;
     sertifikat|prod-sertifikat) atur_tenggat "$WAKTU_SERTIFIKAT" ;;
     prod-aktifkan) atur_tenggat "$WAKTU_AKTIFKAN" ;;
+    prod-domain|prod-hapus) atur_tenggat "$WAKTU_NGINX" ;;
     *) atur_tenggat "$WAKTU_BAWAAN" ;;
   esac
   case "$perintah" in

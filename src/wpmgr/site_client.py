@@ -1,9 +1,10 @@
 import base64
+import ipaddress
 import json
 import socket
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
@@ -65,7 +66,7 @@ class TanpaHasil(Exception):
 
 def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict, content: bytes | None = None,
                      timeout: float, tenggat: float, batas_byte: int, potong: bool = False,
-                     periksa=None) -> tuple[int, dict, bytes]:
+                     periksa=None, ekstensi: dict | None = None) -> tuple[int, dict, bytes]:
     """Satu permintaan HTTP dengan tenggat total dan batas byte (putusan F11).
 
     Tenggat total mencakup SELURUH permintaan: koneksi, TLS, pengiriman body,
@@ -86,7 +87,8 @@ def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict
     lebih dari itu melempar MelebihiBatas, atau dengan `potong` dipotong di
     batas dan pembacaan berhenti. `periksa(resp)` dipanggil sebelum body
     dibaca dan boleh melempar untuk menolak respons. Galat httpx diteruskan
-    apa adanya supaya pemanggil yang memetakannya.
+    apa adanya supaya pemanggil yang memetakannya. `ekstensi` (mis.
+    `sni_hostname`) diteruskan ke httpx bersama ekstensi `trace`.
     """
     akhir = time.monotonic() + tenggat
     batal = threading.Event()
@@ -122,7 +124,7 @@ def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict
     def kerja() -> None:
         try:
             with http.stream(method, url, content=content, headers=headers, timeout=timeout,
-                             extensions={"trace": trace}) as resp:
+                             extensions={**(ekstensi or {}), "trace": trace}) as resp:
                 try:
                     if periksa is not None:
                         periksa(resp)
@@ -183,7 +185,7 @@ def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict
 class SiteClient:
     def __init__(
         self, base_url: str, site_id: str, secret_hex: str, client: httpx.Client | None = None,
-        klien_staging: httpx.Client | None = None,
+        klien_staging: httpx.Client | None = None, alamat_tetap: str | None = None,
     ) -> None:
         if not base_url.startswith("https://"):
             raise ValueError("URL site wajib berskema https://")
@@ -194,6 +196,26 @@ class SiteClient:
         # Klien yang disuntikkan (test dengan MockTransport) dipakai juga
         # untuk staging bila klien staging tidak diberikan tersendiri.
         self._klien_staging = klien_staging or client
+        # Lapis 4 (spec §10.1): sesudah DNS berpindah, domain menunjuk VPS
+        # sendiri. Klien hosting lama dipatok ke IP lamanya: koneksi ke IP itu,
+        # tetapi header Host dan SNI tetap domain, sehingga sertifikat tetap
+        # diverifikasi terhadap nama domain (asumsi A1). Path yang
+        # ditandatangani tidak memuat host, jadi kontrak HMAC tidak berubah.
+        self.alamat_tetap: str | None = None
+        self._url_kirim = self.base_url
+        self._header_host: dict[str, str] = {}
+        self._ekstensi: dict[str, str] = {}
+        if alamat_tetap is not None:
+            ip = ipaddress.IPv4Address(alamat_tetap)
+            bagian = urlsplit(self.base_url)
+            host = bagian.hostname
+            if not host:
+                raise ValueError("URL site tanpa host")
+            port = f":{bagian.port}" if bagian.port else ""
+            self.alamat_tetap = str(ip)
+            self._url_kirim = f"https://{ip}{port}{bagian.path}"
+            self._header_host = {"Host": f"{host}{port}"}
+            self._ekstensi = {"sni_hostname": host}
 
     @property
     def _staging_http(self) -> httpx.Client:
@@ -224,11 +246,12 @@ class SiteClient:
         }
         if body:
             headers["Content-Type"] = "application/json"
+        headers.update(self._header_host)
 
         try:
             resp = self._client.request(
-                method, f"{self.base_url}{path}{query}", content=body or None,
-                headers=headers, timeout=timeout,
+                method, f"{self._url_kirim}{path}{query}", content=body or None,
+                headers=headers, timeout=timeout, extensions=self._ekstensi or None,
             )
         except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
             # Koneksi ke site tidak pernah terbentuk (atau tidak pernah
@@ -335,6 +358,7 @@ class SiteClient:
             # Koneksi tidak dipakai ulang (lihat buat_klien_staging), juga bila
             # klien yang disuntikkan masih memakai keep-alive.
             "Connection": "close",
+            **self._header_host,
             **(header_tambahan or {}),
         }
         if body:
@@ -350,9 +374,9 @@ class SiteClient:
                 raise SiteError(BAD_RESPONSE, "Respons connector dikompresi padahal diminta tanpa kompresi")
 
         try:
-            return minta_bertenggat(self._staging_http, method, f"{self.base_url}{path}{query}",
+            return minta_bertenggat(self._staging_http, method, f"{self._url_kirim}{path}{query}",
                                     headers=headers, content=body or None, timeout=timeout, tenggat=tenggat,
-                                    batas_byte=batas_byte, periksa=tolak_kompresi)
+                                    batas_byte=batas_byte, periksa=tolak_kompresi, ekstensi=self._ekstensi)
         except TenggatHabis:
             raise SiteError(kelas_waktu, f"Respons connector melewati tenggat total {tenggat:g} detik") from None
         except MelebihiBatas:

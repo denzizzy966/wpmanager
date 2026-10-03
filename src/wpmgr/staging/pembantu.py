@@ -32,13 +32,26 @@ from urllib.parse import quote
 import bcrypt
 
 from wpmgr.config import Settings, get_settings
-from wpmgr.staging.aman import POLA_NAMA, VERSI_PHP, angka, bersih_teks, nama_sah
+from wpmgr.staging.aman import (
+    POLA_NAMA,
+    POLA_NAMA_PROD,
+    VERSI_PHP,
+    angka,
+    bersih_teks,
+    domain_sah,
+    nama_sah,
+)
 
 log = logging.getLogger("wpmgr.staging.pembantu")
 
 # Cermin `galat()` di deploy/staging/wpmgr-staging.
 KODE_KELUAR = {2: "argumen", 3: "ditolak", 4: "docker", 5: "sertifikat", 6: "impor",
-               7: "konfigurasi", 8: "wpcli", 9: "internal"}
+               7: "konfigurasi", 8: "wpcli", 9: "internal", 10: "nginx", 11: "backup"}
+# Keluar 3 (`galat ditolak`): skrip menolak SEBELUM mengubah apa pun, termasuk
+# saat kunci router (30 s) atau kunci nginx prod-aktifkan (60 s, putusan L4)
+# sedang dipegang proses lain, mis. prod-db-impor yang memegang kunci router
+# sampai 3 jam. Bukan galat final: pemanggil boleh mengulang nanti.
+KODE_TANPA_UBAH = "ditolak"
 PESAN_UMUM = {
     "argumen": "Skrip pembantu menolak argumen permintaan ini.",
     "ditolak": "Skrip pembantu menolak permintaan ini.",
@@ -48,6 +61,8 @@ PESAN_UMUM = {
     "konfigurasi": "Konfigurasi skrip pembantu di server belum lengkap.",
     "wpcli": "Perintah wp-cli di staging gagal.",
     "internal": "Skrip pembantu mengalami galat tak terduga; lihat log server.",
+    "nginx": "Konfigurasi nginx domain ditolak; site lain tidak terpengaruh.",
+    "backup": "Backup situs gagal dibuat.",
     "lain": "Skrip pembantu tidak dapat dijalankan (periksa pemasangan dan sudoers).",
 }
 # Awalan pesan UI per subperintah, supaya pengguna tahu langkah mana yang gagal
@@ -66,11 +81,28 @@ AKSI = {
     "sertifikat": "Menerbitkan sertifikat staging",
     "status": "Membaca status server staging",
     "mail-kredensial": "Membaca kredensial kotak email staging",
+    "prod-siapkan": "Menyiapkan layanan hosting",
+    "prod-buat": "Membuat container situs",
+    "prod-jalan": "Menjalankan situs",
+    "prod-hapus": "Menghapus situs hosting",
+    "prod-db-buat": "Membuat database situs",
+    "prod-db-impor": "Mengimpor database situs",
+    "prod-router-muat": "Memuat ulang router hosting",
+    "prod-domain": "Memasang konfigurasi nginx domain",
+    "prod-sertifikat": "Menerbitkan sertifikat domain",
+    "prod-aktifkan": "Mengaktifkan situs",
+    "prod-backup": "Membuat backup situs",
+    "prod-backup-hapus": "Menghapus backup situs",
+    "prod-status": "Membaca status server hosting",
 }
 _POLA_PREFIX = re.compile(r"[A-Za-z0-9_]{1,20}")
 _POLA_HASH = re.compile(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
 _POLA_RAHASIA = re.compile(r"[0-9a-f]{64}")
 _POLA_KREDENSIAL_MAIL = re.compile(r"wpmgr:[0-9a-f]{48}")
+_POLA_STEMPEL = re.compile(r"[0-9]{8}T[0-9]{6}Z")
+# Keluaran prod-sertifikat: satu kata dari daftar tetap (spec §7.3.3).
+HASIL_SERTIFIKAT = frozenset({"terbit", "tetap", "diperbarui"})
+PENGGUNA_PRATINJAU = "pratinjau"
 
 # Keluaran wp-cli dikendalikan kode salinan site yang bisa saja disusupi:
 # stdout dan stderr ditampung di memori sampai batas ini saja, tidak pernah ke
@@ -94,6 +126,12 @@ TIMEOUT_BUAT = 600
 TIMEOUT_IMPOR = 3 * 3600
 TIMEOUT_WPCLI = 900
 TIMEOUT_SERTIFIKAT = 300
+TIMEOUT_AKTIFKAN = 300
+TIMEOUT_BACKUP = 3 * 3600
+# prod-domain dan prod-hapus: kunci router (prod-hapus, 30 s) dan kunci nginx
+# (60 s) bisa menghabiskan 90 s sebelum pekerjaan dimulai, jadi bawaan 120 s
+# terlalu sempit. Skrip memakai WAKTU_NGINX = 300 + 60 (preflight M13).
+TIMEOUT_NGINX = 300
 UMUR_TAUTAN = 12 * 3600
 
 
@@ -103,6 +141,17 @@ class GalatPembantu(Exception):
         self.kode = kode
         self.pesan = pesan
 
+    @property
+    def tanpa_ubah(self) -> bool:
+        """Skrip menolak tanpa mengubah apa pun (keluar 3), termasuk "sedang sibuk".
+
+        Pemanggil job memperlakukannya sebagai boleh diulang nanti (R15,
+        `GalatDitolakTanpaUbah`), bukan galat final. Kode keluar lain tidak
+        menjamin tanpa perubahan, termasuk `nginx` (10) yang juga dipakai saat
+        kunci nginx prod-domain/prod-sertifikat/prod-hapus sibuk.
+        """
+        return self.kode == KODE_TANPA_UBAH
+
 
 @dataclass(frozen=True)
 class StatusPembantu:
@@ -111,6 +160,16 @@ class StatusPembantu:
     disk_bebas: int
     container: dict[str, bool]
     akses: dict[str, int]
+
+
+@dataclass(frozen=True)
+class StatusProd:
+    mem_tersedia: int
+    disk_total: int
+    disk_bebas: int
+    backup_total: int
+    backup_bebas: int
+    container: dict[str, bool]
 
 
 def _cek_nama(nama) -> str:
@@ -124,6 +183,24 @@ def _cek_id(site_id) -> str:
     if str(uuid.UUID(teks)) != teks:
         raise ValueError("Id site tidak sah")
     return teks
+
+
+def _cek_nama_prod(nama) -> str:
+    if not isinstance(nama, str) or not POLA_NAMA_PROD.fullmatch(nama):
+        raise ValueError("Nama situs tidak sah")
+    return nama
+
+
+def _cek_domain(domain) -> str:
+    if not domain_sah(domain, get_settings().staging_domain):
+        raise ValueError("Domain tidak sah")
+    return domain
+
+
+def _cek_stempel(stempel) -> str:
+    if not isinstance(stempel, str) or not _POLA_STEMPEL.fullmatch(stempel):
+        raise ValueError("Stempel backup tidak sah")
+    return stempel
 
 
 def urai_status(teks: str) -> StatusPembantu:
@@ -152,9 +229,41 @@ def urai_status(teks: str) -> StatusPembantu:
     return StatusPembantu(container=container, akses=akses, **nilai)
 
 
+def urai_status_prod(teks: str) -> StatusProd:
+    """JSON `prod-status`; angka wajib bilangan bulat >= 0, container disaring nama sah."""
+    try:
+        data = json.loads(teks)
+    except ValueError:
+        raise GalatPembantu("status", "Status server hosting tidak terbaca.") from None
+    if not isinstance(data, dict):
+        raise GalatPembantu("status", "Status server hosting tidak terbaca.")
+    nilai = {}
+    for kunci in ("mem_tersedia", "disk_total", "disk_bebas", "backup_total", "backup_bebas"):
+        mentah = data.get(kunci)
+        # `angka` menjepit nilai negatif ke 0; di sini nilai negatif berarti
+        # keluaran rusak, jadi ditolak lebih dulu.
+        if not isinstance(mentah, int) or isinstance(mentah, bool) or mentah < 0:
+            raise GalatPembantu("status", "Status server hosting tidak lengkap.")
+        nilai[kunci] = min(mentah, 2**53)
+    container = {}
+    mentah_c = data.get("container")
+    for k, v in mentah_c.items() if isinstance(mentah_c, dict) else ():
+        if isinstance(k, str) and POLA_NAMA_PROD.fullmatch(k) and isinstance(v, dict):
+            container[k] = v.get("berjalan") is True
+    return StatusProd(container=container, **nilai)
+
+
 def _pesan(subperintah: str, kode: str) -> str:
     aksi = AKSI.get(subperintah)
     return f"{aksi} gagal. {PESAN_UMUM[kode]}" if aksi else PESAN_UMUM[kode]
+
+
+def _stderr_log(stderr: str) -> str:
+    # Stderr bisa memuat path VPS atau keluaran docker/wp-cli: hanya untuk log
+    # server, satu baris (baris baru di-escape supaya tidak bisa memalsukan
+    # entri log), dipotong.
+    satu_baris = stderr.strip().replace("\r", "\\r").replace("\n", "\\n")
+    return bersih_teks(satu_baris, BATAS_STDERR_LOG) or ""
 
 
 class _Penampung:
@@ -263,16 +372,19 @@ class Pembantu:
     @staticmethod
     def _galat(subperintah: str, kode_keluar: int, stderr: str) -> GalatPembantu:
         kode = KODE_KELUAR.get(kode_keluar, "lain")
-        # Stderr bisa memuat path VPS atau keluaran docker/wp-cli: hanya untuk
-        # log server, satu baris (baris baru di-escape supaya tidak bisa
-        # memalsukan entri log), dipotong. Kategorinya dari kode keluar, bukan
-        # dari teks `GALAT <kode>` (dalam kasus tenggat bisa tercetak dua baris).
-        satu_baris = stderr.strip().replace("\r", "\\r").replace("\n", "\\n")
+        # Kategorinya dari kode keluar, bukan dari teks `GALAT <kode>`: dalam
+        # kasus tenggat bisa tercetak dua baris (galat() menulis ke stderr asli).
         log.warning("Skrip pembantu %s gagal (kode keluar %s): %s", subperintah or "-", kode_keluar,
-                    bersih_teks(satu_baris, BATAS_STDERR_LOG))
+                    _stderr_log(stderr))
         return GalatPembantu(kode, _pesan(subperintah, kode))
 
-    def jalankan(self, *argumen: str, masukan: Iterable[Path] = (), timeout: float = TIMEOUT_BAWAAN) -> str:
+    def jalankan(self, *argumen: str, masukan: Iterable[Path] = (), timeout: float = TIMEOUT_BAWAAN,
+                 catat_stderr: bool = False) -> str:
+        """Jalankan satu subperintah dan kembalikan stdout-nya.
+
+        `catat_stderr`: stderr perintah yang BERHASIL juga dicatat ke log
+        server (mis. PERINGATAN certbot delete di prod-hapus, putusan L6).
+        """
         masukan = list(masukan)
         subperintah = argumen[0] if argumen and argumen[0] in AKSI else ""
         mulai = time.monotonic()
@@ -352,6 +464,9 @@ class Pembantu:
             log.warning("Keluaran skrip pembantu %s tidak tuntas dibaca dalam %s detik",
                         subperintah or "-", TENGGANG_AKHIR)
             raise GalatPembantu("lain", PESAN_TIDAK_TUNTAS)
+        if catat_stderr and galat.data.strip():
+            log.warning("Skrip pembantu %s berhasil dengan pesan: %s", subperintah or "-",
+                        _stderr_log(galat.data.decode("utf-8", "replace")))
         return keluar.data.decode("utf-8", "replace")
 
     @staticmethod
@@ -447,6 +562,63 @@ class Pembantu:
         pengguna, _, sandi = teks.partition(":")
         return pengguna, sandi
 
+    # ---- produksi (Lapis 4, spec §7.3.3) -------------------------------------
+
+    def prod_siapkan(self) -> str:
+        return self.jalankan("prod-siapkan", timeout=TIMEOUT_SIAPKAN)
+
+    def prod_buat(self, nama: str, versi_php: str, site_id, domain: str, www: bool) -> str:
+        _cek_nama_prod(nama)
+        if versi_php not in VERSI_PHP:
+            raise ValueError("Versi PHP situs tidak didukung")
+        # Hanya bool sungguhan: "1", 1, atau None bukan penanda yang sah, dan
+        # galat argumen apa pun sebelum subprocess selalu ValueError.
+        if www is not True and www is not False:
+            raise ValueError("Penanda www tidak sah")
+        return self.jalankan("prod-buat", nama, versi_php, _cek_id(site_id), _cek_domain(domain),
+                             "1" if www else "0", timeout=TIMEOUT_BUAT)
+
+    def prod_jalan(self, nama: str) -> str:
+        return self.jalankan("prod-jalan", _cek_nama_prod(nama))
+
+    def prod_hapus(self, nama: str) -> str:
+        # Sukses pun bisa membawa PERINGATAN (lineage certbot tidak terhapus,
+        # putusan L6): stderr-nya dicatat supaya pengelola bisa membersihkan manual.
+        return self.jalankan("prod-hapus", _cek_nama_prod(nama), timeout=TIMEOUT_NGINX, catat_stderr=True)
+
+    def prod_db_buat(self, nama: str, prefix: str) -> str:
+        _cek_nama_prod(nama)
+        if not isinstance(prefix, str) or not _POLA_PREFIX.fullmatch(prefix):
+            raise ValueError("Prefix tabel tidak sah")
+        return self.jalankan("prod-db-buat", nama, prefix)
+
+    def prod_db_impor(self, nama: str, berkas: list[Path]) -> str:
+        return self.jalankan("prod-db-impor", _cek_nama_prod(nama), masukan=berkas, timeout=TIMEOUT_IMPOR)
+
+    def prod_router_muat(self) -> str:
+        return self.jalankan("prod-router-muat")
+
+    def prod_domain(self, nama: str) -> str:
+        return self.jalankan("prod-domain", _cek_nama_prod(nama), timeout=TIMEOUT_NGINX)
+
+    def prod_sertifikat(self, nama: str) -> str:
+        teks = self.jalankan("prod-sertifikat", _cek_nama_prod(nama), timeout=TIMEOUT_SERTIFIKAT).strip()
+        if teks not in HASIL_SERTIFIKAT:
+            raise GalatPembantu("lain", PESAN_TIDAK_TUNTAS)
+        return teks
+
+    def prod_aktifkan(self, nama: str) -> str:
+        return self.jalankan("prod-aktifkan", _cek_nama_prod(nama), timeout=TIMEOUT_AKTIFKAN)
+
+    def prod_backup(self, nama: str, stempel: str) -> str:
+        return self.jalankan("prod-backup", _cek_nama_prod(nama), _cek_stempel(stempel), timeout=TIMEOUT_BACKUP)
+
+    def prod_backup_hapus(self, nama: str, stempel: str) -> str:
+        return self.jalankan("prod-backup-hapus", _cek_nama_prod(nama), _cek_stempel(stempel))
+
+    def prod_status(self) -> StatusProd:
+        return urai_status_prod(self.jalankan("prod-status"))
+
 
 def sandi_baru() -> str:
     return secrets.token_urlsafe(12)
@@ -490,6 +662,21 @@ def hapus_akses_router(dir_staging: Path, nama: str) -> None:
     _cek_nama(nama)
     for akhiran in (".htpasswd", ".rahasia"):
         (Path(dir_staging) / "router" / f"{nama}{akhiran}").unlink(missing_ok=True)
+
+
+def tulis_htpasswd_pratinjau(dir_hosting: Path, nama: str, sandi_hash: str) -> None:
+    """Satu baris htpasswd pratinjau yang dibaca `prod-router-muat` (spec §10.2); divalidasi di dua sisi."""
+    _cek_nama_prod(nama)
+    if not isinstance(sandi_hash, str) or not _POLA_HASH.fullmatch(sandi_hash):
+        raise ValueError("Hash kata sandi tidak sah")
+    d = Path(dir_hosting) / "router"
+    d.mkdir(parents=True, exist_ok=True)
+    _tulis_atomik(d / f"{nama}.htpasswd", f"{PENGGUNA_PRATINJAU}:{sandi_hash}\n")
+
+
+def hapus_htpasswd_pratinjau(dir_hosting: Path, nama: str) -> None:
+    _cek_nama_prod(nama)
+    (Path(dir_hosting) / "router" / f"{nama}.htpasswd").unlink(missing_ok=True)
 
 
 def _md5_tautan(rahasia: str, host: str, kedaluwarsa: int) -> str:

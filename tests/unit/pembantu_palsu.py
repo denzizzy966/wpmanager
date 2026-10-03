@@ -73,6 +73,10 @@ def main() -> int:
     if keluar:
         sys.stderr.buffer.write(os.environ.get("PALSU_STDERR", "").encode("utf-8"))
         return int(keluar)
+    stdout = os.environ.get("PALSU_STDOUT")
+    if stdout is not None:
+        sys.stdout.write(stdout)
+        return 0
     if perintah == "status":
         sys.stdout.write(os.environ.get("PALSU_STATUS", "{}"))
     elif perintah == "tidur":
