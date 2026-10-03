@@ -39,6 +39,12 @@ case "${1-}" in
     [[ " $* " == *" wpmgr-prod "* ]] && berkas="$PALSU/jaringan-prod"
     if [[ "${2-}" == inspect ]]; then
       [[ -f "$berkas" ]] || exit 1
+      # Jawaban atribut jaringan produksi (cek_jaringan_prod): bawaan sesuai,
+      # dapat diganti lewat jaringan-prod-jembatan / jaringan-prod-subnet.
+      case "$*" in
+        *bridge.name*) cat "$PALSU/jaringan-prod-jembatan" 2>/dev/null || echo br-wpmgrprod ;;
+        *Subnet*) cat "$PALSU/jaringan-prod-subnet" 2>/dev/null || echo 172.31.251.0/24 ;;
+      esac
     else
       touch "$berkas"
     fi

@@ -1050,6 +1050,7 @@ KONF
   [ -z "$(docker_log)" ]
   run "$SKRIP" prod-status
   [ "$status" -eq 7 ]
+  [[ "$output" == *"kosong"* ]]
   run "$SKRIP" prod-status tambahan
   [ "$status" -eq 2 ]
   run "$SKRIP" prod-siapkan tambahan
@@ -1068,14 +1069,16 @@ KONF
   echo 'PROD_ROUTER_PORT=0.0.0.0:8091' >> "$WPMGR_STG_KONF"
   run "$SKRIP" prod-status
   [ "$status" -eq 7 ]
+  [[ "$output" == *"PROD_ROUTER_PORT harus di 127.0.0.1"* ]]
   sed -i '/^PROD_ROUTER_PORT=/d' "$WPMGR_STG_KONF"
   sed -i 's/^IP_PUBLIK=.*/IP_PUBLIK=169.58.91.300/' "$WPMGR_STG_KONF"
   run "$SKRIP" prod-status
   [ "$status" -eq 7 ]
+  [[ "$output" == *"alamat IPv4 tidak sah"* ]]
   sed -i '/^IP_PUBLIK=/d' "$WPMGR_STG_KONF"
   run "$SKRIP" prod-status
   [ "$status" -eq 7 ]
-  [[ "$output" == *"IP_PUBLIK"* ]]
+  [[ "$output" == *"IP_PUBLIK wajib diisi"* ]]
 }
 
 @test "HOSTING_DIR di dalam STAGING_DIR ditolak" {
@@ -1084,6 +1087,7 @@ KONF
     sed -i "s#^HOSTING_DIR=.*#HOSTING_DIR=$salah#" "$WPMGR_STG_KONF"
     run "$SKRIP" prod-status
     [ "$status" -eq 7 ]
+    [[ "$output" == *"berimpit"* ]]
   done
 }
 
@@ -1131,6 +1135,8 @@ KONF
     -gt "$(grep -n '^\[-A\]\[WPMGR-PROD-MASUK\]\[-j\]\[DROP\]$' "$PALSU/iptables.log" | cut -d: -f1)" ]
   [ "$(grep -n '^\[-F\]\[WPMGR-PROD-MASUK\]$' "$PALSU/iptables.log" | cut -d: -f1)" \
     -lt "$(grep -n '^\[-A\]\[WPMGR-PROD-MASUK\]' "$PALSU/iptables.log" | head -1 | cut -d: -f1)" ]
+  # Rantai diganti atomik lewat iptables-restore: tidak ada -F/-N/-A langsung.
+  ! grep -q '^\[-F\]\|^\[-N\]\|^\[-A\]' "$PALSU/iptables-langsung.log" || false
   ! grep -q 'br-wpmgrstg\|WPMGR-STG' "$PALSU/iptables.log" || false
 }
 
@@ -1152,12 +1158,14 @@ KONF
   chown 0:0 "$S/hosting"
   run "$SKRIP" prod-siapkan
   [ "$status" -eq 7 ]
+  [[ "$output" == *"bukan milik user dashboard"* ]]
   rm -rf "$S/hosting"
   mkdir -p "$S/lain"
   chown 1000:1000 "$S/lain"
   ln -s "$S/lain" "$S/hosting"
   run "$SKRIP" prod-siapkan
   [ "$status" -eq 7 ]
+  [[ "$output" == *"HOSTING_DIR tidak ada atau berupa symlink"* ]]
   [ -z "$(docker_log)" ]
 }
 
@@ -1192,4 +1200,137 @@ KONF
   # -I memasang di posisi teratas: yang dipasang belakangan berada di atas.
   [ "$terima" -gt "$drop" ]
   grep -qxF "[-D][INPUT][-i][br-wpmgrstg][-m][conntrack][--ctstate][ESTABLISHED,RELATED][-j][ACCEPT]" "$PALSU/iptables.log"
+}
+
+# ---- putaran perbaikan 1 --------------------------------------------------------
+
+@test "prod-siapkan mengganti rantai produksi secara atomik dengan iptables-restore --noflush" {
+  aktifkan_hosting
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\n' "$D64" "$D64" >> "$S/etc/digest.lock"
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 0 ]
+  harapan='*filter
+:WPMGR-PROD-MASUK - [0:0]
+-A WPMGR-PROD-MASUK -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A WPMGR-PROD-MASUK -d 169.58.91.181 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A WPMGR-PROD-MASUK -j DROP
+COMMIT
+*filter
+:WPMGR-PROD-ANTAR - [0:0]
+-A WPMGR-PROD-ANTAR -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A WPMGR-PROD-ANTAR -s 172.31.251.254 -p tcp --dport 80 -j ACCEPT
+-A WPMGR-PROD-ANTAR -d 172.31.251.252 -p tcp --dport 3306 -j ACCEPT
+-A WPMGR-PROD-ANTAR -j DROP
+COMMIT'
+  [ "$(cat "$PALSU/iptables-restore.log")" = "$harapan" ]
+  [ "$(cat "$PALSU/iptables-restore.args")" = "$(printf '[--noflush]\n[--noflush]')" ]
+  # Tidak ada -F, -N, atau -A langsung pada rantai itu.
+  ! grep -q '^\[-F\]\|^\[-N\]\|^\[-A\]' "$PALSU/iptables-langsung.log" || false
+  # Lompatan idempoten (-C sebelum -I) dan dipasang sesudah rantainya ada.
+  grep -qxF "[-C][INPUT][-i][br-wpmgrprod][-j][WPMGR-PROD-MASUK]" "$PALSU/iptables-langsung.log"
+  grep -qxF "[-I][INPUT][-i][br-wpmgrprod][-j][WPMGR-PROD-MASUK]" "$PALSU/iptables-langsung.log"
+}
+
+@test "siapkan staging mengganti rantai WPMGR-STG-ANTAR secara atomik" {
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\nmailpit=p@sha256:%s\n' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+  harapan='*filter
+:WPMGR-STG-ANTAR - [0:0]
+-A WPMGR-STG-ANTAR -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A WPMGR-STG-ANTAR -s 172.31.250.254 -p tcp --dport 80 -j ACCEPT
+-A WPMGR-STG-ANTAR -d 172.31.250.252 -p tcp --dport 3306 -j ACCEPT
+-A WPMGR-STG-ANTAR -d 172.31.250.253 -p tcp --dport 1025 -j ACCEPT
+-A WPMGR-STG-ANTAR -j DROP
+COMMIT'
+  [ "$(cat "$PALSU/iptables-restore.log")" = "$harapan" ]
+  [ "$(cat "$PALSU/iptables-restore.args")" = '[--noflush]' ]
+  ! grep -q '^\[-F\]\|^\[-N\]\|^\[-A\]' "$PALSU/iptables-langsung.log" || false
+}
+
+@test "siapkan menolak bila iptables-restore gagal dan tidak memasang lompatan" {
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\nmailpit=p@sha256:%s\n' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+  mkdir -p "$BATS_TEST_TMPDIR/gagal"
+  printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 1\n' > "$BATS_TEST_TMPDIR/gagal/iptables-restore"
+  chmod +x "$BATS_TEST_TMPDIR/gagal/iptables-restore"
+  WPMGR_STG_PATH="$BATS_TEST_TMPDIR/gagal:$WPMGR_STG_PATH" run "$SKRIP" siapkan
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"rantai iptables tidak dapat dipasang"* ]]
+  ! grep -q '^\[-I\]\[DOCKER-USER\]\[-i\]\[br-wpmgrstg\]\[-o\]' "$PALSU/iptables.log" || false
+}
+
+@test "HOSTING_DIR: sibling berawalan sama diizinkan, jalur tidak dinormalkan ditolak" {
+  aktifkan_hosting
+  sed -i "s#^HOSTING_DIR=.*#HOSTING_DIR=$S/staging-hosting#" "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 0 ]
+  for salah in "$S//hosting" "$S/./hosting" "$S/hosting/" "$S/hosting/."; do
+    sed -i "s#^HOSTING_DIR=.*#HOSTING_DIR=$salah#" "$WPMGR_STG_KONF"
+    run "$SKRIP" prod-status
+    [ "$status" -eq 7 ]
+    [[ "$output" == *"tidak dinormalkan"* ]]
+  done
+}
+
+@test "jalur STAGING_DIR/KONF_DIR/BACKUP_DIR tidak dinormalkan ditolak, juga lewat kunci produksi" {
+  aktifkan_hosting
+  sed -i "s#^STAGING_DIR=.*#STAGING_DIR=$S//staging#" "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"tidak dinormalkan"* ]]
+  sed -i "s#^STAGING_DIR=.*#STAGING_DIR=$S/staging#" "$WPMGR_STG_KONF"
+  sed -i "s#^BACKUP_DIR=.*#BACKUP_DIR=$S/backup/#" "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"tidak dinormalkan"* ]]
+}
+
+@test "HOSTING_DIR yang memuat STAGING_DIR ditolak dan direktori milik root di dalam HOSTING_DIR/STAGING_DIR ditolak" {
+  aktifkan_hosting
+  sed -i "s#^HOSTING_DIR=.*#HOSTING_DIR=$S#" "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"berimpit"* ]]
+  sed -i "s#^HOSTING_DIR=.*#HOSTING_DIR=$S/hosting#" "$WPMGR_STG_KONF"
+  for kunci in BACKUP_DIR PROD_CERT_DIR NGINX_HOSTING_DIR; do
+    for dalam in "$S/hosting/x" "$S/staging/x"; do
+      sed -i "s#^$kunci=.*#$kunci=$dalam#" "$WPMGR_STG_KONF"
+      run "$SKRIP" prod-status
+      [ "$status" -eq 7 ]
+      [[ "$output" == *"direktori milik root"* ]]
+    done
+    sed -i "s#^$kunci=.*#$kunci=$S/aman#" "$WPMGR_STG_KONF"
+  done
+  sed -i "s#^KONF_DIR=.*#KONF_DIR=$S/hosting/etc#" "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"direktori milik root"* ]]
+}
+
+@test "prod-siapkan menolak jaringan wpmgr-prod yang jembatan atau subnetnya salah sebelum menyentuh iptables" {
+  aktifkan_hosting
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\n' "$D64" "$D64" >> "$S/etc/digest.lock"
+  printf 'br-lain' > "$PALSU/jaringan-prod-jembatan"
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"jembatan atau subnetnya tidak sesuai"* ]]
+  rm -f "$PALSU/jaringan-prod-jembatan"
+  printf '10.9.0.0/24' > "$PALSU/jaringan-prod-subnet"
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"jembatan atau subnetnya tidak sesuai"* ]]
+  [ ! -e "$PALSU/iptables.log" ]
+  ! grep -q '^\[run\]\|^\[start\]\|^\[rm\]' "$PALSU/docker.log" || false
+}
+
+@test "konfigurasi staging-saja dengan SUBNET 172.31.251.0/24 tetap lolos (M8)" {
+  sed -i 's#^SUBNET=.*#SUBNET=172.31.251.0/24#' "$WPMGR_STG_KONF"
+  run "$SKRIP" status
+  [ "$status" -eq 0 ]
 }

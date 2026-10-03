@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# iptables-restore tiruan: mencatat argumen ke iptables-restore.args dan
+# muatan (stdin) apa adanya ke iptables-restore.log, lalu menerjemahkannya ke
+# iptables.log seperti efeknya pada kernel: header `:RANTAI - [0:0]` dengan
+# --noflush mengosongkan/membuat rantai itu ([-F][RANTAI]) dan setiap
+# `-A ...` menjadi satu panggilan -A.
+printf '[%s]' "$@" >> "$PALSU/iptables-restore.args"
+printf '\n' >> "$PALSU/iptables-restore.args"
+muatan="$(cat)"
+printf '%s\n' "$muatan" >> "$PALSU/iptables-restore.log"
+while IFS= read -r baris; do
+  case "$baris" in
+    :*)
+      rantai="${baris%% *}"
+      printf '[-F][%s]\n' "${rantai#:}" >> "$PALSU/iptables.log" ;;
+    "-A "*)
+      read -ra kata <<< "$baris"
+      printf '[%s]' "${kata[@]}" >> "$PALSU/iptables.log"
+      printf '\n' >> "$PALSU/iptables.log" ;;
+  esac
+done <<< "$muatan"
+exit 0

@@ -258,10 +258,22 @@ PENGGUNA_UID|PENGGUNA_GID|AKAR_LOKAL|AKAR_DAEMON|TANPA_IPTABLES|TANPA_SERTIFIKAT
     [[ "$PROD_SUBNET" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || galat konfigurasi "PROD_SUBNET tidak sah"
     hitung_ip_prod
     [[ "$HOSTING_DIR" =~ $POLA_JALUR && "$HOSTING_DIR" != *..* ]] || galat konfigurasi "path konfigurasi tidak sah"
+    for p in "$HOSTING_DIR" "$STAGING_DIR" "$KONF_DIR" "$BACKUP_DIR" "$PROD_CERT_DIR" "$NGINX_HOSTING_DIR"; do
+      jalur_bersih "$p"
+    done
     # Pemangkasan staging menghapus setiap direktori UUID di STAGING_DIR yang
     # tidak punya baris Staging; situs produksi tidak boleh berada di sana
     # (RFP1), dan sebaliknya.
-    [[ "$HOSTING_DIR" != "$STAGING_DIR" && "$HOSTING_DIR" != "$STAGING_DIR"/* && "$STAGING_DIR" != "$HOSTING_DIR"/* ]]       || galat konfigurasi "HOSTING_DIR tidak boleh berimpit dengan STAGING_DIR"
+    if di_dalam "$HOSTING_DIR" "$STAGING_DIR" || di_dalam "$STAGING_DIR" "$HOSTING_DIR"; then
+      galat konfigurasi "HOSTING_DIR tidak boleh berimpit dengan STAGING_DIR"
+    fi
+    # Direktori tulis-root tidak boleh berada di pohon yang bisa diubah
+    # container/dashboard maupun di pohon yang dipangkas staging.
+    for p in "$KONF_DIR" "$BACKUP_DIR" "$PROD_CERT_DIR" "$NGINX_HOSTING_DIR"; do
+      if di_dalam "$p" "$HOSTING_DIR" || di_dalam "$p" "$STAGING_DIR"; then
+        galat konfigurasi "direktori milik root tidak boleh di dalam HOSTING_DIR atau STAGING_DIR"
+      fi
+    done
     [[ -n "$IP_PUBLIK" ]] || galat konfigurasi "IP_PUBLIK wajib diisi bila HOSTING_DIR diisi"
     [[ "$IP_PUBLIK" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || galat konfigurasi "IP_PUBLIK tidak sah"
     angka_ip "$IP_PUBLIK" >/dev/null
@@ -344,6 +356,17 @@ hitung_ip_layanan() {
   IP_MAIL="$(ip_dari_angka $(( siaran - 2 )))"
   IP_DB="$(ip_dari_angka $(( siaran - 3 )))"
 }
+
+# Jalur harus sudah dinormalkan sebelum dibandingkan secara teks (awalan
+# string): "//", "/./", akhiran "/" atau "/." membuat HOSTING_DIR=/a//b lolos
+# dari pemeriksaan "di dalam STAGING_DIR" padahal menunjuk tempat yang sama.
+jalur_bersih() {
+  local j="$1"
+  [[ "$j" != *//* && "$j" != */./* && "$j" != */ && "$j" != */. ]] || galat konfigurasi "path konfigurasi tidak dinormalkan"
+}
+
+# $1 jalur, $2 basis: benar bila $1 sama dengan atau di dalam $2.
+di_dalam() { [[ "$1" == "$2" || "$1" == "$2"/* ]]; }
 
 # IPv4 bertitik ke bilangan 32 bit; setiap oktet 0..255.
 angka_ip() {
@@ -537,12 +560,13 @@ image() {
 # $3: container db (staging bawaan; produksi wpmgr-prod-db).
 opsi_klien() {
   local wadah="${3:-wpmgr-stg-db}" pesan="database staging tidak dapat dihubungi"
-  if [[ "$wadah" == wpmgr-prod-db ]]; then
-    pastikan_layanan_prod db
-    pesan="database hosting tidak dapat dihubungi"
-  else
-    pastikan_layanan db
-  fi
+  case "$wadah" in
+    wpmgr-stg-db) pastikan_layanan db ;;
+    wpmgr-prod-db)
+      pastikan_layanan_prod db
+      pesan="database hosting tidak dapat dihubungi" ;;
+    *) galat internal "container database tidak dikenal" ;;
+  esac
   OPSI_WADAH="$wadah"
   OPSI_KLIEN="/run/wpmgr-klien-$$-$RANDOM.cnf"
   # Path diteruskan sebagai argumen posisi, tidak disisipkan ke teks skrip sh.
@@ -622,16 +646,33 @@ pastikan_brnf() {
   [[ "$nilai" == 1 ]]     || galat konfigurasi "br_netfilter/bridge-nf-call-iptables harus aktif agar isolasi staging berlaku"
 }
 
+# Mengganti seluruh isi satu rantai filter dalam SATU transaksi:
+# `iptables-restore --noflush` menerapkan header `:RANTAI - [0:0]` (rantai
+# dibuat atau dikosongkan) dan semua aturannya sekaligus, tidak menyentuh
+# rantai lain. Mengosongkan lalu mengisi satu per satu membuka celah: selama
+# lompatan ke rantai itu sudah aktif, rantai kosong berarti tanpa pembatasan,
+# dan koneksi yang dibuka container pada saat itu tetap diterima oleh aturan
+# ESTABLISHED/RELATED sesudahnya. $1 nama rantai, sisanya satu aturan per
+# argumen (tanpa awalan -A).
+ganti_rantai() {
+  local rantai="$1" muatan aturan
+  shift
+  muatan="*filter"$'\n'":$rantai - [0:0]"$'\n'
+  for aturan in "$@"; do
+    muatan+="-A $rantai $aturan"$'\n'
+  done
+  muatan+="COMMIT"$'\n'
+  printf '%s' "$muatan" | iptables-restore --noflush || galat docker "rantai iptables tidak dapat dipasang"
+}
+
 pasang_isolasi_antar() {
   local rantai=WPMGR-STG-ANTAR
-  iptables -N "$rantai" 2>/dev/null || iptables -n -L "$rantai" >/dev/null \
-    || galat docker "rantai iptables staging tidak dapat dibuat"
-  iptables -F "$rantai"
-  iptables -A "$rantai" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A "$rantai" -s "$IP_ROUTER" -p tcp --dport 80 -j ACCEPT
-  iptables -A "$rantai" -d "$IP_DB" -p tcp --dport 3306 -j ACCEPT
-  iptables -A "$rantai" -d "$IP_MAIL" -p tcp --dport 1025 -j ACCEPT
-  iptables -A "$rantai" -j DROP
+  ganti_rantai "$rantai" \
+    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" \
+    "-s $IP_ROUTER -p tcp --dport 80 -j ACCEPT" \
+    "-d $IP_DB -p tcp --dport 3306 -j ACCEPT" \
+    "-d $IP_MAIL -p tcp --dport 1025 -j ACCEPT" \
+    "-j DROP"
   iptables -C DOCKER-USER -i "$JEMBATAN" -o "$JEMBATAN" -j "$rantai" 2>/dev/null \
     || iptables -I DOCKER-USER -i "$JEMBATAN" -o "$JEMBATAN" -j "$rantai"
 }
@@ -1271,9 +1312,9 @@ cmd_mail_kredensial() {
 # KONF_DIR/prod. Subperintah staging tidak pernah menyentuh label ini dan
 # sebaliknya (pastikan_milik dengan kunci label).
 
-# Isolasi jembatan produksi (spec §7.2). Rantai sendiri yang dikosongkan dan
-# diisi ulang setiap kali, supaya urutan ACCEPT-sebelum-DROP selalu benar
-# (Koreksi #3):
+# Isolasi jembatan produksi (spec §7.2). Rantai sendiri yang diganti isinya
+# secara atomik setiap kali, supaya urutan ACCEPT-sebelum-DROP selalu benar
+# dan tidak ada saat rantai kosong (Koreksi #3, putusan L1):
 # - INPUT: hanya balasan koneksi yang dibuka host dan "loopback" ke 80/443 IP
 #   publik VPS (WP-Cron, Site Health, proses latar plugin memanggil URL situs
 #   sendiri). Port itu sudah terbuka untuk seluruh internet; selebihnya
@@ -1283,25 +1324,23 @@ cmd_mail_kredensial() {
 #   dibuang (situs A tidak bisa membuka http://wpp-B/).
 pasang_iptables_prod() {
   local j masuk=WPMGR-PROD-MASUK antar=WPMGR-PROD-ANTAR
-  iptables -N "$masuk" 2>/dev/null || iptables -n -L "$masuk" >/dev/null \
-    || galat docker "rantai iptables hosting tidak dapat dibuat"
-  iptables -F "$masuk"
-  iptables -A "$masuk" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A "$masuk" -d "$IP_PUBLIK" -p tcp -m multiport --dports 80,443 -j ACCEPT
-  iptables -A "$masuk" -j DROP
+  # Rantai diganti atomik (ganti_rantai) SEBELUM lompatan dipasang; lompatan
+  # tetap idempoten (-C sebelum -I).
+  ganti_rantai "$masuk" \
+    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" \
+    "-d $IP_PUBLIK -p tcp -m multiport --dports 80,443 -j ACCEPT" \
+    "-j DROP"
   iptables -C INPUT -i "$JEMBATAN_PROD" -j "$masuk" 2>/dev/null \
     || iptables -I INPUT -i "$JEMBATAN_PROD" -j "$masuk"
   for j in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
     iptables -C DOCKER-USER -i "$JEMBATAN_PROD" ! -o "$JEMBATAN_PROD" -d "$j" -j DROP 2>/dev/null \
       || iptables -I DOCKER-USER -i "$JEMBATAN_PROD" ! -o "$JEMBATAN_PROD" -d "$j" -j DROP
   done
-  iptables -N "$antar" 2>/dev/null || iptables -n -L "$antar" >/dev/null \
-    || galat docker "rantai iptables hosting tidak dapat dibuat"
-  iptables -F "$antar"
-  iptables -A "$antar" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A "$antar" -s "$IP_PROD_ROUTER" -p tcp --dport 80 -j ACCEPT
-  iptables -A "$antar" -d "$IP_PROD_DB" -p tcp --dport 3306 -j ACCEPT
-  iptables -A "$antar" -j DROP
+  ganti_rantai "$antar" \
+    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" \
+    "-s $IP_PROD_ROUTER -p tcp --dport 80 -j ACCEPT" \
+    "-d $IP_PROD_DB -p tcp --dport 3306 -j ACCEPT" \
+    "-j DROP"
   iptables -C DOCKER-USER -i "$JEMBATAN_PROD" -o "$JEMBATAN_PROD" -j "$antar" 2>/dev/null \
     || iptables -I DOCKER-USER -i "$JEMBATAN_PROD" -o "$JEMBATAN_PROD" -j "$antar"
 }
@@ -1312,6 +1351,19 @@ tulis_php_ini_prod() {
     "upload_max_filesize = 64M" "post_max_size = 64M" "memory_limit = 256M" \
     "max_execution_time = 120" "expose_php = Off" > "$KONF_PROD/php.ini"
   chmod 0644 "$KONF_PROD/php.ini"
+}
+
+# Jaringan wpmgr-prod yang sudah ada dipakai apa adanya hanya bila jembatan dan
+# subnetnya persis yang diharapkan: aturan iptables mengacu pada nama jembatan
+# dan alamat layanan, jadi jaringan buatan lain membuat isolasi tidak berlaku.
+cek_jaringan_prod() {
+  local jembatan subnet
+  jembatan="$(dk network inspect --format '{{ index .Options "com.docker.network.bridge.name" }}' "$JARINGAN_PROD")" \
+    || galat docker "jaringan hosting tidak terbaca"
+  subnet="$(dk network inspect --format '{{ range .IPAM.Config }}{{ .Subnet }}{{ end }}' "$JARINGAN_PROD")" \
+    || galat docker "jaringan hosting tidak terbaca"
+  [[ "$jembatan" == "$JEMBATAN_PROD" && "$subnet" == "$PROD_SUBNET" ]] \
+    || galat konfigurasi "jaringan wpmgr-prod sudah ada tetapi jembatan atau subnetnya tidak sesuai"
 }
 
 cmd_prod_siapkan() {
@@ -1339,6 +1391,8 @@ cmd_prod_siapkan() {
   if ! dk network inspect "$JARINGAN_PROD" >/dev/null 2>&1; then
     dk network create --driver bridge --subnet "$PROD_SUBNET" --opt "com.docker.network.bridge.name=$JEMBATAN_PROD" \
       --label wpmgr.hosting=layanan:jaringan "$JARINGAN_PROD" >/dev/null || galat docker "jaringan hosting tidak dapat dibuat"
+  else
+    cek_jaringan_prod
   fi
   if [[ "$TANPA_IPTABLES" != 1 ]]; then
     pastikan_brnf

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 printf '[%s]' "$@" >> "$PALSU/iptables.log"
 printf '\n' >> "$PALSU/iptables.log"
+# Panggilan langsung (bukan terjemahan iptables-restore): test memastikan
+# tidak ada -F pada rantai yang diganti atomik.
+printf '[%s]' "$@" >> "$PALSU/iptables-langsung.log"
+printf '\n' >> "$PALSU/iptables-langsung.log"
 [[ "${1-}" == "-C" ]] && exit 1
 exit 0
