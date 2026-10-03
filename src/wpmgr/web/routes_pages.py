@@ -12,13 +12,16 @@ from wpmgr import db
 from wpmgr.config import get_settings
 from wpmgr.connector_paket import NAMA_ZIP, baca_manifest
 from wpmgr.keamanan import JENDELA_ERROR_BARU, nilai_keamanan
+from wpmgr.kesehatan import masalah_hosting
 from wpmgr.laporan import susun_laporan
 from wpmgr.models import (
     ActivityLog,
     CatatanError,
+    HostingVps,
     Site,
     SitePackage,
     Staging,
+    StatusHosting,
     StatusStaging,
     UptimeStatus,
     User,
@@ -153,7 +156,7 @@ def simpan_site(
 TAB_DETAIL = [
     ("ringkasan", "Ringkasan"), ("paket", "Paket"), ("uptime", "Uptime"),
     ("error", "Error"), ("login", "Login"), ("traffic", "Traffic"), ("staging", "Staging"),
-    ("aktivitas", "Aktivitas"),
+    ("hosting", "Hosting VPS"), ("aktivitas", "Aktivitas"),
 ]
 # [0-9] dan \Z, bukan \d dan $ (lihat POLA_PROPERTY di traffic.py): \d juga
 # cocok dengan digit non-ASCII, dan $ cocok sebelum baris baru di akhir --
@@ -169,7 +172,9 @@ def _bulan_lalu(hari_ini: date) -> str:
 @router.get("/sites/{site_id}")
 def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalaman, tab: str = "ringkasan"):
     staging_aktif = get_settings().staging_aktif
-    tab_detail = [t for t in TAB_DETAIL if t[0] != "staging" or staging_aktif]
+    hosting_aktif = get_settings().hosting_aktif
+    tab_detail = [t for t in TAB_DETAIL
+                  if (t[0] != "staging" or staging_aktif) and (t[0] != "hosting" or hosting_aktif)]
     sah = {k for k, _ in tab_detail}
     # Hanya nilai dari daftar putih yang boleh masuk ke ekspresi Alpine di template.
     tab = tab if tab in sah else "ringkasan"
@@ -209,6 +214,7 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
         keamanan = nilai_keamanan(sesi, site, sekarang)
         anomali = anomali_site(sesi, site.id, sekarang.date())
         staging = sesi.scalar(select(Staging).where(Staging.site_id == site_id)) if staging_aktif else None
+        hosting = sesi.scalar(select(HostingVps).where(HostingVps.site_id == site_id)) if hosting_aktif else None
     lencana = {
         "uptime": "!" if site.uptime_status == UptimeStatus.mati else "",
         "error": jumlah_error or "",
@@ -216,11 +222,13 @@ def halaman_detail(request: Request, site_id: uuid.UUID, pengguna: PenggunaHalam
         "traffic": "!" if anomali else "",
         "staging": "!" if staging is not None and (
             staging.status == StatusStaging.gagal or staging.dorong_gagal_pada is not None) else "",
+        "hosting": "!" if hosting is not None and (
+            hosting.status == StatusHosting.gagal or "backup_gagal" in masalah_hosting(hosting, sekarang)) else "",
     }
     return _tpl().TemplateResponse(
         request, "site_detail.html",
         {"pengguna": pengguna, "site": site, "paket": paket, "riwayat": riwayat,
-         "tab": tab, "tab_detail": tab_detail, "staging_aktif": staging_aktif, "lencana": lencana,
+         "tab": tab, "tab_detail": tab_detail, "staging_aktif": staging_aktif, "hosting_aktif": hosting_aktif, "lencana": lencana,
          "bulan_lalu": _bulan_lalu(sekarang.date()),
          "ga4_aktif": bool(get_settings().ga4_credentials),
          "pesan_diubah_segarkan": PESAN_DIUBAH_SEGARKAN},

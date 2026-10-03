@@ -15,9 +15,11 @@ from wpmgr.keamanan import (
 )
 from wpmgr.models import (
     CatatanError,
+    HostingVps,
     Site,
     SiteStatus,
     Staging,
+    StatusHosting,
     StatusStaging,
     TrafficHarian,
     UptimeStatus,
@@ -29,20 +31,25 @@ from wpmgr.uptime import persen_uptime_per_site
 from wpmgr.versi import lebih_lama
 
 URUTAN_CHIP = [
-    "mati", "perlu_diperiksa", "dorong_gagal", "diserang", "error_baru", "ssl", "koneksi",
-    "penangkap_terbatas", "staging_gagal", "traffic_anjlok", "traffic_melonjak", "connector_usang",
+    "mati", "perlu_diperiksa", "dorong_gagal", "hosting_gagal", "diserang", "error_baru", "ssl", "koneksi",
+    "penangkap_terbatas", "staging_gagal", "pindah_gagal", "backup_gagal", "traffic_anjlok", "traffic_melonjak",
+    "connector_usang",
 ]
 TINGKAT_MASALAH = {
-    "mati": 1, "perlu_diperiksa": 1, "dorong_gagal": 1,
+    "mati": 1, "perlu_diperiksa": 1, "dorong_gagal": 1, "hosting_gagal": 1,
     "diserang": 2, "error_baru": 2, "ssl": 2, "koneksi": 2, "penangkap_terbatas": 2, "staging_gagal": 2,
+    "pindah_gagal": 2, "backup_gagal": 2,
     "traffic_anjlok": 3, "traffic_melonjak": 3, "connector_usang": 3,
 }
 TAB_MASALAH = {
-    "mati": "uptime", "perlu_diperiksa": "login", "dorong_gagal": "staging", "diserang": "login",
-    "error_baru": "error", "ssl": "uptime", "koneksi": "ringkasan", "penangkap_terbatas": "ringkasan",
-    "staging_gagal": "staging", "traffic_anjlok": "traffic", "traffic_melonjak": "traffic",
+    "mati": "uptime", "perlu_diperiksa": "login", "dorong_gagal": "staging", "hosting_gagal": "hosting",
+    "diserang": "login", "error_baru": "error", "ssl": "uptime", "koneksi": "ringkasan",
+    "penangkap_terbatas": "ringkasan", "staging_gagal": "staging", "pindah_gagal": "hosting",
+    "backup_gagal": "hosting", "traffic_anjlok": "traffic", "traffic_melonjak": "traffic",
     "connector_usang": "ringkasan",
 }
+# Backup harian berjalan 02:30 WIB; 36 jam memberi satu hari kelonggaran.
+JENDELA_BACKUP = timedelta(hours=36)
 TINGKAT_SEHAT = 4
 
 
@@ -109,6 +116,28 @@ def masalah_staging(st: Staging | None) -> list[str]:
     return masalah
 
 
+def masalah_hosting(h: HostingVps | None, sekarang: datetime) -> list[str]:
+    """Chip hosting VPS satu site (spec Lapis 4 §13).
+
+    - `hosting_gagal`: situs sudah dilayani VPS tetapi aktivasi gagal final
+      (asal 'produksi'): pengunjung mungkin melihat situs rusak.
+    - `pindah_gagal`: salinan atau aktivasi gagal sebelum dilayani VPS; site
+      lama masih produksi.
+    - `backup_gagal`: situs dilayani VPS dan backup terakhir gagal, atau backup
+      sukses terakhir (atau aktivasi, bila belum pernah) lebih dari 36 jam lalu.
+    """
+    if h is None:
+        return []
+    masalah = []
+    if h.status == StatusHosting.gagal:
+        masalah.append("hosting_gagal" if h.gagal_asal == ASAL_PRODUKSI else "pindah_gagal")
+    if h.dilayani_vps_pada is not None:
+        acuan = h.backup_terakhir_pada or h.aktif_pada
+        if h.backup_gagal_pada is not None or (acuan is not None and sekarang - acuan > JENDELA_BACKUP):
+            masalah.append("backup_gagal")
+    return masalah
+
+
 def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
     sekarang = sekarang or datetime.now(timezone.utc)
     hari_ini = sekarang.date()
@@ -124,6 +153,9 @@ def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
     stagings = {}
     if site_ids and get_settings().staging_aktif:
         stagings = {st.site_id: st for st in sesi.scalars(select(Staging).where(Staging.site_id.in_(site_ids)))}
+    hostings = {}
+    if site_ids and get_settings().hosting_aktif:
+        hostings = {h.site_id: h for h in sesi.scalars(select(HostingVps).where(HostingVps.site_id.in_(site_ids)))}
 
     semua = []
     for site in sites:
@@ -154,6 +186,8 @@ def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
             masalah.append("connector_usang")
         st = stagings.get(site.id)
         masalah.extend(masalah_staging(st))
+        hv = hostings.get(site.id)
+        masalah.extend(masalah_hosting(hv, sekarang))
 
         utama = min(masalah, key=lambda m: (TINGKAT_MASALAH[m], URUTAN_CHIP.index(m)), default=None)
         semua.append({
@@ -177,6 +211,7 @@ def susun_kesehatan(sesi: Session, sekarang: datetime | None = None) -> dict:
             "koneksi": site.status.value,
             "connector_version": site.connector_version,
             "staging_status": st.status.value if st is not None else None,
+            "hosting_status": hv.status.value if hv is not None else None,
         })
 
     semua.sort(key=lambda b: (b["tingkat"], b["nama"].lower()))

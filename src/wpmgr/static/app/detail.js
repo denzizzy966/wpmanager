@@ -1,4 +1,4 @@
-const TAB_SAH = ['ringkasan', 'paket', 'uptime', 'error', 'login', 'traffic', 'staging', 'aktivitas'];
+const TAB_SAH = ['ringkasan', 'paket', 'uptime', 'error', 'login', 'traffic', 'staging', 'hosting', 'aktivitas'];
 const TEKS_KEAMANAN_DETAIL = { aman: 'Aman', diserang: 'Diserang', perlu_diperiksa: 'Perlu diperiksa' };
 
 function detailSite(siteId, tabAwal) {
@@ -19,8 +19,9 @@ function detailSite(siteId, tabAwal) {
       if (!new URLSearchParams(location.search).get('tab')) {
         try {
           const t = localStorage.getItem('wpmgr_tab');
-          // Tab Staging hanya ada bila fitur staging menyala (staging.js dimuat).
-          if (TAB_SAH.includes(t) && (t !== 'staging' || typeof tabStaging === 'function')) this.tab = t;
+          // Tab Staging/Hosting hanya ada bila fiturnya menyala (script-nya dimuat).
+          if (TAB_SAH.includes(t) && (t !== 'staging' || typeof tabStaging === 'function')
+              && (t !== 'hosting' || typeof tabHosting === 'function')) this.tab = t;
         } catch (e) { /* localStorage bisa diblokir; tab bawaan tetap berlaku */ }
       }
       this.muatTab();

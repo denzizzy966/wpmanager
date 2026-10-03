@@ -1,0 +1,156 @@
+{# Tab Hosting VPS (spec Lapis 4 §12). Semua nilai dari site, DNS, dan job
+   dirender lewat x-text; hanya site.id (UUID buatan server) yang masuk ke
+   ekspresi Alpine. Nama dan domain tidak pernah diinterpolasi ke ekspresi:
+   domain dibaca dari JSON API lewat x-text. #}
+<section x-show="tab === 'hosting'">
+  <div x-data="tabHosting('{{ site.id }}')" x-init="mulai(tab)">
+    <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
+    <p class="info" x-show="info" x-text="info" role="status"></p>
+    <p class="redup" x-show="!data && !galat">Memuat data hosting…</p>
+
+    <template x-if="sandi">
+      <div class="panel">
+        <p><strong>Kata sandi pratinjau</strong> (hanya ditampilkan sekali, simpan sekarang): pengguna
+           <code>pratinjau</code>, kata sandi <code x-text="sandi"></code>
+           <button type="button" @click="salin(sandi)">Salin</button>
+           <button type="button" @click="tutupSandi()">Tutup</button></p>
+      </div>
+    </template>
+
+    <template x-if="data && data.job">
+      <div class="panel">
+        <p><strong x-text="teksJob(data.job.tipe)"></strong>
+           <span x-show="data.job.status === 'pending'" class="redup">(menunggu giliran worker)</span>
+           — <span x-text="data.job.progres.teks"></span></p>
+        <div class="batang-progres" x-show="data.job.progres.persen !== null">
+          <div :style="`width:${lebar()}%`"></div>
+        </div>
+        <button type="button" x-show="bolehBatal()" @click="aksi('batal', 'Pembatalan diminta; job berhenti di antara potongan.')"
+                :disabled="data.hosting && data.hosting.batal_diminta"
+                x-text="data.hosting && data.hosting.batal_diminta ? 'Pembatalan diminta…' : 'Batal'"></button>
+        <span class="redup" x-show="!bolehBatal()" x-text="alasanTanpaBatal()"></span>
+      </div>
+    </template>
+
+    <template x-if="data && !data.hosting">
+      <div>
+        <p>Pindahkan site ini dari hosting lama ke VPS dashboard. Site lama tidak pernah diubah; sampai DNS
+           diubah, pengunjung tetap dilayani hosting lama.</p>
+        <p class="redup">Syarat: connector 3.0 terpasang di site lama, pairing sukses, dan <em>Izinkan staging</em>
+           menyala di <em>Pengaturan → WP Manager</em>.</p>
+        <p class="galat" x-show="!data.izin_connector">Connector site ini belum mengizinkan staging.</p>
+        <button type="button" @click="pindahkan()" :disabled="!!alasanPindah()">Pindahkan ke VPS</button>
+        <span class="redup" x-show="alasanPindah()" x-text="alasanPindah()"></span>
+      </div>
+    </template>
+
+    <template x-if="data && data.hosting">
+      <div>
+        <p>Status: <strong x-text="data.hosting.status_teks"></strong> · domain <code x-text="data.hosting.domain"></code>
+           <span class="redup" x-show="data.hosting.ditarik_pada">· disalin <span x-text="waktu(data.hosting.ditarik_pada)"></span>
+           (berkas <span x-text="data.hosting.ukuran_file_teks"></span>, database <span x-text="data.hosting.ukuran_db_teks"></span>,
+           PHP <span x-text="data.hosting.versi_php || '—'"></span>)</span></p>
+        <p class="galat" x-show="data.hosting.galat" x-text="data.hosting.galat"></p>
+        <p class="redup" x-show="data.job">Tombol dinonaktifkan selama pekerjaan hosting berjalan.</p>
+
+        <div x-show="data.hosting.status === 'pratinjau'">
+          <p>Pratinjau: <a :href="aman(data.hosting.url_pratinjau)" target="_blank" rel="noopener noreferrer"
+             x-text="data.hosting.url_pratinjau"></a> · pengguna <code>pratinjau</code> ·
+             <span x-text="data.hosting.pratinjau_sertifikat_pada ? 'HTTPS aktif' : 'sertifikat pratinjau belum terbit (salin ulang untuk mencoba lagi)'"></span></p>
+          <p class="redup">Email diblokir, mesin pencari ditolak, dan WP-Cron mati selama pratinjau. Cara kedua: tambahkan
+             baris ini ke berkas hosts komputer Anda lalu buka domain asli; browser akan memperingatkan sertifikat
+             (sertifikat pratinjau), lanjutkan saja. Hapus barisnya sesudah selesai.</p>
+          <pre class="pesan-detail" x-text="barisHosts()"></pre>
+          <div class="toolbar">
+            <button type="button" @click="aksi('lanjut-dns', 'Menunggu DNS; dashboard memeriksa tiap 10 menit.')"
+                    :disabled="!!data.job">Pratinjau sudah benar, lanjut ke DNS</button>
+            <button type="button" @click="salinUlang()" :disabled="!!data.job">Salin ulang</button>
+            <button type="button" @click="sandiBaru()" :disabled="!!data.job">Buat ulang kata sandi</button>
+            <button type="button" @click="batalkanPindah()" :disabled="!!data.job">Batalkan pindah</button>
+          </div>
+        </div>
+
+        <div x-show="data.hosting.status === 'menunggu_dns'">
+          <p>Ubah record DNS domain di panel DNS (mis. hPanel) seperti tabel berikut. Dashboard memeriksa DNS tiap
+             10 menit dan mengaktifkan situs otomatis begitu DNS menunjuk VPS.</p>
+          <table>
+            <tr><th>Jenis</th><th>Nama</th><th>Tindakan</th><th>Nilai</th><th>Cek terakhir</th></tr>
+            <template x-for="(r, i) in data.hosting.instruksi" :key="i">
+              <tr><td x-text="r.jenis"></td><td x-text="r.nama"></td><td x-text="teksAksi(r)"></td>
+                  <td><code x-text="r.nilai || '—'"></code></td><td x-text="r.ok ? 'sudah benar' : 'belum'"></td></tr>
+            </template>
+          </table>
+          <p class="redup" x-show="data.ipv6">Record AAAA diarahkan ke IPv6 VPS
+             (<code x-text="data.ipv6"></code>); jangan biarkan AAAA lama.</p>
+          <p class="redup">Record AAAA lama wajib dihapus (atau diarahkan ke IPv6 VPS bila tabel memintanya):
+             Let's Encrypt mendahulukan IPv6, dan pengunjung IPv6 akan tetap ke hosting lama.</p>
+          <p class="galat" x-show="adaCdn()">Domain memakai CDN Hostinger: matikan CDN di hPanel, lalu ganti CNAME www
+             (...hstgr.net) dengan record A ke VPS.</p>
+          <p class="redup">Turunkan TTL record ke 300 detik sehari sebelumnya bila memungkinkan.</p>
+          <p>Cek terakhir: <span x-text="waktu(data.hosting.dns_dicek_pada)"></span> —
+             <span x-text="teksDns()"></span></p>
+          <p class="redup" x-show="data.hosting.coba_lagi_pada">Sertifikat domain gagal terakhir kali; aktivasi
+             otomatis menunggu sampai <span x-text="waktu(data.hosting.coba_lagi_pada)"></span>.</p>
+          <div class="toolbar">
+            <button type="button" @click="aktifkan(false)" :disabled="!!data.job">Periksa DNS &amp; aktifkan sekarang</button>
+            <button type="button" @click="aksi('kembali-pratinjau', 'Kembali ke pratinjau; aktivasi otomatis dihentikan.')"
+                    :disabled="!!data.job">Kembali ke pratinjau</button>
+            <button type="button" @click="aktifkanTanpaSalin()" :disabled="!!alasanTanpaSalin()">Aktifkan tanpa salin ulang</button>
+          </div>
+          <p class="redup" x-show="alasanTanpaSalin()" x-text="alasanTanpaSalin()"></p>
+          <p class="redup">Aktifkan tanpa salin ulang hanya bila hosting lama sudah tidak terjangkau: data sejak salinan
+             terakhir (<span x-text="waktu(data.hosting.ditarik_pada)"></span>) tidak ikut. Anda diminta mengetik domain.</p>
+        </div>
+
+        <div class="panel peringatan" x-show="data.hosting.status === 'mengaktifkan'" role="alert">
+          <strong>Sedang mengaktifkan situs di VPS</strong> — jangan ubah DNS sampai selesai.
+        </div>
+
+        <div x-show="data.hosting.status === 'aktif'">
+          <p>Dihosting di VPS sejak <strong x-text="waktu(data.hosting.aktif_pada)"></strong> · sertifikat domain
+             <span x-text="waktu(data.hosting.sertifikat_pada)"></span></p>
+          <p class="redup">Situs sudah dilayani VPS: hosting lama boleh dimatikan. Sebelumnya, periksa entri form atau
+             komentar yang mungkin masuk ke hosting lama sejak salinan terakhir. Mengembalikan DNS ke hosting lama
+             berarti data baru di VPS tidak ikut kembali.</p>
+          <p class="redup">Pemulihan backup dilakukan manual; lihat README, bagian "Pindah hosting (Lapis 4)",
+             "Pemulihan backup manual".</p>
+          <h3>Backup</h3>
+          <div id="hosting-backup"></div>
+          <p class="galat" x-show="data.hosting.backup_gagal_pada">Backup terakhir gagal
+             (<span x-text="waktu(data.hosting.backup_gagal_pada)"></span>).</p>
+          <p class="redup" x-show="data.backup.length === 0">Belum ada backup.</p>
+          <table x-show="data.backup.length">
+            <tr><th>Waktu</th><th>Database</th><th>Berkas</th><th>Jenis</th><th>Status</th></tr>
+            <template x-for="b in data.backup" :key="b.id">
+              <tr><td x-text="waktu(b.dibuat_pada)"></td><td x-text="b.ukuran_db_teks"></td>
+                  <td x-text="b.ukuran_file_teks"></td><td x-text="b.manual ? 'manual' : 'harian'"></td>
+                  <td x-text="b.status"></td></tr>
+            </template>
+          </table>
+        </div>
+
+        <div x-show="data.hosting.status === 'gagal'">
+          <div class="panel peringatan" x-show="data.hosting.dilayani_vps_pada" role="alert">
+            <strong>Situs sudah dilayani VPS tetapi pemeriksaan akhir gagal.</strong> Periksa situs; bila rusak,
+            arahkan DNS kembali ke hosting lama (masih utuh).
+          </div>
+          <div class="toolbar">
+            <button type="button" x-show="data.hosting.gagal_asal === 'salinan' && !data.hosting.dilayani_vps_pada"
+                    @click="salinUlang()" :disabled="!!data.job">Salin ulang</button>
+            <button type="button" x-show="!data.hosting.dilayani_vps_pada" @click="aktifkan(false)"
+                    :disabled="!!data.job">Periksa DNS &amp; aktifkan sekarang</button>
+            <button type="button" x-show="data.hosting.dilayani_vps_pada" @click="aktifkan(false)"
+                    :disabled="!!data.job">Periksa ulang</button>
+            <button type="button" x-show="!data.hosting.dilayani_vps_pada" @click="aktifkanTanpaSalin()"
+                    :disabled="!!alasanTanpaSalin()">Aktifkan tanpa salin ulang</button>
+            <button type="button" x-show="!data.hosting.dilayani_vps_pada" @click="batalkanPindah()"
+                    :disabled="!!data.job">Batalkan pindah</button>
+          </div>
+          <p class="redup" x-show="data.hosting.dilayani_vps_pada">Periksa ulang hanya mengirim ulang
+             pengaktifan dan memverifikasi situs; tidak menyalin ulang dan tidak mengubah DNS.</p>
+          <p class="redup" x-show="!data.hosting.dilayani_vps_pada && alasanTanpaSalin()" x-text="alasanTanpaSalin()"></p>
+        </div>
+      </div>
+    </template>
+  </div>
+</section>

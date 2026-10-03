@@ -256,6 +256,7 @@
   </section>
 
   {% if staging_aktif %}{% include "_tab_staging.html" %}{% endif %}
+  {% if hosting_aktif %}{% include "_tab_hosting.html" %}{% endif %}
 
   <section x-show="tab === 'aktivitas'">
     <ul>
@@ -267,4 +268,5 @@
 </div>
 <script src="/static/app/detail.js"></script>
 {% if staging_aktif %}<script src="/static/app/staging.js"></script>{% endif %}
+{% if hosting_aktif %}<script src="/static/app/hosting.js"></script>{% endif %}
 {% endblock %}

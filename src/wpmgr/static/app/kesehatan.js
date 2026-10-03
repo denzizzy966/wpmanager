@@ -1,16 +1,19 @@
 const URUTAN_CHIP = [
-  'mati', 'perlu_diperiksa', 'dorong_gagal', 'diserang', 'error_baru', 'ssl', 'koneksi',
-  'penangkap_terbatas', 'staging_gagal', 'traffic_anjlok', 'traffic_melonjak', 'connector_usang',
+  'mati', 'perlu_diperiksa', 'dorong_gagal', 'hosting_gagal', 'diserang', 'error_baru', 'ssl', 'koneksi',
+  'penangkap_terbatas', 'staging_gagal', 'pindah_gagal', 'backup_gagal', 'traffic_anjlok', 'traffic_melonjak',
+  'connector_usang',
 ];
 const LABEL_CHIP = {
-  mati: 'mati', perlu_diperiksa: 'perlu diperiksa', dorong_gagal: 'dorong ke produksi gagal', diserang: 'diserang',
-  error_baru: 'error baru', ssl: 'SSL bermasalah', koneksi: 'koneksi bermasalah',
-  penangkap_terbatas: 'penangkap terbatas', staging_gagal: 'staging gagal', traffic_anjlok: 'traffic anjlok',
+  mati: 'mati', perlu_diperiksa: 'perlu diperiksa', dorong_gagal: 'dorong ke produksi gagal',
+  hosting_gagal: 'situs di VPS bermasalah', diserang: 'diserang', error_baru: 'error baru', ssl: 'SSL bermasalah',
+  koneksi: 'koneksi bermasalah', penangkap_terbatas: 'penangkap terbatas', staging_gagal: 'staging gagal',
+  pindah_gagal: 'pindah hosting gagal', backup_gagal: 'backup gagal', traffic_anjlok: 'traffic anjlok',
   traffic_melonjak: 'traffic melonjak', connector_usang: 'connector usang',
 };
 const TINGKAT_CHIP = {
-  mati: 1, perlu_diperiksa: 1, dorong_gagal: 1, diserang: 2, error_baru: 2, ssl: 2, koneksi: 2,
-  penangkap_terbatas: 2, staging_gagal: 2, traffic_anjlok: 3, traffic_melonjak: 3, connector_usang: 3,
+  mati: 1, perlu_diperiksa: 1, dorong_gagal: 1, hosting_gagal: 1, diserang: 2, error_baru: 2, ssl: 2, koneksi: 2,
+  penangkap_terbatas: 2, staging_gagal: 2, pindah_gagal: 2, backup_gagal: 2, traffic_anjlok: 3,
+  traffic_melonjak: 3, connector_usang: 3,
 };
 const KELAS_TINGKAT = { 1: 'chip-merah', 2: 'chip-kuning', 3: 'chip-biru' };
 const TEKS_UPTIME = { naik: 'Naik', mati: 'Mati', terblokir: 'Terblokir', belum_dicek: 'Belum dicek' };
