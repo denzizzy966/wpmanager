@@ -1913,14 +1913,17 @@ siap_aktifkan() {
   tulis_state_prod toko pratinjau
   printf 'LAMA' > "$(NGF)"
   touch "$PALSU/flock-gagal-9"
+  # Putusan L8: kunci sibuk selalu keluar 3 (tanpa perubahan, boleh diulang).
   run "$SKRIP" prod-domain toko
-  [ "$status" -eq 10 ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"GALAT ditolak"* ]]
   [ "$(cat "$(NGF)")" = "LAMA" ]
   [ ! -e "$PALSU/nginx.log" ]
   # Kunci lebih dulu: situs yang belum ada pun menunggu kunci, sehingga state
   # yang dihapus/diaktifkan proses pemegang kunci tidak pernah dibaca basi.
   run "$SKRIP" prod-domain belum-ada
-  [ "$status" -eq 10 ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"sedang diubah proses lain"* ]]
 }
 
 @test "NGINX_UJI_SAJA=1 menguji tanpa reload" {
@@ -1974,7 +1977,7 @@ siap_aktifkan() {
   tulis_state_prod toko pratinjau
   touch "$PALSU/flock-gagal-9"
   run "$SKRIP" prod-sertifikat toko
-  [ "$status" -eq 10 ]
+  [ "$status" -eq 3 ]
   [ ! -e "$S/hcerts/$DOM/fullchain.pem" ]
   rm -f "$PALSU/flock-gagal-9"
   run "$SKRIP" prod-sertifikat toko
@@ -2398,6 +2401,50 @@ sert_masih_lama() {
   [ "$(wc -l < "$PALSU/flock.log")" -eq 2 ]
   sed -n 1p "$PALSU/flock.log" | grep -qE '^\[-w\]\[30\]\[-x\]\[[0-9]+\]$'
   [ "$(sed -n 2p "$PALSU/flock.log")" = '[-w][60][-x][9]' ]
+}
+
+@test "prod-hapus: prasyarat yang menolak keluar 3 sebelum perubahan apa pun" {
+  siap_aktifkan
+  printf 'PRATINJAU' > "$(NGF)"
+  # PROD_CERT_DIR bisa ditulis grup.
+  chmod g+w "$S/hcerts"
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 3 ]
+  [ "$(cat "$(NGF)")" = "PRATINJAU" ]
+  [ -e "$S/hcerts/$DOM/fullchain.pem" ]
+  [ ! -e "$PALSU/nginx.log" ]
+  [ ! -e "$PALSU/systemctl.log" ]
+  chmod g-w "$S/hcerts"
+  # Container wpp-toko milik pihak lain.
+  printf 'situs:lain' > "$PALSU/wadah/wpp-toko.hosting"
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 3 ]
+  [ "$(cat "$(NGF)")" = "PRATINJAU" ]
+  [ -e "$S/hcerts/$DOM/fullchain.pem" ]
+  printf 'situs:toko' > "$PALSU/wadah/wpp-toko.hosting"
+  # Layanan database hosting belum disiapkan.
+  rm -f "$PALSU/wadah/wpmgr-prod-db" "$PALSU/wadah/wpmgr-prod-db.hosting"
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 3 ]
+  [ "$(cat "$(NGF)")" = "PRATINJAU" ]
+  [ -e "$S/hcerts/$DOM/fullchain.pem" ]
+  [ -e "$S/etc/prod/situs/toko" ]
+  [ ! -e "$PALSU/nginx.log" ]
+  ! grep -q '^\[rm\]\|^\[exec\]' "$PALSU/docker.log" || false
+}
+
+@test "prod-hapus: penolakan sesudah perubahan pertama bukan kode 3" {
+  siap_aktifkan
+  printf 'PRATINJAU' > "$(NGF)"
+  # Sesudah berkas domain dihapus dan nginx dimuat ulang, PROD_CERT_DIR
+  # menjadi bisa ditulis grup: pemeriksaan ulang sebelum rm -rf menolak.
+  printf 'chmod g+w %q\n' "$S/hcerts" > "$PALSU/reload-kait"
+  run "$SKRIP" prod-hapus toko
+  [ "$status" -eq 9 ]
+  [[ "$output" == *"GALAT internal"* ]]
+  [[ "$output" != *"GALAT ditolak"* ]]
+  [ ! -e "$(NGF)" ]
+  [ -e "$S/hcerts/$DOM/fullchain.pem" ]
 }
 
 @test "prod-domain dan prod-hapus bertenggat 360 s (TIMEOUT Python 300 + 60): kunci bisa menunggu 90 s" {

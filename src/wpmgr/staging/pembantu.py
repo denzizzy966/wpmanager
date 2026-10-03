@@ -47,10 +47,18 @@ log = logging.getLogger("wpmgr.staging.pembantu")
 # Cermin `galat()` di deploy/staging/wpmgr-staging.
 KODE_KELUAR = {2: "argumen", 3: "ditolak", 4: "docker", 5: "sertifikat", 6: "impor",
                7: "konfigurasi", 8: "wpcli", 9: "internal", 10: "nginx", 11: "backup"}
-# Keluar 3 (`galat ditolak`): skrip menolak SEBELUM mengubah apa pun, termasuk
-# saat kunci router (30 s) atau kunci nginx prod-aktifkan (60 s, putusan L4)
-# sedang dipegang proses lain, mis. prod-db-impor yang memegang kunci router
-# sampai 3 jam. Bukan galat final: pemanggil boleh mengulang nanti.
+# Keluar 3 (`galat ditolak`): skrip menolak permintaan ini; bukan galat final,
+# pemanggil boleh mengulang nanti. Jaminan "tanpa perubahan" dari skrip:
+# - kunci sibuk (kunci router 30 s, kunci nginx 60 s; putusan L4/L8) selalu 3
+#   dan selalu sebelum perubahan, di subperintah mana pun; mis. prod-db-impor
+#   memegang kunci router sampai 3 jam;
+# - prod-aktifkan dan prod-hapus menjalankan semua prasyarat lebih dulu, dan
+#   penolakan sesudah perubahan pertama dilaporkan `internal` (9), bukan 3
+#   (SUDAH_BERUBAH, Koreksi #5, review Task 5 I1);
+# - subperintah lain umumnya menolak di prasyarat, tetapi TIDAK dijamin tanpa
+#   perubahan: prod-siapkan/prod-buat bisa sudah membuat direktori, image,
+#   atau jaringan, dan prod-db-buat bisa menolak saat menulis wp-config
+#   sesudah database dibuat. Semuanya idempoten, jadi mengulang tetap aman.
 KODE_TANPA_UBAH = "ditolak"
 PESAN_UMUM = {
     "argumen": "Skrip pembantu menolak argumen permintaan ini.",
@@ -143,12 +151,12 @@ class GalatPembantu(Exception):
 
     @property
     def tanpa_ubah(self) -> bool:
-        """Skrip menolak tanpa mengubah apa pun (keluar 3), termasuk "sedang sibuk".
+        """Skrip menolak (keluar 3), termasuk "kunci sedang sibuk"; lihat `KODE_TANPA_UBAH`.
 
         Pemanggil job memperlakukannya sebagai boleh diulang nanti (R15,
         `GalatDitolakTanpaUbah`), bukan galat final. Kode keluar lain tidak
-        menjamin tanpa perubahan, termasuk `nginx` (10) yang juga dipakai saat
-        kunci nginx prod-domain/prod-sertifikat/prod-hapus sibuk.
+        pernah berarti tanpa perubahan; `nginx` (10) kini hanya berarti
+        nginx -t atau reload menolak konfigurasi baru (berkas lama dipulihkan).
         """
         return self.kode == KODE_TANPA_UBAH
 

@@ -37,6 +37,10 @@ TIMEOUT_STAGING_TERAPKAN = 60.0
 TENGGAT_STAGING = 120.0
 TENGGAT_STAGING_TERAPKAN = 150.0
 BATAS_JSON_STAGING = 32 * 1024 * 1024
+# ping lewat jalur bertenggat (putusan L9, klien hosting lama): balasan ping
+# connector hanya beberapa ratus byte.
+TENGGAT_PING_BERTENGGAT = 20.0
+BATAS_PING_BERTENGGAT = 64 * 1024
 # Isi 8 MiB + meta 1 MiB + kepala: paket sah terbesar dari connector.
 BATAS_BINER_STAGING = paket.BATAS_PAKET
 
@@ -66,7 +70,8 @@ class TanpaHasil(Exception):
 
 def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict, content: bytes | None = None,
                      timeout: float, tenggat: float, batas_byte: int, potong: bool = False,
-                     periksa=None, ekstensi: dict | None = None) -> tuple[int, dict, bytes]:
+                     periksa=None, ekstensi: dict | None = None,
+                     ikuti_alihan: bool | None = None) -> tuple[int, dict, bytes]:
     """Satu permintaan HTTP dengan tenggat total dan batas byte (putusan F11).
 
     Tenggat total mencakup SELURUH permintaan: koneksi, TLS, pengiriman body,
@@ -89,7 +94,10 @@ def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict
     dibaca dan boleh melempar untuk menolak respons. Galat httpx diteruskan
     apa adanya supaya pemanggil yang memetakannya. `ekstensi` (mis.
     `sni_hostname`) diteruskan ke httpx bersama ekstensi `trace`.
+    `ikuti_alihan` (bila tidak None) menimpa `follow_redirects` klien untuk
+    permintaan ini.
     """
+    opsi_alihan = {} if ikuti_alihan is None else {"follow_redirects": ikuti_alihan}
     akhir = time.monotonic() + tenggat
     batal = threading.Event()
     soket: list = []
@@ -124,7 +132,7 @@ def minta_bertenggat(http: httpx.Client, method: str, url: str, *, headers: dict
     def kerja() -> None:
         try:
             with http.stream(method, url, content=content, headers=headers, timeout=timeout,
-                             extensions={**(ekstensi or {}), "trace": trace}) as resp:
+                             extensions={**(ekstensi or {}), "trace": trace}, **opsi_alihan) as resp:
                 try:
                     if periksa is not None:
                         periksa(resp)
@@ -205,6 +213,10 @@ class SiteClient:
         self._url_kirim = self.base_url
         self._header_host: dict[str, str] = {}
         self._ekstensi: dict[str, str] = {}
+        # Permintaan yang dipatok IP tidak pernah mengikuti alihan, apa pun
+        # setelan klien yang disuntikkan: alihan ke host lain berarti
+        # meninggalkan IP yang dipatok (review Task 5 M3).
+        self._opsi_alihan: dict[str, bool] = {}
         if alamat_tetap is not None:
             ip = ipaddress.IPv4Address(alamat_tetap)
             bagian = urlsplit(self.base_url)
@@ -216,6 +228,7 @@ class SiteClient:
             self._url_kirim = f"https://{ip}{port}{bagian.path}"
             self._header_host = {"Host": f"{host}{port}"}
             self._ekstensi = {"sni_hostname": host}
+            self._opsi_alihan = {"follow_redirects": False}
 
     @property
     def _staging_http(self) -> httpx.Client:
@@ -251,7 +264,7 @@ class SiteClient:
         try:
             resp = self._client.request(
                 method, f"{self._url_kirim}{path}{query}", content=body or None,
-                headers=headers, timeout=timeout, extensions=self._ekstensi or None,
+                headers=headers, timeout=timeout, extensions=self._ekstensi or None, **self._opsi_alihan,
             )
         except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
             # Koneksi ke site tidak pernah terbentuk (atau tidak pernah
@@ -376,7 +389,8 @@ class SiteClient:
         try:
             return minta_bertenggat(self._staging_http, method, f"{self._url_kirim}{path}{query}",
                                     headers=headers, content=body or None, timeout=timeout, tenggat=tenggat,
-                                    batas_byte=batas_byte, periksa=tolak_kompresi, ekstensi=self._ekstensi)
+                                    batas_byte=batas_byte, periksa=tolak_kompresi, ekstensi=self._ekstensi,
+                                    ikuti_alihan=self._opsi_alihan.get("follow_redirects"))
         except TenggatHabis:
             raise SiteError(kelas_waktu, f"Respons connector melewati tenggat total {tenggat:g} detik") from None
         except MelebihiBatas:
@@ -442,6 +456,14 @@ class SiteClient:
                 raise SiteError(BAD_RESPONSE, f"Paket staging rusak: {exc}") from exc
         galat = self._galat_dari(status, headers, isi)
         raise galat or SiteError(BAD_RESPONSE, "Balasan connector bukan paket staging")
+
+    def ping_bertenggat(self) -> dict:
+        """ping lewat `_kirim` (putusan L9): tenggat total, batas byte, Connection: close.
+
+        Untuk klien hosting lama; `ping()` Lapis 1 tidak berubah.
+        """
+        return self._json_objek(*self._kirim("GET", f"{PREFIX}/ping", b"", TIMEOUT_PING, TENGGAT_PING_BERTENGGAT,
+                                             False, "", "application/json", None, BATAS_PING_BERTENGGAT))
 
     def staging_manifest(self, kursor: str | None = None, batas: int = 5000) -> dict:
         param = {"batas": str(int(batas))}

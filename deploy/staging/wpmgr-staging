@@ -1920,16 +1920,17 @@ cmd_prod_router_muat() {
 # dalam prod-aktifkan memanggil kunci_router yang sudah dipegang = no-op),
 # jadi dua proses tidak pernah saling menunggu.
 #
-# $1: kode galat bila tenggat kunci habis (bawaan nginx). prod-aktifkan
-# memakai `ditolak` (putusan L4): kuncinya diambil sebelum perubahan apa pun,
-# jadi "sibuk" di sana berarti "tanpa perubahan" (kontrak keluar 3).
+# Tenggat kunci habis selalu `ditolak` (keluar 3, putusan L4/L8), seperti
+# kunci_router: setiap subperintah mengambil kunci ini sebelum mengubah
+# berkas nginx domain atau sertifikat terpasang, jadi "sibuk" berarti "tanpa
+# perubahan" dan boleh diulang. Keluar 10 (`nginx`) hanya berarti nginx -t
+# atau reload menolak konfigurasi baru.
 kunci_nginx() {
-  local kode="${1:-nginx}"
   (( KUNCI_NGINX_ADA == 0 )) || return 0
   [[ -d "$KONF_PROD" && ! -L "$KONF_PROD" ]] || galat ditolak "jalankan 'wpmgr-staging prod-siapkan' dulu"
   cek_dir_root_ketat "$KONF_PROD"
   exec 9>>"$KONF_PROD/nginx.lock" || galat konfigurasi "berkas kunci nginx tidak dapat dibuka"
-  dibatasi flock -w 60 -x 9 || galat "$kode" "konfigurasi nginx sedang diubah proses lain"
+  dibatasi flock -w 60 -x 9 || galat ditolak "konfigurasi nginx sedang diubah proses lain"
   KUNCI_NGINX_ADA=1
 }
 
@@ -2424,7 +2425,7 @@ cmd_prod_aktifkan() {
   butuh_hosting
   local nama="$1"
   kunci_router
-  kunci_nginx ditolak
+  kunci_nginx
   muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
   [[ -n "$S_PREFIX" && -s "$KONF_PROD/db/$nama" ]] || galat ditolak "database situs belum dibuat"
   pastikan_milik "wpp-$nama" "situs:$nama" wpmgr.hosting || galat ditolak "container situs belum dibuat"
@@ -2455,12 +2456,22 @@ cmd_prod_aktifkan() {
 # bawah kunci nginx sesudah berkas domain dihapus, jadi tidak ada konfigurasi
 # nginx yang masih merujuknya. Penghapusan lineage best-effort: kegagalannya
 # hanya dicatat sebagai PERINGATAN di stderr (tidak menggagalkan batal pindah).
-hapus_sertifikat_domain() {
+# Pemeriksaan direktori sudah dijalankan cmd_prod_hapus sebagai prasyarat
+# (pra_cek_hapus_sertifikat); di sini diulang tepat sebelum `rm -rf` sebagai
+# root, dan penolakannya dilaporkan internal (SUDAH_BERUBAH=1), bukan 3.
+pra_cek_hapus_sertifikat() {
   local domain="$1"
   cek_dir_root_ketat "$PROD_CERT_DIR"
-  rm -rf -- "${PROD_CERT_DIR:?}/$domain"
   if [[ "$SERTIFIKAT_SENDIRI" != 1 && -e "$LE_DIR/config/renewal/$domain.conf" ]]; then
     cek_mount_root "$LE_DIR" d "$(dirname -- "$LE_DIR")"
+  fi
+}
+
+hapus_sertifikat_domain() {
+  local domain="$1"
+  pra_cek_hapus_sertifikat "$domain"
+  rm -rf -- "${PROD_CERT_DIR:?}/$domain"
+  if [[ "$SERTIFIKAT_SENDIRI" != 1 && -e "$LE_DIR/config/renewal/$domain.conf" ]]; then
     if ! dibatasi certbot delete --non-interactive --cert-name "$domain" --config-dir "$LE_DIR/config" \
          --work-dir "$LE_DIR/work" --logs-dir "$LE_DIR/logs" >/dev/null 2>&1; then
       printf 'PERINGATAN: lineage certbot domain tidak dapat dihapus; hapus manual (README)\n' >&2
@@ -2471,26 +2482,43 @@ hapus_sertifikat_domain() {
 cmd_prod_hapus() {
   cek_nama_prod "${1-}"
   butuh_hosting
-  local nama="$1" db
+  local nama="$1" db ada_state=0 ada_wadah=0 ada_router=0
   # MODE dibaca di bawah kunci router (urutan router lalu nginx, sama dengan
   # prod-aktifkan): aktivasi yang sedang berjalan tidak bisa membuat situs
   # aktif di sela pemeriksaan dan penghapusan, dan render router/impor DB
   # tidak bisa memulihkan berkas router atau database yang baru dihapus.
   kunci_router
+  # Prasyarat dulu, semuanya sebelum perubahan pertama: keluar 3 dari
+  # prod-hapus berarti tidak ada yang berubah (putusan I1 review Task 5).
   if muat_state "$nama"; then
+    ada_state=1
     # Situs yang sudah dilayani VPS dilepas manual (README), tidak lewat dashboard.
     [[ "$S_MODE" != aktif ]] || galat ditolak "situs sudah aktif; lepas manual (README)"
     kunci_nginx
+    cek_dir_nginx
+    pra_cek_hapus_sertifikat "$S_DOMAIN"
+  fi
+  if pastikan_milik "wpp-$nama" "situs:$nama" wpmgr.hosting; then
+    ada_wadah=1
+  fi
+  pastikan_layanan_prod db
+  [[ -s "$KONF_PROD/db-root" ]] || galat konfigurasi "kata sandi root database tidak ada"
+  if pastikan_milik wpmgr-prod-router layanan:router wpmgr.hosting; then
+    ada_router=1
+  fi
+  # Sejak baris ini penolakan apa pun bukan lagi kode 3 (lihat galat()).
+  SUDAH_BERUBAH=1
+  if (( ada_state == 1 )); then
     hapus_domain "$S_DOMAIN"
     hapus_sertifikat_domain "$S_DOMAIN"
   fi
-  if pastikan_milik "wpp-$nama" "situs:$nama" wpmgr.hosting; then
+  if (( ada_wadah == 1 )); then
     dk rm -f "wpp-$nama" >/dev/null || galat docker "container situs tidak dapat dihapus"
   fi
   db="$(nama_db_prod "$nama")"
   sql_root "DROP DATABASE IF EXISTS \`$db\`; DROP USER IF EXISTS '$db'@'%';" wpmgr-prod-db "$KONF_PROD/db-root"
   rm -f "$KONF_PROD/db/$nama" "$KONF_PROD/router/conf.d/prd-$nama.conf" "$KONF_PROD/router/htpasswd/$nama"
-  if pastikan_milik wpmgr-prod-router layanan:router wpmgr.hosting; then
+  if (( ada_router == 1 )); then
     dk exec wpmgr-prod-router nginx -s reload >/dev/null 2>&1 || true
   fi
   rm -f "$KONF_PROD/situs/$nama"

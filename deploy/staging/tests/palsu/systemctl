@@ -5,4 +5,9 @@ printf '\n' >> "$PALSU/systemctl.log"
 if [[ "${1-}" == reload && -f "$PALSU/reload-gagal" ]]; then
   exit 1
 fi
+# $PALSU/reload-kait: skrip bash yang dijalankan saat reload berhasil, untuk
+# mengubah keadaan di tengah subperintah (penolakan sesudah perubahan pertama).
+if [[ "${1-}" == reload && -f "$PALSU/reload-kait" ]]; then
+  bash "$PALSU/reload-kait"
+fi
 exit 0

@@ -1,6 +1,7 @@
 import json
 import ssl
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,8 +11,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from wpmgr import site_client
 from wpmgr.crypto import enkripsi_secret
-from wpmgr.errors import STAGING_DITOLAK, SiteError
+from wpmgr.errors import BAD_RESPONSE, STAGING_DITOLAK, TRANSIENT, SiteError
 from wpmgr.hosting import umum
 from wpmgr.hosting.umum import (
     METODE_BACA,
@@ -223,7 +225,9 @@ def test_klien_lama_dipatok_ke_ip_lama(ipv4_vps, monkeypatch):
 
 
 @pytest.mark.parametrize("ip", [None, "", "10.0.0.5", "127.0.0.1", "192.168.1.1", "169.58.91.181", "2a02::1",
-                                "100.64.1.1", "203.0.113.5", "001.2.3.4"])
+                                "100.64.1.1", "203.0.113.5", "001.2.3.4",
+                                # Multicast lolos `is_global` di Python 3.10 (review M4).
+                                "224.0.0.251", "233.252.0.1", "239.255.255.250"])
 def test_alamat_lama_tidak_sah_ditolak(ipv4_vps, ip):
     assert alamat_lama_sah(ip) is False
     site, h = _site_dan_hosting(ip)
@@ -234,3 +238,166 @@ def test_alamat_lama_tidak_sah_ditolak(ipv4_vps, ip):
 
 def test_alamat_lama_publik_diterima(ipv4_vps):
     assert alamat_lama_sah(IP_LAMA) is True
+
+
+# ---- fix round 1 (review Task 5) ------------------------------------------------------
+
+
+def _klien_lama_dengan(monkeypatch, handler, **opsi):
+    monkeypatch.setattr(umum, "buat_http_lama",
+                        lambda: httpx.Client(transport=httpx.MockTransport(handler), **opsi))
+    return klien_lama(*_site_dan_hosting())
+
+
+def test_ping_lama_lewat_jalur_bertenggat(ipv4_vps, monkeypatch):
+    # Putusan L9: ping ke hosting lama memakai minta_bertenggat (tenggat total,
+    # batas byte, Connection: close), bukan _panggil Lapis 1.
+    diminta = []
+
+    def h(r):
+        diminta.append(r)
+        _cek_tanda_tangan(r)
+        return httpx.Response(200, json={"ok": True})
+
+    assert _klien_lama_dengan(monkeypatch, h).ping() == {"ok": True}
+    r = diminta[0]
+    assert (r.method, r.url.path) == ("GET", "/wp-json/wpmgr/v1/ping")
+    assert r.headers["connection"] == "close"
+    assert r.headers["accept-encoding"] == "identity"
+    assert "trace" in r.extensions
+    assert site_client.TENGGAT_PING_BERTENGGAT == 20.0
+    assert site_client.BATAS_PING_BERTENGGAT == 64 * 1024
+
+
+def test_ping_lama_yang_menetes_dihentikan_tenggat_total(ipv4_vps, monkeypatch):
+    monkeypatch.setattr(site_client, "TENGGAT_PING_BERTENGGAT", 0.3)
+
+    def menetes():
+        for _ in range(200):
+            time.sleep(0.02)
+            yield b" "
+
+    k = _klien_lama_dengan(monkeypatch, lambda r: httpx.Response(200, content=menetes()))
+    mulai = time.monotonic()
+    with pytest.raises(SiteError) as e:
+        k.ping()
+    assert time.monotonic() - mulai < 3
+    assert e.value.error_class == TRANSIENT
+    assert "tenggat" in e.value.pesan
+
+
+def test_ping_lama_melebihi_batas_byte_ditolak(ipv4_vps, monkeypatch):
+    besar = b'{"ok": true, "x": "' + b"W" * (64 * 1024) + b'"}'
+    k = _klien_lama_dengan(monkeypatch, lambda r: httpx.Response(200, content=besar))
+    with pytest.raises(SiteError) as e:
+        k.ping()
+    assert e.value.error_class == BAD_RESPONSE
+    assert "batas" in e.value.pesan
+
+
+def test_ping_lapis1_tidak_berubah():
+    diminta = []
+
+    def h(r):
+        diminta.append(r)
+        return httpx.Response(200, json={"ok": True})
+
+    SiteClient("https://toko.co.id", "s1", SECRET, client=httpx.Client(transport=httpx.MockTransport(h))).ping()
+    assert "connection" not in diminta[0].headers or diminta[0].headers["connection"] != "close"
+    assert "trace" not in diminta[0].extensions
+
+
+def test_klien_lama_menolak_rute_di_luar_daftar_tanpa_mengirim(ipv4_vps, monkeypatch):
+    # Review M2: baca-saja struktural, bukan hanya karena pembungkusnya tidak
+    # punya metode tulis.
+    diminta = []
+
+    def h(r):
+        diminta.append(r)
+        return httpx.Response(200, json={"ok": True})
+
+    k = _klien_lama_dengan(monkeypatch, h)
+    dalam = k._klien
+    for panggil in (lambda: dalam.staging_terapkan({"tukar": "x"}), lambda: dalam.staging_unggah(b"x"),
+                    lambda: dalam.staging_bersihkan("d1"), lambda: dalam.staging_snapshot(["a"]),
+                    lambda: dalam.update("plugin", "akismet", "5.3"), lambda: dalam.inventory(),
+                    lambda: dalam.events(None), lambda: dalam.traffic(), lambda: dalam.ping()):
+        with pytest.raises(SiteError) as e:
+            panggil()
+        assert e.value.error_class == STAGING_DITOLAK
+    assert diminta == []
+
+
+def test_klien_lama_rute_baca_tetap_diizinkan(ipv4_vps, monkeypatch):
+    from wpmgr.staging.paket import susun
+
+    data = susun({"berkas": [{"path": "a"}]}, [b"isi"])
+    diminta = []
+
+    def h(r):
+        diminta.append((r.method, r.url.path))
+        if r.url.path.endswith(("/staging/file", "/staging/tabel")):
+            return httpx.Response(200, content=data)
+        return httpx.Response(200, json={"ok": True})
+
+    k = _klien_lama_dengan(monkeypatch, h)
+    k.ping()
+    k.staging_manifest(None, batas=10)
+    k.staging_file(["a"])
+    k.staging_rentang("a", 0, 3)
+    k.staging_tabel("wp_posts", None)
+    k.staging_tanda_air()
+    p = "/wp-json/wpmgr/v1"
+    assert diminta == [("GET", f"{p}/ping"), ("GET", f"{p}/staging/manifest"), ("POST", f"{p}/staging/file"),
+                       ("POST", f"{p}/staging/file"), ("POST", f"{p}/staging/tabel"),
+                       ("GET", f"{p}/staging/tanda-air")]
+
+
+def test_alamat_tetap_tidak_mengikuti_alihan(monkeypatch):
+    # Review M3: walau klien yang disuntikkan mengikuti alihan, permintaan
+    # yang dipatok IP tidak pernah dialihkan ke host lain.
+    diminta = []
+
+    def h(r):
+        diminta.append(r)
+        if r.url.host == "jahat.test":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(302, headers={"Location": "https://jahat.test/wp-json/wpmgr/v1/ping"})
+
+    http = httpx.Client(transport=httpx.MockTransport(h), follow_redirects=True)
+    k = SiteClient("https://www.toko.co.id", "s1", SECRET, client=http, alamat_tetap=IP_LAMA)
+    for panggil in (k.ping, k.ping_bertenggat, k.staging_tanda_air):
+        diminta.clear()
+        with pytest.raises(SiteError):
+            panggil()
+        assert [r.url.host for r in diminta] == [IP_LAMA]
+
+
+def test_kirim_dipatok_tetap_connection_close_dan_tanpa_kompresi():
+    diminta = []
+
+    def h(r):
+        diminta.append(r)
+        return httpx.Response(200, json={"ok": True})
+
+    k = SiteClient("https://www.toko.co.id", "s1", SECRET, client=httpx.Client(transport=httpx.MockTransport(h)),
+                   alamat_tetap=IP_LAMA)
+    k.staging_tanda_air()
+    k.staging_manifest(None, batas=10)
+    for r in diminta:
+        assert r.url.host == IP_LAMA and r.headers["host"] == "www.toko.co.id"
+        assert r.headers["connection"] == "close"
+        assert r.headers["accept-encoding"] == "identity"
+        assert r.extensions["sni_hostname"] == "www.toko.co.id"
+
+
+def test_sertifikat_nama_lain_ditolak_di_jalur_kirim(tmp_path):
+    ca, daun, kunci = _sertifikat(tmp_path, "lain.test")
+    with _server_tls(daun, kunci) as srv:
+        port = srv.server_address[1]
+        http = httpx.Client(verify=ssl.create_default_context(cafile=str(ca)))
+        k = SiteClient(f"https://nama-uji.test:{port}", "s1", SECRET, client=http, alamat_tetap="127.0.0.1")
+        for panggil in (k.staging_tanda_air, k.ping_bertenggat):
+            with pytest.raises(SiteError):
+                panggil()
+    assert srv.host_diterima == []
