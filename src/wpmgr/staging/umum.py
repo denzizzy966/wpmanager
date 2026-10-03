@@ -262,23 +262,32 @@ def harus_berhenti() -> bool:
     return worker._berhenti
 
 
-def _batal_diminta(sesi: Session, staging_id) -> bool:
-    return sesi.scalar(select(Staging.batal_diminta_pada).where(Staging.id == staging_id)) is not None
+def _batal_diminta(sesi: Session, baris_id, kelas=Staging) -> bool:
+    return sesi.scalar(select(kelas.batal_diminta_pada).where(kelas.id == baris_id)) is not None
 
 
-def periksa_batal(sesi: Session, staging: Staging) -> None:
-    if _batal_diminta(sesi, staging.id):
+def periksa_batal(sesi: Session, baris) -> None:
+    """`baris`: Staging atau HostingVps (kolom `id` dan `batal_diminta_pada`), dibaca ulang dari DB."""
+    # Baris Staging memakai bentuk panggilan Lapis 3 (dua argumen): test
+    # Lapis 3 mengganti `_batal_diminta` dengan tiruan dua argumen
+    # (putusan preflight P3).
+    if isinstance(baris, Staging):
+        diminta = _batal_diminta(sesi, baris.id)
+    else:
+        diminta = _batal_diminta(sesi, baris.id, type(baris))
+    if diminta:
         raise Dibatalkan()
 
 
-def titik_potongan(sesi: Session, job: Job, staging: Staging | None) -> None:
+def titik_potongan(sesi: Session, job: Job, baris) -> None:
     """Dipanggil di antara potongan: batal, penghentian worker, dan detak.
 
-    `staging` None hanya untuk kembalikan setelah staging dihapus: tidak ada
-    kolom batal yang bisa diperiksa.
+    `baris` adalah pemilik kolom batal (Staging atau HostingVps). None hanya
+    untuk kembalikan setelah staging dihapus: tidak ada kolom batal yang bisa
+    diperiksa.
     """
-    if staging is not None:
-        periksa_batal(sesi, staging)
+    if baris is not None:
+        periksa_batal(sesi, baris)
     if harus_berhenti():
         # Berhenti karena deploy/restart bukan kegagalan: jatah percobaan
         # tidak dihabiskan, dan progres di payload membuat job melanjutkan.

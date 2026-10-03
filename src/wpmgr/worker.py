@@ -27,7 +27,7 @@ from wpmgr.jobs.queue import (
     worker_id,
 )
 from wpmgr.models import (
-    JOB_STAGING,
+    JOB_RUNTIME,
     ActivityLog,
     Job,
     JobStatus,
@@ -59,7 +59,7 @@ def _tangani_sinyal(signum, frame):
 
 
 def jenis_worker(instans: str) -> str:
-    """Instans systemd `wpmgr-worker@staging*` hanya mengambil job staging."""
+    """Instans systemd `wpmgr-worker@staging*` hanya mengambil job runtime (staging dan hosting)."""
     return "staging" if instans.startswith("staging") else "umum"
 
 
@@ -108,10 +108,12 @@ def proses_satu(sesi: Session, worker: str, buat_klien_fn=buat_klien, jenis: str
         if not _masih_milik_kita(sesi, job_id, worker):
             log.warning("Klaim job %s sudah diambil alih; hasil tidak ditulis", job_id)
             return True
-        if job.tipe not in JOB_STAGING:
+        if job.tipe not in JOB_RUNTIME:
             # Job staging tidak membuktikan apa pun tentang koneksi ke
             # produksi (uji update bahkan tidak menghubunginya), jadi
             # suksesnya juga tidak memulihkan status site (putusan F8).
+            # Job hosting juga tidak: ia berbicara ke hosting lama lewat IP
+            # yang dipatok, atau ke skrip root.
             _pulihkan_status(sesi, site)
         selesai_sukses(sesi, job, hasil if isinstance(hasil, dict) else {})
         return True
@@ -140,8 +142,8 @@ def _catat_kesalahan_internal(sesi: Session, job_id: int, worker: str, exc: Exce
         return
 
     job = sesi.get(Job, job_id)
-    if job.tipe in JOB_STAGING:
-        # Teks pengecualian job staging bisa memuat path VPS atau isi payload,
+    if job.tipe in JOB_RUNTIME:
+        # Teks pengecualian job runtime (staging/hosting) bisa memuat path VPS atau isi payload,
         # dan job.error tampil di UI (putusan F12): traceback-nya sudah di log
         # server, yang disimpan hanya pesan tetap.
         pesan = PESAN_TAK_TERDUGA
@@ -201,7 +203,7 @@ def _catat_kegagalan(sesi, job, site, exc: SiteError, worker: str, buat_klien_fn
     # job staging ini berlaku apa pun kelasnya (putusan F8): 403
     # wpmgr_staging_token dibaca auth_error, dan tanpa pengecualian ini site
     # sehat berubah menjadi needs_reconnect.
-    sentuh_site = job.tipe not in JOB_STAGING and kelas not in KELAS_STAGING
+    sentuh_site = job.tipe not in JOB_RUNTIME and kelas not in KELAS_STAGING
     status_baru = STATUS_SITE_DARI_ERROR.get(kelas) if sentuh_site else None
     if kelas == TRANSIENT and job.status != JobStatus.failed:
         # Masih akan diulang. Satu gangguan jaringan sesaat bukan alasan

@@ -125,3 +125,33 @@ def site_staging(sesi, site, staging_aktif):
     sesi.add(st)
     sesi.commit()
     return st
+
+
+@pytest.fixture
+def hosting_aktif(tmp_path, monkeypatch):
+    """Fitur hosting VPS menyala (butuh domain staging) dengan WPMGR_HOSTING_DIR sementara."""
+    from wpmgr.config import get_settings
+
+    monkeypatch.setenv("WPMGR_STAGING_DOMAIN", "staging.contoh.id")
+    monkeypatch.setenv("WPMGR_STAGING_DIR", str(tmp_path / "stg"))
+    monkeypatch.setenv("WPMGR_HOSTING_IPV4", "169.58.91.181")
+    monkeypatch.setenv("WPMGR_HOSTING_DIR", str(tmp_path / "hosting"))
+    get_settings.cache_clear()
+    yield tmp_path / "hosting"
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def site_hosting(sesi, site, hosting_aktif):
+    from wpmgr.crypto import enkripsi_secret
+    from wpmgr.models import HostingVps
+    from wpmgr.staging.pembantu import hash_sandi
+
+    site.url = "https://toko.co.id"
+    site.secret_terenkripsi = enkripsi_secret("f" * 64)
+    site.fitur = ["self_update", "staging"]
+    h = HostingVps(site_id=site.id, nama="toko-co-id", domain="toko.co.id", dengan_www=True,
+                   ip_lama="93.184.216.34", sandi_hash=hash_sandi("rahasia-pratinjau"))
+    sesi.add(h)
+    sesi.commit()
+    return h

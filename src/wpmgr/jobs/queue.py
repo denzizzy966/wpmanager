@@ -16,37 +16,50 @@ log = logging.getLogger("wpmgr.jobs.queue")
 # Percobaan pertama ditambah satu ulangan.
 BATAS_PERCOBAAN_BAD_RESPONSE = 2
 
-_STAGING = "('staging_tarik', 'staging_uji_update', 'staging_dorong', 'staging_kembalikan')"
-_STAGING_BACA = "('staging_tarik', 'staging_uji_update')"
-# Pasangan (j, j2) yang TIDAK boleh berjalan bersamaan di satu site.
+# Job runtime (staging Lapis 3 + hosting Lapis 4) diproses worker staging dan
+# diserialkan satu sama lain per site. Yang hanya membaca produksi/hosting
+# lama (_RUNTIME_BACA) boleh berjalan bersama job non-runtime site yang sama.
+_RUNTIME = ("('staging_tarik', 'staging_uji_update', 'staging_dorong', 'staging_kembalikan', "
+            "'pindah_tarik', 'pindah_aktifkan', 'backup_hosting')")
+_RUNTIME_BACA = "('staging_tarik', 'staging_uji_update', 'pindah_tarik')"
+# Pasangan (j, j2) yang TIDAK boleh berjalan bersamaan di satu site. Dua job
+# runtime selalu bentrok: indeks unik staging dan hosting terpisah
+# (uq_jobs_staging_aktif, uq_jobs_hosting_aktif), jadi job staging dan job
+# hosting site yang sama bisa sama-sama tertunda, dan hanya aturan ini (lewat
+# SQL_AMBIL dan SQL_BENTROK) yang mencegah keduanya berjalan bersamaan.
 _BENTROK = (
-    f"NOT (j.tipe IN {_STAGING_BACA} AND j2.tipe NOT IN {_STAGING})"
-    f" AND NOT (j2.tipe IN {_STAGING_BACA} AND j.tipe NOT IN {_STAGING})"
+    f"NOT (j.tipe IN {_RUNTIME_BACA} AND j2.tipe NOT IN {_RUNTIME})"
+    f" AND NOT (j2.tipe IN {_RUNTIME_BACA} AND j.tipe NOT IN {_RUNTIME})"
 )
 
+
 # Job yang menahan job lain di site yang sama: yang sedang berjalan, dan (I1)
-# dorong/kembalikan TERTUNDA yang sudah menyentuh produksi (`unggah_mulai`
-# atau `langkah_terapkan` di kemajuan) -- menunggu percobaan ulang atau
-# pemulihan, produksi bisa setengah diterapkan, jadi job Lapis 1 (update,
-# scan, ...) tidak boleh berjalan di atasnya. Hanya berlaku bagi kandidat
-# non-staging (`:kand` = alias tabel kandidat); tarik/uji staging tidak
-# bisa berdampingan dengan dorong tertunda (uq_jobs_staging_aktif).
+# job TERTUNDA yang sudah menyentuh produksi -- dorong/kembalikan dengan
+# `unggah_mulai` atau `langkah_terapkan` di kemajuan, atau pindah_aktifkan
+# yang sudah memulai tukar (`langkah_aktifkan` tukar/verifikasi/beres).
+# Produksi bisa setengah diterapkan/beralih, jadi job Lapis 1 (update, scan,
+# ...) tidak boleh berjalan di atasnya. Hanya berlaku bagi kandidat
+# non-runtime (`:kand` = alias tabel kandidat), seperti spec §10.4; job
+# runtime lain tetap diserialkan terhadap job yang sedang BERJALAN lewat
+# _BENTROK.
 def _menahan(kand: str) -> str:
     return (
         "(j2.status = 'running'"
         " OR (j2.status = 'pending'"
-        " AND j2.tipe IN ('staging_dorong', 'staging_kembalikan')"
-        f" AND {kand}.tipe NOT IN {_STAGING}"
+        f" AND {kand}.tipe NOT IN {_RUNTIME}"
+        " AND ((j2.tipe IN ('staging_dorong', 'staging_kembalikan')"
         " AND (j2.payload #> '{kemajuan,langkah_terapkan}' IS NOT NULL"
-        " OR (j2.payload #>> '{kemajuan,unggah_mulai}') = 'true')))"
+        " OR (j2.payload #>> '{kemajuan,unggah_mulai}') = 'true'))"
+        " OR (j2.tipe = 'pindah_aktifkan'"
+        " AND (j2.payload #>> '{kemajuan,langkah_aktifkan}') IN ('tukar', 'verifikasi', 'beres')))))"
     )
 
 
 # Satu job berjalan per site, dengan dua pengecualian (Koreksi #1): tarik
-# dan uji staging hanya membaca produksi, jadi tidak menahan dan tidak
-# ditahan job non-staging. Dorong/kembalikan menulis ke produksi dan tetap
+# dan uji staging, juga pindah_tarik, hanya membaca produksi/hosting lama,
+# jadi tidak menahan dan tidak ditahan job non-runtime. Job runtime lain
 # eksklusif terhadap semuanya. `:jenis` memisahkan worker staging (job
-# berjam-jam) dari worker umum.
+# runtime berjam-jam: staging dan hosting) dari worker umum.
 #
 # NOT EXISTS di sini hanya penyaring cepat: di READ COMMITTED ia membaca
 # snapshot awal pernyataan, jadi job yang baru di-commit worker lain sesudah
@@ -68,7 +81,7 @@ SQL_AMBIL = text(
               AND j.scheduled_for <= now()
               AND s.status <> 'disabled'
               AND (CAST(:jenis AS text) IS NULL
-                   OR (CAST(:jenis AS text) = 'staging') = (j.tipe IN {_STAGING}))
+                   OR (CAST(:jenis AS text) = 'staging') = (j.tipe IN {_RUNTIME}))
               AND NOT EXISTS (
                     SELECT 1 FROM jobs j2
                      WHERE j2.site_id = j.site_id
@@ -191,6 +204,8 @@ def jeda_menit(attempts: int) -> int:
 
 # Langkah terapkan sejak tukar dikirim ke produksi (tulis-lebih-dulu di dorong).
 LANGKAH_SESUDAH_TUKAR = frozenset({"tukar", "pulihkan", "dipulihkan", "selesai", "beres"})
+# Lapis 4: langkah pindah_aktifkan sejak prod-aktifkan dikirim (spec §10.4).
+LANGKAH_AKTIFKAN_SESUDAH_TUKAR = frozenset({"tukar", "verifikasi", "beres"})
 _JOB_PRODUKSI = frozenset({JobType.staging_dorong, JobType.staging_kembalikan})
 # Produksi yang setengah ditukar tidak boleh dibiarkan bergantung pada WP-Cron:
 # job dicoba lagi terus (jeda dibatasi) sampai batas ini, tidak berhenti di max_attempts.
@@ -199,21 +214,68 @@ BATAS_PEMULIHAN = timedelta(hours=24)
 
 
 def menyentuh_produksi(job: Job) -> bool:
-    """Dorong/kembalikan yang sudah mengirim tukar ke produksi dan tidak terbukti dipulihkan."""
+    """Job yang sudah mengirim perubahan ke produksi dan tidak terbukti dipulihkan (R26).
+
+    Dorong/kembalikan sesudah tukar, atau pindah_aktifkan sesudah
+    `prod-aktifkan` dikirim (situs mungkin sudah dilayani VPS setengah jalan).
+    """
+    k = (job.payload or {}).get("kemajuan") or {}
+    if job.tipe == JobType.pindah_aktifkan:
+        return k.get("langkah_aktifkan") in LANGKAH_AKTIFKAN_SESUDAH_TUKAR
     if job.tipe not in _JOB_PRODUKSI:
         return False
-    k = (job.payload or {}).get("kemajuan") or {}
     return k.get("langkah_terapkan") in LANGKAH_SESUDAH_TUKAR and not k.get("pulih_terkonfirmasi")
 
 
-def _mulai_tukar(job: Job) -> datetime | None:
+def _waktu_kemajuan(job: Job, kunci: str) -> datetime | None:
     k = (job.payload or {}).get("kemajuan") or {}
     try:
-        mulai = datetime.fromisoformat(k["tukar_pada"])
+        mulai = datetime.fromisoformat(k[kunci])
     except (KeyError, TypeError, ValueError):
-        # Job dari sebelum penanda ini ada: batas dihitung dari pembuatan job.
-        return job.dibuat_pada
+        return None
     return mulai if mulai.tzinfo else mulai.replace(tzinfo=timezone.utc)
+
+
+def _mulai_tukar(job: Job) -> datetime | None:
+    # Job dari sebelum penanda ini ada: batas dihitung dari pembuatan job.
+    return _waktu_kemajuan(job, "tukar_pada") or job.dibuat_pada
+
+
+# ---- skrip pembantu sibuk/menolak tanpa perubahan (Lapis 4) ---------------------
+#
+# Skrip root keluar 3 (`GalatPembantu.tanpa_ubah`) bila kunci router/nginx
+# sedang dipegang -- kunci router dipegang selama `prod-db-impor` situs lain,
+# sampai 3 jam -- atau bila prasyaratnya menolak sebelum mengubah apa pun.
+# Job hosting yang ditolak begini dijadwalkan ulang dengan jeda yang bertambah
+# (dibatasi seperti pemulihan) selama BATAS_SIBUK sejak penolakan pertama
+# dalam satu rentetan. Pembungkus `hosting.umum.jalankan_hosting` mencatat
+# rentetan itu di kemajuan (`sibuk_sejak`, `sibuk_kali`) dan mengembalikan
+# jatah percobaan, jadi `akan_diulang` tetap memutuskan "diulang" lewat aturan
+# biasanya; di sini hanya jendela dan jedanya.
+BATAS_SIBUK = timedelta(hours=4)
+
+
+def sibuk_kali(job: Job) -> int:
+    """Panjang rentetan penolakan sibuk terakhir (0 = kegagalan terakhir bukan penolakan sibuk)."""
+    k = (job.payload or {}).get("kemajuan") or {}
+    try:
+        return max(0, int(k.get("sibuk_kali") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def dalam_batas_sibuk(job: Job, sekarang: datetime | None = None) -> bool:
+    """Kegagalan terakhir job ini penolakan sibuk, dan jendela rentetannya belum lewat."""
+    if not sibuk_kali(job):
+        return False
+    mulai = _waktu_kemajuan(job, "sibuk_sejak")
+    if mulai is None:
+        return False
+    return (sekarang or datetime.now(timezone.utc)) - mulai < BATAS_SIBUK
+
+
+def _jeda_dibatasi(kali: int) -> int:
+    return min(jeda_menit(min(kali, 10)), JEDA_PEMULIHAN_MAKS_MENIT)
 
 
 def dalam_batas_pemulihan(job: Job, sekarang: datetime | None = None) -> bool:
@@ -278,7 +340,11 @@ def selesai_gagal(sesi: Session, job: Job, error_class: str, pesan: str) -> None
         if dalam_batas_pemulihan(job):
             # Backoff eksponensial yang tak dibatasi melewati batas 24 jam dan
             # meluap di timedelta; pemulihan produksi dicoba tiap <= 15 menit.
-            menit = min(jeda_menit(min(job.attempts, 10)), JEDA_PEMULIHAN_MAKS_MENIT)
+            menit = _jeda_dibatasi(job.attempts)
+        elif dalam_batas_sibuk(job):
+            # Jatah percobaan dikembalikan pada penolakan sibuk, jadi jedanya
+            # bertambah menurut panjang rentetan, bukan menurut `attempts`.
+            menit = _jeda_dibatasi(sibuk_kali(job))
         job.scheduled_for = safunc.now() + timedelta(minutes=menit)
         job.started_at = None
     else:

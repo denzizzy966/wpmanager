@@ -4,12 +4,16 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from wpmgr.errors import UNKNOWN
+from wpmgr.hosting import umum as hosting_umum
 from wpmgr.jobs.queue import dalam_batas_pemulihan
 from wpmgr.models import (
+    JOB_HOSTING,
     JOB_STAGING,
     ActivityLog,
+    HostingVps,
     Job,
     JobStatus,
+    JobType,
     Staging,
     StatusStaging,
 )
@@ -51,6 +55,28 @@ def _lepas_staging(sesi: Session, job: Job) -> None:
         st.dorong_gagal_pada = umum.sekarang()
 
 
+def _lepas_hosting(sesi: Session, job: Job) -> None:
+    """Hosting milik job yatim yang tidak akan diulang (pola `_lepas_staging`, spec §10.6).
+
+    Aturan status sama dengan pembungkus (`hosting.umum.status_gagal_final`).
+    Backup tidak pernah mengubah status; kegagalannya ditandai
+    `backup_gagal_pada`. Urutan kunci: jobs lalu hosting_vps.
+    """
+    h = sesi.scalar(select(HostingVps).where(HostingVps.site_id == job.site_id).with_for_update())
+    if h is None:
+        return
+    if job.tipe == JobType.backup_hosting:
+        h.backup_gagal_pada = hosting_umum.sekarang()
+        return
+    if h.status not in hosting_umum.STATUS_KERJA_SEMUA:
+        return
+    status, asal, galat = hosting_umum.status_gagal_final(job, h, hosting_umum.PESAN_TERHENTI)
+    h.status = status
+    h.gagal_asal = asal
+    h.galat = galat
+    h.batal_diminta_pada = None
+
+
 def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) -> int:
     """Kembalikan job `running` yang kuncinya basi ke `pending`, atau tandai `unknown` bila jatah habis.
 
@@ -88,6 +114,8 @@ def pulihkan_job_yatim(sesi: Session, batas_menit: int = BATAS_MENIT_DEFAULT) ->
             pesan = f"Job ditinggalkan worker {pemegang} tanpa sisa percobaan"
             if job.tipe in JOB_STAGING:
                 _lepas_staging(sesi, job)
+            elif job.tipe in JOB_HOSTING:
+                _lepas_hosting(sesi, job)
         sesi.add(
             ActivityLog(
                 site_id=job.site_id, job_id=job.id, level="warning", pesan=pesan,
