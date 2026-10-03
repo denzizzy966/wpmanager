@@ -846,15 +846,19 @@ def ukuran_dir(path: Path) -> int:
     return total
 
 
-def hapus_dir_staging(relatif: str) -> None:
-    """Hapus direktori di bawah WPMGR_STAGING_DIR tanpa pernah mengikuti symlink."""
+def hapus_dir_staging(relatif: str, akar: Path | None = None) -> None:
+    """Hapus direktori di bawah `akar` (bawaan WPMGR_STAGING_DIR) tanpa pernah mengikuti symlink.
+
+    `akar` lain dipakai nisan di WPMGR_HOSTING_DIR (Koreksi #9): pohon itu
+    juga ditulis container, jadi aturan symlink yang sama berlaku.
+    """
     if sys.platform.startswith("linux") and not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
         # Pohon files/, log/, ekspor/ ditulis container staging. rmtree non-fd
         # bisa dibelokkan symlink yang ditukar di tengah jalan ke luar akar
         # staging (data PostgreSQL, kode dashboard, .env): lebih baik gagal keras.
         raise RuntimeError("shutil.rmtree di Python ini tidak kebal symlink; penghapusan staging tidak aman")
     try:
-        p = jalur_di_dalam(get_settings().jalur_staging, relatif)
+        p = jalur_di_dalam(akar if akar is not None else get_settings().jalur_staging, relatif)
     except PathTidakAman:
         return
     try:
@@ -892,7 +896,9 @@ def hapus_nisan(akar: Path, nisan: str) -> None:
             # Tautannya saja yang dihapus; targetnya tidak pernah disentuh.
             hapus_tautan(akar, nisan)
         elif stat.S_ISDIR(st.st_mode):
-            hapus_dir_staging(nisan)
+            # Relatif terhadap akar nisan itu sendiri, bukan selalu
+            # WPMGR_STAGING_DIR (Koreksi #9).
+            hapus_dir_staging(nisan, akar)
         else:
             hapus_berkas(akar, nisan)
     except (OSError, PathTidakAman) as exc:

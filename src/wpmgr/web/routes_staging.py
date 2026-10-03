@@ -8,6 +8,10 @@ sampai commit perubahan statusnya. Pemeriksaan "sibuk" dibaca dari baris job
 menunggu percobaan ulang di site yang dinonaktifkan tidak pernah diklaim
 worker, sementara statusnya bisa saja masih `siap`.
 
+Lapis 4: route yang mengantrekan job staging juga mengunci baris
+`hosting_vps` (sesudah `sites`, sebelum `staging`) dan menolak selama pindah
+hosting berjalan (`_kunci_antre`).
+
 Site yang dinonaktifkan tidak membatalkan job staging tertundanya: job itu
 bisa berupa dorong/kembalikan yang sudah setengah jalan di produksi dan
 harus dituntaskan begitu site diaktifkan lagi. Route menolaknya dengan
@@ -39,8 +43,10 @@ from wpmgr.errors import STAGING_DITOLAK, STAGING_MATI, TRANSIENT, UNKNOWN, Site
 from wpmgr.fitur import STAGING, punya_fitur
 from wpmgr.jobs.handlers import buat_klien
 from wpmgr.models import (
+    JOB_HOSTING,
     JOB_STAGING,
     ActivityLog,
+    HostingVps,
     Job,
     JobStatus,
     JobType,
@@ -51,6 +57,7 @@ from wpmgr.models import (
     Staging,
     StagingSnapshot,
     StagingUji,
+    StatusHosting,
     StatusStaging,
     User,
 )
@@ -115,6 +122,9 @@ LABEL_TAHAP = {
     "snapshot_db": "Snapshot database produksi", "snapshot_catat": "Mencatat snapshot",
     "unggah": "Mengunggah ke produksi", "cek_ulang": "Memeriksa ulang data baru", "terapkan": "Menerapkan di produksi",
     "cek": "Memeriksa halaman utama", "tanpa_perubahan": "Tidak ada perubahan untuk didorong",
+    "pratinjau": "Menyiapkan pratinjau (sertifikat dan nginx)", "selesai": "Menyelesaikan", "dns": "Memeriksa DNS",
+    "tukar": "Mengaktifkan situs di VPS", "verifikasi": "Memeriksa situs lewat HTTPS", "beres": "Menyelesaikan aktivasi",
+    "backup": "Membuat backup",
 }
 # Hanya di tahap ini byte_selesai/byte_total menggambarkan pekerjaan yang
 # sedang berjalan; di tahap lain nilainya sisa tahap sebelumnya.
@@ -150,10 +160,12 @@ def ringkas_kemajuan(job: Job, sekarang: datetime | None = None) -> dict:
     if not isinstance(k, dict):
         k = {}
     tahap_uji = k.get("tahap_uji")
-    # Uji menjalankan tarik lebih dulu (tahap_uji "tarik"): selama itu tahap
-    # tarik yang ditampilkan.
+    langkah = k.get("langkah_aktifkan")
+    # Uji menjalankan tarik lebih dulu (tahap_uji "tarik"), dan aktivasi
+    # hosting juga (langkah "tarik"): selama itu tahap tarik yang ditampilkan.
     tahap = k.get("tahap_dorong") or k.get("tahap_balik") \
-        or (tahap_uji if tahap_uji not in (None, "tarik") else None) or k.get("tahap") or "mulai"
+        or (tahap_uji if tahap_uji not in (None, "tarik") else None) or k.get("tahap_backup") \
+        or (langkah if langkah not in (None, "tarik") else None) or k.get("tahap") or "mulai"
     tahap = tahap if isinstance(tahap, str) and tahap in LABEL_TAHAP else "mulai"
     total = angka(k.get("byte_total"), 0, 2**62) or 0
     selesai = min(angka(k.get("byte_selesai"), 0, 2**62) or 0, total)
@@ -210,6 +222,39 @@ def _kunci_staging(sesi, site_id: uuid.UUID) -> Staging | None:
 def _kunci(sesi, site_id: uuid.UUID) -> Staging | None:
     """Kontrak kunci cron: sites FOR NO KEY UPDATE lalu staging FOR UPDATE, sampai commit."""
     _kunci_site(sesi, site_id)
+    return _kunci_staging(sesi, site_id)
+
+
+PESAN_SIBUK_HOSTING = "Pindah hosting VPS untuk site ini sedang berjalan; tunggu sampai selesai."
+# Status hosting yang sedang menulis salinan VPS atau menukar produksi.
+STATUS_HOSTING_SIBUK = (StatusHosting.menyalin, StatusHosting.mengaktifkan)
+
+
+def _tolak_bila_hosting_sibuk(sesi, site_id: uuid.UUID) -> None:
+    """Job staging tidak diantrekan selama pindah hosting berjalan (carry Task 6).
+
+    Pemanggil sudah memegang kunci baris sites; baris hosting_vps dikunci
+    FOR UPDATE sesudahnya (urutan kunci Global Constraints) sampai commit,
+    jadi status yang diperiksa tidak bisa berubah sebelum job tersimpan.
+    Job hosting tertunda (mis. `pindah_aktifkan` yang menunggu ulang R26)
+    juga menolak: dorong staging yang diklaim di sela percobaan ulang itu
+    akan menulis ke produksi yang setengah beralih.
+    """
+    h = sesi.scalar(select(HostingVps).where(HostingVps.site_id == site_id).with_for_update()
+                    .execution_options(populate_existing=True))
+    sibuk = h is not None and h.status in STATUS_HOSTING_SIBUK
+    if not sibuk:
+        sibuk = sesi.scalar(select(Job.id).where(
+            Job.site_id == site_id, Job.tipe.in_(JOB_HOSTING),
+            Job.status.in_((JobStatus.pending, JobStatus.running))).limit(1)) is not None
+    if sibuk:
+        raise HTTPException(status_code=409, detail=PESAN_SIBUK_HOSTING)
+
+
+def _kunci_antre(sesi, site_id: uuid.UUID) -> Staging | None:
+    """`_kunci` untuk route yang mengantrekan job staging: sites, hosting_vps (tolak bila sibuk), lalu staging."""
+    _kunci_site(sesi, site_id)
+    _tolak_bila_hosting_sibuk(sesi, site_id)
     return _kunci_staging(sesi, site_id)
 
 
@@ -373,7 +418,10 @@ class PermintaanBuat(BaseModel):
 def _nama_unik(sesi, dasar: str) -> str:
     kandidat = dasar
     for i in range(2, 100):
-        if sesi.scalar(select(Staging.id).where(Staging.nama == kandidat)) is None:
+        # Label vps-<n> dipakai host pratinjau hosting VPS (spec Lapis 4 §10.7).
+        dipakai_hosting = kandidat.startswith("vps-") and sesi.scalar(
+            select(HostingVps.id).where(HostingVps.nama == kandidat[4:])) is not None
+        if not dipakai_hosting and sesi.scalar(select(Staging.id).where(Staging.nama == kandidat)) is None:
             return kandidat
         akhiran = f"-{i}"
         kandidat = dasar[:40 - len(akhiran)].rstrip("-") + akhiran
@@ -387,7 +435,7 @@ def buat_atau_segarkan(site_id: uuid.UUID, req: PermintaanBuat, pengguna: Penggu
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
         _izin(site)
-        st = _kunci(sesi, site_id)
+        st = _kunci_antre(sesi, site_id)
         _tolak_bila_sibuk(sesi, site)
         sandi = None
         if st is None:
@@ -538,6 +586,9 @@ KUNCI_KEMAJUAN_PRODUKSI = ("tahap_dorong", "tahap_balik", "langkah_terapkan")
 
 
 PESAN_PAKSA_KONFIRMASI = "Konfirmasi harus persis sama dengan nama site."
+# Spec Lapis 4 §10.7: kaskade site tidak boleh meninggalkan container produksi yatim.
+PESAN_HAPUS_SITE_HOSTING = "Batalkan pindah hosting dulu."
+PESAN_HAPUS_SITE_DIHOSTING = "Site ini dihosting di VPS; lepas manual (README)."
 
 
 def _tandai_produksi_bersih_paksa(sesi, site: Site, pengguna: User) -> None:
@@ -588,7 +639,21 @@ def bersihkan_untuk_hapus_site(sesi, site: Site, paksa: bool = False, pengguna: 
     Container, database, dan akses router staging tidak ikut kaskade: dibongkar
     di sini. Berkas `<site_id>/` dipangkas cron (tanpa baris Staging maupun
     snapshot, seluruh direktori dibuang).
+
+    Selama ada baris `hosting_vps` (status apa pun, paksa atau bukan), site
+    ditolak dicabut (putusan L7): kaskade akan menghapus baris itu, tetapi
+    container `wpp-<nama>`, database, berkas nginx host, dan sertifikat
+    produksinya tetap hidup tanpa pemilik. Sebelum dilayani VPS, pindah
+    dibatalkan dulu (DELETE .../hosting membongkarnya lewat prod-hapus);
+    sesudahnya situs itu produksi dan dilepas manual. Baris hosting dikunci
+    (sesudah sites, kontrak kunci) supaya tidak bisa dibuat di sela
+    pemeriksaan ini dan penghapusan site.
     """
+    h = sesi.scalar(select(HostingVps).where(HostingVps.site_id == site.id).with_for_update()
+                    .execution_options(populate_existing=True))
+    if h is not None:
+        raise HTTPException(status_code=409, detail=PESAN_HAPUS_SITE_DIHOSTING if h.dilayani_vps_pada is not None
+                            else PESAN_HAPUS_SITE_HOSTING)
     berjalan = sesi.scalar(select(Job.id).where(
         Job.site_id == site.id, Job.tipe.in_(JOB_STAGING), Job.status == JobStatus.running).limit(1))
     if berjalan is not None:
@@ -677,7 +742,7 @@ def antrekan_dorong(site_id: uuid.UUID, req: PermintaanDorong, pengguna: Penggun
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
         _izin(site)
-        st = _kunci(sesi, site_id)
+        st = _kunci_antre(sesi, site_id)
         if st is None:
             raise HTTPException(status_code=409, detail=PESAN_BELUM_DIBUAT)
         _periksa_dorong(st)
@@ -699,7 +764,7 @@ def antrekan_kembalikan(site_id: uuid.UUID, req: PermintaanKembalikan, pengguna:
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
         _izin(site)
-        _kunci(sesi, site_id)
+        _kunci_antre(sesi, site_id)
         snap = sesi.get(StagingSnapshot, req.snapshot_id)
         if snap is None or snap.site_id != site_id or snap.status not in dorong_mod.STATUS_SNAPSHOT_SAH:
             raise HTTPException(status_code=404, detail="Snapshot tidak ditemukan atau sudah dipangkas.")
@@ -816,7 +881,7 @@ def uji_site(site_id: uuid.UUID, req: PermintaanUji, pengguna: PenggunaApi):
     paket = _paket_uji(req.paket)
     with db.SessionLocal() as sesi:
         site = _site(sesi, site_id)
-        st = _kunci(sesi, site_id)
+        st = _kunci_antre(sesi, site_id)
         _periksa_uji(sesi, site, st, req.konfirmasi)
         payload = {"paket": _isi_dari(sesi, site_id, paket), "konfirmasi": req.konfirmasi}
         job, = _simpan_job(sesi, [_job_baru(site_id, JobType.staging_uji_update, payload, pengguna)])
@@ -851,10 +916,17 @@ def uji_banyak(req: PermintaanUjiBanyak, pengguna: PenggunaApi):
     with db.SessionLocal() as sesi:
         sites = {site_id: _site(sesi, site_id) for site_id in paket}
         # Lewatan 2, di bawah kunci: semua baris sites (urutan tetap), lalu
-        # semua baris staging, sesuai kontrak kunci cron.
+        # semua baris hosting_vps, lalu semua baris staging, sesuai kontrak
+        # kunci cron (Global Constraints Lapis 4).
         urutan = sorted(paket, key=str)
         for site_id in urutan:
             _kunci_site(sesi, site_id)
+        for site_id in urutan:
+            try:
+                _tolak_bila_hosting_sibuk(sesi, site_id)
+            except HTTPException as exc:
+                raise HTTPException(status_code=exc.status_code,
+                                    detail=f"{sites[site_id].nama}: {exc.detail}") from None
         staging = {site_id: _kunci_staging(sesi, site_id) for site_id in urutan}
         for site_id in paket:
             try:

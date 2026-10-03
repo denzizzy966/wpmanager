@@ -122,6 +122,7 @@ def buat_app() -> FastAPI:
         return RedirectResponse("/login", status_code=303)
 
     from wpmgr.web.routes_api import router as api_router
+    from wpmgr.web.routes_hosting import router as hosting_router
     from wpmgr.web.routes_monitoring import router as monitoring_router
     from wpmgr.web.routes_pages import router as pages_router
     from wpmgr.web.routes_pair import router as pair_router
@@ -131,6 +132,7 @@ def buat_app() -> FastAPI:
     app.include_router(pair_router)
     app.include_router(monitoring_router)
     app.include_router(staging_router)
+    app.include_router(hosting_router)
     app.include_router(pages_router)
     return app
 

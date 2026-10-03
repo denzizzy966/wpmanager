@@ -43,6 +43,7 @@ from wpmgr.models import HostingVps, Job, JobType, Site, StatusHosting
 from wpmgr.site_client import PREFIX, SiteClient, buat_klien_staging
 from wpmgr.staging import umum as stg
 from wpmgr.staging.aman import bersih_teks
+from wpmgr.staging.cron import _kunci_site
 from wpmgr.staging.pembantu import GalatPembantu
 
 log = logging.getLogger("wpmgr.hosting.umum")
@@ -197,6 +198,19 @@ def host_pratinjau(hosting) -> str:
 
 def url_pratinjau(hosting) -> str:
     return f"https://{host_pratinjau(hosting)}"
+
+
+def kunci_hosting(sesi: Session, site_id) -> HostingVps | None:
+    """Kontrak kunci baris (Global Constraints): `sites` FOR NO KEY UPDATE lalu `hosting_vps` FOR UPDATE.
+
+    Dipegang sampai commit berikutnya. Satu definisi untuk route dan cron
+    hosting (preflight M6), supaya urutannya tidak pernah berbeda di antara
+    keduanya (urutan yang berbeda = deadlock). Baris dibaca ulang
+    (`populate_existing`): sesi tidak mengedaluwarsakan objek saat commit.
+    """
+    _kunci_site(sesi, site_id)
+    return sesi.scalar(select(HostingVps).where(HostingVps.site_id == site_id).with_for_update()
+                       .execution_options(populate_existing=True))
 
 
 def muat_hosting(sesi: Session, job: Job) -> tuple[Site, HostingVps]:
