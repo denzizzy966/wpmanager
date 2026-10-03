@@ -79,6 +79,9 @@ def main() -> int:
         return 0
     if perintah == "status":
         sys.stdout.write(os.environ.get("PALSU_STATUS", "{}"))
+    elif perintah == "prod-aktifkan":
+        # Cermin `echo "aktif"` di akhir cmd_prod_aktifkan (review Task 10 M7).
+        sys.stdout.write("aktif\n")
     elif perintah == "tidur":
         time.sleep(30)
     elif perintah == "gagal":

@@ -564,7 +564,8 @@ def test_prod_tenggat_python_per_subperintah(monkeypatch, tmp_path):
 
     def catat(*argumen, timeout=modul_pembantu.TIMEOUT_BAWAAN, **_):
         dipanggil.append((argumen[0], timeout))
-        return "terbit"
+        # Keluaran sah tiap subperintah yang memeriksa keluarannya (M7 Task 10).
+        return "aktif" if argumen[0] == "prod-aktifkan" else "terbit"
 
     monkeypatch.setattr(p, "jalankan", catat)
     p.prod_hapus("toko")
@@ -637,3 +638,46 @@ def test_prod_hapus_sukses_tanpa_stderr_tidak_mencatat(pembantu, catatan, caplog
     caplog.set_level(logging.WARNING, logger="wpmgr.staging.pembantu")
     pembantu.prod_hapus("toko")
     assert not [r for r in caplog.records if "prod-hapus" in r.getMessage()]
+
+
+# ---- review Task 10: keluaran prod-aktifkan (M7) dan kunci sibuk (M5) ----------------
+
+
+@pytest.mark.parametrize("keluaran", ["aktif\n", "aktif"])
+def test_prod_aktifkan_keluaran_aktif(pembantu, catatan, monkeypatch, keluaran):
+    monkeypatch.setenv("PALSU_STDOUT", keluaran)
+    assert pembantu.prod_aktifkan("toko") == "aktif"
+
+
+# Kosong ditiru dengan spasi: di Windows variabel lingkungan kosong = tidak ada.
+@pytest.mark.parametrize("keluaran", [" \n", "AKTIF", "aktif\nlagi", "ok"])
+def test_prod_aktifkan_keluaran_lain_ditolak(pembantu, catatan, monkeypatch, keluaran):
+    # Keluar 0 tanpa "aktif": keluaran tidak tuntas, hasil tidak pasti.
+    monkeypatch.setenv("PALSU_STDOUT", keluaran)
+    with pytest.raises(GalatPembantu) as e:
+        pembantu.prod_aktifkan("toko")
+    assert e.value.kode == "lain" and e.value.tanpa_ubah is False
+    assert e.value.pesan == modul_pembantu.PESAN_TIDAK_TUNTAS
+
+
+@pytest.mark.parametrize("kode_keluar,stderr,sibuk", [
+    (3, "GALAT ditolak: router hosting sedang dipakai proses lain\n", True),
+    (3, "GALAT ditolak: konfigurasi nginx sedang diubah proses lain\n", True),
+    (3, "GALAT internal: dihentikan\nGALAT ditolak: router hosting sedang dipakai proses lain\n", True),
+    (3, "GALAT ditolak: sertifikat domain belum ada\n", False),
+    (9, "GALAT internal: router hosting sedang dipakai proses lain\n", False),
+])
+def test_kunci_sibuk_dibedakan_dari_prasyarat(pembantu, catatan, monkeypatch, kode_keluar, stderr, sibuk):
+    monkeypatch.setenv("PALSU_KELUAR", str(kode_keluar))
+    monkeypatch.setenv("PALSU_STDERR", stderr)
+    with pytest.raises(GalatPembantu) as e:
+        pembantu.prod_aktifkan("toko")
+    assert e.value.sibuk is sibuk
+    # Pesan tetap tidak berubah; stderr tidak pernah sampai ke UI.
+    assert "router" not in e.value.pesan and "nginx" not in e.value.pesan
+
+
+def test_penanda_kunci_sibuk_cermin_skrip_pembantu():
+    skrip = (Path(__file__).parents[2] / "deploy" / "staging" / "wpmgr-staging").read_text(encoding="utf-8")
+    for teks in modul_pembantu.PENANDA_KUNCI_SIBUK:
+        assert re.search(r'flock -w [0-9]+ -x [^|]*\|\| galat ditolak "' + re.escape(teks) + '"', skrip), teks

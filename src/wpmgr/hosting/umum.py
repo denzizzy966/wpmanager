@@ -375,7 +375,15 @@ def _gagal_final(sesi: Session, job: Job, hosting_id, pesan: str) -> None:
 
 
 def _kembali_tanpa_ubah(sesi: Session, job: Job, hosting_id, pesan: str) -> None:
-    """Penolakan tanpa perubahan: status sebelum job (backup: hanya `backup_gagal_pada`)."""
+    """Penolakan tanpa perubahan: status sebelum job (backup: hanya `backup_gagal_pada`).
+
+    "Tanpa perubahan" berlaku untuk langkah yang menolak, bukan untuk
+    seluruh job: percobaan sebelumnya bisa sudah menulis salinan VPS
+    setengah jadi (mis. tarik terakhir aktivasi terputus, lalu DNS menolak;
+    atau pindah_tarik yang izinnya dicabut di tengah). Salinan seperti itu
+    tidak boleh tersembunyi di balik status siap (spec §10.3): `gagal`
+    'salinan' (review Task 10 I2).
+    """
     sesi.rollback()
     if job.tipe == JobType.backup_hosting:
         _tandai_backup_gagal(sesi, hosting_id)
@@ -383,7 +391,11 @@ def _kembali_tanpa_ubah(sesi: Session, job: Job, hosting_id, pesan: str) -> None
     h = sesi.get(HostingVps, hosting_id, populate_existing=True)
     if h is None:
         return
-    status, asal = status_sebelum(job, h)
+    hasil = status_tanpa_salinan_rusak(job, h)
+    if hasil is None:
+        _gagal_final(sesi, job, hosting_id, pesan)
+        return
+    status, asal = hasil
     _tandai(sesi, hosting_id, status, pesan, asal=asal)
 
 
@@ -406,7 +418,7 @@ def _batalkan(sesi: Session, job: Job, site_id, hosting_id, nama: str) -> stg.Ga
 def _akhiri_rentetan_sibuk(sesi: Session, job: Job) -> None:
     """Kegagalan lain sesudah penolakan sibuk: rentetan selesai, jendela berikutnya mulai dari awal."""
     if sibuk_kali(job):
-        stg.simpan_kemajuan(sesi, job, sibuk_kali=0, sibuk_sejak=None, sibuk_langkah=None)
+        stg.simpan_kemajuan(sesi, job, sibuk_kali=0, sibuk_sejak=None, sibuk_langkah=None, sibuk_dilihat=[])
 
 
 def _putuskan(sesi: Session, job: Job, hosting_id, site_id, exc: SiteError, status_kerja, batal_berlaku,
@@ -434,7 +446,7 @@ def _ulang_sesudah_tukar(sesi: Session, job: Job, hosting_id, site_id, pesan: st
 
 
 def _langkah_sekarang(job: Job) -> str:
-    """Penanda langkah job (langkah aktivasi + tahap tarik): rentetan sibuk dimulai ulang bila berubah."""
+    """Penanda langkah job (langkah aktivasi + tahap tarik): rentetan sibuk dimulai ulang di langkah baru."""
     k = stg.kemajuan(job)
     return f"{k.get('langkah_aktifkan') or '-'}/{k.get('tahap') or '-'}"
 
@@ -446,7 +458,7 @@ def _tangani_sibuk(sesi: Session, job: Job, hosting_id, site_id, exc: GalatPemba
     Kunci router dipegang selama `prod-db-impor` situs lain (sampai 3 jam),
     dan kunci nginx yang sibuk juga keluar 3. Selama `queue.BATAS_SIBUK`
     sejak penolakan pertama rentetan ini (rentetan dimulai ulang bila job
-    sudah maju ke langkah lain), job diulang dengan jeda yang bertambah
+    maju ke langkah yang belum pernah sibuk di rentetan ini), job diulang dengan jeda yang bertambah
     (queue.selesai_gagal), jatah percobaannya dikembalikan (pola
     GalatBerhenti), dan baris hosting tetap di status kerjanya dengan pesan
     netral. Sesudah jendela itu: berakhir seperti penolakan tanpa ubah
@@ -460,10 +472,24 @@ def _tangani_sibuk(sesi: Session, job: Job, hosting_id, site_id, exc: GalatPemba
         return _batalkan(sesi, job, site_id, hosting_id, nama)
     k = stg.kemajuan(job)
     langkah = _langkah_sekarang(job)
-    kali = sibuk_kali(job) if k.get("sibuk_langkah") == langkah else 0
+    # Rentetan dimulai ulang hanya bila job maju ke langkah yang BELUM pernah
+    # ditolak sibuk dalam rentetan ini (kemajuan sungguhan). Langkah yang
+    # bergantian -- tarik terakhir aktivasi yang sibuk di impor, lalu tukar
+    # yang sibuk di prod-aktifkan, lalu impor lagi -- meneruskan rentetan
+    # yang sama, jadi jendela BATAS_SIBUK tetap berakhir (review Task 10 M4).
+    # Langkah yang sudah ditolak sibuk diingat selama rentetannya berjalan
+    # (juga sesudah jendela dimulai ulang di langkah baru), sehingga
+    # banyaknya mulai ulang dibatasi jumlah langkah yang berbeda.
+    berjalan = sibuk_kali(job) > 0
+    dilihat = [x for x in (k.get("sibuk_dilihat") or []) if isinstance(x, str)] if berjalan else []
+    if berjalan and isinstance(k.get("sibuk_langkah"), str) and k["sibuk_langkah"] not in dilihat:
+        dilihat.append(k["sibuk_langkah"])
+    kali = sibuk_kali(job) if langkah in dilihat else 0
     sejak = k.get("sibuk_sejak") if kali else None
+    if langkah not in dilihat:
+        dilihat.append(langkah)
     stg.simpan_kemajuan(sesi, job, sibuk_sejak=sejak or sekarang().isoformat(), sibuk_kali=kali + 1,
-                        sibuk_langkah=langkah)
+                        sibuk_langkah=langkah, sibuk_dilihat=dilihat[-20:])
     if dalam_batas_sibuk(job):
         job.attempts = max(0, job.attempts - 1)
         sesi.commit()

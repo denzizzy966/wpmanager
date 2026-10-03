@@ -9,7 +9,7 @@ tarik terakhir, tukar (tulis-lebih-dulu), verifikasi.
 
 import logging
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -266,7 +266,18 @@ PESAN_TUKAR_DITOLAK = ("VPS menolak mengaktifkan situs (sertifikat, database, at
 PESAN_VERIFIKASI = "Situs belum menjawab HTTPS dengan benar lewat VPS; diperiksa lagi otomatis."
 PESAN_SALINAN_BELUM_UTUH = ("Salinan VPS belum utuh; aktivasi tanpa tarik ulang dari hosting lama ditolak. "
                             "Salin ke VPS lagi dulu.")
+PESAN_SERVER_SIBUK = ("Server VPS sedang sibuk dengan proses lain sehingga aktivasi belum dijalankan; "
+                      "tidak ada yang diubah, coba lagi nanti.")
+PESAN_PERIKSA_ULANG = "Situs sudah dilayani VPS; pemeriksaan ulang hanya bisa dari status gagal atau aktif."
 STATUS_BOLEH_AKTIFKAN = ("menunggu_dns", "gagal")
+# Putusan L17: tarik terakhir yang selesai belum selama ini dipakai lagi oleh
+# percobaan ulang job yang sama, bukan diekspor ulang dari hosting lama.
+UMUR_TARIK_TERAKHIR = timedelta(minutes=60)
+
+
+def buat_http_verifikasi(**opsi) -> httpx.Client:
+    """Klien verifikasi: tanpa ikut alihan (3xx dinilai apa adanya) dan tanpa keep-alive (tenggat total)."""
+    return httpx.Client(follow_redirects=False, limits=httpx.Limits(max_keepalive_connections=0), **opsi)
 
 
 def ambil_halaman_verifikasi(host: str) -> tuple[int, dict] | None:
@@ -275,7 +286,7 @@ def ambil_halaman_verifikasi(host: str) -> tuple[int, dict] | None:
     Sertifikat diverifikasi terhadap nama host: situs yang hanya punya
     sertifikat pratinjau tidak lolos. None = tidak ada jawaban yang sah.
     """
-    with httpx.Client(follow_redirects=False, limits=httpx.Limits(max_keepalive_connections=0)) as http:
+    with buat_http_verifikasi() as http:
         try:
             status, header, _ = minta_bertenggat(
                 http, "GET", f"https://{ALAMAT_VERIFIKASI}/",
@@ -404,24 +415,38 @@ def _tarik_terakhir(sesi, job, site, h: HostingVps, pb) -> None:
     if (job.payload or {}).get("tanpa_tarik_ulang"):
         return
     k = stg.kemajuan(job)
+    selesai_pada = _waktu_kemajuan(k, "tarik_selesai_pada")
     if k.get("tahap") in hu.TAHAP_SALINAN_UTUH:
-        # Tarik job ini sudah selesai pada percobaan sebelumnya (mis. tukar
-        # ditolak karena kunci sibuk, putusan L10): hosting lama masih
-        # menerima data selama menunggu, jadi tarik dimulai lagi dari
-        # manifest (inkremental terhadap files/), bukan dilewati.
+        if selesai_pada is not None and hu.sekarang() - selesai_pada <= UMUR_TARIK_TERAKHIR:
+            # Putusan L17: tarik job ini selesai belum lama (mis. tukar ditolak
+            # sibuk lalu diulang); dipakai lagi supaya hosting lama tidak
+            # diekspor ulang setiap percobaan.
+            return
+        # Lebih tua dari itu: hosting lama masih menerima data selama job
+        # menunggu, jadi tarik dimulai lagi dari manifest (inkremental
+        # terhadap files/), bukan dilewati.
         k.pop("tahap")
     # Data terakhir dari hosting lama, lewat IP yang dipatok (RF4): DNS
     # domain sudah menunjuk VPS sendiri pada titik ini.
     k = salin(sesi, job, site, h, hu.klien_lama(site, h), pb, k)
     rampungkan_salinan(sesi, job, site, h, k, None)
+    if selesai_pada is None:
+        # Tarik pertama job ini tuntas: kemajuan sungguhan, rentetan sibuk
+        # sebelumnya selesai (M4). Tarik penyegaran bukan kemajuan baru.
+        hu._akhiri_rentetan_sibuk(sesi, job)
+    stg.simpan_kemajuan(sesi, job, tarik_selesai_pada=hu.sekarang().isoformat())
+
+
+def _waktu_kemajuan(k: dict, kunci: str) -> datetime | None:
+    try:
+        waktu = datetime.fromisoformat(k[kunci])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return waktu if waktu.tzinfo else waktu.replace(tzinfo=timezone.utc)
 
 
 def _waktu_tukar(k: dict) -> datetime:
-    try:
-        waktu = datetime.fromisoformat(k["tukar_pada"])
-    except (KeyError, TypeError, ValueError):
-        return hu.sekarang()
-    return waktu if waktu.tzinfo else waktu.replace(tzinfo=timezone.utc)
+    return _waktu_kemajuan(k, "tukar_pada") or hu.sekarang()
 
 
 def _pasang_penanda(sesi, h: HostingVps, waktu: datetime) -> None:
@@ -450,15 +475,24 @@ def _mulai_tukar(sesi, job, h: HostingVps) -> None:
 def _cabut_tukar(sesi, job, akar: Path, h: HostingVps) -> None:
     """prod-aktifkan keluar 3 pada kiriman pertama: pasti tanpa perubahan (Koreksi #5).
 
-    Situs masih pratinjau (konstanta WPMGR_PRATINJAU tetap ada), jadi
-    pemblokir email dipasang lagi (Koreksi #6) sebelum penanda
-    tulis-lebih-dulu dicabut: baris hosting dulu, lalu langkah job (dua
-    commit, kebalikan `_mulai_tukar`). Terhenti di antaranya meninggalkan job
-    di `tukar` tanpa penanda hosting -- dipasang lagi oleh `_kirim_tukar` --,
-    tidak pernah penanda terisi dengan langkah sebelum tukar. Mu-plugin yang
-    gagal ditulis dilaporkan sesudah penanda dicabut: salinan perlu disalin
-    ulang (`gagal` 'salinan'), bukan produksi yang tersentuh.
+    Urutan: (1) `tukar_dikirim=False` di job, (2) pemblokir email dipasang
+    lagi -- situs masih pratinjau, konstanta WPMGR_PRATINJAU tetap ada
+    (Koreksi #6) --, (3) `dilayani_vps_pada` dicabut di baris hosting, (4)
+    langkah job kembali ke `dns`. Setiap tulisan DB satu commit sendiri
+    (baris job dan hosting_vps tidak pernah satu transaksi). Terhenti di mana
+    pun meninggalkan job di `tukar` dengan `tukar_dikirim` False: percobaan
+    berikutnya mengirim lagi sebagai kiriman pertama (penanda hosting yang
+    hilang dipasang lagi oleh `_kirim_tukar`), tidak pernah penanda terisi
+    dengan langkah sebelum tukar. Mu-plugin yang gagal ditulis dilaporkan
+    sesudah penanda dicabut: salinan perlu disalin ulang (`gagal`
+    'salinan'), bukan produksi yang tersentuh.
     """
+    # Langkah pertama, dipagari klaim: worker zombi (klaimnya sudah direbut
+    # reaper) berhenti di KlaimHilang di sini sebelum menyentuh mu-plugin
+    # atau penanda. Terhenti sesudahnya, percobaan berikutnya melihat
+    # `tukar_dikirim` False, jadi keluar 3 berikutnya tetap diperlakukan
+    # sebagai kiriman pertama dan pencabutan ini diulang (review Task 10 I1).
+    stg.simpan_kemajuan(sesi, job, tukar_dikirim=False)
     galat = None
     try:
         tulis_mu_plugin(akar)
@@ -467,7 +501,7 @@ def _cabut_tukar(sesi, job, akar: Path, h: HostingVps) -> None:
     baris = sesi.get(HostingVps, h.id, populate_existing=True)
     baris.dilayani_vps_pada = None
     sesi.commit()
-    _langkah(sesi, job, "dns", tukar_pada=None, tukar_dikirim=False)
+    _langkah(sesi, job, "dns", tukar_pada=None)
     if galat is not None:
         raise galat
 
@@ -501,8 +535,12 @@ def _kirim_tukar(sesi, job, site, h: HostingVps, pb) -> None:
         # Dilempar ulang sebagai GalatPembantu keluar 3: pembungkus
         # menjadwalkannya ulang sebagai sibuk (putusan L10; kunci router
         # dipegang impor situs lain sampai 3 jam). Lewat jendela sibuk, status
-        # kembali seperti sebelum job dengan pesan tetap ini (spec §10.4).
-        raise GalatPembantu(exc.kode, PESAN_TUKAR_DITOLAK) from None
+        # kembali seperti sebelum job dengan pesan tetap ini (spec §10.4);
+        # kunci yang sibuk tidak menyalahkan sertifikat/database/container (M5).
+        pesan = PESAN_SERVER_SIBUK if exc.sibuk else PESAN_TUKAR_DITOLAK
+        raise GalatPembantu(exc.kode, pesan, sibuk=exc.sibuk) from None
+    # Kemajuan sungguhan: rentetan sibuk sebelum tukar selesai (M4).
+    hu._akhiri_rentetan_sibuk(sesi, job)
     _langkah(sesi, job, "verifikasi")
 
 
@@ -541,15 +579,33 @@ def _beres(sesi, job, site, h: HostingVps) -> dict:
     return hasil
 
 
+def _periksa_ulang(sesi, job) -> None:
+    """Tombol Periksa ulang untuk situs yang sudah dilayani VPS (Koreksi #13, putusan L16), jendela R26 baru.
+
+    Dari `gagal` (asal produksi): masuk di `tukar` sebagai kiriman ulang --
+    prod-aktifkan idempoten di bawah MODE=aktif (putusan L5), jadi aktivasi
+    yang dulu terhenti di tengah dituntaskan, lalu verifikasi. Dari `aktif`:
+    hanya verifikasi. Status lain dengan `dilayani_vps_pada` terisi tidak
+    semestinya ada: ditolak tanpa ubah (langkah masih sebelum tukar).
+    Tanpa DNS, sertifikat, dan tarik: data situs kini di VPS.
+    """
+    awal = stg.kemajuan(job).get("status_hosting_awal")
+    sekarang = hu.sekarang().isoformat()
+    if awal == StatusHosting.gagal.value:
+        _langkah(sesi, job, "tukar", tukar_pada=sekarang, tukar_dikirim=True)
+    elif awal == StatusHosting.aktif.value:
+        _langkah(sesi, job, "verifikasi", tukar_pada=sekarang)
+    else:
+        raise stg.GalatDitolakTanpaUbah(PESAN_PERIKSA_ULANG)
+
+
 def aktifkan(sesi, job, site, h: HostingVps, pb) -> dict:
     # Dibaca ulang: sesi tidak mengedaluwarsakan objek saat commit.
     h = sesi.get(HostingVps, h.id, populate_existing=True)
     langkah = stg.kemajuan(job).get("langkah_aktifkan")
     if langkah not in LANGKAH_AKTIFKAN_SESUDAH_TUKAR:
         if h.dilayani_vps_pada is not None:
-            # "Periksa ulang" untuk gagal asal produksi: langsung verifikasi,
-            # dengan jendela R26 baru (Koreksi #13). Tanpa tarik dan tukar ulang.
-            _langkah(sesi, job, "verifikasi", tukar_pada=hu.sekarang().isoformat())
+            _periksa_ulang(sesi, job)
         else:
             # Sebelum tukar, percobaan ulang selalu mulai lagi dari dns: DNS
             # bisa saja dikembalikan pengguna (spec §10.4).

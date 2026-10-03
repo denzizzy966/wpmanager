@@ -110,6 +110,14 @@ _POLA_KREDENSIAL_MAIL = re.compile(r"wpmgr:[0-9a-f]{48}")
 _POLA_STEMPEL = re.compile(r"[0-9]{8}T[0-9]{6}Z")
 # Keluaran prod-sertifikat: satu kata dari daftar tetap (spec §7.3.3).
 HASIL_SERTIFIKAT = frozenset({"terbit", "tetap", "diperbarui"})
+# Keluaran prod-aktifkan yang tuntas (`echo "aktif"` di akhir cmd_prod_aktifkan).
+HASIL_AKTIFKAN = "aktif"
+# Teks `galat ditolak` saat kunci router/nginx habis waktu menunggu (cermin
+# kunci_router dan kunci_nginx di skrip). Keluar 3 dengan baris ini berarti
+# server sibuk dengan proses lain, bukan prasyarat yang ditolak; pemanggil
+# memakai pesan netral (review Task 10 M5). Teks skrip root tetap, tidak
+# pernah memuat masukan, jadi hanya baris GALAT persis ini yang dicocokkan.
+PENANDA_KUNCI_SIBUK = ("router hosting sedang dipakai proses lain", "konfigurasi nginx sedang diubah proses lain")
 PENGGUNA_PRATINJAU = "pratinjau"
 
 # Keluaran wp-cli dikendalikan kode salinan site yang bisa saja disusupi:
@@ -144,10 +152,12 @@ UMUR_TAUTAN = 12 * 3600
 
 
 class GalatPembantu(Exception):
-    def __init__(self, kode: str, pesan: str) -> None:
+    def __init__(self, kode: str, pesan: str, sibuk: bool = False) -> None:
         super().__init__(pesan)
         self.kode = kode
         self.pesan = pesan
+        # Keluar 3 karena kunci router/nginx sibuk (lihat PENANDA_KUNCI_SIBUK).
+        self.sibuk = sibuk
 
     @property
     def tanpa_ubah(self) -> bool:
@@ -384,7 +394,8 @@ class Pembantu:
         # kasus tenggat bisa tercetak dua baris (galat() menulis ke stderr asli).
         log.warning("Skrip pembantu %s gagal (kode keluar %s): %s", subperintah or "-", kode_keluar,
                     _stderr_log(stderr))
-        return GalatPembantu(kode, _pesan(subperintah, kode))
+        sibuk = kode == KODE_TANPA_UBAH and any(f"GALAT ditolak: {p}" in stderr for p in PENANDA_KUNCI_SIBUK)
+        return GalatPembantu(kode, _pesan(subperintah, kode), sibuk=sibuk)
 
     def jalankan(self, *argumen: str, masukan: Iterable[Path] = (), timeout: float = TIMEOUT_BAWAAN,
                  catat_stderr: bool = False) -> str:
@@ -616,7 +627,12 @@ class Pembantu:
         return teks
 
     def prod_aktifkan(self, nama: str) -> str:
-        return self.jalankan("prod-aktifkan", _cek_nama_prod(nama), timeout=TIMEOUT_AKTIFKAN)
+        # Seperti prod-sertifikat: keluar 0 tanpa "aktif" berarti keluaran
+        # tidak tuntas, jadi hasilnya tidak pasti (review Task 10 M7).
+        teks = self.jalankan("prod-aktifkan", _cek_nama_prod(nama), timeout=TIMEOUT_AKTIFKAN).strip()
+        if teks != HASIL_AKTIFKAN:
+            raise GalatPembantu("lain", PESAN_TIDAK_TUNTAS)
+        return teks
 
     def prod_backup(self, nama: str, stempel: str) -> str:
         return self.jalankan("prod-backup", _cek_nama_prod(nama), _cek_stempel(stempel), timeout=TIMEOUT_BACKUP)
