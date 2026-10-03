@@ -1011,3 +1011,185 @@ mailpit=p@sha256:%s
   run "$SKRIP" siapkan
   [ "$status" -eq 0 ]
 }
+
+# ---- produksi (Lapis 4) --------------------------------------------------------
+
+DOM=toko.co.id
+
+# Container tiruan yang hanya berlabel wpmgr.hosting (label staging kosong).
+wadah_prod() {
+  : > "$PALSU/wadah/$1"
+  printf '%s' "$2" > "$PALSU/wadah/$1.hosting"
+}
+
+# Menyalakan produksi di staging.conf test dan meniru keadaan sesudah
+# `prod-siapkan`: direktori root, sandi root DB, php.ini, jaringan, layanan.
+aktifkan_hosting() {
+  mkdir -p "$S/hosting/router" "$S/hcerts" "$S/nginx-hosting" "$S/backup" \
+    "$S/etc/prod/situs" "$S/etc/prod/db" "$S/etc/prod/router/conf.d" "$S/etc/prod/router/htpasswd" \
+    "$S/etc/prod/nginx-cadangan"
+  chown 1000:1000 "$S/hosting" "$S/hosting/router"
+  cat >> "$WPMGR_STG_KONF" <<KONF
+HOSTING_DIR=$S/hosting
+PROD_CERT_DIR=$S/hcerts
+NGINX_HOSTING_DIR=$S/nginx-hosting
+BACKUP_DIR=$S/backup
+IP_PUBLIK=169.58.91.181
+KONF
+  printf 'prodrahasia' > "$S/etc/prod/db-root"
+  printf '; php.ini tiruan\n' > "$S/etc/prod/php.ini"
+  touch "$PALSU/jaringan-prod"
+  wadah_prod wpmgr-prod-db layanan:db
+  wadah_prod wpmgr-prod-router layanan:router
+}
+
+@test "prod-siapkan dilewati dan prod-* lain ditolak bila HOSTING_DIR kosong" {
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"hosting tidak dikonfigurasi; dilewati"* ]]
+  [ -z "$(docker_log)" ]
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  run "$SKRIP" prod-status tambahan
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-siapkan tambahan
+  [ "$status" -eq 2 ]
+}
+
+@test "konfigurasi hosting divalidasi: subnet beririsan, port router, dan IP publik" {
+  aktifkan_hosting
+  run "$SKRIP" prod-status
+  [ "$status" -eq 0 ]
+  echo 'PROD_SUBNET=172.31.250.128/25' >> "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"beririsan"* ]]
+  sed -i '/^PROD_SUBNET=/d' "$WPMGR_STG_KONF"
+  echo 'PROD_ROUTER_PORT=0.0.0.0:8091' >> "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  sed -i '/^PROD_ROUTER_PORT=/d' "$WPMGR_STG_KONF"
+  sed -i 's/^IP_PUBLIK=.*/IP_PUBLIK=169.58.91.300/' "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  sed -i '/^IP_PUBLIK=/d' "$WPMGR_STG_KONF"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"IP_PUBLIK"* ]]
+}
+
+@test "HOSTING_DIR di dalam STAGING_DIR ditolak" {
+  aktifkan_hosting
+  for salah in "$S/staging/hosting" "$S/staging" "$S"; do
+    sed -i "s#^HOSTING_DIR=.*#HOSTING_DIR=$salah#" "$WPMGR_STG_KONF"
+    run "$SKRIP" prod-status
+    [ "$status" -eq 7 ]
+  done
+}
+
+@test "prod-siapkan membuat direktori, jaringan, layanan, dan isolasi produksi" {
+  aktifkan_hosting
+  rm -rf "$S/etc/prod" "$PALSU/jaringan-prod" "$PALSU/wadah/wpmgr-prod-db" "$PALSU/wadah/wpmgr-prod-db.hosting" \
+    "$PALSU/wadah/wpmgr-prod-router" "$PALSU/wadah/wpmgr-prod-router.hosting"
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\n' "$D64" "$D64" >> "$S/etc/digest.lock"
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"hosting siap"* ]]
+  [ "$(stat -c %a "$S/etc/prod")" = 700 ]
+  [ "$(stat -c %a "$S/etc/prod/situs")" = 700 ]
+  [ "$(stat -c %a "$S/etc/prod/db")" = 700 ]
+  [ "$(stat -c %a "$S/hcerts")" = 700 ]
+  [ "$(stat -c %a "$S/backup")" = 700 ]
+  [ "$(stat -c %a "$S/etc/prod/nginx.lock")" = 600 ]
+  [[ "$(cat "$S/etc/prod/db-root")" =~ ^[0-9a-f]{64}$ ]]
+  [ "$(stat -c %a "$S/etc/prod/db-root")" = 600 ]
+  for baris in 'upload_max_filesize = 64M' 'post_max_size = 64M' 'memory_limit = 256M' \
+               'max_execution_time = 120' 'expose_php = Off'; do
+    grep -qxF "$baris" "$S/etc/prod/php.ini"
+  done
+  [ "$(stat -c %a "$S/etc/prod/php.ini")" = 644 ]
+  grep -qF 'return 444;' "$S/etc/prod/router/conf.d/00-bawaan.conf"
+  [ -d "$S/hosting/router" ]
+  grep -qxF "[network][create][--driver][bridge][--subnet][172.31.251.0/24][--opt][com.docker.network.bridge.name=br-wpmgrprod][--label][wpmgr.hosting=layanan:jaringan][wpmgr-prod]" "$PALSU/docker.log"
+  grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-prod-db\]\[--label\]\[wpmgr.hosting=layanan:db\]\[--network\]\[wpmgr-prod\]\[--ip\]\[172.31.251.252\]\[--restart\]\[unless-stopped\]\[--memory\]\[768m\]\[--env-file\]\[[^]]*\]\[-v\]\[wpmgr-prod-db:/var/lib/mysql\]\[m@sha256:b\{64\}\]\[--innodb-buffer-pool-size=256M\]\[--max-allowed-packet=64M\]\[--local-infile=0\]$' "$PALSU/docker.log"
+  grep -qxF "[run][-d][--name][wpmgr-prod-router][--label][wpmgr.hosting=layanan:router][--network][wpmgr-prod][--ip][172.31.251.254][--restart][unless-stopped][--memory][128m][-p][127.0.0.1:8091:80][-v][$S/etc/prod/router/conf.d:/etc/nginx/conf.d:ro][-v][$S/etc/prod/router/htpasswd:/etc/nginx/wpmgr-htpasswd:ro][n@sha256:$D64]" "$PALSU/docker.log"
+  ! grep -q 'MARIADB_ROOT_PASSWORD=\|wpmgr-stg-' "$PALSU/docker.log" || false
+  masuk='[-A][WPMGR-PROD-MASUK][-m][conntrack][--ctstate][ESTABLISHED,RELATED][-j][ACCEPT]
+[-A][WPMGR-PROD-MASUK][-d][169.58.91.181][-p][tcp][-m][multiport][--dports][80,443][-j][ACCEPT]
+[-A][WPMGR-PROD-MASUK][-j][DROP]'
+  [ "$(grep '^\[-A\]\[WPMGR-PROD-MASUK\]' "$PALSU/iptables.log")" = "$masuk" ]
+  antar='[-A][WPMGR-PROD-ANTAR][-m][conntrack][--ctstate][ESTABLISHED,RELATED][-j][ACCEPT]
+[-A][WPMGR-PROD-ANTAR][-s][172.31.251.254][-p][tcp][--dport][80][-j][ACCEPT]
+[-A][WPMGR-PROD-ANTAR][-d][172.31.251.252][-p][tcp][--dport][3306][-j][ACCEPT]
+[-A][WPMGR-PROD-ANTAR][-j][DROP]'
+  [ "$(grep '^\[-A\]\[WPMGR-PROD-ANTAR\]' "$PALSU/iptables.log")" = "$antar" ]
+  grep -qxF "[-I][DOCKER-USER][-i][br-wpmgrprod][!][-o][br-wpmgrprod][-d][172.16.0.0/12][-j][DROP]" "$PALSU/iptables.log"
+  grep -qxF "[-I][DOCKER-USER][-i][br-wpmgrprod][-o][br-wpmgrprod][-j][WPMGR-PROD-ANTAR]" "$PALSU/iptables.log"
+  # Lompatan INPUT dipasang sesudah rantainya terisi penuh (-F lalu -A).
+  [ "$(grep -n '^\[-I\]\[INPUT\]\[-i\]\[br-wpmgrprod\]\[-j\]\[WPMGR-PROD-MASUK\]$' "$PALSU/iptables.log" | cut -d: -f1)" \
+    -gt "$(grep -n '^\[-A\]\[WPMGR-PROD-MASUK\]\[-j\]\[DROP\]$' "$PALSU/iptables.log" | cut -d: -f1)" ]
+  [ "$(grep -n '^\[-F\]\[WPMGR-PROD-MASUK\]$' "$PALSU/iptables.log" | cut -d: -f1)" \
+    -lt "$(grep -n '^\[-A\]\[WPMGR-PROD-MASUK\]' "$PALSU/iptables.log" | head -1 | cut -d: -f1)" ]
+  ! grep -q 'br-wpmgrstg\|WPMGR-STG' "$PALSU/iptables.log" || false
+}
+
+@test "prod-siapkan idempoten: layanan yang sesuai hanya dijalankan ulang, sandi root tidak ditimpa" {
+  aktifkan_hosting
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\n' "$D64" "$D64" >> "$S/etc/digest.lock"
+  printf '172.31.251.252' > "$PALSU/wadah/wpmgr-prod-db.ip"
+  printf '172.31.251.254' > "$PALSU/wadah/wpmgr-prod-router.ip"
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 0 ]
+  grep -qxF "[start][wpmgr-prod-db]" "$PALSU/docker.log"
+  grep -qxF "[start][wpmgr-prod-router]" "$PALSU/docker.log"
+  ! grep -q '^\[run\]\|^\[rm\]\|^\[network\]\[create\]' "$PALSU/docker.log" || false
+  [ "$(cat "$S/etc/prod/db-root")" = prodrahasia ]
+}
+
+@test "prod-siapkan menolak HOSTING_DIR yang bukan milik user dashboard atau berupa symlink" {
+  aktifkan_hosting
+  chown 0:0 "$S/hosting"
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 7 ]
+  rm -rf "$S/hosting"
+  mkdir -p "$S/lain"
+  chown 1000:1000 "$S/lain"
+  ln -s "$S/lain" "$S/hosting"
+  run "$SKRIP" prod-siapkan
+  [ "$status" -eq 7 ]
+  [ -z "$(docker_log)" ]
+}
+
+@test "prod-status mencetak JSON memori, disk hosting, disk backup, dan container produksi saja" {
+  aktifkan_hosting
+  printf 'wpp-toko|running\nwpp-lain|exited\nwpmgr-prod-db|running\nwpp-JAHAT|running\n' > "$PALSU/ps-hosting"
+  printf 'wp-staging|running\n' > "$PALSU/ps"
+  run "$SKRIP" prod-status
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"mem_tersedia":4294967296,"disk_total":200000000000,"disk_bebas":60000000000,"backup_total":200000000000,"backup_bebas":60000000000,"container":{"toko":{"berjalan":true},"lain":{"berjalan":false}}}' ]
+  grep -qxF "[ps][-a][--filter][label=wpmgr.hosting][--format][{{.Names}}|{{.State}}]" "$PALSU/docker.log"
+}
+
+@test "subperintah staging menolak container yang hanya berlabel wpmgr.hosting" {
+  wadah_prod wp-toko situs:toko
+  run "$SKRIP" jalan toko
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"bukan milik staging"* ]]
+  run "$SKRIP" hapus toko
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[start\]\|^\[rm\]' "$PALSU/docker.log" || false
+}
+
+@test "siapkan staging menerima balasan koneksi host di atas DROP INPUT (Koreksi #4)" {
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  printf 'mariadb=m@sha256:%s\nnginx=n@sha256:%s\nmailpit=p@sha256:%s\n' "$D64" "$D64" "$D64" >> "$S/etc/digest.lock"
+  rm -f "$S/etc/wp-cli.phar"
+  run "$SKRIP" siapkan
+  [ "$status" -eq 0 ]
+  drop="$(grep -n '^\[-I\]\[INPUT\]\[-i\]\[br-wpmgrstg\]\[-j\]\[DROP\]$' "$PALSU/iptables.log" | cut -d: -f1)"
+  terima="$(grep -n '^\[-I\]\[INPUT\]\[-i\]\[br-wpmgrstg\]\[-m\]\[conntrack\]\[--ctstate\]\[ESTABLISHED,RELATED\]\[-j\]\[ACCEPT\]$' "$PALSU/iptables.log" | cut -d: -f1)"
+  # -I memasang di posisi teratas: yang dipasang belakangan berada di atas.
+  [ "$terima" -gt "$drop" ]
+  grep -qxF "[-D][INPUT][-i][br-wpmgrstg][-m][conntrack][--ctstate][ESTABLISHED,RELATED][-j][ACCEPT]" "$PALSU/iptables.log"
+}
