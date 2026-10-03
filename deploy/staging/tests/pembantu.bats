@@ -1334,3 +1334,274 @@ COMMIT'
   run "$SKRIP" status
   [ "$status" -eq 0 ]
 }
+
+HTPASSWD='pratinjau:$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ01234'
+
+# State root situs produksi seperti ditulis prod-buat (+ prefix dari prod-db-buat).
+tulis_state_prod() {
+  printf 'SITE_ID=%s\nDOMAIN=%s\nWWW=1\nPREFIX=wp_\nPHP=8.1\nMODE=%s\n' "${4:-$ID}" "${3:-$DOM}" "$2" \
+    > "$S/etc/prod/situs/$1"
+  chmod 0600 "$S/etc/prod/situs/$1"
+}
+
+# Direktori situs produksi milik user dashboard (UID 1000), seperti dibuat prod-buat.
+buat_situs_prod() {
+  mkdir -p "$S/hosting/$ID/files" "$S/hosting/$ID/log"
+  chown 1000:1000 "$S/hosting/$ID" "$S/hosting/$ID/files" "$S/hosting/$ID/log"
+}
+
+# Jawaban `docker inspect .Mounts` untuk wpp-toko: mount buatan prod-buat bagi site $1.
+mounts_prod() {
+  printf '%s|/var/www/html\n%s|/wpmgr-log\n%s|/usr/local/etc/php/conf.d/zz-wpmgr.ini\n' \
+    "$S/hosting/$1/files" "$S/hosting/$1/log" "$S/etc/prod/php.ini" > "$PALSU/wadah/wpp-toko.mounts"
+}
+
+@test "prod-buat menolak argumen tidak sah sebelum docker dipanggil" {
+  aktifkan_hosting
+  l63="$(printf 'a%.0s' $(seq 1 63))"
+  for domain in "www.$DOM" "Toko.co.id" "$DOM." "toko..co.id" "a.staging.contoh.id" "staging.contoh.id" \
+                "$(printf 'toko.co.id\nx.id')" "-toko.co.id" "toko.c" "$l63.$l63.$l63.$l63.id" "toko_x.co.id"; do
+    run "$SKRIP" prod-buat toko 8.1 "$ID" "$domain" 1
+    [ "$status" -eq 2 ]
+  done
+  run "$SKRIP" prod-buat "$(printf 'a%.0s' $(seq 1 37))" 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-buat Toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-buat toko 9.9 "$ID" "$DOM" 1
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-buat toko 8.1 "../$ID" "$DOM" 1
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 2
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM"
+  [ "$status" -eq 2 ]
+  [[ "$output" != *"subperintah tidak dikenal"* ]]
+  [ -z "$(docker_log)" ]
+  [ -z "$(ls -A "$S/etc/prod/situs")" ]
+}
+
+@test "prod-buat menjalankan wpp-<nama> dengan batas dan mount produksi lalu menulis state" {
+  aktifkan_hosting
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 0 ]
+  diharapkan="[run][-d][--name][wpp-toko][--label][wpmgr.hosting=situs:toko][--network][wpmgr-prod][--restart][unless-stopped][--memory][512m][--memory-swap][512m][--cpus][1][--pids-limit][256][--user][1000:1000][--cap-drop][ALL][--sysctl][net.ipv4.ip_unprivileged_port_start=0][--security-opt][no-new-privileges][--mount][type=bind,src=$S/hosting/$ID/files,dst=/var/www/html][--mount][type=bind,src=$S/hosting/$ID/log,dst=/wpmgr-log][--mount][type=bind,src=$S/etc/prod/php.ini,dst=/usr/local/etc/php/conf.d/zz-wpmgr.ini,readonly][wordpress@sha256:$D64]"
+  grep -qxF "$diharapkan" "$PALSU/docker.log"
+  ! grep -q 'wpmgr-ekspor\|/usr/local/bin/wp\|wpmgr.staging=' "$PALSU/docker.log" || false
+  [ "$(cat "$S/etc/prod/situs/toko")" = "$(printf 'SITE_ID=%s\nDOMAIN=%s\nWWW=1\nPREFIX=\nPHP=8.1\nMODE=pratinjau' "$ID" "$DOM")" ]
+  [ "$(stat -c %a "$S/etc/prod/situs/toko")" = 600 ]
+  [ "$(stat -c %u "$S/hosting/$ID/files")" = 1000 ]
+  grep -q "^\[--reuid=1000\]\[--regid=1000\]\[--clear-groups\]\[--\]\[mkdir\]\[-p\]\[$S/hosting/$ID/files\]\[$S/hosting/$ID/log\]$" "$PALSU/setpriv.log"
+}
+
+@test "prod-buat menolak domain milik state lain dan state milik site atau domain lain" {
+  aktifkan_hosting
+  LAIN=11111111-2222-3333-4444-555555555555
+  tulis_state_prod lain pratinjau "$DOM" "$LAIN"
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 3 ]
+  rm -f "$S/etc/prod/situs/lain"
+  tulis_state_prod toko pratinjau "$DOM" "$LAIN"
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 3 ]
+  tulis_state_prod toko pratinjau lain.co.id
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[run\]\|^\[rm\]' "$PALSU/docker.log" || false
+}
+
+@test "prod-buat menolak container bernama sama yang bukan milik hosting" {
+  aktifkan_hosting
+  printf 'situs:toko' > "$PALSU/wadah/wpp-toko"
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"bukan milik hosting"* ]]
+  ! grep -q '^\[run\]\|^\[rm\]\|^\[start\]' "$PALSU/docker.log" || false
+}
+
+@test "prod-buat pada MODE=aktif hanya menjalankan container yang ada dan tidak pernah membuat ulang" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko aktif
+  wadah_prod wpp-toko situs:toko
+  printf 'wordpress@sha256:lama' > "$PALSU/wadah/wpp-toko.image"
+  printf '1000:1000' > "$PALSU/wadah/wpp-toko.user"
+  mounts_prod "$ID"
+  run "$SKRIP" prod-buat toko 8.2 "$ID" "$DOM" 0
+  [ "$status" -eq 0 ]
+  grep -qxF "[start][wpp-toko]" "$PALSU/docker.log"
+  ! grep -q '^\[run\]\|^\[rm\]' "$PALSU/docker.log" || false
+  grep -qxF 'MODE=aktif' "$S/etc/prod/situs/toko"
+  grep -qxF 'PHP=8.1' "$S/etc/prod/situs/toko"
+  rm -f "$PALSU/wadah/wpp-toko" "$PALSU/wadah/wpp-toko.hosting"
+  : > "$PALSU/docker.log"
+  run "$SKRIP" prod-buat toko 8.1 "$ID" "$DOM" 1
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[run\]' "$PALSU/docker.log" || false
+}
+
+@test "prod-jalan memeriksa sumber mount sebelum start" {
+  aktifkan_hosting
+  buat_situs_prod
+  wadah_prod wpp-toko situs:toko
+  mounts_prod "$ID"
+  run "$SKRIP" prod-jalan toko
+  [ "$status" -eq 0 ]
+  grep -qxF "[start][wpp-toko]" "$PALSU/docker.log"
+  : > "$PALSU/docker.log"
+  # Mount asing.
+  printf '/etc|/host-etc\n' >> "$PALSU/wadah/wpp-toko.mounts"
+  run "$SKRIP" prod-jalan toko
+  [ "$status" -eq 3 ]
+  # Bentuk mount staging (ekspor + wp-cli) bukan buatan prod-buat.
+  printf '%s|/var/www/html\n%s|/wpmgr-log\n%s|/wpmgr-ekspor\n%s|/usr/local/etc/php/conf.d/zz-wpmgr.ini\n' \
+    "$S/hosting/$ID/files" "$S/hosting/$ID/log" "$S/hosting/$ID/ekspor" "$S/etc/prod/php.ini" > "$PALSU/wadah/wpp-toko.mounts"
+  run "$SKRIP" prod-jalan toko
+  [ "$status" -eq 3 ]
+  # files/ berupa symlink.
+  mounts_prod "$ID"
+  mkdir -p "$S/lain"
+  chown 1000:1000 "$S/lain"
+  rmdir "$S/hosting/$ID/files"
+  ln -s "$S/lain" "$S/hosting/$ID/files"
+  run "$SKRIP" prod-jalan toko
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[start\]' "$PALSU/docker.log" || false
+  # Container milik staging dengan nama yang sama.
+  printf 'situs:toko' > "$PALSU/wadah/wpp-toko"
+  rm -f "$PALSU/wadah/wpp-toko.hosting"
+  run "$SKRIP" prod-jalan toko
+  [ "$status" -eq 3 ]
+}
+
+@test "prod-db-buat menulis wp-config pratinjau sebagai user dashboard dengan hak DB terbatas" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko-a pratinjau
+  run "$SKRIP" prod-db-buat toko-a wpx_
+  [ "$status" -eq 0 ]
+  cfg="$S/hosting/$ID/files/wp-config.php"
+  grep -qF "define( 'DB_NAME', 'prd_toko_a' );" "$cfg"
+  grep -qF "define( 'DB_USER', 'prd_toko_a' );" "$cfg"
+  grep -qF "define( 'DB_HOST', 'wpmgr-prod-db' );" "$cfg"
+  grep -qF "\$table_prefix = 'wpx_';" "$cfg"
+  grep -qF "define( 'WPMGR_PRATINJAU', true );" "$cfg"
+  grep -qF "define( 'WPMGR_PRATINJAU_HOST', 'vps-toko-a.staging.contoh.id' );" "$cfg"
+  grep -qF "define( 'WPMGR_DOMAIN', 'toko.co.id' );" "$cfg"
+  grep -qF "define( 'DISABLE_WP_CRON', true );" "$cfg"
+  grep -qF "define( 'AUTOMATIC_UPDATER_DISABLED', true );" "$cfg"
+  grep -qF "if ( isset( \$_SERVER['HTTP_HOST'] ) && WPMGR_PRATINJAU_HOST === \$_SERVER['HTTP_HOST'] ) {" "$cfg"
+  grep -qxF "    define( 'WP_HOME', 'https://' . WPMGR_PRATINJAU_HOST );" "$cfg"
+  grep -qF "'/wpmgr-log/php-error.log'" "$cfg"
+  grep -qF "\$_SERVER['HTTPS'] = 'on';" "$cfg"
+  # Tanpa WP_HOME tetap: nilai home/siteurl dari database (hosting lama) yang berlaku.
+  ! grep -q "^define( 'WP_HOME'\|WPMGR_STAGING\|WPMGR_DISABLE_MONITORING" "$cfg" || false
+  grep -q "^\[--reuid=1000\]\[--regid=1000\]\[--clear-groups\]\[--\]\[mv\]\[-fT\]\[--\]\[$S/hosting/$ID/files/.wp-config.[A-Za-z0-9]*\]\[$cfg\]$" "$PALSU/setpriv.log"
+  [[ "$(cat "$PALSU/stdin-1")" == *"password=prodrahasia"* ]]
+  sql="$(cat "$PALSU/stdin-2")"
+  [[ "$sql" == *"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, LOCK TABLES, CREATE TEMPORARY TABLES, REFERENCES, CREATE VIEW, SHOW VIEW ON \`prd_toko_a\`.*"* ]]
+  [[ "$sql" != *TRIGGER* && "$sql" != *EVENT* && "$sql" != *ROUTINE* && "$sql" != *FILE* && "$sql" != *"GRANT ALL"* ]]
+  grep -q '^\[exec\]\[-i\]\[wpmgr-prod-db\]\[mariadb\]' "$PALSU/docker.log"
+  ! grep -q 'wpmgr-stg-db' "$PALSU/docker.log" || false
+  pw="$(cat "$S/etc/prod/db/toko-a")"
+  [[ "$pw" =~ ^[0-9a-f]{48}$ ]]
+  [ "$(stat -c %a "$S/etc/prod/db/toko-a")" = 600 ]
+  grep -qF "define( 'DB_PASSWORD', '$pw' );" "$cfg"
+  grep -qxF 'PREFIX=wpx_' "$S/etc/prod/situs/toko-a"
+  run "$SKRIP" prod-db-buat toko-a "wp_'; x"
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-db-buat belum wp_
+  [ "$status" -eq 3 ]
+}
+
+@test "prod-db-buat tidak mengikuti symlink wp-config.php" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  printf 'JANGAN-DISENTUH' > "$S/target-luar"
+  ln -s "$S/target-luar" "$S/hosting/$ID/files/wp-config.php"
+  run "$SKRIP" prod-db-buat toko wp_
+  [ "$status" -eq 0 ]
+  [ "$(cat "$S/target-luar")" = "JANGAN-DISENTUH" ]
+  [ ! -L "$S/hosting/$ID/files/wp-config.php" ]
+  grep -qF "define( 'DB_NAME', 'prd_toko' );" "$S/hosting/$ID/files/wp-config.php"
+}
+
+@test "prod-db-impor menolak MODE=aktif" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko aktif
+  printf 'sandi-situs' > "$S/etc/prod/db/toko"
+  run bash -c "printf 'DROP DATABASE prd_toko;' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 3 ]
+  run "$SKRIP" prod-db-buat toko wp_
+  [ "$status" -eq 3 ]
+  ! grep -q '^\[exec\]' "$PALSU/docker.log" || false
+  [ ! -e "$S/hosting/$ID/files/wp-config.php" ]
+}
+
+@test "prod-db-impor membuat ulang database sebagai root produksi lalu mengimpor sebagai user situs" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  run bash -c "printf 'SELECT 1;' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 3 ]
+  printf 'sandi-situs' > "$S/etc/prod/db/toko"
+  run bash -c "printf 'INSERT INTO t VALUES (1);' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$PALSU/stdin-1")" == *"password=prodrahasia"* ]]
+  [[ "$(cat "$PALSU/stdin-2")" == *'SET GLOBAL local_infile=0; DROP DATABASE IF EXISTS `prd_toko`; CREATE DATABASE `prd_toko`'* ]]
+  [[ "$(cat "$PALSU/stdin-3")" == *"user=prd_toko"* && "$(cat "$PALSU/stdin-3")" == *"password=sandi-situs"* ]]
+  [ "$(cat "$PALSU/stdin-4")" = "INSERT INTO t VALUES (1);" ]
+  grep -q '^\[exec\]\[-i\]\[wpmgr-prod-db\]\[mariadb\]\[--defaults-extra-file=/run/wpmgr-klien-[0-9-]*\.cnf\]\[--binary-mode\]\[--local-infile=0\]\[--max-allowed-packet=64M\]\[prd_toko\]$' "$PALSU/docker.log"
+  ! grep -q 'sandi-situs\|prodrahasia' "$PALSU/docker.log" || false
+  # Berkas opsi klien dihapus dari container produksi, bukan staging.
+  grep -q '^\[exec\]\[wpmgr-prod-db\]\[rm\]\[-f\]\[/run/wpmgr-klien-' "$PALSU/docker.log"
+}
+
+@test "prod-router-muat merender pratinjau dengan Basic Auth dan aktif tanpa pengaman" {
+  aktifkan_hosting
+  tulis_state_prod toko pratinjau
+  printf 'SITE_ID=%s\nDOMAIN=lain.id\nWWW=0\nPREFIX=wp_\nPHP=8.1\nMODE=aktif\n' \
+    11111111-2222-3333-4444-555555555555 > "$S/etc/prod/situs/lain"
+  # Situs pratinjau yang htpasswd-nya belum ditulis dashboard dilewati.
+  printf 'SITE_ID=%s\nDOMAIN=baru.id\nWWW=0\nPREFIX=\nPHP=8.1\nMODE=pratinjau\n' \
+    22222222-3333-4444-5555-666666666666 > "$S/etc/prod/situs/baru"
+  printf '%s\n' "$HTPASSWD" > "$S/hosting/router/toko.htpasswd"
+  run "$SKRIP" prod-router-muat
+  [ "$status" -eq 0 ]
+  c="$S/etc/prod/router/conf.d/prd-toko.conf"
+  grep -qxF "    server_name toko.co.id www.toko.co.id vps-toko.staging.contoh.id;" "$c"
+  grep -qxF '    auth_basic "Pratinjau toko";' "$c"
+  grep -qxF "    auth_basic_user_file /etc/nginx/wpmgr-htpasswd/toko;" "$c"
+  grep -qxF '    add_header X-Robots-Tag "noindex, nofollow" always;' "$c"
+  grep -qxF '        set $wpmgr_hulu wpp-toko;' "$c"
+  grep -qxF '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' "$c"
+  grep -qxF '    absolute_redirect off;' "$c"
+  l="$S/etc/prod/router/conf.d/prd-lain.conf"
+  grep -qxF "    server_name lain.id;" "$l"
+  ! grep -q 'auth_basic\|X-Robots-Tag\|vps-' "$l" || false
+  [ ! -e "$S/etc/prod/router/conf.d/prd-baru.conf" ]
+  [ "$(cat "$S/etc/prod/router/htpasswd/toko")" = "$HTPASSWD" ]
+  [ ! -e "$S/etc/prod/router/htpasswd/lain" ]
+  grep -qxF "[exec][wpmgr-prod-router][nginx][-t]" "$PALSU/docker.log"
+  grep -qxF "[exec][wpmgr-prod-router][nginx][-s][reload]" "$PALSU/docker.log"
+  ! grep -q 'wpmgr-stg-router' "$PALSU/docker.log" || false
+}
+
+@test "prod-router-muat menolak htpasswd berbahaya dan memulihkan konfigurasi lama bila nginx -t gagal" {
+  aktifkan_hosting
+  tulis_state_prod toko pratinjau
+  printf 'lama' > "$S/etc/prod/router/conf.d/prd-lama.conf"
+  printf 'pratinjau:bukan-bcrypt\n' > "$S/hosting/router/toko.htpasswd"
+  run "$SKRIP" prod-router-muat
+  [ "$status" -eq 2 ]
+  [ "$(cat "$S/etc/prod/router/conf.d/prd-lama.conf")" = "lama" ]
+  printf '%s\n' "$HTPASSWD" > "$S/hosting/router/toko.htpasswd"
+  touch "$PALSU/nginx-gagal"
+  run "$SKRIP" prod-router-muat
+  [ "$status" -eq 4 ]
+  [ "$(cat "$S/etc/prod/router/conf.d/prd-lama.conf")" = "lama" ]
+  [ ! -e "$S/etc/prod/router/conf.d/prd-toko.conf" ]
+  ! grep -q 'reload' "$PALSU/docker.log" || false
+}

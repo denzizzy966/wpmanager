@@ -57,6 +57,10 @@ WAKTU_SERTIFIKAT=360   # TIMEOUT_SERTIFIKAT 300 + 60
 TENGGAT=$(( SECONDS + WAKTU_BAWAAN ))
 
 ROUTER_CADANGAN=""
+# Router yang sedang dipasang ulang: KONF_DIR/router + awalan stg- (staging)
+# atau KONF_DIR/prod/router + awalan prd- (produksi).
+ROUTER_TUJUAN=""
+ROUTER_AWALAN="stg-"
 # Penanda "baris GALAT sudah dicetak". Berupa berkas, bukan variabel, karena
 # galat bisa terjadi di subshell substitusi perintah; tanpa penanda ini
 # jebakan ERR di induknya akan mencetak GALAT kedua dan menimpa kodenya.
@@ -97,8 +101,8 @@ trap galat_tak_terduga ERR
 # Mengembalikan konfigurasi router lama; dipanggil dari jebakan EXIT selama
 # ROUTER_CADANGAN terisi, sebelum direktori sementara (cadangannya) dihapus.
 pulihkan_router() {
-  local tujuan="$KONF_DIR/router"
-  rm -f "$tujuan/conf.d/"stg-*.conf "$tujuan/htpasswd/"* 2>/dev/null || true
+  local tujuan="${ROUTER_TUJUAN:-$KONF_DIR/router}"
+  rm -f "$tujuan/conf.d/${ROUTER_AWALAN}"*.conf "$tujuan/htpasswd/"* 2>/dev/null || true
   cp -a "$ROUTER_CADANGAN/conf.d/." "$tujuan/conf.d/" 2>/dev/null || true
   cp -a "$ROUTER_CADANGAN/htpasswd/." "$tujuan/htpasswd/" 2>/dev/null || true
   ROUTER_CADANGAN=""
@@ -1442,6 +1446,377 @@ cmd_prod_status() {
     "$mem" "$total" "$bebas" "$b_total" "$b_bebas" "$wadah"
 }
 
+# ---- state situs produksi ---------------------------------------------------
+# KONF_PROD/situs/<nama>: satu-satunya catatan root tentang situs produksi.
+# Ditulis hanya skrip ini (0600 root) dan dibaca dengan parser ketat:
+# dashboard tidak bisa mengubah SITE_ID, DOMAIN, atau MODE situs mana pun.
+
+POLA_ID='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+POLA_DOMAIN_PROD='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$'
+
+# 0 = state ada dan sah (S_* terisi); 1 = tidak ada; galat bila rusak.
+muat_state() {
+  local berkas="$KONF_PROD/situs/$1" baris
+  S_SITE_ID="" S_DOMAIN="" S_WWW="" S_PREFIX="" S_PHP="" S_MODE=""
+  [[ -e "$berkas" || -L "$berkas" ]] || return 1
+  [[ -f "$berkas" && ! -L "$berkas" ]] || galat konfigurasi "state situs rusak"
+  while IFS= read -r baris || [[ -n "$baris" ]]; do
+    [[ "$baris" =~ ^(SITE_ID|DOMAIN|WWW|PREFIX|PHP|MODE)=(.*)$ ]] || galat konfigurasi "state situs rusak"
+    printf -v "S_${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
+  done < "$berkas"
+  [[ "$S_SITE_ID" =~ $POLA_ID && "$S_DOMAIN" =~ $POLA_DOMAIN_PROD && "$S_WWW" =~ ^[01]$ \
+     && "$S_MODE" =~ ^(pratinjau|aktif)$ ]] || galat konfigurasi "state situs rusak"
+  [[ -z "$S_PREFIX" || "$S_PREFIX" =~ ^[A-Za-z0-9_]{1,20}$ ]] || galat konfigurasi "state situs rusak"
+  [[ -z "$S_PHP" || " ${VERSI_PHP[*]} " == *" $S_PHP "* ]] || galat konfigurasi "state situs rusak"
+  return 0
+}
+
+tulis_state() {
+  local sementara
+  install -d -m 0700 "$KONF_PROD/situs"
+  sementara="$(mktemp "$KONF_PROD/situs/.$1.XXXXXX")"
+  SEMENTARA+=("$sementara")
+  printf 'SITE_ID=%s\nDOMAIN=%s\nWWW=%s\nPREFIX=%s\nPHP=%s\nMODE=%s\n' \
+    "$S_SITE_ID" "$S_DOMAIN" "$S_WWW" "$S_PREFIX" "$S_PHP" "$S_MODE" > "$sementara"
+  chmod 0600 "$sementara"
+  mv -fT "$sementara" "$KONF_PROD/situs/$1"
+}
+
+# 0 bila domain $1 sudah tercatat di state situs selain $2.
+domain_dipakai_lain() {
+  local f
+  shopt -s nullglob
+  for f in "$KONF_PROD"/situs/*; do
+    [[ "${f##*/}" == "$2" ]] && continue
+    grep -qxF "DOMAIN=$1" "$f" && return 0
+  done
+  return 1
+}
+
+nama_db_prod() { printf 'prd_%s' "${1//-/_}"; }
+
+pastikan_siap_prod() {
+  dk network inspect "$JARINGAN_PROD" >/dev/null 2>&1 || galat ditolak "jalankan 'wpmgr-staging prod-siapkan' dulu"
+  [[ -s "$KONF_PROD/php.ini" ]] || galat ditolak "jalankan 'wpmgr-staging prod-siapkan' dulu"
+}
+
+# ---- container per situs produksi ------------------------------------------
+
+# Sumber bind mount wpp-<nama> harus persis files/ dan log/ milik SATU
+# HOSTING_DIR/<site_id> ditambah php.ini root read-only (pola cek_mount_wadah
+# staging, putusan R13). Mode `struktur` mengisi MOUNT_ID; `penuh` juga
+# memeriksa setiap sumber.
+cek_mount_wadah_prod() {
+  local wadah="$1" mode="$2" daftar sumber tujuan lokal sub s id="" terlihat=" " p ini=""
+  local pengguna=()
+  daftar="$(dk inspect --type container --format '{{range .Mounts}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' "$wadah")" \
+    || galat docker "container tidak terbaca"
+  while IFS='|' read -r sumber tujuan; do
+    [[ -z "$sumber" && -z "$tujuan" ]] && continue
+    [[ "$sumber" =~ $POLA_JALUR && "$sumber" != *..* ]] || galat ditolak "sumber mount container tidak sah"
+    lokal="$(jalur_lokal "$sumber")"
+    case "$tujuan" in
+      /var/www/html) sub=files ;;
+      /wpmgr-log) sub=log ;;
+      /usr/local/etc/php/conf.d/zz-wpmgr.ini)
+        [[ "$lokal" == "$KONF_PROD/php.ini" && -z "$ini" ]] || galat ditolak "sumber mount container tidak sah"
+        ini="$lokal"
+        continue ;;
+      *) galat ditolak "container memuat mount yang tidak dikenal" ;;
+    esac
+    [[ "$terlihat" != *" $sub "* ]] || galat ditolak "sumber mount container tidak sah"
+    terlihat+="$sub "
+    [[ "$lokal" == "$HOSTING_DIR"/*/"$sub" ]] || galat ditolak "sumber mount container tidak sah"
+    s="${lokal#"$HOSTING_DIR"/}"
+    s="${s%/"$sub"}"
+    [[ "$s" =~ $POLA_ID ]] || galat ditolak "sumber mount container tidak sah"
+    [[ -z "$id" || "$id" == "$s" ]] || galat ditolak "sumber mount container tidak sah"
+    id="$s"
+    pengguna+=("$lokal")
+  done <<< "$daftar"
+  [[ "$terlihat" == *" files "* && "$terlihat" == *" log "* && -n "$ini" ]] \
+    || galat ditolak "sumber mount container tidak lengkap"
+  MOUNT_ID="$id"
+  if [[ "$mode" == penuh ]]; then
+    for p in "${pengguna[@]}"; do
+      cek_mount_pengguna "$p" "$HOSTING_DIR"
+    done
+    cek_mount_root "$ini" f "$KONF_DIR"
+  fi
+}
+
+cmd_prod_buat() {
+  cek_nama_prod "${1-}"
+  cek_versi "${2-}"
+  cek_id "${3-}"
+  cek_domain "${4-}"
+  cek_www "${5-}"
+  butuh_hosting
+  local nama="$1" versi="$2" wadah="wpp-$1" situs img sekarang pemakai d m_files m_log m_ini
+  pastikan_siap_prod
+  if muat_state "$nama"; then
+    [[ "$S_SITE_ID" == "$3" && "$S_DOMAIN" == "$4" ]] \
+      || galat ditolak "nama situs ini sudah dipakai site atau domain lain"
+    if [[ "$S_MODE" == pratinjau && ( "$S_WWW" != "$5" || "$S_PHP" != "$versi" ) ]]; then
+      S_WWW="$5"
+      S_PHP="$versi"
+      tulis_state "$nama"
+    fi
+  else
+    ! domain_dipakai_lain "$4" "$nama" || galat ditolak "domain sudah dipakai situs lain"
+    S_SITE_ID="$3" S_DOMAIN="$4" S_WWW="$5" S_PREFIX="" S_PHP="$versi" S_MODE=pratinjau
+    tulis_state "$nama"
+  fi
+  # Situs aktif tetap memakai versi PHP saat diaktifkan; mengganti image
+  # berarti membuat ulang container produksi, dan itu langkah manual.
+  [[ "$S_MODE" == pratinjau ]] || versi="$S_PHP"
+  situs="$HOSTING_DIR/$S_SITE_ID"
+  img="$(image "php${versi/./}" "wordpress:php${versi}-apache")"
+  sbg_pengguna mkdir -p "$situs/files" "$situs/log" 2>/dev/null \
+    || galat ditolak "direktori situs tidak dapat disiapkan"
+  for d in files log; do
+    cek_mount_pengguna "$situs/$d" "$HOSTING_DIR"
+  done
+  cek_mount_root "$KONF_PROD/php.ini" f "$KONF_DIR"
+  m_files="$(jalur_daemon "$situs/files")"
+  m_log="$(jalur_daemon "$situs/log")"
+  m_ini="$(jalur_daemon "$KONF_PROD/php.ini")"
+  if pastikan_milik "$wadah" "situs:$nama" wpmgr.hosting; then
+    cek_mount_wadah_prod "$wadah" struktur
+    if [[ "$S_MODE" == aktif ]]; then
+      # Situs yang sudah dilayani VPS tidak pernah dibuat ulang lewat dashboard.
+      [[ "$MOUNT_ID" == "$S_SITE_ID" ]] || galat ditolak "container situs aktif tidak cocok dengan state"
+      cek_mount_wadah_prod "$wadah" penuh
+      dk start "$wadah" >/dev/null || galat docker "container situs tidak dapat dijalankan"
+      return 0
+    fi
+    sekarang="$(dk inspect --type container --format '{{ .Config.Image }}' "$wadah")" \
+      || galat docker "container tidak terbaca"
+    pemakai="$(dk inspect --type container --format '{{ .Config.User }}' "$wadah")" \
+      || galat docker "container tidak terbaca"
+    if [[ "$sekarang" == "$img" && "$pemakai" == "$UID_W:$GID_W" && "$MOUNT_ID" == "$S_SITE_ID" ]]; then
+      cek_mount_wadah_prod "$wadah" penuh
+      dk start "$wadah" >/dev/null || galat docker "container situs tidak dapat dijalankan"
+      return 0
+    fi
+    dk rm -f "$wadah" >/dev/null || galat docker "container lama tidak dapat dihapus"
+  elif [[ "$S_MODE" == aktif ]]; then
+    galat ditolak "situs aktif tanpa container; pulihkan manual (README)"
+  fi
+  # Opsi keamanan sama dengan staging (putusan R13): UID dashboard tanpa
+  # capability, --mount (sumber hilang = galat), batas memori produksi.
+  dk run -d --name "$wadah" --label "wpmgr.hosting=situs:$nama" --network "$JARINGAN_PROD" \
+    --restart unless-stopped --memory 512m --memory-swap 512m --cpus 1 --pids-limit 256 \
+    --user "$UID_W:$GID_W" --cap-drop ALL --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+    --security-opt no-new-privileges \
+    --mount "type=bind,src=$m_files,dst=/var/www/html" \
+    --mount "type=bind,src=$m_log,dst=/wpmgr-log" \
+    --mount "type=bind,src=$m_ini,dst=/usr/local/etc/php/conf.d/zz-wpmgr.ini,readonly" \
+    "$img" >/dev/null || galat docker "container situs tidak dapat dibuat"
+}
+
+cmd_prod_jalan() {
+  cek_nama_prod "${1-}"
+  butuh_hosting
+  pastikan_milik "wpp-$1" "situs:$1" wpmgr.hosting || galat ditolak "situs belum dibuat"
+  cek_mount_wadah_prod "wpp-$1" penuh
+  dk start "wpp-$1" >/dev/null || galat docker "situs tidak dapat dijalankan"
+}
+
+# ---- database dan wp-config produksi -----------------------------------------
+
+# wp-config.php produksi (spec §7.6). Tanpa WP_HOME/WP_SITEURL tetap: nilai
+# dari database (sama dengan hosting lama) yang berlaku. Mode pratinjau
+# menambah pengaman yang dicabut prod-aktifkan; database tidak pernah diubah
+# untuk pengaman. Memakai S_* dari muat_state.
+wp_config_prod() {
+  local nama="$1" mode="$2" db pw k garam
+  db="$(nama_db_prod "$nama")"
+  pw="$(cat "$KONF_PROD/db/$nama")"
+  printf '%s\n' "<?php" \
+    "// Dibuat oleh wpmgr-staging untuk situs $nama ($S_DOMAIN). Jangan diedit; selalu ditimpa." \
+    "define( 'DB_NAME', '$db' );" \
+    "define( 'DB_USER', '$db' );" \
+    "define( 'DB_PASSWORD', '$pw' );" \
+    "define( 'DB_HOST', 'wpmgr-prod-db' );" \
+    "define( 'DB_CHARSET', 'utf8mb4' );" \
+    "define( 'DB_COLLATE', '' );" \
+    "\$table_prefix = '$S_PREFIX';" \
+    "define( 'WP_DEBUG', false );" \
+    "@ini_set( 'display_errors', '0' );" \
+    "@ini_set( 'log_errors', '1' );" \
+    "@ini_set( 'error_log', '/wpmgr-log/php-error.log' );" \
+    "// Router hosting selalu mengirim X-Forwarded-Proto https (TLS diakhiri nginx host)." \
+    "if ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === \$_SERVER['HTTP_X_FORWARDED_PROTO'] ) {" \
+    "    \$_SERVER['HTTPS'] = 'on';" \
+    "}"
+  if [[ "$mode" == pratinjau ]]; then
+    printf '%s\n' \
+      "define( 'WPMGR_PRATINJAU', true );" \
+      "define( 'WPMGR_PRATINJAU_HOST', 'vps-$nama.$DOMAIN' );" \
+      "define( 'WPMGR_DOMAIN', '$S_DOMAIN' );" \
+      "define( 'DISABLE_WP_CRON', true );" \
+      "define( 'AUTOMATIC_UPDATER_DISABLED', true );" \
+      "if ( isset( \$_SERVER['HTTP_HOST'] ) && WPMGR_PRATINJAU_HOST === \$_SERVER['HTTP_HOST'] ) {" \
+      "    define( 'WP_HOME', 'https://' . WPMGR_PRATINJAU_HOST );" \
+      "    define( 'WP_SITEURL', 'https://' . WPMGR_PRATINJAU_HOST );" \
+      "}"
+  fi
+  for k in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+    garam="$(acak 32)"
+    printf "define( '%s', '%s' );\n" "$k" "$garam"
+  done
+  printf '%s\n' "if ( ! defined( 'ABSPATH' ) ) {" "    define( 'ABSPATH', __DIR__ . '/' );" "}" \
+    "require_once ABSPATH . 'wp-settings.php';"
+}
+
+cmd_prod_db_buat() {
+  cek_nama_prod "${1-}"
+  cek_prefix "${2-}"
+  butuh_hosting
+  local nama="$1" db pw
+  muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
+  [[ "$S_MODE" != aktif ]] || galat ditolak "situs sudah aktif; database tidak boleh dibuat ulang"
+  db="$(nama_db_prod "$nama")"
+  pw="$(acak 24)"
+  # Hak sama dengan user staging (Koreksi #8 Lapis 3): DML/DDL atas database
+  # sendiri, tanpa TRIGGER/EVENT/ROUTINE/FILE dan tanpa GRANT OPTION.
+  sql_root "CREATE DATABASE IF NOT EXISTS \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$db'@'%' IDENTIFIED BY '$pw';
+ALTER USER '$db'@'%' IDENTIFIED BY '$pw';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, LOCK TABLES, CREATE TEMPORARY TABLES, REFERENCES, CREATE VIEW, SHOW VIEW ON \`$db\`.* TO '$db'@'%';" \
+    wpmgr-prod-db "$KONF_PROD/db-root"
+  install -d -m 0700 "$KONF_PROD/db"
+  printf '%s' "$pw" > "$KONF_PROD/db/$nama"
+  chmod 0600 "$KONF_PROD/db/$nama"
+  S_PREFIX="$2"
+  tulis_state "$nama"
+  tulis_wp_config wp_config_prod "$HOSTING_DIR/$S_SITE_ID/files" "$nama" pratinjau
+}
+
+cmd_prod_db_impor() {
+  cek_nama_prod "${1-}"
+  butuh_hosting
+  local nama="$1" db sandi
+  muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
+  # Batas satu arah (spec §4): data situs yang sudah dilayani VPS tidak
+  # pernah ditimpa salinan dari hosting lama, sekalipun dashboard meminta.
+  [[ "$S_MODE" != aktif ]] || galat ditolak "situs sudah aktif; impor ditolak"
+  [[ -s "$KONF_PROD/db/$nama" ]] || galat ditolak "database situs belum dibuat (prod-db-buat)"
+  db="$(nama_db_prod "$nama")"
+  sandi="$(cat "$KONF_PROD/db/$nama")"
+  sql_root "SET GLOBAL local_infile=0; DROP DATABASE IF EXISTS \`$db\`; CREATE DATABASE \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+    wpmgr-prod-db "$KONF_PROD/db-root"
+  # SQL dari hosting lama (bisa saja disusupi) diimpor sebagai user situs ini.
+  opsi_klien "$db" "$sandi" wpmgr-prod-db
+  dk exec -i wpmgr-prod-db mariadb --defaults-extra-file="$OPSI_KLIEN" --binary-mode --local-infile=0 \
+    --max-allowed-packet=64M "$db" || galat impor "impor database situs gagal"
+}
+
+# ---- router produksi ----------------------------------------------------------
+
+# Template tetap router produksi (spec §7.5). Basic Auth dan noindex hanya
+# selama pratinjau; host pratinjau vps-<nama>.<DOMAIN> juga hanya saat itu.
+konf_router_prod() {
+  local nama="$1" domain="$2" www="$3" mode="$4" nama_server="$2"
+  if [[ "$www" == 1 ]]; then
+    nama_server+=" www.$domain"
+  fi
+  if [[ "$mode" == pratinjau ]]; then
+    nama_server+=" vps-$nama.$DOMAIN"
+  fi
+  cat <<KONF
+# Dibuat wpmgr-staging prod-router-muat untuk situs $nama ($mode). Jangan diedit.
+server {
+    listen 80;
+    server_name $nama_server;
+    client_max_body_size 64m;
+    absolute_redirect off;
+KONF
+  if [[ "$mode" == pratinjau ]]; then
+    cat <<KONF
+    auth_basic "Pratinjau $nama";
+    auth_basic_user_file /etc/nginx/wpmgr-htpasswd/$nama;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+KONF
+  fi
+  cat <<KONF
+    location / {
+        set \$wpmgr_hulu wpp-$nama;
+        proxy_pass http://\$wpmgr_hulu;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;
+    }
+}
+KONF
+}
+
+# Render ulang SEMUA situs dari state root (pola cmd_router_muat, Koreksi #6
+# Lapis 3): dari dashboard hanya diambil satu baris htpasswd bcrypt per situs
+# pratinjau, dibaca sebagai user dashboard dengan batas ukuran. Situs
+# pratinjau tanpa htpasswd dilewati (belum siap), bukan menggagalkan router
+# untuk situs lain. $1 (opsional): situs yang dirender mode aktif walau
+# state-nya masih pratinjau (prod-aktifkan langkah 2). Mengubah S_* (memuat
+# state setiap situs); pemanggil memuat ulang state-nya sendiri sesudahnya.
+muat_router_prod() {
+  local nama_aktif="${1-}" tujuan="$KONF_PROD/router" baru cadangan f n mode baris
+  # shellcheck disable=SC2016 # `$` di sini literal regex (awalan bcrypt), bukan ekspansi.
+  local pola_htpasswd='^pratinjau:\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$'
+  pastikan_layanan_prod router
+  baru="$(mktemp -d)"
+  SEMENTARA+=("$baru")
+  cadangan="$(mktemp -d)"
+  SEMENTARA+=("$cadangan")
+  shopt -s nullglob
+  for f in "$KONF_PROD"/situs/*; do
+    n="${f##*/}"
+    [[ "$n" =~ ^[a-z0-9-]{1,36}$ ]] || continue
+    muat_state "$n" || continue
+    mode="$S_MODE"
+    if [[ "$n" == "$nama_aktif" ]]; then
+      mode=aktif
+    fi
+    if [[ "$mode" == pratinjau ]]; then
+      [[ -e "$HOSTING_DIR/router/$n.htpasswd" || -L "$HOSTING_DIR/router/$n.htpasswd" ]] || continue
+      baris="$(sbg_pengguna head -c 1024 "$HOSTING_DIR/router/$n.htpasswd" 2>/dev/null)" \
+        || galat argumen "htpasswd pratinjau tidak terbaca"
+      [[ "$baris" =~ $pola_htpasswd ]] || galat argumen "htpasswd pratinjau tidak sah"
+      printf '%s\n' "$baris" > "$baru/$n.htpasswd"
+    fi
+    konf_router_prod "$n" "$S_DOMAIN" "$S_WWW" "$mode" > "$baru/prd-$n.conf"
+  done
+  mkdir -p "$cadangan/conf.d" "$cadangan/htpasswd"
+  cp -a "$tujuan/conf.d/." "$cadangan/conf.d/" 2>/dev/null || galat docker "cadangan konfigurasi router gagal"
+  cp -a "$tujuan/htpasswd/." "$cadangan/htpasswd/" 2>/dev/null || galat docker "cadangan konfigurasi router gagal"
+  # Sejak baris ini konfigurasi aktif diubah; kegagalan apa pun sesudahnya
+  # memulihkan cadangan lewat jebakan EXIT.
+  ROUTER_TUJUAN="$tujuan"
+  ROUTER_AWALAN="prd-"
+  ROUTER_CADANGAN="$cadangan"
+  rm -f "$tujuan/conf.d/"prd-*.conf "$tujuan/htpasswd/"*
+  for f in "$baru"/prd-*.conf; do
+    install -m 0644 "$f" "$tujuan/conf.d/" 2>/dev/null \
+      || galat docker "konfigurasi router hosting tidak dapat dipasang; konfigurasi lama dipulihkan"
+  done
+  for f in "$baru"/*.htpasswd; do
+    n="$(basename "$f" .htpasswd)"
+    install -m 0644 "$f" "$tujuan/htpasswd/$n" 2>/dev/null \
+      || galat docker "konfigurasi router hosting tidak dapat dipasang; konfigurasi lama dipulihkan"
+  done
+  dk exec wpmgr-prod-router nginx -t >/dev/null 2>&1 \
+    || galat docker "konfigurasi router hosting ditolak nginx -t; konfigurasi lama dipulihkan"
+  dk exec wpmgr-prod-router nginx -s reload >/dev/null \
+    || galat docker "router hosting tidak dapat dimuat ulang; konfigurasi lama dipulihkan"
+  ROUTER_CADANGAN=""
+}
+
+cmd_prod_router_muat() {
+  butuh_hosting
+  muat_router_prod
+}
+
 # ---- utama ---------------------------------------------------------------
 
 utama() {
@@ -1449,12 +1824,16 @@ utama() {
   [[ $# -gt 0 ]] && shift
   muat_konf
   case "$perintah" in
-    siapkan|router-muat|status|mail-kredensial|prod-siapkan|prod-status)
+    siapkan|router-muat|status|mail-kredensial|prod-siapkan|prod-status|prod-router-muat)
       [[ $# -eq 0 ]] || galat argumen "subperintah ini tidak menerima argumen" ;;
     buat|db-buat)
       [[ $# -eq 3 ]] || galat argumen "jumlah argumen salah" ;;
-    jalan|jeda|hapus|db-hapus|db-impor|sertifikat)
+    jalan|jeda|hapus|db-hapus|db-impor|sertifikat|prod-jalan|prod-db-impor)
       [[ $# -eq 1 ]] || galat argumen "jumlah argumen salah" ;;
+    prod-db-buat)
+      [[ $# -eq 2 ]] || galat argumen "jumlah argumen salah" ;;
+    prod-buat)
+      [[ $# -eq 5 ]] || galat argumen "jumlah argumen salah" ;;
     wpcli)
       [[ $# -ge 3 && $# -le 5 ]] || galat argumen "jumlah argumen salah" ;;
     *)
@@ -1462,8 +1841,8 @@ utama() {
   esac
   case "$perintah" in
     siapkan|prod-siapkan) atur_tenggat "$WAKTU_SIAPKAN" ;;
-    buat) atur_tenggat "$WAKTU_BUAT" ;;
-    db-impor) atur_tenggat "$WAKTU_IMPOR" ;;
+    buat|prod-buat) atur_tenggat "$WAKTU_BUAT" ;;
+    db-impor|prod-db-impor) atur_tenggat "$WAKTU_IMPOR" ;;
     wpcli) atur_tenggat "$WAKTU_WPCLI" ;;
     sertifikat) atur_tenggat "$WAKTU_SERTIFIKAT" ;;
     *) atur_tenggat "$WAKTU_BAWAAN" ;;
@@ -1484,6 +1863,11 @@ utama() {
     mail-kredensial) cmd_mail_kredensial ;;
     prod-siapkan) cmd_prod_siapkan ;;
     prod-status) cmd_prod_status ;;
+    prod-buat) cmd_prod_buat "$@" ;;
+    prod-jalan) cmd_prod_jalan "$@" ;;
+    prod-db-buat) cmd_prod_db_buat "$@" ;;
+    prod-db-impor) cmd_prod_db_impor "$@" ;;
+    prod-router-muat) cmd_prod_router_muat ;;
   esac
 }
 
