@@ -2622,12 +2622,13 @@ STEMPEL=20261003T023000Z
   run "$SKRIP" prod-backup toko "$STEMPEL"
   [ "$status" -eq 11 ]
   [[ "$output" == *"GALAT backup:"* ]]
-  [ -z "$(ls -A "$S/backup/$ID")" ]
+  # Hanya berkas kunci yang tersisa: tanpa direktori stempel atau .tmp.
+  [ "$(ls -A "$S/backup/$ID")" = ".kunci" ]
   rm -f "$PALSU/dump-gagal"
   printf '2' > "$PALSU/tar-keluar"
   run "$SKRIP" prod-backup toko "$STEMPEL"
   [ "$status" -eq 11 ]
-  [ -z "$(ls -A "$S/backup/$ID")" ]
+  [ "$(ls -A "$S/backup/$ID")" = ".kunci" ]
   # GNU tar keluar 1 = berkas berubah saat dibaca (situs hidup): arsip tetap dipakai.
   printf '1' > "$PALSU/tar-keluar"
   run "$SKRIP" prod-backup toko "$STEMPEL"
@@ -2642,4 +2643,72 @@ STEMPEL=20261003T023000Z
   baris="$(grep -F '[mariadb-dump]' "$PALSU/timeout.log")"
   [[ "$baris" =~ ^\[-k\]\[10\]\[([0-9]+)\]\[docker\] ]]
   (( BASH_REMATCH[1] > 10800 && BASH_REMATCH[1] <= 11100 ))
+}
+
+# ---- fix round 1 Task 14 ---------------------------------------------------------
+
+# Nomor baris pertama di docker.log yang cocok dengan regex $1.
+baris_docker() { grep -nE "$1" "$PALSU/docker.log" | head -n 1 | cut -d: -f1; }
+
+@test "prod-backup: symlink di files/ diarsipkan sebagai tautan, targetnya tidak ikut" {
+  siap_aktifkan
+  printf 'RAHASIA-ROOT' > "$S/rahasia"
+  mkdir -p "$S/luar"
+  printf 'LUAR-ISI' > "$S/luar/dalam"
+  ln -s "$S/rahasia" "$S/hosting/$ID/files/x"
+  ln -s "$S/luar/" "$S/hosting/$ID/files/d"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  arsip="$S/backup/$ID/$STEMPEL/files.tar.gz"
+  daftar="$(tar -tvzf "$arsip")"
+  grep -qE "files/x -> $S/rahasia\$" <<< "$daftar"
+  grep -qE "files/d -> $S/luar/?\$" <<< "$daftar"
+  ! grep -q 'files/d/dalam' <<< "$daftar" || false
+  ! gzip -dc "$arsip" | grep -aq 'RAHASIA-ROOT' || false
+  ! gzip -dc "$arsip" | grep -aq 'LUAR-ISI' || false
+}
+
+@test "prod-backup: files/ berupa symlink ditolak sebelum tar berjalan" {
+  siap_aktifkan
+  mkdir -p "$S/luar"
+  printf 'LUAR-ISI' > "$S/luar/dalam"
+  rm -rf "$S/hosting/$ID/files"
+  ln -s "$S/luar" "$S/hosting/$ID/files"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 3 ]
+  ! grep -q '\[tar\]' "$PALSU/setpriv.log" 2>/dev/null || false
+  [ ! -e "$S/backup/$ID/$STEMPEL" ]
+  [ ! -e "$S/backup/$ID/.$STEMPEL.tmp" ]
+}
+
+@test "prod-backup: berkas opsi klien dihapus sesudah dump, juga saat dump gagal" {
+  siap_aktifkan
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  dump="$(baris_docker '^\[exec\]\[wpmgr-prod-db\]\[mariadb-dump\]')"
+  hapus="$(baris_docker '^\[exec\]\[wpmgr-prod-db\]\[rm\]\[-f\]\[/run/wpmgr-klien-[0-9-]+\.cnf\]$')"
+  [ -n "$dump" ] && [ -n "$hapus" ] && (( hapus > dump ))
+  : > "$PALSU/docker.log"
+  touch "$PALSU/dump-gagal"
+  run "$SKRIP" prod-backup toko 20261004T023000Z
+  [ "$status" -eq 11 ]
+  dump="$(baris_docker '^\[exec\]\[wpmgr-prod-db\]\[mariadb-dump\]')"
+  hapus="$(baris_docker '^\[exec\]\[wpmgr-prod-db\]\[rm\]\[-f\]\[/run/wpmgr-klien-[0-9-]+\.cnf\]$')"
+  [ -n "$dump" ] && [ -n "$hapus" ] && (( hapus > dump ))
+}
+
+@test "prod-backup: kunci per situs; tenggat kunci habis = ditolak (3) sebelum perubahan apa pun" {
+  siap_aktifkan
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  grep -qE '^\[-w\]\[60\]\[-x\]\[[0-9]+\]$' "$PALSU/flock.log"
+  [ "$(stat -c %a:%u "$S/backup/$ID/.kunci")" = "600:0" ]
+  : > "$PALSU/docker.log"
+  touch "$PALSU/flock-gagal"
+  run "$SKRIP" prod-backup toko 20261004T023000Z
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"GALAT ditolak: backup situs ini sedang dibuat proses lain"* ]]
+  ! grep -q 'mariadb-dump' "$PALSU/docker.log" || false
+  [ ! -e "$S/backup/$ID/20261004T023000Z" ]
+  [ ! -e "$S/backup/$ID/.20261004T023000Z.tmp" ]
 }

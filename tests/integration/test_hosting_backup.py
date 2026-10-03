@@ -164,7 +164,7 @@ def test_pangkas_berdetak_tanpa_titik_potongan_berbaris_hosting(sesi, aktif, pb,
     monkeypatch.setattr(umum, "titik_potongan", lambda sesi_, job, baris: titik.append(baris))
     _, hasil = _jalankan(sesi, aktif)
     assert len(detak) >= hasil["dipangkas"] > 0
-    assert all(b is None for b in titik)
+    assert titik == []
 
 
 def test_backup_sibuk_dijadwalkan_ulang_tanpa_menandai_gagal(sesi, aktif, pb):
@@ -182,6 +182,50 @@ def test_backup_sibuk_dijadwalkan_ulang_tanpa_menandai_gagal(sesi, aktif, pb):
     assert "prod_backup_hapus" not in pb.nama_panggilan()
     j = sesi.get(Job, job.id, populate_existing=True)
     assert akan_diulang(j, TRANSIENT)
+
+
+@pytest.mark.parametrize("subperintah", ["prod_backup", "prod_status"])
+def test_penolakan_pasti_bukan_sibuk_langsung_gagal(sesi, aktif, pb, subperintah):
+    # Fix round 1 M1: keluar 3 yang bukan kunci sibuk (state/database belum ada, direktori tidak
+    # aman) gagal sekarang (R15), tidak diulang sebagai "sibuk" sampai 4 jam.
+    _lama(sesi, aktif, 12)
+    pesan = "Membuat backup situs gagal. Skrip pembantu menolak permintaan ini."
+    pb.gagal[subperintah] = GalatPembantu("ditolak", pesan, sibuk=False)
+    job = buat_job(sesi, aktif.site_id, JobType.backup_hosting)
+    with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
+        backup.tangani_backup_hosting(sesi, job, None)
+    assert e.value.pesan == pesan
+    assert not akan_diulang(sesi.get(Job, job.id, populate_existing=True), e.value.error_class)
+    h = _h(sesi, aktif)
+    assert (h.status, h.galat) == (StatusHosting.aktif, None)
+    assert h.backup_gagal_pada is not None
+    assert "prod_backup_hapus" not in pb.nama_panggilan()
+    assert "sibuk_kali" not in umum.kemajuan(sesi.get(Job, job.id, populate_existing=True))
+
+
+def test_gagal_saat_memangkas_tidak_menandai_backup_gagal(sesi, aktif, pb, monkeypatch):
+    # Fix round 1 M6: backup_terakhir_pada di-commit bersama baris backup, SEBELUM memangkas;
+    # galat tak terduga saat memangkas tidak membuat backup yang ada tampak gagal.
+    _lama(sesi, aktif, 12)
+    dilihat = []
+    pangkas_asli = backup.pangkas
+
+    def pangkas_lalu_meledak(sesi_, h, tujuan, job=None):
+        dilihat.append(sesi.get(HostingVps, aktif.id, populate_existing=True).backup_terakhir_pada)
+        pangkas_asli(sesi_, h, tujuan, job)
+        raise RuntimeError("galat tak terduga")
+
+    monkeypatch.setattr(backup, "pangkas", pangkas_lalu_meledak)
+    job = buat_job(sesi, aktif.site_id, JobType.backup_hosting)
+    job.attempts = job.max_attempts
+    sesi.commit()
+    hasil = backup.tangani_backup_hosting(sesi, job, None)
+    assert dilihat and dilihat[0] is not None
+    assert hasil["dipangkas"] == 0
+    h = _h(sesi, aktif)
+    assert h.backup_terakhir_pada is not None and h.backup_gagal_pada is None
+    assert h.status == StatusHosting.aktif
+    assert sesi.query(HostingBackup).filter(HostingBackup.job_id == job.id).one().status == "tersedia"
 
 
 def test_muat_ditolak_sebelum_tukar_hanya_menandai_backup_gagal(sesi, aktif, pb, monkeypatch):

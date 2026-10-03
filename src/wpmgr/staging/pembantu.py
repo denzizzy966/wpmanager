@@ -112,12 +112,14 @@ _POLA_STEMPEL = re.compile(r"[0-9]{8}T[0-9]{6}Z")
 HASIL_SERTIFIKAT = frozenset({"terbit", "tetap", "diperbarui"})
 # Keluaran prod-aktifkan yang tuntas (`echo "aktif"` di akhir cmd_prod_aktifkan).
 HASIL_AKTIFKAN = "aktif"
-# Teks `galat ditolak` saat kunci router/nginx habis waktu menunggu (cermin
-# kunci_router dan kunci_nginx di skrip). Keluar 3 dengan baris ini berarti
-# server sibuk dengan proses lain, bukan prasyarat yang ditolak; pemanggil
-# memakai pesan netral (review Task 10 M5). Teks skrip root tetap, tidak
-# pernah memuat masukan, jadi hanya baris GALAT persis ini yang dicocokkan.
-PENANDA_KUNCI_SIBUK = ("router hosting sedang dipakai proses lain", "konfigurasi nginx sedang diubah proses lain")
+# Teks `galat ditolak` saat kunci router/nginx/backup habis waktu menunggu
+# (cermin kunci_router, kunci_nginx, dan kunci_backup di skrip). Keluar 3
+# dengan baris ini berarti server sibuk dengan proses lain, bukan prasyarat
+# yang ditolak; pemanggil memakai pesan netral (review Task 10 M5). Teks skrip
+# root tetap, tidak pernah memuat masukan, jadi hanya baris GALAT persis ini
+# yang dicocokkan.
+PENANDA_KUNCI_SIBUK = ("router hosting sedang dipakai proses lain", "konfigurasi nginx sedang diubah proses lain",
+                       "backup situs ini sedang dibuat proses lain")
 PENGGUNA_PRATINJAU = "pratinjau"
 
 # Keluaran wp-cli dikendalikan kode salinan site yang bisa saja disusupi:

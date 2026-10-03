@@ -188,7 +188,8 @@ def antrekan_backup_pertama(sesi) -> int:
     for site_id in ids:
         try:
             h = kunci_hosting(sesi, site_id)
-            if h is None or h.status != StatusHosting.aktif or h.backup_terakhir_pada is not None                     or h.backup_gagal_pada is not None or ada_job_hosting(sesi, site_id):
+            if h is None or h.status != StatusHosting.aktif or h.backup_terakhir_pada is not None \
+                    or h.backup_gagal_pada is not None or ada_job_hosting(sesi, site_id):
                 sesi.commit()
                 continue
             sesi.add(Job(site_id=site_id, tipe=JobType.backup_hosting, payload={"manual": False}))

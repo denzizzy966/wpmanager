@@ -2551,6 +2551,20 @@ siapkan_dir_backup() {
   cek_dir_root_ketat "$akar"
 }
 
+# Kunci backup per situs (flock pada BACKUP_DIR/<site_id>/.kunci, dilepas saat
+# skrip keluar): dua prod-backup untuk situs yang sama (mis. worker zombi yang
+# klaimnya sudah direbut reaper dan job barunya) tidak pernah menulis ke
+# direktori situs itu bersamaan. Direktorinya sudah lolos siapkan_dir_backup
+# (root, 0700 ketat). Tenggat habis = `ditolak` (keluar 3) sebelum perubahan
+# apa pun, sama dengan kunci_router/kunci_nginx: "sibuk", boleh diulang.
+kunci_backup() {
+  local berkas="$BACKUP_DIR/$1/.kunci" fd
+  [[ ! -L "$berkas" ]] || galat ditolak "berkas kunci backup tidak sah"
+  ( umask 077; : >> "$berkas" ) || galat konfigurasi "berkas kunci backup tidak dapat dibuat"
+  exec {fd}>> "$berkas" || galat konfigurasi "berkas kunci backup tidak dapat dibuka"
+  dibatasi flock -w 60 -x "$fd" || galat ditolak "backup situs ini sedang dibuat proses lain"
+}
+
 # BACKUP_DIR/<site_id>/<stempel>/ milik root 0700: db.sql.gz (mariadb-dump
 # sebagai root di wpmgr-prod-db, kata sandi lewat berkas opsi klien, di-gzip
 # di host), files.tar.gz (tar SEBAGAI user dashboard: tidak mengikuti symlink
@@ -2567,6 +2581,7 @@ cmd_prod_backup() {
   muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
   [[ -n "$S_PREFIX" ]] || galat ditolak "database situs belum dibuat"
   siapkan_dir_backup "$S_SITE_ID"
+  kunci_backup "$S_SITE_ID"
   akar="$BACKUP_DIR/$S_SITE_ID"
   dasar="$akar/$stempel"
   if [[ -e "$dasar" || -L "$dasar" ]]; then

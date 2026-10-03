@@ -176,6 +176,15 @@ def pangkas(sesi, h: HostingVps, tujuan: TujuanBackup, job=None) -> int:
     return n
 
 
+def _tolak_permanen(exc: GalatPembantu) -> Exception:
+    """Keluar 3 yang BUKAN kunci sibuk (state/database situs belum ada, direktori backup tidak
+    aman) bersifat pasti: gagal sekarang (R15), bukan diulang sebagai "sibuk" sampai 4 jam.
+    Kunci sibuk (`GalatPembantu.sibuk`) diteruskan ke pembungkus (diulang dengan jeda, L10)."""
+    if exc.tanpa_ubah and not exc.sibuk:
+        return stg.GalatDitolakTanpaUbah(exc.pesan)
+    return exc
+
+
 def backup_hosting(sesi, job, site, h: HostingVps, pb) -> dict:
     if h.dilayani_vps_pada is None:
         raise stg.GalatDitolakTanpaUbah(PESAN_BELUM_DILAYANI)
@@ -185,23 +194,40 @@ def backup_hosting(sesi, job, site, h: HostingVps, pb) -> dict:
         # (prod-backup idempoten per stempel).
         stempel = stempel_dari(hu.sekarang())
         stg.simpan_kemajuan(sesi, job, stempel=stempel, tahap_backup="backup")
-    status = pb.prod_status()
+    try:
+        status = pb.prod_status()
+    except GalatPembantu as exc:
+        raise _tolak_permanen(exc) from None
     pesan = cek_disk_backup(status, h.ukuran_file + h.ukuran_db)
     if pesan:
         raise stg.GalatDitolakTanpaUbah(pesan)
     tujuan = tujuan_dari_setelan(pb)
-    with stg.detak_latar(sesi, job):
-        hasil = tujuan.buat(h, stempel)
+    try:
+        with stg.detak_latar(sesi, job):
+            hasil = tujuan.buat(h, stempel)
+    except GalatPembantu as exc:
+        raise _tolak_permanen(exc) from None
     sesi.execute(insert(HostingBackup).values(
         site_id=h.site_id, job_id=job.id, tujuan=tujuan.kode, stempel=stempel, status=STATUS_TERSEDIA,
         manual=bool((job.payload or {}).get("manual")), ukuran_db=hasil.ukuran_db, ukuran_file=hasil.ukuran_file,
         sha256_db=hasil.sha256_db, sha256_file=hasil.sha256_file,
     ).on_conflict_do_nothing(constraint="uq_hosting_backup_stempel"))
-    sesi.commit()
-    dipangkas = pangkas(sesi, h, tujuan, job)
+    # Backup tersimpan = backup berhasil, dalam commit yang sama dengan barisnya: apa pun yang
+    # terjadi saat memangkas sesudahnya tidak boleh membuatnya tampak gagal.
     baris = sesi.get(HostingVps, h.id, populate_existing=True)
     baris.backup_terakhir_pada = hu.sekarang()
     baris.backup_gagal_pada = None
+    sesi.commit()
+    try:
+        dipangkas = pangkas(sesi, h, tujuan, job)
+    except stg.KlaimHilang:
+        raise
+    except Exception:
+        # Pemangkasan diulang pada backup berikutnya. Baris yang sudah dipangkas ter-commit satu
+        # per satu; sisanya tetap `tersedia`.
+        sesi.rollback()
+        log.exception("Pemangkasan backup situs %s gagal; dicoba lagi pada backup berikutnya", h.nama)
+        dipangkas = 0
     ringkas = {"stempel": stempel, "ukuran_db": hasil.ukuran_db, "ukuran_file": hasil.ukuran_file,
                "dipangkas": dipangkas}
     stg.catat_aktivitas(sesi, h.site_id, job, "Backup situs dibuat", {

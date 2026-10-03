@@ -672,6 +672,9 @@ def test_prod_aktifkan_keluaran_lain_ditolak(pembantu, catatan, monkeypatch, kel
     (3, "GALAT internal: dihentikan\nGALAT ditolak: router hosting sedang dipakai proses lain\n", True),
     (3, "GALAT ditolak: sertifikat domain belum ada\n", False),
     (9, "GALAT internal: router hosting sedang dipakai proses lain\n", False),
+    # Fix round 1 Task 14 (M2): kunci backup per situs.
+    (3, "GALAT ditolak: backup situs ini sedang dibuat proses lain\n", True),
+    (3, "GALAT ditolak: database situs belum dibuat\n", False),
 ])
 def test_kunci_sibuk_dibedakan_dari_prasyarat(pembantu, catatan, monkeypatch, kode_keluar, stderr, sibuk):
     monkeypatch.setenv("PALSU_KELUAR", str(kode_keluar))
