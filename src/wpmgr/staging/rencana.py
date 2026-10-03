@@ -101,11 +101,13 @@ class Selisih:
         return sum(x.ukuran for x in self.diambil)
 
 
-def selisih(produksi: dict[str, Entri], lokal: dict[str, Entri]) -> Selisih:
+def selisih(produksi: dict[str, Entri], lokal: dict[str, Entri],
+            dilindungi: frozenset[str] = DILINDUNGI_STAGING) -> Selisih:
+    """`dilindungi`: berkas milik tujuan salinan (staging atau hosting) yang tidak pernah ditimpa/dihapus tarik."""
     hasil = Selisih()
     for path in sorted(produksi):
-        if path in DILINDUNGI_STAGING:
-            # Berkas milik staging sendiri tidak pernah ditimpa oleh tarik,
+        if path in dilindungi:
+            # Berkas milik tujuan sendiri tidak pernah ditimpa oleh tarik,
             # sekalipun produksi punya berkas bernama sama.
             continue
         e = produksi[path]
@@ -113,7 +115,7 @@ def selisih(produksi: dict[str, Entri], lokal: dict[str, Entri]) -> Selisih:
             hasil.baru.append(e)
         elif berubah(e, lokal[path]):
             hasil.berubah.append(e)
-    hasil.hapus = sorted(p for p in lokal if p not in produksi and p not in DILINDUNGI_STAGING)
+    hasil.hapus = sorted(p for p in lokal if p not in produksi and p not in dilindungi)
     return hasil
 
 

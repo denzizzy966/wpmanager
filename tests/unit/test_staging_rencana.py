@@ -406,3 +406,14 @@ def test_rakit_rentang_total_jauh_melebihi_manifest_berarti_berubah():
     r = RakitRentang(Entri("x", 100 * mib, 5, None), panjang=4)
     assert r.terima({"path": "x", "dari": 0, "total": 200 * mib, "mtime": 6}, b"abcd") == "berubah"
     assert r.dari == 0
+
+
+def test_selisih_dengan_daftar_dilindungi_milik_tujuan():
+    dilindungi = frozenset({"wp-config.php", "wp-content/mu-plugins/wpmgr-pratinjau.php"})
+    produksi = {"wp-content/mu-plugins/wpmgr-pratinjau.php": e("wp-content/mu-plugins/wpmgr-pratinjau.php", h=H2),
+                "wp-content/mu-plugins/wpmgr-staging.php": e("wp-content/mu-plugins/wpmgr-staging.php")}
+    lokal = {"wp-content/mu-plugins/wpmgr-pratinjau.php": e("wp-content/mu-plugins/wpmgr-pratinjau.php")}
+    s = selisih(produksi, lokal, dilindungi)
+    # Berkas milik tujuan tidak ditimpa; berkas staging bukan milik tujuan ini, jadi ikut disalin.
+    assert [x.path for x in s.diambil] == ["wp-content/mu-plugins/wpmgr-staging.php"]
+    assert s.hapus == []

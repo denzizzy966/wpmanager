@@ -20,6 +20,8 @@ import math
 import re
 import secrets
 import shutil
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -489,14 +491,15 @@ class Salin:
         self._simpan()
 
 
-def _sinkron_berkas(sesi, job, staging, klien, akar: Path, produksi: dict, k: dict) -> dict:
+def _sinkron_berkas(sesi, job, baris, klien, akar: Path, produksi: dict, k: dict,
+                    dilindungi: frozenset[str] = DILINDUNGI_STAGING) -> dict:
     indeks = Indeks(akar / "indeks.jsonl")
     lokal = indeks.muat()
-    beda = selisih(produksi, lokal)
-    salin = Salin(sesi, job, staging, klien, akar / "files", indeks, lokal, k)
+    beda = selisih(produksi, lokal, dilindungi)
+    salin = Salin(sesi, job, baris, klien, akar / "files", indeks, lokal, k)
     for i, path in enumerate(beda.hapus):
         if i % HAPUS_PER_TITIK == 0:
-            umum.titik_potongan(sesi, job, staging)
+            umum.titik_potongan(sesi, job, baris)
         salin.hapus(path)
     for pot in bagi_potongan(beda.diambil, ukuran_paket=UKURAN_PAKET):
         if pot.jenis == "rentang":
@@ -612,7 +615,8 @@ def _siapkan_runtime(sesi, job, staging: Staging, site, pb, akar: Path, info: di
         pb.wpcli(staging.nama, "cache", "flush")
 
 
-def _bangun_ulang_indeks(sesi, job, akar: Path, peringatan: list[str]) -> None:
+def _bangun_ulang_indeks(sesi, job, akar: Path, peringatan: list[str],
+                         dilindungi: frozenset[str] = DILINDUNGI_STAGING) -> None:
     """Putusan F3: indeks dibangun ulang dari isi files/ di awal setiap tarik baru.
 
     Suntingan di staging (dan plugin yang diperbarui uji update) lalu
@@ -632,8 +636,8 @@ def _bangun_ulang_indeks(sesi, job, akar: Path, peringatan: list[str]) -> None:
             hapus_tautan(akar / "files", p)
         except (PathTidakAman, OSError):
             peringatan.append(bersih_teks(f"Symlink staging {p} tidak dapat dihapus.", 300))
-    # Berkas milik staging sendiri tidak pernah menjadi bagian salinan.
-    indeks.padatkan({p: e for p, e in lokal.items() if p not in DILINDUNGI_STAGING})
+    # Berkas milik tujuan sendiri tidak pernah menjadi bagian salinan.
+    indeks.padatkan({p: e for p, e in lokal.items() if p not in dilindungi})
 
 
 # ---- job ----------------------------------------------------------------------
@@ -686,43 +690,72 @@ def berkas_secret_staging(sesi, staging: Staging, info: dict, db_dir: Path) -> P
     return berkas
 
 
-def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = True) -> dict:
-    if not punya_fitur(site, STAGING):
-        raise _tolak(job, "Connector site ini belum mengizinkan staging. Aktifkan 'Izinkan staging' "
-                          "di Pengaturan -> WP Manager (connector 3.0).")
-    if not staging.sandi_hash or not staging.rahasia_router_terenkripsi:
-        raise _tolak(job, "Akses preview staging belum dibuat; buat ulang kata sandi preview.")
-    akar = umum.dir_site(site.id)
+# ---- mesin salin bersama (spec Lapis 4 §10.2) -----------------------------------
+
+
+@dataclass
+class TujuanSalinan:
+    """Ke mana dan bagaimana tarik menyalin: staging (Lapis 3) atau hosting VPS (Lapis 4).
+
+    Mesin tarik (`tarik_inti`) tidak tahu tujuannya; yang berbeda hanya
+    sumber status server, gerbang awal, pemeriksaan info site, SQL tambahan,
+    impor, dan penyiapan runtime. `baris` dipakai titik potongan (kolom
+    `batal_diminta_pada`). `dilindungi`: berkas milik tujuan di files/ yang
+    tidak pernah ditimpa atau dihapus tarik.
+    """
+
+    akar: Path
+    baris: object
+    status_sumber: Callable[[], object]
+    cek_awal: Callable[[object], str | None]
+    periksa_info: Callable[[dict], None]
+    sql_tambahan: Callable[[object, dict, Path], None]
+    impor: Callable[[dict, list[Path]], None]
+    siapkan_runtime: Callable[[object, object, dict], None]
+    dilindungi: frozenset = DILINDUNGI_STAGING
+    subdir: tuple = ("files", "log", "ekspor")
+    tahap_akhir: str = "sertifikat"
+
+
+def tarik_inti(sesi, job, site, klien, tujuan: TujuanSalinan, k: dict) -> dict:
+    """Tahap salin bersama: manifest -> berkas -> tanda_air -> db -> impor -> penyiapan.
+
+    Semantik Lapis 3 tidak berubah: R21 (penolakan sebelum salinan disentuh =
+    tanpa ubah), F3 (indeks dibangun ulang dari files/ di awal tarik baru),
+    anggaran byte, dan peringatan. `k` adalah kemajuan job saat dipanggil;
+    nilai kembali adalah kemajuan terakhir dengan `tahap = tujuan.tahap_akhir`.
+    """
+    akar = tujuan.akar
     tarik_dir = akar / "tarik"
-    pertama = staging.ditarik_pada is None
-    k = umum.kemajuan(job)
     # "tahap" (bukan sekadar kemajuan kosong): uji update memakai kemajuan
     # yang sama dan sudah menyimpan tahap_uji sebelum memanggil tarik().
     baru = "tahap" not in k
-    for d in (akar / "files", akar / "log", akar / "ekspor"):
-        d.mkdir(parents=True, exist_ok=True)
+    for d in tujuan.subdir:
+        (akar / d).mkdir(parents=True, exist_ok=True)
 
     try:
-        status = pb.status()
-        if not staging.aktif:
-            pesan = cek_ram(status) or cek_maks_aktif(jumlah_aktif(sesi, staging), get_settings().staging_maks_aktif)
-            if pesan:
-                raise _tolak(job, pesan)
+        status = tujuan.status_sumber()
+        pesan = tujuan.cek_awal(status)
+        if pesan:
+            raise _tolak(job, pesan)
 
         if baru:
             shutil.rmtree(tarik_dir, ignore_errors=True)
             peringatan: list[str] = []
-            _bangun_ulang_indeks(sesi, job, akar, peringatan)
+            _bangun_ulang_indeks(sesi, job, akar, peringatan, tujuan.dilindungi)
             k = umum.simpan_kemajuan(sesi, job, tahap="manifest", mulai=umum.sekarang().isoformat(),
                                      byte_selesai=0, byte_diterima=0, byte_total=0,
                                      peringatan=peringatan[:MAKS_PERINGATAN], berkas_dilewati=0)
         tarik_dir.mkdir(parents=True, exist_ok=True)
 
         if k["tahap"] == "manifest":
-            k = ambil_manifest(sesi, job, staging, klien, tarik_dir, k)
+            k = ambil_manifest(sesi, job, tujuan.baris, klien, tarik_dir, k)
+            # Info site yang tidak bisa dilayani tujuan ditolak di sini, sebelum
+            # salinan disentuh (R21): tahap masih "manifest".
+            tujuan.periksa_info(k["info"])
             produksi = _muat_manifest(tarik_dir)
             lokal = Indeks(akar / "indeks.jsonl").muat()
-            beda = selisih(produksi, lokal)
+            beda = selisih(produksi, lokal, tujuan.dilindungi)
             pesan = cek_disk(status, kebutuhan_disk(beda.byte, k["info"]["ukuran_db"]))
             if pesan:
                 raise _tolak(job, pesan)
@@ -735,18 +768,18 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
                                       "nama tidak sah, atau lebih dari 2000 tabel).")
             if info["php_peringatan"]:
                 _tambah_peringatan(k, f"PHP produksi {info['php'] or 'tidak diketahui'} tidak tersedia; "
-                                      f"staging memakai PHP {info['versi_php']}.")
+                                      f"salinan memakai PHP {info['versi_php']}.")
             k = _simpan(sesi, job, k, tahap="berkas", byte_total=beda.byte, byte_selesai=0, byte_diterima=0)
 
         info = k["info"]
         if k["tahap"] == "berkas":
             produksi = _muat_manifest(tarik_dir)
-            k = _sinkron_berkas(sesi, job, staging, klien, akar, produksi, k)
+            k = _sinkron_berkas(sesi, job, tujuan.baris, klien, akar, produksi, k, tujuan.dilindungi)
 
         if k["tahap"] == "tanda_air":
-            umum.titik_potongan(sesi, job, staging)
-            # Diambil sebelum ekspor database (Koreksi #20): data yang masuk
-            # selama ekspor ikut terdeteksi sebagai "baru" saat dorong.
+            umum.titik_potongan(sesi, job, tujuan.baris)
+            # Diambil sebelum ekspor database (Koreksi #20 Lapis 3): data yang
+            # masuk selama ekspor ikut terdeteksi sebagai "baru" saat dorong.
             ta = urai_tanda_air(umum.ulangi(klien.staging_tanda_air))
             if ta is None:
                 raise umum.galat_gagal("Tanda air produksi tidak dapat dibaca.")
@@ -754,26 +787,25 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
                         db_diterima=0)
 
         if k["tahap"] == "db":
-            k = ekspor_db(sesi, job, staging, klien, tarik_dir, info, k, "impor")
+            k = ekspor_db(sesi, job, tujuan.baris, klien, tarik_dir, info, k, "impor")
 
         if k["tahap"] == "impor":
-            umum.titik_potongan(sesi, job, staging)
+            umum.titik_potongan(sesi, job, tujuan.baris)
             # Impor yang gagal/terputus meninggalkan database setengah terisi
             # (docker exec tidak meneruskan TERM; mariadb melihat EOF dan
             # menyimpan yang sudah masuk). Karena itu tahap ini selalu diulang
-            # utuh, tidak pernah dilanjutkan di tengah: db-buat idempoten, dan
-            # db-impor di skrip pembantu membuang lalu membuat ulang database
-            # sebelum mengimpor.
-            berkas_secret_staging(sesi, staging, info, tarik_dir / "db")
+            # utuh, tidak pernah dilanjutkan di tengah: pembuatan database
+            # idempoten, dan impor di skrip pembantu membuang lalu membuat
+            # ulang database sebelum mengimpor.
+            tujuan.sql_tambahan(sesi, info, tarik_dir / "db")
             with umum.detak_latar(sesi, job):
-                pb.db_buat(staging.nama, site.id, info["prefix"])
-                pb.db_impor(staging.nama, [tarik_dir / "prelude.sql", *sorted((tarik_dir / "db").glob("*.sql"))])
+                tujuan.impor(info, [tarik_dir / "prelude.sql", *sorted((tarik_dir / "db").glob("*.sql"))])
             k = _simpan(sesi, job, k, tahap="penyiapan")
 
         if k["tahap"] == "penyiapan":
-            umum.titik_potongan(sesi, job, staging)
-            _siapkan_runtime(sesi, job, staging, site, pb, akar, info)
-            k = _simpan(sesi, job, k, tahap="sertifikat")
+            umum.titik_potongan(sesi, job, tujuan.baris)
+            tujuan.siapkan_runtime(sesi, job, info)
+            k = _simpan(sesi, job, k, tahap=tujuan.tahap_akhir)
     except umum.Dibatalkan:
         shutil.rmtree(tarik_dir, ignore_errors=True)
         raise
@@ -783,14 +815,55 @@ def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = Tru
         # Penolakan dari tahap manifest (multisite, wp-content di luar
         # ABSPATH, connector menolak) sebelum salinan disentuh: tanpa ubah (R21).
         if exc.error_class == STAGING_DITOLAK and salinan_belum_disentuh(job):
-            raise umum.GalatDitolakTanpaUbah(exc.pesan) from None
+            g = umum.GalatDitolakTanpaUbah(exc.pesan)
+            # Preflight M5: `kode` connector ikut terbawa, supaya pembungkus
+            # hosting tahu teksnya milik connector dan memakai pesan tetap.
+            g.kode = exc.kode
+            raise g from None
         raise
     except PathTidakAman:
-        # Container staging menukar direktori di files/ dengan symlink di sela
+        # Container menukar direktori di files/ dengan symlink di sela
         # pemeriksaan; pesan tetap, tanpa path VPS. Tarik berikutnya menghapus
         # symlink itu (_bangun_ulang_indeks).
-        raise umum.galat_gagal("Struktur folder staging tidak aman (ada symlink yang ditukar selama tarik); "
+        raise umum.galat_gagal("Struktur folder salinan tidak aman (ada symlink yang ditukar selama tarik); "
                                "jalankan tarik lagi.") from None
+    return k
+
+
+def _tujuan_staging(sesi, job, site, staging: Staging, pb) -> TujuanSalinan:
+    """Tujuan salinan Lapis 3: staging `<nama>.<domain staging>` (perilaku tidak berubah)."""
+    akar = umum.dir_site(site.id)
+
+    def cek_awal(status) -> str | None:
+        if staging.aktif:
+            return None
+        return cek_ram(status) or cek_maks_aktif(jumlah_aktif(sesi, staging), get_settings().staging_maks_aktif)
+
+    def impor(info: dict, berkas: list[Path]) -> None:
+        pb.db_buat(staging.nama, site.id, info["prefix"])
+        pb.db_impor(staging.nama, berkas)
+
+    return TujuanSalinan(
+        akar=akar, baris=staging, status_sumber=pb.status, cek_awal=cek_awal,
+        periksa_info=lambda info: None,
+        # Putusan R25: secret connector salinan diganti secret milik staging ini.
+        sql_tambahan=lambda sesi_, info, db_dir: berkas_secret_staging(sesi_, staging, info, db_dir),
+        impor=impor,
+        siapkan_runtime=lambda sesi_, job_, info: _siapkan_runtime(sesi_, job_, staging, site, pb, akar, info),
+    )
+
+
+def tarik(sesi, job, site, staging: Staging, klien, pb, akhir_status: bool = True) -> dict:
+    if not punya_fitur(site, STAGING):
+        raise _tolak(job, "Connector site ini belum mengizinkan staging. Aktifkan 'Izinkan staging' "
+                          "di Pengaturan -> WP Manager (connector 3.0).")
+    if not staging.sandi_hash or not staging.rahasia_router_terenkripsi:
+        raise _tolak(job, "Akses preview staging belum dibuat; buat ulang kata sandi preview.")
+    akar = umum.dir_site(site.id)
+    tarik_dir = akar / "tarik"
+    pertama = staging.ditarik_pada is None
+    k = tarik_inti(sesi, job, site, klien, _tujuan_staging(sesi, job, site, staging, pb), umum.kemajuan(job))
+    info = k["info"]
 
     sertifikat_ok = True
     try:
