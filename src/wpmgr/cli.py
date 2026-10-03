@@ -14,12 +14,18 @@ from wpmgr.connector_paket import bangun_paket, sumber_bawaan
 from wpmgr.db import get_session
 from wpmgr.fitur import EVENTS, TRAFFIC
 from wpmgr.geoip import unduh_geoip
-from wpmgr.hosting.cron import cek_dns_semua, perpanjang_sertifikat_hosting
+from wpmgr.hosting.cron import (
+    antrekan_backup_harian,
+    antrekan_backup_pertama,
+    cek_dns_semua,
+    perpanjang_sertifikat_hosting,
+)
 from wpmgr.jobs.queue import antrekan_jika_belum, antrekan_scan
 from wpmgr.jobs.reaper import pulihkan_job_yatim
 from wpmgr.kunci import (
     KUNCI_GA4,
     KUNCI_GEOIP,
+    KUNCI_HOSTING_BACKUP,
     KUNCI_HOSTING_DNS,
     KUNCI_HOSTING_SERTIFIKAT,
     KUNCI_RETENSI,
@@ -239,9 +245,13 @@ def hosting_cek_dns() -> dict | None:
         if not dapat:
             print("Cek DNS hosting lain masih berjalan; dilewati")
             return None
+        sekarang = datetime.now(timezone.utc)
         with get_session() as sesi:
-            hasil = cek_dns_semua(sesi, datetime.now(timezone.utc))
-    print(f"Cek DNS hosting: {hasil['diperiksa']} diperiksa, {hasil['diantrekan']} aktivasi diantrekan")
+            hasil = cek_dns_semua(sesi, sekarang)
+            # Koreksi #2: backup pertama sesudah aktivasi diantrekan di sini, bukan di langkah `beres`.
+            hasil["backup_pertama"] = antrekan_backup_pertama(sesi)
+    print(f"Cek DNS hosting: {hasil['diperiksa']} diperiksa, {hasil['diantrekan']} aktivasi diantrekan, "
+          f"{hasil['backup_pertama']} backup pertama diantrekan")
     return hasil
 
 
@@ -256,6 +266,19 @@ def renew_hosting_certs() -> dict | None:
             hasil = perpanjang_sertifikat_hosting(sesi, Pembantu.dari_setelan(), datetime.now(timezone.utc))
     print(f"Sertifikat hosting: {hasil['berhasil']} berhasil ({hasil['diperbarui']} diperbarui), "
           f"{hasil['gagal']} gagal")
+    return hasil
+
+
+def backup_hosting() -> dict | None:
+    if _hosting_mati():
+        return None
+    with kunci_advisory(db.engine, KUNCI_HOSTING_BACKUP) as dapat:
+        if not dapat:
+            print("Pengantrean backup hosting lain masih berjalan; dilewati")
+            return None
+        with get_session() as sesi:
+            hasil = antrekan_backup_harian(sesi, datetime.now(timezone.utc))
+    print(f"Backup hosting: {hasil['diantrekan']} diantrekan, {hasil['dilewati']} dilewati")
     return hasil
 
 
@@ -282,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("prune-staging")
     sub.add_parser("hosting-cek-dns")
     sub.add_parser("renew-hosting-certs")
+    sub.add_parser("backup-hosting")
 
     args = parser.parse_args(argv)
     if args.perintah == "enqueue-scans":
@@ -316,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
         hosting_cek_dns()
     elif args.perintah == "renew-hosting-certs":
         renew_hosting_certs()
+    elif args.perintah == "backup-hosting":
+        backup_hosting()
     return 0
 
 

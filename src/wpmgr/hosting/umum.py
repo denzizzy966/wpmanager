@@ -537,12 +537,19 @@ def _muat_atau_lepas(sesi: Session, job: Job) -> tuple[Site, HostingVps]:
     ditinggal percobaan sebelumnya di status kerja (`menyalin`/
     `mengaktifkan`) ditutup tanpa merusak salinan yang sehat
     (`status_tanpa_salinan_rusak`; salinan setengah jadi -> `gagal` 'salinan').
+    Backup tidak pernah mengubah status hosting (spec §10.5), juga di jalur
+    ini: hanya `backup_gagal_pada` yang diisi, walau baris tertinggal di
+    status kerja basi (minor tertunda review Task 6).
     """
     try:
         return muat_hosting(sesi, job)
     except SiteError as exc:
         sesi.rollback()
         h = sesi.scalar(select(HostingVps).where(HostingVps.site_id == job.site_id))
+        if job.tipe == JobType.backup_hosting:
+            if h is not None:
+                _tandai_backup_gagal(sesi, h.id)
+            raise
         if menyentuh_produksi(job):
             if akan_diulang(job, TRANSIENT):
                 raise SiteError(TRANSIENT, exc.pesan) from None

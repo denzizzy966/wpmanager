@@ -115,7 +115,9 @@
           <p class="redup">Pemulihan backup dilakukan manual; lihat README, bagian "Pindah hosting (Lapis 4)",
              "Pemulihan backup manual".</p>
           <h3>Backup</h3>
-          <div id="hosting-backup"></div>
+          <div id="hosting-backup" class="toolbar">
+            <button type="button" @click="backupSekarang()" :disabled="!!data.job">Backup sekarang</button>
+          </div>
           <p class="galat" x-show="data.hosting.backup_gagal_pada">Backup terakhir gagal
              (<span x-text="waktu(data.hosting.backup_gagal_pada)"></span>).</p>
           <p class="redup" x-show="data.backup.length === 0">Belum ada backup.</p>

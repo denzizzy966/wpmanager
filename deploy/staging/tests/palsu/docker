@@ -59,6 +59,11 @@ case "${1-}" in
       echo "$$" > "$PALSU/exec-lama.pid"
       exec sleep 300
     fi
+    if [[ "$*" == *mariadb-dump* ]]; then
+      # dump-gagal: dump terputus (keluar bukan 0) sesudah sebagian keluaran.
+      echo "-- dump tiruan"
+      [[ -f "$PALSU/dump-gagal" ]] && exit 2
+    fi
     if [[ " $* " == *" -i "* ]]; then
       n=$(( $(cat "$PALSU/n" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$PALSU/n"

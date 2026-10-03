@@ -2486,3 +2486,160 @@ sert_masih_lama() {
   [ ! -e "$PALSU/systemctl.log" ]
   [ -e "$S/etc/prod/situs/toko" ]
 }
+
+# ---- backup (Task 14) ----------------------------------------------------------
+
+STEMPEL=20261003T023000Z
+
+@test "prod-backup menjalankan tar sebagai UID dashboard" {
+  siap_aktifkan
+  printf 'isi' > "$S/hosting/$ID/files/index.php"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  d="$S/backup/$ID/$STEMPEL"
+  grep -qxF "[--reuid=1000][--regid=1000][--clear-groups][--][tar][-C][$S/hosting/$ID][--numeric-owner][-czf][-][files]" "$PALSU/setpriv.log"
+  grep -q '^\[exec\]\[wpmgr-prod-db\]\[mariadb-dump\]\[--defaults-extra-file=/run/wpmgr-klien-[0-9-]*\.cnf\]\[--single-transaction\]\[--quick\]\[--hex-blob\]\[--no-tablespaces\]\[--default-character-set=utf8mb4\]\[prd_toko\]$' "$PALSU/docker.log"
+  ! grep -q 'prodrahasia' "$PALSU/docker.log" || false
+  [ "$(stat -c %a "$d")" = 700 ]
+  for f in db.sql.gz files.tar.gz manifest.json; do
+    [ "$(stat -c %a:%u "$d/$f")" = "600:0" ]
+  done
+  [ "$output" = "$(cat "$d/manifest.json")" ]
+  [[ "$output" == '{"versi":1,"site_id":"'"$ID"'","nama":"toko","domain":"toko.co.id","stempel":"'"$STEMPEL"'","versi_php":"8.1","prefix":"wp_",'* ]]
+  [[ "$output" == *"\"sha256_db\":\"$(sha256sum "$d/db.sql.gz" | cut -d' ' -f1)\""* ]]
+  [[ "$output" == *"\"sha256_file\":\"$(sha256sum "$d/files.tar.gz" | cut -d' ' -f1)\""* ]]
+  [[ "$output" == *"\"ukuran_file\":$(stat -c %s "$d/files.tar.gz"),"* ]]
+  [ "$(gzip -dc "$d/db.sql.gz")" = "-- dump tiruan" ]
+  tar -tzf "$d/files.tar.gz" | grep -qx 'files/index.php'
+  [ ! -e "$S/backup/$ID/.$STEMPEL.tmp" ]
+}
+
+@test "prod-backup idempoten per stempel dan menolak direktori stempel yang rusak" {
+  siap_aktifkan
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  pertama="$output"
+  : > "$PALSU/docker.log"
+  : > "$PALSU/setpriv.log"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$pertama" ]
+  ! grep -q 'mariadb-dump' "$PALSU/docker.log" || false
+  ! grep -q '\[tar\]' "$PALSU/setpriv.log" || false
+  printf 'rusak' > "$S/backup/$ID/$STEMPEL/manifest.json"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 11 ]
+}
+
+@test "prod-backup menolak stempel atau nama tidak sah dan situs tanpa database" {
+  siap_aktifkan
+  for s in 2026-10-03 "$STEMPEL"x "../$STEMPEL" "$(printf '%s\nx' "$STEMPEL")"; do
+    run "$SKRIP" prod-backup toko "$s"
+    [ "$status" -eq 2 ]
+  done
+  run "$SKRIP" prod-backup Toko "$STEMPEL"
+  [ "$status" -eq 2 ]
+  sed -i 's/^PREFIX=.*/PREFIX=/' "$S/etc/prod/situs/toko"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 3 ]
+  [ -z "$(ls -A "$S/backup")" ]
+}
+
+@test "prod-backup-hapus menolak symlink" {
+  siap_aktifkan
+  mkdir -p "$S/backup/$ID" "$S/lain-backup"
+  printf 'JANGAN' > "$S/lain-backup/penting"
+  ln -s "$S/lain-backup" "$S/backup/$ID/$STEMPEL"
+  run "$SKRIP" prod-backup-hapus toko "$STEMPEL"
+  [ "$status" -eq 3 ]
+  [ "$(cat "$S/lain-backup/penting")" = "JANGAN" ]
+  rm -f "$S/backup/$ID/$STEMPEL"
+  run "$SKRIP" prod-backup-hapus toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ -d "$S/backup/$ID/$STEMPEL" ]
+  run "$SKRIP" prod-backup-hapus toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  [ ! -e "$S/backup/$ID/$STEMPEL" ]
+}
+
+# Preflight M14 (spec §18.4): argumen prod-backup dan prod-backup-hapus.
+@test "argumen prod-backup dan prod-backup-hapus divalidasi sebelum apa pun disentuh" {
+  siap_aktifkan
+  for s in "" 2026-10-03 "$STEMPEL"x "../$STEMPEL" "20261003t023000z" "$(printf '%s\nx' "$STEMPEL")" "*"; do
+    run "$SKRIP" prod-backup-hapus toko "$s"
+    [ "$status" -eq 2 ]
+  done
+  for nama in "" Toko "../x" "a;id" "$(printf 'a\nb')" "$(printf 'a%.0s' $(seq 1 37))"; do
+    run "$SKRIP" prod-backup-hapus "$nama" "$STEMPEL"
+    [ "$status" -eq 2 ]
+    run "$SKRIP" prod-backup "$nama" "$STEMPEL"
+    [ "$status" -eq 2 ]
+  done
+  run "$SKRIP" prod-backup-hapus toko
+  [ "$status" -eq 2 ]
+  [[ "$output" != *"subperintah tidak dikenal"* ]]
+  run "$SKRIP" prod-backup-hapus toko "$STEMPEL" lain
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-backup toko
+  [ "$status" -eq 2 ]
+  run "$SKRIP" prod-backup toko "$STEMPEL" lain
+  [ "$status" -eq 2 ]
+  [ -z "$(docker_log)" ]
+  [ ! -e "$PALSU/setpriv.log" ]
+  [ -z "$(ls -A "$S/backup")" ]
+}
+
+@test "prod-backup-hapus menolak backup bukan milik root dan situs yang belum dibuat" {
+  siap_aktifkan
+  mkdir -p "$S/backup/$ID/$STEMPEL"
+  chown 1000:1000 "$S/backup/$ID/$STEMPEL"
+  run "$SKRIP" prod-backup-hapus toko "$STEMPEL"
+  [ "$status" -eq 3 ]
+  [ -d "$S/backup/$ID/$STEMPEL" ]
+  run "$SKRIP" prod-backup-hapus belum-ada "$STEMPEL"
+  [ "$status" -eq 3 ]
+}
+
+@test "prod-backup menolak BACKUP_DIR yang bisa ditulis pengguna lain dan direktori situs berupa symlink" {
+  siap_aktifkan
+  chmod 0777 "$S/backup"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 3 ]
+  [ -z "$(ls -A "$S/backup")" ]
+  chmod 0700 "$S/backup"
+  mkdir -p "$S/lain-backup"
+  ln -s "$S/lain-backup" "$S/backup/$ID"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 3 ]
+  [ -z "$(ls -A "$S/lain-backup")" ]
+  ! grep -q 'mariadb-dump' "$PALSU/docker.log" || false
+}
+
+@test "prod-backup gagal (dump atau tar fatal) tanpa meninggalkan direktori stempel; tar keluar 1 diterima" {
+  siap_aktifkan
+  touch "$PALSU/dump-gagal"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 11 ]
+  [[ "$output" == *"GALAT backup:"* ]]
+  [ -z "$(ls -A "$S/backup/$ID")" ]
+  rm -f "$PALSU/dump-gagal"
+  printf '2' > "$PALSU/tar-keluar"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 11 ]
+  [ -z "$(ls -A "$S/backup/$ID")" ]
+  # GNU tar keluar 1 = berkas berubah saat dibaca (situs hidup): arsip tetap dipakai.
+  printf '1' > "$PALSU/tar-keluar"
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  [ -f "$S/backup/$ID/$STEMPEL/manifest.json" ]
+}
+
+@test "prod-backup memakai tenggat WAKTU_BACKUP" {
+  siap_aktifkan
+  run "$SKRIP" prod-backup toko "$STEMPEL"
+  [ "$status" -eq 0 ]
+  baris="$(grep -F '[mariadb-dump]' "$PALSU/timeout.log")"
+  [[ "$baris" =~ ^\[-k\]\[10\]\[([0-9]+)\]\[docker\] ]]
+  (( BASH_REMATCH[1] > 10800 && BASH_REMATCH[1] <= 11100 ))
+}

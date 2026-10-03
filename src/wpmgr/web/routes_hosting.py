@@ -96,6 +96,7 @@ PESAN_TANPA_JOB = "Tidak ada pekerjaan hosting yang bisa dibatalkan."
 PESAN_BATAL_BACKUP = "Backup tidak bisa dibatalkan."
 PESAN_BATAL_SESUDAH_TUKAR = "Aktivasi sudah mengubah VPS dan tidak bisa dibatalkan lagi."
 PESAN_HAPUS_DILAYANI = "Site ini dihosting di VPS; lepas manual (README)."
+PESAN_BACKUP_BELUM = "Backup hanya untuk situs yang sudah dilayani VPS."
 
 
 def _iso(nilai):
@@ -497,3 +498,31 @@ def batalkan_pindah(site_id: uuid.UUID, req: PermintaanHapus, pengguna: Pengguna
     for n in nisan:
         _hapus_nisan(akar, n)
     return {"ok": True}
+
+
+# ---- backup (spec §11; tanpa route pemulihan, unduh, atau baca isi backup) --------------
+
+
+@router.get("/api/sites/{site_id}/hosting/backup")
+def daftar_backup_route(site_id: uuid.UUID, pengguna: PenggunaApi):
+    # Fitur mati: GET menjawab {"aktif_fitur": false} seperti status_hosting (preflight M3).
+    if not get_settings().hosting_aktif:
+        return {"aktif_fitur": False}
+    with db.SessionLocal() as sesi:
+        site_atau_404(sesi, site_id)
+        return {"backup": daftar_backup(sesi, site_id)}
+
+
+@router.post("/api/sites/{site_id}/hosting/backup")
+def backup_sekarang(site_id: uuid.UUID, pengguna: PenggunaApi):
+    fitur_hosting()
+    with db.SessionLocal() as sesi:
+        site_atau_404(sesi, site_id)
+        h = _hosting_atau_409(sesi, site_id)
+        if h.dilayani_vps_pada is None:
+            raise HTTPException(status_code=409, detail=PESAN_BACKUP_BELUM)
+        tolak_bila_sibuk(sesi, site_id)
+        stg.catat_aktivitas(sesi, site_id, None, "Backup situs manual diminta", user_id=pengguna.id)
+        job = simpan_job_hosting(sesi, Job(site_id=site_id, tipe=JobType.backup_hosting, payload={"manual": True},
+                                           dibuat_oleh=pengguna.id))
+        return {"job_id": job.id}

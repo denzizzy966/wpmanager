@@ -55,6 +55,7 @@ WAKTU_IMPOR=11100      # TIMEOUT_IMPOR 3 jam + 300
 WAKTU_WPCLI=960        # TIMEOUT_WPCLI 900 + 60
 WAKTU_SERTIFIKAT=360   # TIMEOUT_SERTIFIKAT 300 + 60
 WAKTU_AKTIFKAN=360     # TIMEOUT_AKTIFKAN 300 + 60
+WAKTU_BACKUP=11100     # TIMEOUT_BACKUP 3 jam + 300
 WAKTU_NGINX=360        # TIMEOUT_NGINX 300 + 60 (prod-domain, prod-hapus: kunci bisa menunggu 90 s)
 TENGGAT=$(( SECONDS + WAKTU_BAWAAN ))
 
@@ -2524,6 +2525,107 @@ cmd_prod_hapus() {
   rm -f "$KONF_PROD/situs/$nama"
 }
 
+# ---- backup (spec §9.2) ------------------------------------------------------------
+
+# Satu baris JSON buatan prod-backup sendiri; dipakai untuk mengenali backup
+# yang sudah selesai pada percobaan ulang dengan stempel yang sama.
+POLA_MANIFEST_BACKUP='^\{"versi":1,"site_id":"[0-9a-f-]{36}","nama":"[a-z0-9-]{1,36}","domain":"[a-z0-9.-]{1,253}","stempel":"[0-9]{8}T[0-9]{6}Z","versi_php":"[0-9.]{0,4}","prefix":"[A-Za-z0-9_]{1,20}","ukuran_db":[0-9]{1,20},"ukuran_file":[0-9]{1,20},"sha256_db":"[0-9a-f]{64}","sha256_file":"[0-9a-f]{64}"\}$'
+
+manifest_backup_sah() {
+  local isi
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  isi="$(head -c 4096 -- "$1")"
+  [[ "$isi" =~ $POLA_MANIFEST_BACKUP ]]
+}
+
+# BACKUP_DIR dan BACKUP_DIR/<site_id>: milik root sampai induknya, bukan
+# symlink, dan tidak bisa ditulis grup/pengguna lain (cek_dir_root_ketat).
+# Direktori per situs dibuat 0700; tidak ada container atau user dashboard
+# yang memasang atau membaca BACKUP_DIR.
+siapkan_dir_backup() {
+  local akar="$BACKUP_DIR/$1"
+  cek_dir_root_ketat "$BACKUP_DIR"
+  if [[ ! -e "$akar" && ! -L "$akar" ]]; then
+    install -d -m 0700 "$akar"
+  fi
+  cek_dir_root_ketat "$akar"
+}
+
+# BACKUP_DIR/<site_id>/<stempel>/ milik root 0700: db.sql.gz (mariadb-dump
+# sebagai root di wpmgr-prod-db, kata sandi lewat berkas opsi klien, di-gzip
+# di host), files.tar.gz (tar SEBAGAI user dashboard: tidak mengikuti symlink
+# dan tidak membaca apa pun di luar hak user itu, termasuk saat direktori
+# ditukar di tengah jalan; root hanya menerima aliran byte, RF7), dan
+# manifest.json. Ditulis ke .<stempel>.tmp lalu rename, jadi direktori
+# <stempel> hanya ada bila backup tuntas; kegagalan apa pun menghapus .tmp
+# lewat jebakan EXIT (SEMENTARA).
+cmd_prod_backup() {
+  cek_nama_prod "${1-}"
+  cek_stempel "${2-}"
+  butuh_hosting
+  local nama="$1" stempel="$2" akar dasar sementara db sandi sha_db sha_file ukuran_db ukuran_file rc=0
+  muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
+  [[ -n "$S_PREFIX" ]] || galat ditolak "database situs belum dibuat"
+  siapkan_dir_backup "$S_SITE_ID"
+  akar="$BACKUP_DIR/$S_SITE_ID"
+  dasar="$akar/$stempel"
+  if [[ -e "$dasar" || -L "$dasar" ]]; then
+    # Idempoten untuk percobaan ulang: backup yang sudah selesai dicetak lagi.
+    [[ -d "$dasar" && ! -L "$dasar" ]] || galat backup "backup dengan stempel ini tidak sah"
+    [[ -f "$dasar/db.sql.gz" && ! -L "$dasar/db.sql.gz" && -f "$dasar/files.tar.gz" && ! -L "$dasar/files.tar.gz" ]] \
+      || galat backup "backup dengan stempel ini rusak"
+    manifest_backup_sah "$dasar/manifest.json" || galat backup "backup dengan stempel ini rusak"
+    cat "$dasar/manifest.json"
+    return 0
+  fi
+  sementara="$akar/.$stempel.tmp"
+  rm -rf -- "$sementara"
+  install -d -m 0700 "$sementara"
+  SEMENTARA+=("$sementara")
+  db="$(nama_db_prod "$nama")"
+  sandi="$(cat "$KONF_PROD/db-root")" || galat konfigurasi "kata sandi root database hosting tidak ada"
+  opsi_klien root "$sandi" wpmgr-prod-db
+  dk exec wpmgr-prod-db mariadb-dump --defaults-extra-file="$OPSI_KLIEN" --single-transaction --quick \
+    --hex-blob --no-tablespaces --default-character-set=utf8mb4 "$db" | gzip -c > "$sementara/db.sql.gz" \
+    || galat backup "dump database situs gagal"
+  hapus_opsi_klien
+  cek_mount_pengguna "$HOSTING_DIR/$S_SITE_ID/files" "$HOSTING_DIR"
+  # tar keluar 1 = ada berkas yang berubah selagi dibaca (situs tetap hidup
+  # selama backup, mis. cache plugin); arsipnya tetap utuh dan dipakai.
+  # Keluar >= 2 (berkas tak terbaca, tenggat habis) = backup gagal.
+  sbg_pengguna tar -C "$HOSTING_DIR/$S_SITE_ID" --numeric-owner -czf - files > "$sementara/files.tar.gz" || rc=$?
+  (( rc <= 1 )) || galat backup "arsip berkas situs gagal"
+  sha_db="$(sha256sum "$sementara/db.sql.gz" | cut -d' ' -f1)"
+  sha_file="$(sha256sum "$sementara/files.tar.gz" | cut -d' ' -f1)"
+  ukuran_db="$(stat -c %s "$sementara/db.sql.gz")"
+  ukuran_file="$(stat -c %s "$sementara/files.tar.gz")"
+  printf '{"versi":1,"site_id":"%s","nama":"%s","domain":"%s","stempel":"%s","versi_php":"%s","prefix":"%s","ukuran_db":%s,"ukuran_file":%s,"sha256_db":"%s","sha256_file":"%s"}\n' \
+    "$S_SITE_ID" "$nama" "$S_DOMAIN" "$stempel" "$S_PHP" "$S_PREFIX" "$ukuran_db" "$ukuran_file" "$sha_db" \
+    "$sha_file" > "$sementara/manifest.json"
+  manifest_backup_sah "$sementara/manifest.json" || galat backup "manifest backup tidak sah"
+  chmod 0600 "$sementara/db.sql.gz" "$sementara/files.tar.gz" "$sementara/manifest.json"
+  mv -T "$sementara" "$dasar"
+  cat "$dasar/manifest.json"
+}
+
+# Tidak ada = sukses (idempoten). Hanya direktori asli milik root di bawah
+# BACKUP_DIR/<site_id> yang dihapus; symlink atau milik user lain ditolak
+# (keluar 3) tanpa menyentuh targetnya. `rm -rf` tidak mengikuti symlink di
+# dalam direktori itu.
+cmd_prod_backup_hapus() {
+  cek_nama_prod "${1-}"
+  cek_stempel "${2-}"
+  butuh_hosting
+  muat_state "$1" || galat ditolak "situs belum dibuat (prod-buat)"
+  local akar="$BACKUP_DIR/$S_SITE_ID" dasar="$BACKUP_DIR/$S_SITE_ID/$2"
+  [[ -e "$dasar" || -L "$dasar" ]] || return 0
+  cek_dir_root_ketat "$BACKUP_DIR"
+  cek_dir_root_ketat "$akar"
+  [[ -d "$dasar" && ! -L "$dasar" ]] || galat ditolak "backup bukan direktori asli"
+  [[ "$(stat -c %u -- "$dasar")" == 0 ]] || galat ditolak "backup bukan milik root"
+  rm -rf -- "$dasar"
+}
+
 # ---- utama ---------------------------------------------------------------
 
 utama() {
@@ -2537,7 +2639,7 @@ utama() {
       [[ $# -eq 3 ]] || galat argumen "jumlah argumen salah" ;;
     jalan|jeda|hapus|db-hapus|db-impor|sertifikat|prod-jalan|prod-db-impor|prod-domain|prod-sertifikat|prod-aktifkan|prod-hapus)
       [[ $# -eq 1 ]] || galat argumen "jumlah argumen salah" ;;
-    prod-db-buat)
+    prod-db-buat|prod-backup|prod-backup-hapus)
       [[ $# -eq 2 ]] || galat argumen "jumlah argumen salah" ;;
     prod-buat)
       [[ $# -eq 5 ]] || galat argumen "jumlah argumen salah" ;;
@@ -2554,6 +2656,7 @@ utama() {
     sertifikat|prod-sertifikat) atur_tenggat "$WAKTU_SERTIFIKAT" ;;
     prod-aktifkan) atur_tenggat "$WAKTU_AKTIFKAN" ;;
     prod-domain|prod-hapus) atur_tenggat "$WAKTU_NGINX" ;;
+    prod-backup) atur_tenggat "$WAKTU_BACKUP" ;;
     *) atur_tenggat "$WAKTU_BAWAAN" ;;
   esac
   case "$perintah" in
@@ -2581,6 +2684,8 @@ utama() {
     prod-sertifikat) cmd_prod_sertifikat "$@" ;;
     prod-aktifkan) cmd_prod_aktifkan "$@" ;;
     prod-hapus) cmd_prod_hapus "$@" ;;
+    prod-backup) cmd_prod_backup "$@" ;;
+    prod-backup-hapus) cmd_prod_backup_hapus "$@" ;;
   esac
 }
 

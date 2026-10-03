@@ -534,11 +534,12 @@ def cek_ram(status, tujuan: str = "staging") -> str | None:
     return None
 
 
-def cek_disk(status, tambahan: int) -> str | None:
+def cek_disk(status, tambahan: int, awalan: str = "Sisa disk sesudah tarik") -> str | None:
+    """Sisa disk sesudah menulis `tambahan` byte >= 15%; `awalan` hanya kata di pesan (tarik atau backup)."""
     total = max(1, status.disk_total)
     sisa = status.disk_bebas - max(0, tambahan)
     if sisa / total < SISA_DISK_MINIMUM:
-        return (f"Sisa disk sesudah tarik akan {format_byte(max(0, sisa))} "
+        return (f"{awalan} akan {format_byte(max(0, sisa))} "
                 f"({int(max(0, sisa) * 100 // total)}% dari {format_byte(total)}); minimal 15%.")
     return None
 

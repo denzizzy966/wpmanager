@@ -184,6 +184,10 @@ function tabHosting(siteId) {
       this.muat();
     },
 
+    async backupSekarang() {
+      await this.aksi('backup', 'Backup diantrekan.');
+    },
+
     // Alasan tombol nonaktif; string kosong = boleh. Cermin prasyarat API (409 tetap ditampilkan).
     alasanPindah() {
       if (!this.data) return 'Memuat…';

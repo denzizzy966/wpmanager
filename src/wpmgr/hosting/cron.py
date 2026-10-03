@@ -26,8 +26,8 @@ from wpmgr.staging.cron import POLA_NISAN, _dir_nyata
 from wpmgr.staging.dorong import hapus_nisan
 from wpmgr.staging.pembantu import GalatPembantu
 
-__all__ = ["PESAN_SERTIFIKAT_GAGAL", "ada_job_hosting", "cek_dns_semua", "kunci_hosting",
-           "perpanjang_sertifikat_hosting", "sapu_nisan_hosting"]
+__all__ = ["PESAN_SERTIFIKAT_GAGAL", "ada_job_hosting", "antrekan_backup_harian", "antrekan_backup_pertama",
+           "cek_dns_semua", "kunci_hosting", "perpanjang_sertifikat_hosting", "sapu_nisan_hosting"]
 
 log = logging.getLogger("wpmgr.hosting.cron")
 PESAN_SERTIFIKAT_GAGAL = "Sertifikat domain belum dapat diperpanjang; lihat log server."
@@ -145,3 +145,59 @@ def perpanjang_sertifikat_hosting(sesi, pb, sekarang: datetime) -> dict:
             sesi.rollback()
             log.warning("Perpanjangan sertifikat hosting %s gagal: %s", hid, type(exc).__name__)
     return hasil
+
+
+def antrekan_backup_harian(sesi, sekarang: datetime) -> dict:
+    """backup_hosting untuk setiap situs yang dilayani VPS; uq_jobs_hosting_aktif = dilewati (spec §15).
+
+    `sekarang` tidak dipakai untuk memilih situs (setiap situs yang dilayani
+    dibackup sekali per putaran cron); stempel dibuat job saat berjalan.
+    """
+    hasil = {"diantrekan": 0, "dilewati": 0}
+    ids = sesi.scalars(select(HostingVps.site_id).where(HostingVps.dilayani_vps_pada.is_not(None))
+                       .order_by(HostingVps.nama)).all()
+    sesi.commit()
+    for site_id in ids:
+        try:
+            h = kunci_hosting(sesi, site_id)
+            if h is None or h.dilayani_vps_pada is None:
+                sesi.commit()
+                continue
+            sesi.add(Job(site_id=site_id, tipe=JobType.backup_hosting, payload={"manual": False}))
+            try:
+                sesi.commit()
+                hasil["diantrekan"] += 1
+            except IntegrityError:
+                # Job hosting lain (aktivasi, backup manual) masih tertunda/berjalan.
+                sesi.rollback()
+                hasil["dilewati"] += 1
+        except Exception as exc:  # noqa: BLE001 isolasi per situs
+            sesi.rollback()
+            log.warning("Pengantrean backup hosting site %s gagal: %s", site_id, type(exc).__name__)
+    return hasil
+
+
+def antrekan_backup_pertama(sesi) -> int:
+    """Backup pertama sesudah aktivasi (Koreksi #2): situs aktif yang belum pernah dibackup
+    dan belum pernah gagal backup, tanpa job hosting aktif."""
+    n = 0
+    ids = sesi.scalars(select(HostingVps.site_id).where(
+        HostingVps.status == StatusHosting.aktif, HostingVps.backup_terakhir_pada.is_(None),
+        HostingVps.backup_gagal_pada.is_(None)).order_by(HostingVps.nama)).all()
+    sesi.commit()
+    for site_id in ids:
+        try:
+            h = kunci_hosting(sesi, site_id)
+            if h is None or h.status != StatusHosting.aktif or h.backup_terakhir_pada is not None                     or h.backup_gagal_pada is not None or ada_job_hosting(sesi, site_id):
+                sesi.commit()
+                continue
+            sesi.add(Job(site_id=site_id, tipe=JobType.backup_hosting, payload={"manual": False}))
+            try:
+                sesi.commit()
+                n += 1
+            except IntegrityError:
+                sesi.rollback()
+        except Exception as exc:  # noqa: BLE001 isolasi per situs
+            sesi.rollback()
+            log.warning("Pengantrean backup pertama site %s gagal: %s", site_id, type(exc).__name__)
+    return n

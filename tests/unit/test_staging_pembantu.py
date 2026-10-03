@@ -590,6 +590,12 @@ def test_tenggat_python_cocok_dengan_tenggat_skrip():
     assert waktu["NGINX"] == modul_pembantu.TIMEOUT_NGINX + 60
     assert waktu["AKTIFKAN"] == modul_pembantu.TIMEOUT_AKTIFKAN + 60
     assert re.search(r'^ +prod-domain\|prod-hapus\) atur_tenggat "\$WAKTU_NGINX" ;;$', skrip, re.MULTILINE)
+    # prod-backup (dump + tar sampai 3 jam): skrip minimal TIMEOUT_BACKUP + 60
+    # (carry Task 5); prod-backup-hapus memakai bawaan (TIMEOUT_BAWAAN + 60).
+    assert waktu["BACKUP"] >= modul_pembantu.TIMEOUT_BACKUP + 60
+    assert waktu["BAWAAN"] == modul_pembantu.TIMEOUT_BAWAAN + 60
+    assert re.search(r'^ +prod-backup\) atur_tenggat "\$WAKTU_BACKUP" ;;$', skrip, re.MULTILINE)
+    assert not re.search(r'^ +[a-z|-]*prod-backup-hapus[a-z|-]*\) atur_tenggat', skrip, re.MULTILINE)
 
 
 def test_prod_kode_keluar_3_berarti_tanpa_ubah(pembantu, catatan, monkeypatch):

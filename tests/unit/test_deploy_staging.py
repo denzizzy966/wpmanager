@@ -120,6 +120,16 @@ def test_crontab_hosting_zona_vps_tanpa_cron_tz():
     assert any(b.startswith("50   21 * * *") and "wpmgr.cli renew-hosting-certs" in b for b in baris)
 
 
+def test_crontab_backup_hosting_zona_vps():
+    """Backup harian ±02:30 WIB = 21:30 Europe/Berlin (putusan L19), bukan 02:30 zona VPS."""
+    teks = (AKAR / "deploy" / "crontab").read_text(encoding="utf-8")
+    baris = [b for b in teks.splitlines() if b.strip() and not b.startswith("#")]
+    backup = [b for b in baris if "wpmgr.cli backup-hosting" in b]
+    assert len(backup) == 1 and backup[0].startswith("30   21 * * *")
+    assert ">> /var/log/wpmgr/cron.log 2>&1" in backup[0]
+    assert "02:30 WIB" in teks
+
+
 def test_crontab_berakhiran_baris_lf():
     assert b"\r" not in (AKAR / "deploy" / "crontab").read_bytes()
     assert "deploy/crontab text eol=lf" in (AKAR / ".gitattributes").read_text(encoding="utf-8").splitlines()

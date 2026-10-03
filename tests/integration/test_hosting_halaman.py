@@ -83,3 +83,12 @@ def test_hosting_tanpa_storage_dan_innerhtml():
                      "insertAdjacentHTML", "x-html", "|safe"):
             assert kata not in isi, kata
     assert "{{ site.nama" not in tpl and "{{ site.url" not in tpl
+
+
+def test_tombol_backup_sekarang():
+    # Task 14: tombol di bagian situs aktif, nonaktif selagi ada job hosting; pesan galat dari server
+    # (teks tetap) tampil lewat `aksi` -> x-text.
+    js = (AKAR / "static" / "app" / "hosting.js").read_text(encoding="utf-8")
+    tpl = (AKAR / "templates" / "_tab_hosting.html").read_text(encoding="utf-8")
+    assert '<button type="button" @click="backupSekarang()" :disabled="!!data.job">Backup sekarang</button>' in tpl
+    assert "async backupSekarang() {\n      await this.aksi('backup', 'Backup diantrekan.');" in js

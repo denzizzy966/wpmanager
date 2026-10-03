@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# tar tiruan: meneruskan ke tar asli. Bila $PALSU/tar-keluar berisi angka,
+# arsip tetap ditulis lalu tar keluar dengan kode itu (1 = "berkas berubah
+# saat dibaca" GNU tar, 2 = galat fatal).
+rc=127
+for asli in /bin/tar /usr/bin/tar; do
+  if [[ -x "$asli" ]]; then
+    rc=0
+    "$asli" "$@" || rc=$?
+    break
+  fi
+done
+if [[ -n "${PALSU-}" && -s "$PALSU/tar-keluar" ]]; then
+  exit "$(cat "$PALSU/tar-keluar")"
+fi
+exit "$rc"

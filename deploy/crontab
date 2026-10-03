@@ -15,8 +15,9 @@
 20   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli renew-staging-certs   >> /var/log/wpmgr/cron.log 2>&1
 40   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli prune-staging         >> /var/log/wpmgr/cron.log 2>&1
 # Lapis 4 -- hosting VPS. cron di VPS (Debian/Ubuntu cron 3.0pl1) tidak mengenal CRON_TZ,
-# jadi jadwal ditulis dalam zona VPS Europe/Berlin. Padanan WIB: 21:50 Berlin = 02:50 WIB
-# (musim dingin) / 03:50 WIB (musim panas). Jadwal hosting berikutnya (mis. backup-hosting)
-# mengikuti aturan yang sama: zona VPS, bukan WIB.
+# jadi jadwal ditulis dalam zona VPS Europe/Berlin (putusan L19). Padanan WIB (UTC+7):
+#   backup-hosting      21:30 Berlin = 02:30 WIB (musim panas, CEST) / 03:30 WIB (musim dingin, CET)
+#   renew-hosting-certs 21:50 Berlin = 02:50 WIB (musim panas, CEST) / 03:50 WIB (musim dingin, CET)
+30   21 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli backup-hosting        >> /var/log/wpmgr/cron.log 2>&1
 */10 * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli hosting-cek-dns       >> /var/log/wpmgr/cron.log 2>&1
 50   21 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli renew-hosting-certs   >> /var/log/wpmgr/cron.log 2>&1
