@@ -108,3 +108,17 @@ def test_readme_menjelaskan_pemasangan():
                   "root-owned",  # /var/lib/wpmgr harus tetap root-owned (minor)
                   ):
         assert wajib in readme, wajib
+
+
+def test_crontab_cron_tz_hanya_untuk_baris_hosting():
+    """CRON_TZ berlaku untuk semua baris sesudahnya: blok hosting wajib di akhir berkas (spec §15, A15)."""
+    baris = [b for b in (AKAR / "deploy" / "crontab").read_text(encoding="utf-8").splitlines()
+             if b.strip() and not b.startswith("#")]
+    tz = [i for i, b in enumerate(baris) if b.startswith("CRON_TZ=")]
+    assert len(tz) == 1 and baris[tz[0]] == "CRON_TZ=Asia/Jakarta"
+    sebelum, sesudah = baris[:tz[0]], baris[tz[0] + 1:]
+    assert not any("hosting" in b for b in sebelum)
+    assert sesudah and all("wpmgr.cli hosting-" in b or "wpmgr.cli renew-hosting-certs" in b
+                           or "wpmgr.cli backup-hosting" in b for b in sesudah)
+    assert any(b.startswith("*/10 * * * *") and "hosting-cek-dns" in b for b in sesudah)
+    assert any(b.startswith("50   3 * * *") and "renew-hosting-certs" in b for b in sesudah)

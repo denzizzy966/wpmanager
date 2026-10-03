@@ -14,3 +14,9 @@
 10   * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli staging-jeda-otomatis >> /var/log/wpmgr/cron.log 2>&1
 20   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli renew-staging-certs   >> /var/log/wpmgr/cron.log 2>&1
 40   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli prune-staging         >> /var/log/wpmgr/cron.log 2>&1
+# Lapis 4 -- hosting VPS. CRON_TZ berlaku untuk SEMUA baris sesudahnya; zona
+# waktu sistem VPS Europe/Berlin, jadi jadwal di bawah ini WIB (spec §15, A15).
+# Blok ini wajib tetap di akhir berkas.
+CRON_TZ=Asia/Jakarta
+*/10 * * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli hosting-cek-dns       >> /var/log/wpmgr/cron.log 2>&1
+50   3 * * *  cd /opt/wpmgr && .venv/bin/python -m wpmgr.cli renew-hosting-certs   >> /var/log/wpmgr/cron.log 2>&1
