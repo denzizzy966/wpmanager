@@ -12,6 +12,7 @@ from wpmgr.hosting.dns import (
     backoff_mengizinkan,
     coba_lagi_pada,
     instruksi,
+    ip_lama_dan_cdn,
     ip_lama_dari_dns,
     periksa_dns,
 )
@@ -39,6 +40,14 @@ def ipv6_vps(setelan, monkeypatch):
 
     monkeypatch.setenv("WPMGR_HOSTING_IPV6", VPS6)
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _tanpa_jaringan(monkeypatch):
+    def terlarang():
+        raise AssertionError("buat_penanya dipanggil: test harus memberi penanya palsu")
+
+    monkeypatch.setattr(dns_mod, "buat_penanya", terlarang)
 
 
 class PenanyaPalsu:
@@ -145,7 +154,7 @@ def test_dns_resolver_tidak_menjawab_belum_lolos(setelan):
 
 
 @pytest.mark.parametrize("caa,ok", [
-    ((), True), (("issue letsencrypt.org",), True), (("issuewild letsencrypt.org",), True),
+    ((), True), (("issue letsencrypt.org",), True), (("issuewild letsencrypt.org",), False),
     (("issue sectigo.com",), False), (("iodef mailto:a@b.id",), False),
 ])
 def test_dns_caa(setelan, caa, ok):
@@ -300,3 +309,145 @@ def test_nilai_dns_tidak_sah_dibuang():
     assert dns_mod._nilai_rdata("A", Rd("1.2.3.4")) == "1.2.3.4"
     assert dns_mod._nilai_rdata("A", Rd("<x>")) is None
     assert dns_mod._nilai_rdata("AAAA", Rd("zzz")) is None
+
+
+# ---- putaran perbaikan 1 --------------------------------------------------------------------
+
+
+def test_ada_www_tiga_keadaan(setelan):
+    semua_mati = PenanyaPalsu({(R1, "www.toko.co.id", "A"): None, (R2, "www.toko.co.id", "A"): None})
+    assert ada_www("toko.co.id", penanya=semua_mati) is None
+    assert ada_www("toko.co.id", penanya=PenanyaPalsu({})) is False  # NXDOMAIN di semua resolver
+    assert ada_www("toko.co.id", penanya=PenanyaPalsu({
+        (R1, "www.toko.co.id", "A"): None, (R2, "www.toko.co.id", "A"): Jawaban((LAMA,))})) is True
+    assert ada_www("toko.co.id", penanya=PenanyaPalsu({(R1, "www.toko.co.id", "A"): None})) is False
+
+
+@pytest.mark.parametrize("caa,ok", [
+    (Jawaban((), ada=1), False),  # `0 issue ""`: tak terbaca tetap ada, melarang semua CA
+    (Jawaban(("issue letsencrypt.org; validationmethods=dns-01",), ada=1), False),
+    (Jawaban(("issue letsencrypt.org; validationmethods=dns-01,http-01",), ada=1), True),
+    (Jawaban(("issue letsencrypt.org; accounturi=https://x",), ada=1), True),
+    (Jawaban(("issue notletsencrypt.org",), ada=1), False),
+    (Jawaban(("issue letsencrypt.org.evil.com",), ada=1), False),
+    (Jawaban(("issue evil.com; x=letsencrypt.org",), ada=1), False),
+    (Jawaban(("issuewild letsencrypt.org",), ada=1), False),
+    (Jawaban(("issue sectigo.com", "issue letsencrypt.org"), ada=2), True),
+    (Jawaban(("issue letsencrypt.org",), ada=3), True),
+])
+def test_dns_caa_gagal_tertutup(setelan, caa, ok):
+    p = _sudah_pindah()
+    p.jawaban[(R1, "toko.co.id", "CAA")] = caa
+    hasil = periksa_dns(_h(), penanya=p)
+    assert _item(hasil, "@", "CAA")["ok"] is ok and hasil.ok is ok
+
+
+def test_dns_caa_www_sendiri_diperiksa(setelan):
+    p = _sudah_pindah()
+    p.jawaban[(R1, "www.toko.co.id", "CAA")] = Jawaban(("issue sectigo.com",), ada=1)
+    assert _item(periksa_dns(_h(), penanya=p), "@", "CAA")["kode"] == "caa"
+    assert _item(periksa_dns(_h(www=False), penanya=p), "@", "CAA")["kode"] == "cocok"
+
+
+def test_ip_lama_lewat_cdn_hostinger_none(setelan):
+    # Bentuk rizkycahayaraya.com: A apex = IP CDN, www CNAME ke *.cdn.hstgr.net.
+    p = PenanyaPalsu({(None, "toko.co.id", "A"): Jawaban(("84.32.84.10",)),
+                      (None, "www.toko.co.id", "A"): Jawaban(("84.32.84.10",), cname="toko.co.id.cdn.hstgr.net")})
+    assert ip_lama_dari_dns("toko.co.id", penanya=p) is None
+    assert ip_lama_dan_cdn("toko.co.id", penanya=p) == (None, True)
+    assert "hPanel" in dns_mod.PESAN_CDN_IP_LAMA
+    p2 = PenanyaPalsu({(None, "toko.co.id", "A"): Jawaban(("84.32.84.10",), cname="a.hstgr.net")})
+    assert ip_lama_dan_cdn("toko.co.id", penanya=p2) == (None, True)
+    biasa = PenanyaPalsu({(None, "toko.co.id", "A"): Jawaban((LAMA,))})
+    assert ip_lama_dan_cdn("toko.co.id", penanya=biasa) == (LAMA, False)
+
+
+def test_cname_hstgr_didahulukan_dari_beda_resolver(setelan):
+    p = _sudah_pindah()
+    p.jawaban[(R1, "www.toko.co.id", "A")] = Jawaban(("185.10.10.10",), cname="x.cdn.hstgr.net")
+    p.jawaban[(R2, "www.toko.co.id", "A")] = Jawaban((VPS,))
+    hasil = periksa_dns(_h(), penanya=p)
+    assert _item(hasil, "www", "A")["kode"] == "cname" and hasil.pesan == dns_mod.PESAN_CDN
+
+
+def test_batas_titik_hstgr():
+    assert dns_mod._hstgr("evilhstgr.net") is False
+    assert dns_mod._hstgr("hstgr.net") and dns_mod._hstgr("a.cdn.hstgr.net")
+    assert not dns_mod._hstgr(None)
+
+
+def test_instruksi_www_cname_ke_apex_ikut_apex(setelan):
+    p = _sudah_pindah()
+    p.jawaban[(None, "toko.co.id", "A")] = Jawaban((LAMA,))
+    p.jawaban[(None, "www.toko.co.id", "A")] = Jawaban((LAMA,), cname="toko.co.id")
+    h = _h()
+    h.dns_hasil = periksa_dns(h, penanya=p).ke_json()
+    www = next(x for x in instruksi(h, VPS, None) if x["jenis"] == "A" and x["nama"] == "www")
+    assert www["aksi"] == "ikut_apex" and www["ikut_apex"] is True
+
+
+@pytest.mark.parametrize("rusak", ["teks", 5, ["a"], {"nama": "x"}, {"nama": 7}])
+def test_instruksi_dns_hasil_bukan_dict(setelan, rusak):
+    h = _h()
+    h.dns_hasil = rusak
+    assert len(instruksi(h, VPS, None)) == 4
+
+
+def test_nilai_dibatasi_terurut(setelan):
+    ips = [f"10.0.0.{i}" for i in range(20, 0, -1)]
+    p = PenanyaPalsu({(None, "toko.co.id", "A"): Jawaban(tuple(ips))})
+    a = _item(periksa_dns(_h(www=False), penanya=p), "@", "A")
+    assert a["terlihat"] == sorted(ips)[: dns_mod.MAKS_NILAI]
+
+
+# ---- PenanyaDns dengan dnspython palsu -------------------------------------------------------
+
+
+class _Rd:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _Jawab:
+    def __init__(self, rrset, kanonik="toko.co.id."):
+        self.rrset = rrset
+        self.canonical_name = kanonik
+
+
+def _pasang_resolver(monkeypatch, hasil):
+    class R:
+        def __init__(self, configure=True):
+            assert configure is False
+
+        def resolve(self, nama, jenis, **opsi):
+            assert opsi == {"raise_on_no_answer": False, "search": False}
+            assert self.lifetime == self.timeout == 2.5 and self.nameservers == [R1]
+            if isinstance(hasil, Exception):
+                raise hasil
+            return hasil
+
+    monkeypatch.setattr(dns_mod.dns.resolver, "Resolver", R)
+
+
+def test_penanya_nxdomain_dan_galat(monkeypatch):
+    _pasang_resolver(monkeypatch, dns_mod.dns.resolver.NXDOMAIN())
+    assert dns_mod.PenanyaDns().tanya(R1, "toko.co.id", "A", 2.5) == Jawaban()
+    _pasang_resolver(monkeypatch, dns_mod.dns.exception.Timeout())
+    assert dns_mod.PenanyaDns().tanya(R1, "toko.co.id", "A", 2.5) is None
+
+
+def test_penanya_kanonik_dan_batas_nilai(monkeypatch):
+    rr = [_Rd(address=f"10.0.0.{i}") for i in range(30, 0, -1)] + [_Rd(address="bukan-ip")]
+    _pasang_resolver(monkeypatch, _Jawab(rr, "www.toko.co.id.cdn.hstgr.net."))
+    j = dns_mod.PenanyaDns().tanya(R1, "www.toko.co.id", "A", 2.5)
+    assert j.cname == "www.toko.co.id.cdn.hstgr.net"
+    assert len(j.nilai) == dns_mod.MAKS_NILAI and list(j.nilai) == sorted(j.nilai)
+    _pasang_resolver(monkeypatch, _Jawab([_Rd(address="1.2.3.4")], "toko.co.id."))
+    assert dns_mod.PenanyaDns().tanya(R1, "toko.co.id", "A", 2.5) == Jawaban(("1.2.3.4",))
+
+
+def test_penanya_caa_tak_terbaca_tetap_terhitung(monkeypatch):
+    rr = [_Rd(tag=b"issue", value=b""), _Rd(tag=b"issue", value="é".encode()), _Rd(tag=b"issue", value=b"a" * 300)]
+    _pasang_resolver(monkeypatch, _Jawab(rr))
+    j = dns_mod.PenanyaDns().tanya(R1, "toko.co.id", "CAA", 2.5)
+    assert j.nilai == () and j.ada == 3 and j.terisi

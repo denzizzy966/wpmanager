@@ -34,6 +34,8 @@ PESAN_LOLOS = "DNS sudah menunjuk VPS."
 PESAN_MENYEBAR = "DNS sedang menyebar"
 PESAN_CDN = ("Domain memakai CDN Hostinger: matikan CDN di hPanel, lalu ganti CNAME www "
             "(...hstgr.net) dengan record A ke VPS.")
+PESAN_CDN_IP_LAMA = ("Domain masih lewat CDN Hostinger sehingga IP hosting lama tidak terlihat: matikan CDN "
+                     "di hPanel, tunggu DNS menyebar, lalu coba lagi.")
 PESAN_BELUM = "DNS belum menunjuk VPS; ubah record sesuai tabel."
 
 
@@ -46,6 +48,17 @@ class Jawaban:
     nilai: tuple[str, ...] = ()
     # Nama kanonik bila jawaban datang lewat CNAME ke nama lain.
     cname: str | None = None
+    # Jumlah record mentah di RRset (CAA): nilai yang tak terbaca tetap terhitung
+    # supaya CAA yang aneh dianggap ada dan tidak mengizinkan (gagal tertutup).
+    ada: int = 0
+
+    @property
+    def terisi(self) -> bool:
+        return bool(self.nilai) or self.ada > 0
+
+
+def _hstgr(nama: str | None) -> bool:
+    return bool(nama) and (nama == "hstgr.net" or nama.endswith(".hstgr.net"))
 
 
 def _nilai_rdata(jenis: str, rd) -> str | None:
@@ -76,15 +89,19 @@ class PenanyaDns:
             return Jawaban()
         except dns.exception.DNSException:
             return None
-        nilai: list[str] = []
+        nilai: set[str] = set()
+        ada = 0
         for rd in jawab.rrset or ():
+            ada += 1
             teks = _nilai_rdata(jenis, rd)
-            if teks is not None and teks not in nilai:
-                nilai.append(teks)
-            if len(nilai) >= MAKS_NILAI:
+            if teks is not None:
+                nilai.add(teks)
+            if ada >= 4 * MAKS_NILAI:
                 break
+        # Diurutkan sebelum dipotong supaya subset yang tampil tetap.
         kanonik = str(jawab.canonical_name).rstrip(".").lower()
-        return Jawaban(tuple(nilai), kanonik if kanonik != nama.lower() else None)
+        return Jawaban(tuple(sorted(nilai))[:MAKS_NILAI], kanonik if kanonik != nama.lower() else None,
+                       ada if jenis == "CAA" else 0)
 
 
 def buat_penanya() -> PenanyaDns:
@@ -132,6 +149,10 @@ def _nilai_item(label: str, jenis: str, fqdn: str, domain: str, jawaban: list, i
     harus = [ipv4] if jenis == "A" else ([ipv6] if ipv6 else [])
     terlihat = sorted({v for j in jawaban if j is not None for v in j.nilai})[:MAKS_NILAI]
     dasar = {"nama": label, "jenis": jenis, "terlihat": terlihat, "harus": harus}
+    cdn = jenis == "A" and any(j is not None and _hstgr(j.cname) for j in jawaban)
+    if cdn:
+        # CNAME CDN didahulukan: panduannya sama berapa pun resolver yang sudah berubah.
+        return {**dasar, "ok": False, "kode": "cname"}
     # Resolver yang tidak menjawab atau berbeda pendapat = DNS belum stabil.
     if any(j is None for j in jawaban) or len({frozenset(j.nilai) for j in jawaban}) > 1:
         return {**dasar, "ok": False, "kode": "beda_resolver"}
@@ -141,7 +162,7 @@ def _nilai_item(label: str, jenis: str, fqdn: str, domain: str, jawaban: list, i
             kode = "cocok"
         elif ipv4 in nilai:
             kode = "lebih"
-        elif any(j.cname and (j.cname.endswith("hstgr.net") or j.cname not in (fqdn, domain)) for j in jawaban):
+        elif any(j.cname and j.cname not in (fqdn, domain) for j in jawaban):
             # A12: www lewat CNAME ke CDN hosting lama; CNAME harus diganti A.
             kode = "cname"
         else:
@@ -153,21 +174,49 @@ def _nilai_item(label: str, jenis: str, fqdn: str, domain: str, jawaban: list, i
     else:
         # §8.2: AAAA lama wajib dihapus bila VPS tanpa IPv6 di setelan.
         kode = "hapus"
-    return {**dasar, "ok": kode == "cocok", "kode": kode}
+    hasil = {**dasar, "ok": kode == "cocok", "kode": kode}
+    if jenis == "A" and label == "www" and all(j.cname == domain for j in jawaban):
+        hasil["cname_apex"] = True
+    return hasil
 
 
-def _periksa_caa(resolver: str, domain: str, tanya) -> dict:
-    """CAA domain, lalu induknya sampai zona; berhenti di jawaban pertama (spec §8.1)."""
+def _caa_mengizinkan(nilai: tuple[str, ...]) -> bool:
+    """Hanya `issue` untuk letsencrypt.org persis (domain sebelum `;`); `issuewild` tidak
+    berlaku untuk apex/www, dan daftar validationmethods tanpa http-01 tidak mengizinkan."""
+    for v in nilai:
+        tag, _, isi = v.partition(" ")
+        if tag != "issue":
+            continue
+        penerbit, *param = (bagian.strip() for bagian in isi.split(";"))
+        if penerbit != CAA_LETSENCRYPT:
+            continue
+        metode = [p.partition("=")[2].split(",") for p in param if p.startswith("validationmethods=")]
+        if all("http-01" in [m.strip() for m in daftar] for daftar in metode):
+            return True
+    return False
+
+
+def _periksa_caa(resolver: str, domain: str, tanya, dengan_www: bool = False) -> dict:
+    """CAA domain, lalu induknya sampai zona; berhenti di jawaban pertama (spec §8.1).
+
+    RRset yang ada tetapi tak terbaca (`0 issue ""`, terlalu panjang, bukan ASCII)
+    dianggap ada dan tidak mengizinkan. `www` yang punya CAA sendiri juga diperiksa.
+    """
     dasar = {"nama": "@", "jenis": "CAA", "terlihat": [], "harus": []}
+    www = f"www.{domain}"
     label = domain.split(".")
-    for i in range(len(label) - 1):
-        j = tanya(resolver, ".".join(label[i:]), "CAA")
+    awal = ([www] if dengan_www else []) + [".".join(label[i:]) for i in range(len(label) - 1)]
+    ditemukan = []
+    for nama in awal:
+        j = tanya(resolver, nama, "CAA")
         if j is None:
             return {**dasar, "ok": False, "kode": "beda_resolver"}
-        if j.nilai:
-            ok = any(v.split(" ", 1)[0] in ("issue", "issuewild") and CAA_LETSENCRYPT in v for v in j.nilai)
-            return {**dasar, "ok": ok, "kode": "cocok" if ok else "caa"}
-    return {**dasar, "ok": True, "kode": "cocok"}
+        if j.terisi:
+            ditemukan.append(j)
+            if nama != www:
+                break
+    ok = all(_caa_mengizinkan(j.nilai) for j in ditemukan)
+    return {**dasar, "ok": ok, "kode": "cocok" if ok else "caa"}
 
 
 def periksa_dns(hosting, resolver=None, penanya=None, sekarang: datetime | None = None) -> HasilDns:
@@ -183,36 +232,57 @@ def periksa_dns(hosting, resolver=None, penanya=None, sekarang: datetime | None 
         for jenis in ("A", "AAAA"):
             jawaban = [tanya(r, fqdn, jenis) for r in daftar]
             item.append(_nilai_item(label, jenis, fqdn, hosting.domain, jawaban, s.hosting_ipv4, s.hosting_ipv6))
-    item.append(_periksa_caa(daftar[0], hosting.domain, tanya))
+    item.append(_periksa_caa(daftar[0], hosting.domain, tanya, hosting.dengan_www))
     return HasilDns(ok=all(x["ok"] for x in item), dicek=sekarang.isoformat(), nama=item)
+
+
+def ip_lama_dan_cdn(domain: str, penanya=None, resolver=None) -> tuple[str | None, bool]:
+    """(ip_lama, lewat_cdn). `lewat_cdn` True bila apex atau www lewat CNAME `hstgr.net`:
+    A apex-nya IP CDN, bukan IP hosting lama, jadi ip_lama None (pakai PESAN_CDN_IP_LAMA)."""
+    s = get_settings()
+    tanya = _penanya_bertenggat(penanya or buat_penanya())
+    for r in resolver or s.daftar_resolver:
+        j = tanya(r, domain, "A")
+        if j is None:
+            continue
+        w = tanya(r, f"www.{domain}", "A")
+        if _hstgr(j.cname) or (w is not None and _hstgr(w.cname)):
+            return None, True
+        if not j.nilai:
+            continue
+        if s.hosting_ipv4 in j.nilai:
+            return None, False
+        return next((ip for ip in sorted(j.nilai) if alamat_lama_sah(ip)), None), False
+    return None, False
 
 
 def ip_lama_dari_dns(domain: str, penanya=None, resolver=None) -> str | None:
     """IPv4 hosting lama dari A domain (spec §6 langkah 2).
 
-    None bila tidak ada resolver yang menjawab, tidak ada IPv4 publik, atau
-    domain sudah (sebagian) menunjuk VPS -- ip_lama lalu tidak bisa ditentukan.
+    None bila tidak ada resolver yang menjawab, tidak ada IPv4 publik, domain sudah
+    (sebagian) menunjuk VPS, atau domain lewat CDN Hostinger (lihat `ip_lama_dan_cdn`).
     """
-    s = get_settings()
-    tanya = _penanya_bertenggat(penanya or buat_penanya())
-    for r in resolver or s.daftar_resolver:
-        j = tanya(r, domain, "A")
-        if j is None or not j.nilai:
-            continue
-        if s.hosting_ipv4 in j.nilai:
-            return None
-        return next((ip for ip in sorted(j.nilai) if alamat_lama_sah(ip)), None)
-    return None
+    return ip_lama_dan_cdn(domain, penanya, resolver)[0]
 
 
-def ada_www(domain: str, penanya=None, resolver=None) -> bool:
-    """`www.<domain>` punya A (langsung atau lewat CNAME) di salah satu resolver."""
+def ada_www(domain: str, penanya=None, resolver=None) -> bool | None:
+    """`www.<domain>` punya A (langsung atau lewat CNAME) di salah satu resolver.
+
+    True = ada; False = setidaknya satu resolver menjawab dan tidak ada; None = tidak
+    ada resolver yang menjawab (DNS gagal). Pemanggil WAJIB menolak dengan pesan tetap
+    pada None: menganggapnya "tanpa www" bisa mengaktifkan sementara pengunjung www
+    masih ke hosting lama.
+    """
     tanya = _penanya_bertenggat(penanya or buat_penanya())
+    menjawab = False
     for r in resolver or get_settings().daftar_resolver:
         j = tanya(r, f"www.{domain}", "A")
-        if j is not None and j.nilai:
+        if j is None:
+            continue
+        menjawab = True
+        if j.nilai:
             return True
-    return False
+    return False if menjawab else None
 
 
 def _ipv6_sah(nilai) -> bool:
@@ -229,14 +299,20 @@ def instruksi(hosting, ipv4: str, ipv6: str | None) -> list[dict]:
     yang tampil hanya alamat IPv6 yang lolos `ipaddress`.
     """
     hasil = {}
-    for x in ((hosting.dns_hasil or {}).get("nama") or []):
+    mentah = hosting.dns_hasil if isinstance(hosting.dns_hasil, dict) else {}
+    for x in (mentah.get("nama") if isinstance(mentah.get("nama"), list) else []):
         if isinstance(x, dict):
             hasil[(x.get("nama"), x.get("jenis"))] = x
     daftar = []
     for label in ["@"] + (["www"] if hosting.dengan_www else []):
         a = hasil.get((label, "A")) or {}
-        daftar.append({"jenis": "A", "nama": label, "aksi": "ubah", "nilai": ipv4, "ok": a.get("ok") is True,
-                       "cname": a.get("kode") == "cname"})
+        if label == "www" and a.get("cname_apex") is True:
+            # www CNAME ke apex: ikut apex, tidak perlu perubahan terpisah.
+            daftar.append({"jenis": "A", "nama": label, "aksi": "ikut_apex", "nilai": ipv4,
+                           "ok": a.get("ok") is True, "cname": False, "ikut_apex": True})
+        else:
+            daftar.append({"jenis": "A", "nama": label, "aksi": "ubah", "nilai": ipv4, "ok": a.get("ok") is True,
+                           "cname": a.get("kode") == "cname"})
         aaaa = hasil.get((label, "AAAA")) or {}
         if ipv6:
             daftar.append({"jenis": "AAAA", "nama": label, "aksi": "ubah", "nilai": ipv6, "ok": aaaa.get("ok") is True})
