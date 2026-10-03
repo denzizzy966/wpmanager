@@ -298,9 +298,14 @@ def status_sebelum(job: Job, h: HostingVps) -> tuple[StatusHosting, str | None]:
     return StatusHosting.gagal, ASAL_SALINAN
 
 
-def salinan_utuh(job: Job) -> bool:
-    """Tarik job ini sudah menyelesaikan salinan VPS (berkas, database, runtime)."""
-    return stg.kemajuan(job).get("tahap") in TAHAP_SALINAN_UTUH
+def salinan_utuh(job: Job, h: HostingVps) -> bool:
+    """Tarik job ini sudah menyelesaikan salinan VPS (berkas, database, runtime).
+
+    Salinan pertama (`ditarik_pada` masih kosong) baru utuh sesudah
+    `rampungkan_salinan` mengisi `ditarik_pada`; sebelum itu tidak pernah
+    dianggap utuh, walau tahapnya sudah `pratinjau`.
+    """
+    return h.ditarik_pada is not None and stg.kemajuan(job).get("tahap") in TAHAP_SALINAN_UTUH
 
 
 def status_tanpa_salinan_rusak(job: Job, h: HostingVps) -> tuple[StatusHosting, str | None] | None:
@@ -312,7 +317,7 @@ def status_tanpa_salinan_rusak(job: Job, h: HostingVps) -> tuple[StatusHosting, 
     """
     if job.tipe not in STATUS_KERJA or stg.salinan_belum_disentuh(job):
         return status_sebelum(job, h)
-    if not salinan_utuh(job):
+    if not salinan_utuh(job, h):
         return None
     status, asal = status_sebelum(job, h)
     if status == StatusHosting.gagal and asal == ASAL_SALINAN:
@@ -484,20 +489,33 @@ def _tangani_sibuk(sesi: Session, job: Job, hosting_id, site_id, exc: GalatPemba
 
 
 def _muat_atau_lepas(sesi: Session, job: Job) -> tuple[Site, HostingVps]:
-    """`muat_hosting`; bila ditolak (fitur dimatikan sementara job menunggu), status kerja tidak ditinggal.
+    """`muat_hosting`; bila ditolak (fitur dimatikan, baris hilang) selagi job menunggu.
 
-    Percobaan sebelumnya job ini bisa meninggalkan baris di `menyalin`/
-    `mengaktifkan` ("dilanjutkan otomatis"). Job berakhir di sini, jadi baris
-    itu ditutup seperti kegagalan final (aturan `status_gagal_final`).
-    Baris yang sudah hilang tidak meninggalkan apa pun.
+    Sesudah tukar (`queue.menyentuh_produksi`): diulang menurut R26 seperti
+    galat lain (TRANSIENT) sampai batas 24 jam, lalu kegagalan final
+    (`gagal` 'produksi'). Sebelum tukar: job berakhir, dan baris yang
+    ditinggal percobaan sebelumnya di status kerja (`menyalin`/
+    `mengaktifkan`) ditutup tanpa merusak salinan yang sehat
+    (`status_tanpa_salinan_rusak`; salinan setengah jadi -> `gagal` 'salinan').
     """
     try:
         return muat_hosting(sesi, job)
     except SiteError as exc:
         sesi.rollback()
         h = sesi.scalar(select(HostingVps).where(HostingVps.site_id == job.site_id))
+        if menyentuh_produksi(job):
+            if akan_diulang(job, TRANSIENT):
+                raise SiteError(TRANSIENT, exc.pesan) from None
+            if h is not None:
+                _gagal_final(sesi, job, h.id, exc.pesan)
+            raise
         if h is not None and h.status in STATUS_KERJA_SEMUA:
-            _gagal_final(sesi, job, h.id, exc.pesan)
+            hasil = status_tanpa_salinan_rusak(job, h)
+            if hasil is None:
+                _gagal_final(sesi, job, h.id, exc.pesan)
+            else:
+                status, asal = hasil
+                _tandai(sesi, h.id, status, exc.pesan, asal=asal)
         raise
 
 

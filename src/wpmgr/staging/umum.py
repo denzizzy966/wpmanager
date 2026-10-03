@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm.attributes import flag_modified, set_committed_value
 
 from wpmgr.config import get_settings
 from wpmgr.errors import (
@@ -27,6 +27,7 @@ from wpmgr.jobs.queue import (  # noqa: F401
     LANGKAH_SESUDAH_TUKAR,
     akan_diulang,
     menyentuh_produksi,
+    pemegang_klaim,
 )
 from wpmgr.models import (
     ActivityLog,
@@ -189,12 +190,13 @@ def detak(sesi: Session, job: Job) -> None:
     """Perpanjang klaim (locked_at) supaya reaper tidak merebut job yang berjalan lama.
 
     Job yang dipanggil langsung tanpa klaim (test, pemanggilan manual) tidak
-    punya locked_by dan tidak perlu detak.
+    punya pemegang dan tidak perlu detak.
     """
-    if job.locked_by is None:
+    pemegang = pemegang_klaim(job)
+    if pemegang is None:
         return
-    if not _perpanjang(sesi, job.id, job.locked_by):
-        raise KlaimHilang(f"Klaim job {job.id} sudah tidak dipegang {job.locked_by}")
+    if not _perpanjang(sesi, job.id, pemegang):
+        raise KlaimHilang(f"Klaim job {job.id} sudah tidak dipegang {pemegang}")
 
 
 class Detak:
@@ -217,10 +219,11 @@ def detak_latar(sesi: Session, job: Job, jeda: float = JEDA_DETAK) -> Iterator[D
     handler berhenti di titik itu dan tidak menulis apa pun lagi.
     """
     keadaan = Detak()
-    if job.locked_by is None:
+    pemegang = pemegang_klaim(job)
+    if pemegang is None:
         yield keadaan
         return
-    job_id, pemegang = job.id, job.locked_by
+    job_id = job.id
     # Transaksi utas utama yang masih terbuka bisa memegang kunci baris job
     # (mis. kemajuan yang sudah di-flush); detak latar akan tertahan olehnya
     # sepanjang blok. Di-commit di sini supaya blok selalu dimulai bersih.
@@ -302,15 +305,40 @@ def kemajuan(job: Job) -> dict:
 
 
 def simpan_kemajuan(sesi: Session, job: Job, **perubahan) -> dict:
+    """Tulis kemajuan job, dipagari klaim (review Task 6, fix round 2).
+
+    Kemajuan memuat penanda yang menahan job lain (`unggah_mulai`,
+    `langkah_terapkan`, `langkah_aktifkan`; `queue._menahan`). Worker zombi
+    yang klaimnya sudah direbut reaper tidak boleh menuliskannya ke job yang
+    kini tertunda: dua job tertunda dari keluarga runtime berbeda bisa saling
+    menahan selamanya. Karena itu tulisan dan detak menjadi SATU pernyataan
+    yang hanya berlaku selama job masih `running` dan dipegang klaim ini;
+    bila tidak ada baris yang berubah, tidak ada yang di-commit dan
+    KlaimHilang dilempar. Job tanpa klaim (test, pemanggilan manual) ditulis
+    biasa, seperti sebelumnya tanpa detak.
+    """
     payload = dict(job.payload or {})
     k = dict(payload.get("kemajuan") or {})
     k.update(perubahan)
     k["diperbarui"] = sekarang().isoformat()
     payload["kemajuan"] = k
-    job.payload = payload
-    flag_modified(job, "payload")
+    pemegang = pemegang_klaim(job)
+    if pemegang is None:
+        job.payload = payload
+        flag_modified(job, "payload")
+        sesi.commit()
+        return k
+    n = sesi.execute(
+        update(Job)
+        .where(Job.id == job.id, Job.status == JobStatus.running, Job.locked_by == pemegang)
+        .values(payload=payload, locked_at=func.now())
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if n == 0:
+        sesi.rollback()
+        raise KlaimHilang(f"Klaim job {job.id} sudah tidak dipegang {pemegang}")
     sesi.commit()
-    detak(sesi, job)
+    set_committed_value(job, "payload", payload)
     return k
 
 

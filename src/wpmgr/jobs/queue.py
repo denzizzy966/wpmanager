@@ -195,7 +195,22 @@ def ambil_job(sesi: Session, worker: str, jenis: str | None = None) -> Job | Non
         log.info("Klaim job %s dibatalkan: job lain di site yang sama baru saja berjalan", job_id)
         return None
     sesi.commit()
-    return sesi.get(Job, job_id, populate_existing=True)
+    job = sesi.get(Job, job_id, populate_existing=True)
+    # Atribut biasa (bukan kolom): tidak ikut kedaluwarsa saat rollback, jadi
+    # tetap menunjuk pemegang klaim sesudah reaper merebut job ini.
+    job._pemegang_klaim = worker
+    return job
+
+
+def pemegang_klaim(job: Job) -> str | None:
+    """Worker yang mengklaim job ini lewat `ambil_job`, untuk memagari tulisan dan detak.
+
+    `job.locked_by` tidak cukup: rollback mengedaluwarsakan objek, dan sesudah
+    reaper merebut job itu nilai yang dimuat ulang adalah NULL -- worker zombi
+    akan menulis tanpa pagar. Job yang tidak diklaim lewat `ambil_job` (test
+    yang mengisi `locked_by` sendiri) memakai `locked_by`.
+    """
+    return getattr(job, "_pemegang_klaim", None) or job.locked_by
 
 
 def jeda_menit(attempts: int) -> int:

@@ -832,6 +832,7 @@ def test_dibatalkan_dari_inti_sesudah_tukar_diabaikan_dan_diulang(sesi, site_hos
     (JobType.pindah_aktifkan, StatusHosting.menunggu_dns),
 ])
 def test_batal_sesudah_tarik_utuh_tidak_menandai_salinan_rusak(sesi, site_hosting, tipe, status_siap):
+    site_hosting.ditarik_pada = SEKARANG - timedelta(days=1)
     site_hosting.status = StatusHosting.gagal
     site_hosting.gagal_asal = "salinan"
     sesi.commit()
@@ -848,6 +849,7 @@ def test_batal_sesudah_tarik_utuh_tidak_menandai_salinan_rusak(sesi, site_hostin
 
 
 def test_sibuk_lewat_batas_sesudah_tarik_utuh_status_sebelum(sesi, site_hosting):
+    site_hosting.ditarik_pada = SEKARANG - timedelta(days=1)
     site_hosting.status = StatusHosting.pratinjau
     sesi.commit()
     job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik, {"kemajuan": {
@@ -941,5 +943,185 @@ def test_fitur_mati_selagi_menunggu_tidak_meninggalkan_status_kerja(sesi, site_h
         hu.jalankan_hosting(sesi, job, lambda *a: pytest.fail("inti tidak boleh berjalan"), "Aktivasi hosting VPS")
     assert e.value.error_class == STAGING_DITOLAK
     h = _h(sesi, site_hosting)
-    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "salinan", hu.PESAN_FITUR_MATI)
+    # Salinan belum disentuh job ini: status sebelum job (fix round 2), bukan `gagal`.
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.menunggu_dns, None, hu.PESAN_FITUR_MATI)
 
+
+# ---- fix round 2: tulisan kemajuan dipagari klaim (worker zombi) ---------------------
+
+
+def _rebut(engine, job_id):
+    """Reaper di sesi lain merebut job yang klaimnya basi (worker dianggap mati)."""
+    from sqlalchemy import text
+    from sqlalchemy.orm import sessionmaker
+
+    lain = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
+    try:
+        lain.execute(text("UPDATE jobs SET locked_at = now() - interval '30 minutes' WHERE id = :i"), {"i": job_id})
+        lain.commit()
+        assert pulihkan_job_yatim(lain) == 1
+    finally:
+        lain.close()
+
+
+@pytest.mark.parametrize("rollback_dulu", [True, False])
+def test_simpan_kemajuan_worker_zombi_ditolak_tanpa_menulis(engine, sesi, site, rollback_dulu):
+    buat_job(sesi, site.id, JobType.staging_dorong)
+    zombi = ambil_job(sesi, "w-zombi", "staging")
+    _rebut(engine, zombi.id)
+    if rollback_dulu:
+        # Rollback mengedaluwarsakan objek: locked_by dimuat ulang sebagai NULL.
+        sesi.rollback()
+    with pytest.raises(stg.KlaimHilang):
+        stg.simpan_kemajuan(sesi, zombi, unggah_mulai=True, langkah_terapkan="tukar")
+    sesi.expire_all()
+    j = sesi.get(Job, zombi.id)
+    assert j.status == JobStatus.pending and j.locked_by is None
+    assert "kemajuan" not in (j.payload or {})
+
+
+def test_simpan_kemajuan_klaim_sah_menulis_dan_berdetak(sesi, site):
+    from sqlalchemy import text
+
+    buat_job(sesi, site.id, JobType.pindah_tarik)
+    job = ambil_job(sesi, "w1", "staging")
+    sesi.execute(text("UPDATE jobs SET locked_at = now() - interval '10 minutes' WHERE id = :i"), {"i": job.id})
+    sesi.commit()
+    stg.simpan_kemajuan(sesi, job, tahap="berkas")
+    assert stg.kemajuan(job)["tahap"] == "berkas"
+    sesi.expire_all()
+    j = sesi.get(Job, job.id)
+    assert stg.kemajuan(j)["tahap"] == "berkas"
+    assert sesi.scalar(select(func.now() - Job.locked_at).where(Job.id == job.id)) < timedelta(minutes=1)
+
+
+def test_zombi_tidak_menciptakan_saling_tahan(engine, sesi, site):
+    """Dorong D direbut reaper; aktivasi A sampai tukar lalu tertunda; zombi D menulis penanda: A tetap bisa diklaim."""
+    from sqlalchemy import text
+    from sqlalchemy.orm import sessionmaker
+
+    buat_job(sesi, site.id, JobType.staging_dorong)
+    zombi = ambil_job(sesi, "w-zombi", "staging")
+    _rebut(engine, zombi.id)
+
+    lain = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
+    try:
+        lain.execute(text("UPDATE jobs SET scheduled_for = now() + interval '1 hour' WHERE id = :i"), {"i": zombi.id})
+        lain.commit()
+        buat_job(lain, site.id, JobType.pindah_aktifkan)
+        a = ambil_job(lain, "w2", "staging")
+        assert a is not None and a.tipe == JobType.pindah_aktifkan
+        stg.simpan_kemajuan(lain, a, langkah_aktifkan="tukar", tukar_pada=datetime.now(timezone.utc).isoformat())
+        selesai_gagal(lain, a, TRANSIENT, "Situs belum menjawab HTTPS dengan benar.")
+        assert a.status == JobStatus.pending
+        lain.execute(text("UPDATE jobs SET scheduled_for = now() WHERE id IN (:a, :d)"), {"a": a.id, "d": zombi.id})
+        lain.commit()
+        a_id = a.id
+    finally:
+        lain.close()
+
+    # Zombi bangun dan mencoba menulis penanda tukar ke D yang kini tertunda.
+    sesi.rollback()
+    with pytest.raises(stg.KlaimHilang):
+        stg.simpan_kemajuan(sesi, zombi, unggah_mulai=True, langkah_terapkan="tukar")
+    sesi.expire_all()
+    assert ambil_job(sesi, "w3", "staging").id == a_id
+
+
+# ---- fix round 2: salinan pertama belum utuh sebelum rampung (M2) --------------------
+
+
+def test_batal_salinan_pertama_sesudah_tahap_pratinjau_tetap_belum_utuh(sesi, site_hosting):
+    assert site_hosting.ditarik_pada is None
+    site_hosting.status = StatusHosting.gagal
+    site_hosting.gagal_asal = "salinan"
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, tahap="selesai")
+        raise stg.Dibatalkan()
+
+    with pytest.raises(stg.GalatDibatalkan):
+        hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "salinan", hu.PESAN_BATAL_TENGAH)
+
+
+def test_sibuk_lewat_batas_salinan_pertama_tahap_pratinjau_gagal_salinan(sesi, site_hosting):
+    site_hosting.status = StatusHosting.menyalin
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik, {"kemajuan": {
+        "sibuk_sejak": (SEKARANG - timedelta(hours=5)).isoformat(), "sibuk_kali": 20,
+        "sibuk_langkah": "-/pratinjau"}})
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, tahap="pratinjau")
+        raise _sibuk()
+
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
+    assert e.value.error_class == STAGING_GAGAL
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal) == (StatusHosting.gagal, "salinan")
+
+
+# ---- fix round 2: fitur mati / baris hilang sesudah tukar mengikuti R26 (M9) ---------
+
+
+def test_fitur_mati_sesudah_tukar_diulang_r26(sesi, site_hosting, monkeypatch):
+    from wpmgr.config import get_settings
+
+    job = _sesudah_tukar(sesi, site_hosting)
+    site_hosting.status = StatusHosting.mengaktifkan
+    sesi.commit()
+    monkeypatch.delenv("WPMGR_HOSTING_IPV4")
+    get_settings.cache_clear()
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, lambda *a: pytest.fail("inti tidak boleh berjalan"), "Aktivasi hosting VPS")
+    assert e.value.error_class == TRANSIENT
+    assert _h(sesi, site_hosting).status == StatusHosting.mengaktifkan
+    assert akan_diulang(sesi.get(Job, job.id, populate_existing=True), TRANSIENT)
+
+
+def test_fitur_mati_sesudah_tukar_lewat_24_jam_gagal_produksi(sesi, site_hosting, monkeypatch):
+    from wpmgr.config import get_settings
+
+    job = _sesudah_tukar(sesi, site_hosting, jam_lalu=25)
+    site_hosting.status = StatusHosting.mengaktifkan
+    sesi.commit()
+    monkeypatch.delenv("WPMGR_HOSTING_IPV4")
+    get_settings.cache_clear()
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, lambda *a: pytest.fail("inti tidak boleh berjalan"), "Aktivasi hosting VPS")
+    assert e.value.error_class == STAGING_DITOLAK
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "produksi", hu.PESAN_PRODUKSI_GAGAL)
+
+
+def test_baris_hilang_sesudah_tukar_diulang_r26(sesi, site_hosting):
+    job = _sesudah_tukar(sesi, site_hosting)
+    sesi.delete(site_hosting)
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        hu.jalankan_hosting(sesi, job, lambda *a: pytest.fail("inti tidak boleh berjalan"), "Aktivasi hosting VPS")
+    assert e.value.error_class == TRANSIENT and e.value.pesan == hu.PESAN_BELUM_ADA
+
+
+def test_fitur_mati_sebelum_tukar_salinan_sehat_tidak_menjadi_gagal(sesi, site_hosting, monkeypatch):
+    from wpmgr.config import get_settings
+
+    site_hosting.status = StatusHosting.pratinjau
+    site_hosting.ditarik_pada = SEKARANG - timedelta(days=1)
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+    # Percobaan sebelumnya mulai (status kerja) lalu terputus sebelum menyentuh salinan.
+    hu.catat_status_awal(sesi, job, site_hosting)
+    site_hosting.status = StatusHosting.menyalin
+    sesi.commit()
+    monkeypatch.delenv("WPMGR_HOSTING_IPV4")
+    get_settings.cache_clear()
+    with pytest.raises(SiteError):
+        hu.jalankan_hosting(sesi, job, lambda *a: pytest.fail("inti tidak boleh berjalan"), "Salin ke VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.pratinjau, None, hu.PESAN_FITUR_MATI)
