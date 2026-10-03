@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# openssl tiruan untuk SERTIFIKAT_SENDIRI: menulis rantai dan kunci tiruan ke
+# berkas -out dan -keyout.
+printf '[%s]' "$@" >> "$PALSU/openssl.log"
+printf '\n' >> "$PALSU/openssl.log"
+keluar="" kunci=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -out) keluar="$2"; shift ;;
+    -keyout) kunci="$2"; shift ;;
+  esac
+  shift
+done
+if [[ -n "$keluar" ]]; then
+  echo "rantai-sendiri" > "$keluar"
+fi
+if [[ -n "$kunci" ]]; then
+  echo "kunci-sendiri" > "$kunci"
+fi
+exit 0

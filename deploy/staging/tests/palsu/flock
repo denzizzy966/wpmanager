@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# flock tiruan: mencatat panggilan (kunci router produksi) ke $PALSU/flock.log.
-# Berkas $PALSU/flock-gagal membuat tenggat kunci habis (keluar 1).
+# flock tiruan: mencatat panggilan (kunci router produksi dan kunci nginx
+# host) ke $PALSU/flock.log, satu baris per panggilan dan berurutan, supaya
+# urutan pengambilan kunci bisa diuji.
+# Berkas $PALSU/flock-gagal membuat tenggat kunci habis (keluar 1);
+# $PALSU/flock-gagal-<fd> hanya untuk deskriptor itu (argumen terakhir).
 printf '[%s]' "$@" >> "$PALSU/flock.log"
 printf '\n' >> "$PALSU/flock.log"
-[[ ! -f "$PALSU/flock-gagal" ]]
+[[ ! -f "$PALSU/flock-gagal" && ! -f "$PALSU/flock-gagal-${*: -1}" ]]

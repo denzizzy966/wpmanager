@@ -54,6 +54,7 @@ WAKTU_BUAT=660         # TIMEOUT_BUAT 600 + 60
 WAKTU_IMPOR=11100      # TIMEOUT_IMPOR 3 jam + 300
 WAKTU_WPCLI=960        # TIMEOUT_WPCLI 900 + 60
 WAKTU_SERTIFIKAT=360   # TIMEOUT_SERTIFIKAT 300 + 60
+WAKTU_AKTIFKAN=360     # TIMEOUT_AKTIFKAN 300 + 60
 TENGGAT=$(( SECONDS + WAKTU_BAWAAN ))
 
 ROUTER_CADANGAN=""
@@ -63,6 +64,14 @@ ROUTER_TUJUAN=""
 ROUTER_AWALAN="stg-"
 # Deskriptor kunci router produksi; terisi sesudah kunci_router berhasil.
 KUNCI_ROUTER_FD=""
+# 1 sesudah kunci_nginx berhasil (fd 9 dipegang sampai skrip keluar).
+KUNCI_NGINX_ADA=0
+# Berkas nginx domain yang sedang diganti dan salinan lamanya (kosong = tidak
+# ada berkas lama); dipulihkan jebakan EXIT selama NGINX_TUJUAN terisi.
+NGINX_TUJUAN=""
+NGINX_CADANGAN=""
+# prod-aktifkan: 1 sesudah perubahan pertama (Koreksi #5).
+SUDAH_BERUBAH=0
 # Penanda "baris GALAT sudah dicetak". Berupa berkas, bukan variabel, karena
 # galat bisa terjadi di subshell substitusi perintah; tanpa penanda ini
 # jebakan ERR di induknya akan mencetak GALAT kedua dan menimpa kodenya.
@@ -71,6 +80,12 @@ PENANDA_GALAT="$(mktemp)"
 galat() {
   local kode="$1"
   shift
+  # prod-aktifkan: sesudah perubahan pertama, "ditolak" tidak lagi berarti
+  # "tanpa perubahan" (kontrak keluar 3 yang dipakai dashboard untuk
+  # menghapus penanda tulis-lebih-dulu), jadi dilaporkan sebagai internal.
+  if [[ "$kode" == ditolak && "$SUDAH_BERUBAH" == 1 ]]; then
+    kode=internal
+  fi
   printf 'GALAT %s: %s\n' "$kode" "$*" >&2
   printf '1' > "$PENANDA_GALAT" 2>/dev/null || true
   case "$kode" in
@@ -118,6 +133,11 @@ bersihkan() {
   trap - ERR
   if [[ -n "$ROUTER_CADANGAN" ]]; then
     pulihkan_router
+  fi
+  # Berkas nginx domain yang belum lolos uji/reload dikembalikan; kunci nginx
+  # masih dipegang (fd 9 baru tertutup saat proses berakhir).
+  if [[ -n "$NGINX_TUJUAN" ]]; then
+    pulihkan_nginx
   fi
   # Berkas opsi klien MariaDB memuat kata sandi: selalu dihapus, juga saat
   # skrip berhenti karena galat. Batas waktunya sendiri, bukan sisa tenggat,
@@ -1511,10 +1531,11 @@ site_id_dipakai_lain() {
 }
 
 # Kunci router produksi per host (flock, tenggat tetap): render router,
-# pembuatan/impor database, dan aktivasi saling bergantian, bukan berebut.
-# Idempoten dalam satu proses (deskriptor dipegang sampai skrip keluar), jadi
-# pemanggil yang sudah memegangnya (prod-aktifkan langkah 2-4) aman memanggil
-# muat_router_prod lagi.
+# pembuatan/impor database, aktivasi, dan hapus situs saling bergantian, bukan
+# berebut. Idempoten dalam satu proses (deskriptor dipegang sampai skrip
+# keluar), jadi pemanggil yang sudah memegangnya (prod-aktifkan langkah 2-4)
+# aman memanggil muat_router_prod lagi. Urutan terhadap kunci_nginx: lihat
+# komentar kunci_nginx (router selalu lebih dulu).
 kunci_router() {
   [[ -z "$KUNCI_ROUTER_FD" ]] || return 0
   ( umask 077; : >> "$KONF_PROD/router.lock" ) || galat konfigurasi "berkas kunci router tidak dapat dibuat"
@@ -1858,6 +1879,437 @@ cmd_prod_router_muat() {
   muat_router_prod
 }
 
+# ---- nginx host per domain (spec §7.4) ------------------------------------------
+# nginx host juga melayani ±19 site lain dan ERPNext. Skrip ini hanya menulis
+# <domain>.conf (dan berkas sementara berawalan titik) di NGINX_HOSTING_DIR,
+# tidak pernah berkas lain, dan tidak pernah me-reload nginx dengan berkas
+# yang belum lolos `nginx -t`.
+
+# Kunci nginx host (flock pada fd 9, dilepas saat skrip keluar): perubahan
+# berkas di NGINX_HOSTING_DIR, pemasangan sertifikat domain, dan reload nginx
+# host diserialkan. Tenggat 60 s, bukan 120 (preflight M13): prod-domain dan
+# prod-hapus dibatasi TIMEOUT Python 120 s, jadi menunggu kunci tidak boleh
+# menghabiskan seluruh anggaran itu. Idempoten dalam satu proses: membuka
+# ulang fd 9 akan menutup deskriptor lama dan diam-diam melepas kuncinya.
+#
+# URUTAN KUNCI (wajib di setiap subperintah): kunci_router lebih dulu, baru
+# kunci_nginx. prod-aktifkan dan prod-hapus mengambil keduanya dengan urutan
+# itu; prod-domain dan prod-sertifikat hanya kunci_nginx; prod-router-muat,
+# prod-db-buat, dan prod-db-impor hanya kunci_router. Tidak ada jalur yang
+# mengambil kunci_router sesudah memegang kunci_nginx (muat_router_prod di
+# dalam prod-aktifkan memanggil kunci_router yang sudah dipegang = no-op),
+# jadi dua proses tidak pernah saling menunggu.
+kunci_nginx() {
+  (( KUNCI_NGINX_ADA == 0 )) || return 0
+  [[ -d "$KONF_PROD" && ! -L "$KONF_PROD" ]] || galat ditolak "jalankan 'wpmgr-staging prod-siapkan' dulu"
+  exec 9>>"$KONF_PROD/nginx.lock" || galat konfigurasi "berkas kunci nginx tidak dapat dibuka"
+  dibatasi flock -w 60 -x 9 || galat nginx "konfigurasi nginx sedang diubah proses lain"
+  KUNCI_NGINX_ADA=1
+}
+
+# nginx -t dengan stderr ditangkap. Gagal bila kode keluar bukan 0 ATAU ada
+# peringatan "conflicting server name" untuk domain ini: peringatan itu tidak
+# menggagalkan nginx -t, tetapi berarti salah satu server diam-diam diabaikan.
+uji_nginx() {
+  local domain="$1" keluaran rc=0
+  keluaran="$(dibatasi nginx -t 2>&1)" || rc=$?
+  (( rc == 0 )) || return 1
+  if [[ -n "$domain" ]] && grep -qiF -e "conflicting server name \"$domain\"" \
+       -e "conflicting server name \"www.$domain\"" <<< "$keluaran"; then
+    return 1
+  fi
+  return 0
+}
+
+muat_ulang_nginx() {
+  if [[ "$NGINX_UJI_SAJA" == 1 ]]; then
+    return 0
+  fi
+  dibatasi systemctl reload nginx >/dev/null 2>&1
+}
+
+# Mengembalikan berkas domain ke keadaan sebelum perintah: salinan lama
+# (dengan mode aslinya) atau tidak ada. Penggantian lewat berkas sementara
+# berawalan titik + rename, supaya reload nginx dari luar skrip (mis. hook
+# certbot site lain) tidak pernah membaca berkas setengah tersalin. Cadangan
+# dihapus hanya bila pemulihan berhasil.
+pulihkan_nginx() {
+  local sementara
+  if [[ -n "$NGINX_CADANGAN" ]]; then
+    sementara="$(dirname -- "$NGINX_TUJUAN")/.$(basename -- "$NGINX_TUJUAN" .conf).pulih"
+    if cp -pf "$NGINX_CADANGAN" "$sementara" 2>/dev/null && mv -fT "$sementara" "$NGINX_TUJUAN" 2>/dev/null; then
+      rm -f "$NGINX_CADANGAN" 2>/dev/null || true
+    else
+      rm -f "$sementara" 2>/dev/null || true
+    fi
+  else
+    rm -f "$NGINX_TUJUAN" 2>/dev/null || true
+  fi
+  NGINX_TUJUAN=""
+  NGINX_CADANGAN=""
+}
+
+# Pra-cek kepemilikan nama (spec §7.4 langkah 1): domain yang sudah dilayani
+# berkas lain di nginx host (di luar NGINX_HOSTING_DIR) tidak pernah direbut.
+# Penanda `# configuration file <path>:` dari nginx -T menentukan berkas
+# asal; perbandingan prefiks memakai "/" di akhir supaya direktori berawalan
+# mirip (wpmgr-hosting-lain/) tidak dianggap milik sendiri (RFP5). Gagal
+# tertutup: baris sebelum penanda pertama dianggap milik pihak lain. Setiap
+# baris dipecah per `;`/`{`/`}` supaya `server { server_name x; }` sebaris
+# terbaca; kutip dibuang. Batasan: server_name yang dipecah ke beberapa baris
+# hanya terbaca baris pertamanya (nginx -t "conflicting server name" menjadi
+# lapis kedua).
+#
+# Keluaran nginx -T ditangkap utuh tanpa batas byte, pengecualian sadar dari
+# aturan "setiap aliran punya batas byte" (preflight M9): sumbernya
+# konfigurasi milik root di host ini (bukan masukan dashboard/site) dan
+# ukurannya kecil, sedangkan memotongnya membuat pra-cek gagal terbuka
+# (server_name di bagian yang terpotong tidak pernah diperiksa).
+pra_cek_nama() {
+  local domain="$1" konfig hasil
+  konfig="$(dibatasi nginx -T 2>/dev/null)" || galat nginx "konfigurasi nginx host tidak terbaca"
+  hasil="$(awk -v dir="$NGINX_HOSTING_DIR/" -v d="$domain" -v q="'" '
+    BEGIN { luar = 1 }
+    /^# configuration file / {
+      f = $0
+      sub(/^# configuration file /, "", f)
+      sub(/:$/, "", f)
+      luar = (index(f, dir) != 1)
+      next
+    }
+    luar {
+      baris = tolower($0)
+      sub(/#.*/, "", baris)
+      gsub(/"/, "", baris)
+      gsub(q, "", baris)
+      k = split(baris, direktif, /[;{}]/)
+      for (j = 1; j <= k; j++) {
+        p = direktif[j]
+        if (p !~ /^[ \t]*server_name[ \t]/) continue
+        sub(/^[ \t]*server_name[ \t]+/, "", p)
+        n = split(p, nama, /[ \t]+/)
+        for (i = 1; i <= n; i++) {
+          x = nama[i]
+          if (x == d || x == "www." d || x == "." d || x == "*." d) { print "bentrok"; exit }
+        }
+      }
+    }' <<< "$konfig")"
+  [[ "$hasil" != bentrok ]] || galat ditolak "domain sudah dilayani konfigurasi nginx lain di server ini"
+}
+
+# Template tetap berkas nginx domain (spec §7.4). Port 80 melayani tantangan
+# ACME sejak pratinjau. Server 443: mode aktif dengan sertifikat domain (path
+# tetap, dibaca master saat reload); mode pratinjau hanya bila sertifikat
+# host pratinjau sudah ada, dengan domain asli ikut supaya pratinjau lewat
+# berkas hosts berfungsi. Tanpa default_server dan tanpa http2 (opsi per
+# soket di nginx 1.24). Memakai S_*.
+konf_domain() {
+  local nama="$1" mode="$2" nama80="$S_DOMAIN" nama443 sert kunci pratinjau="vps-$1.$DOMAIN"
+  if [[ "$S_WWW" == 1 ]]; then
+    nama80+=" www.$S_DOMAIN"
+  fi
+  cat <<KONF
+# Dibuat wpmgr-staging prod-domain $nama ($mode). Jangan diedit; selalu ditimpa.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $nama80;
+    location ^~ /.well-known/acme-challenge/ {
+        root $ACME_DIR;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+KONF
+  if [[ "$mode" == aktif ]]; then
+    sert="$PROD_CERT_DIR/$S_DOMAIN/fullchain.pem"
+    kunci="$PROD_CERT_DIR/$S_DOMAIN/privkey.pem"
+    nama443="$nama80"
+  elif [[ -f "$CERT_DIR/$pratinjau/fullchain.pem" && -f "$CERT_DIR/$pratinjau/privkey.pem" ]]; then
+    sert="$CERT_DIR/$pratinjau/fullchain.pem"
+    kunci="$CERT_DIR/$pratinjau/privkey.pem"
+    nama443="$pratinjau $nama80"
+  else
+    return 0
+  fi
+  cat <<KONF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $nama443;
+    ssl_certificate     $sert;
+    ssl_certificate_key $kunci;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    client_max_body_size 64M;
+    location / {
+        proxy_pass http://$PROD_ROUTER_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+KONF
+}
+
+# NGINX_HOSTING_DIR dan induknya milik root, bukan symlink: skrip root menulis
+# ke sana dan nginx host memuat semua *.conf di dalamnya.
+cek_dir_nginx() {
+  cek_mount_root "$NGINX_HOSTING_DIR" d "$(dirname -- "$NGINX_HOSTING_DIR")"
+}
+
+# Prosedur aman spec §7.4 langkah 1-6, di bawah kunci_nginx. Setiap kegagalan
+# meninggalkan berkas yang sama dengan sebelum perintah, dan konfigurasi yang
+# berjalan tidak pernah dimuat ulang dengan berkas yang gagal diuji.
+pasang_domain() {
+  local nama="$1" mode="$2" tujuan baru cadangan
+  tujuan="$NGINX_HOSTING_DIR/$S_DOMAIN.conf"
+  # Nama sementara tidak cocok dengan glob include *.conf.
+  baru="$NGINX_HOSTING_DIR/.$S_DOMAIN.baru"
+  cadangan="$KONF_PROD/nginx-cadangan/$S_DOMAIN.conf"
+  cek_dir_nginx
+  pra_cek_nama "$S_DOMAIN"
+  SEMENTARA+=("$baru")
+  rm -f "$baru"
+  konf_domain "$nama" "$mode" > "$baru"
+  chmod 0644 "$baru"
+  install -d -m 0700 "$KONF_PROD/nginx-cadangan"
+  NGINX_CADANGAN=""
+  if [[ -f "$tujuan" ]]; then
+    cp -pf "$tujuan" "$cadangan"
+    NGINX_CADANGAN="$cadangan"
+  fi
+  # Sejak baris ini berkas domain diubah; kegagalan apa pun sesudahnya
+  # (galat eksplisit, set -e, tenggat habis, sinyal) memulihkannya lewat
+  # jebakan EXIT.
+  NGINX_TUJUAN="$tujuan"
+  mv -fT "$baru" "$tujuan"
+  uji_nginx "$S_DOMAIN" || galat nginx "konfigurasi nginx domain ditolak; berkas lama dipulihkan"
+  if ! muat_ulang_nginx; then
+    pulihkan_nginx
+    uji_nginx "" || true
+    muat_ulang_nginx || true
+    galat nginx "nginx host tidak dapat dimuat ulang; berkas lama dipulihkan"
+  fi
+  rm -f "$cadangan"
+  NGINX_TUJUAN=""
+  NGINX_CADANGAN=""
+}
+
+# Menghapus berkas nginx domain (prod-hapus) dengan uji dan reload yang sama.
+hapus_domain() {
+  local tujuan="$NGINX_HOSTING_DIR/$1.conf" cadangan="$KONF_PROD/nginx-cadangan/$1.conf"
+  cek_dir_nginx
+  [[ -e "$tujuan" || -L "$tujuan" ]] || return 0
+  install -d -m 0700 "$KONF_PROD/nginx-cadangan"
+  cp -pf "$tujuan" "$cadangan"
+  NGINX_TUJUAN="$tujuan"
+  NGINX_CADANGAN="$cadangan"
+  rm -f "$tujuan"
+  uji_nginx "" || galat nginx "nginx -t gagal sesudah berkas domain dihapus; berkas dipulihkan"
+  if ! muat_ulang_nginx; then
+    pulihkan_nginx
+    # Preflight M10: diuji ulang dulu seperti pasang_domain (spec §7.4 langkah 5).
+    uji_nginx "" || true
+    muat_ulang_nginx || true
+    galat nginx "nginx host tidak dapat dimuat ulang; berkas dipulihkan"
+  fi
+  rm -f "$cadangan"
+  NGINX_TUJUAN=""
+  NGINX_CADANGAN=""
+}
+
+# Sertifikat domain terpasang: berkas biasa milik root (bukan symlink).
+sertifikat_domain_ada() {
+  local d="$PROD_CERT_DIR/$S_DOMAIN" f
+  [[ -d "$d" && ! -L "$d" ]] || return 1
+  for f in "$d/fullchain.pem" "$d/privkey.pem"; do
+    [[ -f "$f" && ! -L "$f" ]] || return 1
+    [[ "$(stat -c %u -- "$f")" == 0 ]] || return 1
+  done
+  return 0
+}
+
+cmd_prod_domain() {
+  cek_nama_prod "${1-}"
+  butuh_hosting
+  # Kunci dulu, baru state: prod-aktifkan (MODE=aktif) dan prod-hapus
+  # (state dihapus) mengubah state sambil memegang kunci ini. State yang
+  # dibaca sebelum kunci bisa basi dan menimpa berkas aktif dengan berkas
+  # pratinjau, atau menghidupkan lagi berkas situs yang baru dihapus.
+  kunci_nginx
+  muat_state "$1" || galat ditolak "situs belum dibuat (prod-buat)"
+  if [[ "$S_MODE" == aktif ]]; then
+    sertifikat_domain_ada || galat ditolak "sertifikat domain belum ada"
+  fi
+  pasang_domain "$1" "$S_MODE"
+}
+
+# ---- sertifikat domain -----------------------------------------------------------
+
+# Memasang fullchain/privkey dari direktori $1 ke PROD_CERT_DIR/<domain>
+# (path tetap; privkey 0600 root:root, dibaca master nginx saat reload).
+pasang_sertifikat_domain() {
+  local asal="$1" d="$PROD_CERT_DIR/$S_DOMAIN"
+  install -o root -g root -m 0644 "$asal/fullchain.pem" "$d/fullchain.pem"
+  install -o root -g root -m 0600 "$asal/privkey.pem" "$d/privkey.pem"
+}
+
+# HTTP-01 webroot untuk domain dan www (spec §8.4). LE_DIR dipakai bersama
+# staging; nama sertifikat = domain, jadi tidak bertabrakan dengan staging.
+cmd_prod_sertifikat() {
+  cek_nama_prod "${1-}"
+  butuh_hosting
+  local nama="$1" domain d sementara hasil san lama=""
+  local email=(--register-unsafely-without-email) nama_host=()
+  muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
+  domain="$S_DOMAIN"
+  for d in "$PROD_CERT_DIR" "$ACME_DIR" "$LE_DIR"; do
+    cek_mount_root "$d" d "$(dirname -- "$d")"
+  done
+  sementara="$(mktemp -d)"
+  SEMENTARA+=("$sementara")
+  if [[ "$SERTIFIKAT_SENDIRI" == 1 ]]; then
+    if [[ -f "$PROD_CERT_DIR/$domain/fullchain.pem" ]]; then
+      echo "tetap"
+      return 0
+    fi
+    san="DNS:$domain"
+    if [[ "$S_WWW" == 1 ]]; then
+      san+=",DNS:www.$domain"
+    fi
+    dibatasi openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$domain" \
+      -addext "subjectAltName=$san" -keyout "$sementara/privkey.pem" -out "$sementara/fullchain.pem" \
+      >/dev/null 2>&1 || galat sertifikat "sertifikat uji tidak dapat dibuat"
+  else
+    if [[ -n "$ACME_EMAIL" ]]; then
+      email=(-m "$ACME_EMAIL")
+    fi
+    nama_host=(-d "$domain")
+    if [[ "$S_WWW" == 1 ]]; then
+      nama_host+=(-d "www.$domain")
+    fi
+    dibatasi certbot certonly --non-interactive --agree-tos "${email[@]}" --webroot -w "$ACME_DIR" \
+      "${nama_host[@]}" --cert-name "$domain" --config-dir "$LE_DIR/config" --work-dir "$LE_DIR/work" \
+      --logs-dir "$LE_DIR/logs" --keep-until-expiring >/dev/null 2>&1 \
+      || galat sertifikat "sertifikat domain belum dapat diterbitkan"
+    cp -L "$LE_DIR/config/live/$domain/fullchain.pem" "$sementara/fullchain.pem"
+    cp -L "$LE_DIR/config/live/$domain/privkey.pem" "$sementara/privkey.pem"
+  fi
+  # Pemasangan di bawah kunci nginx: reload nginx host oleh proses lain
+  # (prod-domain situs lain) tidak boleh membaca sertifikat setengah tertulis.
+  # MODE dibaca ulang di bawah kunci karena prod-aktifkan bisa mengubahnya
+  # selama certbot berjalan (certbot sendiri tidak memegang kunci).
+  kunci_nginx
+  muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
+  [[ "$S_DOMAIN" == "$domain" ]] || galat ditolak "state situs berubah"
+  hasil=terbit
+  if [[ -f "$PROD_CERT_DIR/$domain/fullchain.pem" ]]; then
+    if cmp -s "$sementara/fullchain.pem" "$PROD_CERT_DIR/$domain/fullchain.pem"; then
+      hasil=tetap
+    else
+      hasil=diperbarui
+    fi
+  fi
+  if [[ "$hasil" != tetap ]]; then
+    [[ ! -L "$PROD_CERT_DIR/$domain" ]] || galat ditolak "direktori sertifikat domain tidak sah"
+    install -d -o root -g root -m 0700 "$PROD_CERT_DIR/$domain"
+    cek_mount_root "$PROD_CERT_DIR/$domain" d "$PROD_CERT_DIR"
+    if [[ "$S_MODE" == aktif && -f "$PROD_CERT_DIR/$domain/fullchain.pem" && -f "$PROD_CERT_DIR/$domain/privkey.pem" ]]; then
+      lama="$sementara/lama"
+      mkdir -p "$lama"
+      cp -p "$PROD_CERT_DIR/$domain/fullchain.pem" "$PROD_CERT_DIR/$domain/privkey.pem" "$lama/"
+    fi
+    pasang_sertifikat_domain "$sementara"
+    if [[ "$S_MODE" == aktif ]]; then
+      # Sertifikat di path tetap yang membuat nginx -t gagal akan membuat
+      # setiap reload nginx host gagal dan nginx tidak bisa start sesudah
+      # reboot (semua site di VPS mati): sertifikat lama dipulihkan.
+      if ! uji_nginx "$domain"; then
+        [[ -z "$lama" ]] || pasang_sertifikat_domain "$lama"
+        galat nginx "nginx -t gagal dengan sertifikat baru; sertifikat lama dipulihkan"
+      fi
+      if ! muat_ulang_nginx; then
+        [[ -z "$lama" ]] || pasang_sertifikat_domain "$lama"
+        muat_ulang_nginx || true
+        galat nginx "nginx host tidak dapat dimuat ulang; sertifikat lama dipulihkan"
+      fi
+    fi
+  fi
+  echo "$hasil"
+}
+
+# ---- aktivasi -----------------------------------------------------------------
+
+# Spec §7.3.3 prod-aktifkan. Kunci router lalu kunci nginx (urutan wajib,
+# lihat kunci_nginx) diambil sebelum state dibaca dan dipegang sampai skrip
+# keluar: render router, prod-db-*, prod-hapus, prod-domain, dan
+# prod-sertifikat tidak bisa menyela langkah (1)-(4). Kunci yang sibuk berarti
+# belum ada perubahan (kunci router: keluar 3).
+# Prasyarat (keluar 3, pasti tanpa perubahan): state, database, container,
+# sertifikat domain, direktori files/ dan NGINX_HOSTING_DIR, pra-cek nama
+# nginx. Lalu berurutan dan idempoten: (1) wp-config aktif, (2) router aktif
+# + reload, (3) nginx domain aktif (gagal = berkas lama dipulihkan), (4)
+# MODE=aktif. Sesudah (1), penolakan apa pun bukan lagi kode 3.
+cmd_prod_aktifkan() {
+  cek_nama_prod "${1-}"
+  butuh_hosting
+  local nama="$1"
+  kunci_router
+  kunci_nginx
+  muat_state "$nama" || galat ditolak "situs belum dibuat (prod-buat)"
+  [[ -n "$S_PREFIX" && -s "$KONF_PROD/db/$nama" ]] || galat ditolak "database situs belum dibuat"
+  pastikan_milik "wpp-$nama" "situs:$nama" wpmgr.hosting || galat ditolak "container situs belum dibuat"
+  sertifikat_domain_ada || galat ditolak "sertifikat domain belum ada"
+  cek_mount_pengguna "$HOSTING_DIR/$S_SITE_ID/files" "$HOSTING_DIR"
+  cek_dir_nginx
+  pra_cek_nama "$S_DOMAIN"
+  SUDAH_BERUBAH=1
+  tulis_wp_config wp_config_prod "$HOSTING_DIR/$S_SITE_ID/files" "$nama" aktif
+  muat_router_prod "$nama"
+  # muat_router_prod memuat state setiap situs (S_*); muat ulang milik situs ini.
+  muat_state "$nama" || galat internal "state situs hilang"
+  pasang_domain "$nama" aktif
+  S_MODE=aktif
+  tulis_state "$nama"
+  echo "aktif"
+}
+
+# ---- hapus situs produksi (batal pindah) ---------------------------------------
+
+cmd_prod_hapus() {
+  cek_nama_prod "${1-}"
+  butuh_hosting
+  local nama="$1" db
+  # MODE dibaca di bawah kunci router (urutan router lalu nginx, sama dengan
+  # prod-aktifkan): aktivasi yang sedang berjalan tidak bisa membuat situs
+  # aktif di sela pemeriksaan dan penghapusan, dan render router/impor DB
+  # tidak bisa memulihkan berkas router atau database yang baru dihapus.
+  kunci_router
+  if muat_state "$nama"; then
+    # Situs yang sudah dilayani VPS dilepas manual (README), tidak lewat dashboard.
+    [[ "$S_MODE" != aktif ]] || galat ditolak "situs sudah aktif; lepas manual (README)"
+    kunci_nginx
+    hapus_domain "$S_DOMAIN"
+  fi
+  if pastikan_milik "wpp-$nama" "situs:$nama" wpmgr.hosting; then
+    dk rm -f "wpp-$nama" >/dev/null || galat docker "container situs tidak dapat dihapus"
+  fi
+  db="$(nama_db_prod "$nama")"
+  sql_root "DROP DATABASE IF EXISTS \`$db\`; DROP USER IF EXISTS '$db'@'%';" wpmgr-prod-db "$KONF_PROD/db-root"
+  rm -f "$KONF_PROD/db/$nama" "$KONF_PROD/router/conf.d/prd-$nama.conf" "$KONF_PROD/router/htpasswd/$nama"
+  if pastikan_milik wpmgr-prod-router layanan:router wpmgr.hosting; then
+    dk exec wpmgr-prod-router nginx -s reload >/dev/null 2>&1 || true
+  fi
+  rm -f "$KONF_PROD/situs/$nama"
+}
+
 # ---- utama ---------------------------------------------------------------
 
 utama() {
@@ -1869,7 +2321,7 @@ utama() {
       [[ $# -eq 0 ]] || galat argumen "subperintah ini tidak menerima argumen" ;;
     buat|db-buat)
       [[ $# -eq 3 ]] || galat argumen "jumlah argumen salah" ;;
-    jalan|jeda|hapus|db-hapus|db-impor|sertifikat|prod-jalan|prod-db-impor)
+    jalan|jeda|hapus|db-hapus|db-impor|sertifikat|prod-jalan|prod-db-impor|prod-domain|prod-sertifikat|prod-aktifkan|prod-hapus)
       [[ $# -eq 1 ]] || galat argumen "jumlah argumen salah" ;;
     prod-db-buat)
       [[ $# -eq 2 ]] || galat argumen "jumlah argumen salah" ;;
@@ -1885,7 +2337,8 @@ utama() {
     buat|prod-buat) atur_tenggat "$WAKTU_BUAT" ;;
     db-impor|prod-db-impor) atur_tenggat "$WAKTU_IMPOR" ;;
     wpcli) atur_tenggat "$WAKTU_WPCLI" ;;
-    sertifikat) atur_tenggat "$WAKTU_SERTIFIKAT" ;;
+    sertifikat|prod-sertifikat) atur_tenggat "$WAKTU_SERTIFIKAT" ;;
+    prod-aktifkan) atur_tenggat "$WAKTU_AKTIFKAN" ;;
     *) atur_tenggat "$WAKTU_BAWAAN" ;;
   esac
   case "$perintah" in
@@ -1909,6 +2362,10 @@ utama() {
     prod-db-buat) cmd_prod_db_buat "$@" ;;
     prod-db-impor) cmd_prod_db_impor "$@" ;;
     prod-router-muat) cmd_prod_router_muat ;;
+    prod-domain) cmd_prod_domain "$@" ;;
+    prod-sertifikat) cmd_prod_sertifikat "$@" ;;
+    prod-aktifkan) cmd_prod_aktifkan "$@" ;;
+    prod-hapus) cmd_prod_hapus "$@" ;;
   esac
 }
 
