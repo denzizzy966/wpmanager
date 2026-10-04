@@ -95,6 +95,8 @@ def klien_http(site) -> SiteClient:
     klien = SiteClient("https://placeholder.test", str(site.id),
                        dekripsi_secret(site.secret_terenkripsi))
     klien.base_url = site.url
+    # Sejak Lapis 4 permintaan dikirim ke `_url_kirim` (turunan base_url saat konstruksi), bukan base_url.
+    klien._url_kirim = site.url
     return klien
 
 
