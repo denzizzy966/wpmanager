@@ -338,13 +338,18 @@ def instruksi(hosting, ipv4: str, ipv6: str | None) -> list[dict]:
 # ---- backoff sertifikat (spec §8.4) ------------------------------------------------
 
 
+def jeda_bertingkat(kali: int) -> timedelta:
+    """min(2^(k-1) jam, 6 jam) sesudah gagal ke-k (k >= 1): 1 -> 2 -> 4 -> 6 jam (spec §8.4)."""
+    return min(timedelta(hours=2 ** min(max(kali, 1) - 1, 10)), JEDA_SERTIFIKAT_MAKS)
+
+
 def coba_lagi_pada(hosting) -> datetime | None:
     """Batas Let's Encrypt (5 validasi gagal per hostname per jam): sesudah gagal
     ke-k, pengantrean otomatis berikutnya tidak sebelum gagal_pada + min(2^(k-1) jam, 6 jam)."""
     kali = hosting.sertifikat_gagal_kali or 0
     if kali <= 0 or hosting.sertifikat_gagal_pada is None:
         return None
-    return hosting.sertifikat_gagal_pada + min(timedelta(hours=2 ** min(kali - 1, 10)), JEDA_SERTIFIKAT_MAKS)
+    return hosting.sertifikat_gagal_pada + jeda_bertingkat(kali)
 
 
 def backoff_mengizinkan(hosting, sekarang: datetime, manual: bool) -> bool:

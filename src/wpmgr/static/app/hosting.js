@@ -9,6 +9,10 @@ const JEDA_POLLING_DNS = 30000;
 const STATUS_BERHENTI_HOSTING = [401, 404];
 const MAKS_GAGAL_HOSTING = 5;
 const TEKS_SIBUK_HOSTING = 'Menunggu pekerjaan hosting yang sedang berjalan selesai.';
+// Teks tetap (final review I2): hosting lama bisa sudah mati, jadi salinan VPS mungkin satu-satunya.
+const TEKS_BATAL_PINDAH = 'Container, database, dan salinan di VPS akan dihapus (site lama tidak disentuh). '
+  + 'PERINGATAN: bila hosting lama sudah mati atau tidak terjangkau, salinan VPS ini mungkin '
+  + 'satu-satunya salinan site yang tersisa dan tidak bisa dikembalikan. Ketik domain untuk konfirmasi:';
 
 // Semua teks dari server (domain, DNS, instruksi, galat, job) hanya masuk ke
 // DOM lewat x-text; tidak ada HTML mentah. Kata sandi pratinjau hanya hidup di
@@ -165,14 +169,19 @@ function tabHosting(siteId) {
 
     async aktifkanTanpaSalin() {
       if (this.alasanTanpaSalin()) return;
-      const domain = window.prompt('Data sejak salinan terakhir tidak ikut. Ketik domain untuk konfirmasi:');
+      const h = this.data.hosting;
+      // Final review I2: juga dari gagal 'salinan' (salinan lengkap dari ditarik_pada); bila salin ulang
+      // terakhir terputus, sebagian berkas di VPS bisa lebih baru dari tanggal itu.
+      const domain = window.prompt(`Aktifkan memakai salinan VPS dari ${this.waktu(h.ditarik_pada)} tanpa menyalin `
+        + 'ulang dari hosting lama. Semua perubahan di site lama sejak itu hilang (pos, halaman, isian form, '
+        + 'pengguna) dan tidak bisa diambil lagi bila hosting lama sudah mati. '
+        + 'Periksa pratinjau lebih dulu bila salin ulang terakhir terputus. Ketik domain untuk konfirmasi:');
       if (domain === null) return;
       await this.aktifkan(true, domain);
     },
 
     async batalkanPindah() {
-      const domain = window.prompt('Container, database, dan salinan di VPS akan dihapus (site lama tidak '
-        + 'disentuh). Ketik domain untuk konfirmasi:');
+      const domain = window.prompt(TEKS_BATAL_PINDAH);
       if (domain === null) return;
       this.mulaiAksi();
       try {
@@ -199,10 +208,8 @@ function tabHosting(siteId) {
       const h = this.data ? this.data.hosting : null;
       if (!h) return '';
       if (this.data.job) return TEKS_SIBUK_HOSTING;
+      // Cermin route/job: cukup salinan lengkap yang pernah ada, juga dari gagal 'salinan' (final review I2).
       if (!h.ditarik_pada) return 'Belum ada salinan utuh; salin dulu.';
-      if (h.status === 'gagal' && h.gagal_asal === 'salinan') {
-        return 'Salinan terakhir setengah jadi; hanya salin ulang yang bisa merampungkannya.';
-      }
       return '';
     },
 

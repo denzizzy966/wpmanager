@@ -359,9 +359,9 @@ def _periksa_aktifkan(h: HostingVps, req: PermintaanAktifkan, sekarang: datetime
         raise HTTPException(status_code=400, detail=PESAN_KONFIRMASI_DOMAIN)
     if dilayani:
         return True
-    if req.tanpa_tarik_ulang and (h.ditarik_pada is None or (
-            h.status == StatusHosting.gagal and h.gagal_asal == hu.ASAL_SALINAN)):
-        # Salinan setengah jadi hanya bisa dirampungkan tarik (spec §10.3).
+    if req.tanpa_tarik_ulang and h.ditarik_pada is None:
+        # Tanpa salinan lengkap yang pernah ada, hanya tarik yang bisa membuatnya. Dari `gagal`
+        # 'salinan' dengan `ditarik_pada` terisi boleh: hosting lama bisa sudah mati (final review I2).
         raise HTTPException(status_code=409, detail=pindah.PESAN_SALINAN_BELUM_UTUH)
     if not dns_mod.backoff_mengizinkan(h, sekarang, manual=True):
         raise HTTPException(status_code=409, detail=PESAN_BACKOFF)

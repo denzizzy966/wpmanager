@@ -26,11 +26,14 @@ from wpmgr.staging.cron import POLA_NISAN, _dir_nyata
 from wpmgr.staging.dorong import hapus_nisan
 from wpmgr.staging.pembantu import GalatPembantu
 
-__all__ = ["PESAN_SERTIFIKAT_GAGAL", "ada_job_hosting", "antrekan_backup_harian", "antrekan_backup_pertama",
-           "cek_dns_semua", "kunci_hosting", "perpanjang_sertifikat_hosting", "sapu_nisan_hosting"]
+__all__ = ["PESAN_SERTIFIKAT_GAGAL", "ada_job_hosting", "aktivasi_otomatis_pada", "antrekan_backup_harian",
+           "antrekan_backup_pertama", "cek_dns_semua", "kunci_hosting", "perpanjang_sertifikat_hosting",
+           "sapu_nisan_hosting"]
 
 log = logging.getLogger("wpmgr.hosting.cron")
 PESAN_SERTIFIKAT_GAGAL = "Sertifikat domain belum dapat diperpanjang; lihat log server."
+# Job pindah terakhir yang dibaca untuk jeda aktivasi otomatis; sesudah 4 kegagalan jedanya sudah maksimum.
+BATAS_RIWAYAT_AKTIVASI = 10
 
 
 def ada_job_hosting(sesi, site_id) -> bool:
@@ -60,6 +63,40 @@ def sapu_nisan_hosting(akar: Path) -> int:
     return n
 
 
+def aktivasi_otomatis_pada(sesi, site_id) -> datetime | None:
+    """Waktu paling awal cron boleh mengantrekan `pindah_aktifkan` lagi; None = tidak ada jeda.
+
+    Final review I1/I2: aktivasi yang gagal sebelum tukar (penolakan pasti
+    skrip pembantu, hosting lama tidak terjangkau saat tarik terakhir,
+    galat lain yang tidak menyentuh salinan) mengembalikan baris ke
+    `menunggu_dns`, dan DNS-nya tetap lolos. Tanpa jeda, cron
+    mengantrekannya lagi tiap 10 menit selamanya: hosting lama diekspor
+    ulang setiap kali, dan tombol "Aktifkan tanpa salin ulang" (nonaktif
+    selama ada job) hampir selalu terkunci. Jedanya dihitung dari riwayat
+    job (tanpa kolom baru): k aktivasi gagal beruntun yang terakhir
+    (`failed`/`unknown`, bukan dibatalkan pengguna; salin atau aktivasi yang
+    sukses memutus rentetan) -> tidak sebelum waktu kegagalan terakhir +
+    jadwal backoff sertifikat (1 -> 2 -> 4 -> 6 jam). Tombol manual tidak
+    terkena jeda ini.
+    """
+    riwayat = sesi.execute(
+        select(Job.tipe, Job.status, Job.error, Job.finished_at, Job.scheduled_for)
+        .where(Job.site_id == site_id, Job.tipe.in_((JobType.pindah_tarik, JobType.pindah_aktifkan)))
+        .order_by(Job.id.desc()).limit(BATAS_RIWAYAT_AKTIVASI)).all()
+    kali, terakhir = 0, None
+    for j in riwayat:
+        if j.tipe != JobType.pindah_aktifkan or j.status not in (JobStatus.failed, JobStatus.unknown) \
+                or j.error == stg.PESAN_DIBATALKAN:
+            break
+        kali += 1
+        if terakhir is None:
+            # Job yang ditandai reaper (`unknown`) tidak punya finished_at.
+            terakhir = j.finished_at or j.scheduled_for
+    if not kali or terakhir is None:
+        return None
+    return terakhir + dns_mod.jeda_bertingkat(kali)
+
+
 def _periksa_satu(sesi, hid, sekarang: datetime, penanya, hasil: dict) -> None:
     h = sesi.get(HostingVps, hid, populate_existing=True)
     if h is None or h.status != StatusHosting.menunggu_dns:
@@ -79,6 +116,10 @@ def _periksa_satu(sesi, hid, sekarang: datetime, penanya, hasil: dict) -> None:
     if not (cek.ok and dns_mod.backoff_mengizinkan(h, sekarang, manual=False)) or ada_job_hosting(sesi, site_id):
         sesi.commit()
         return
+    jeda = aktivasi_otomatis_pada(sesi, site_id)
+    if jeda is not None and sekarang < jeda:
+        sesi.commit()
+        return
     stg.catat_aktivitas(sesi, site_id, None, "DNS sudah menunjuk VPS; aktivasi diantrekan otomatis")
     # `manual` False: backoff sertifikat dalam job bergantung padanya.
     sesi.add(Job(site_id=site_id, tipe=JobType.pindah_aktifkan,
@@ -93,8 +134,9 @@ def _periksa_satu(sesi, hid, sekarang: datetime, penanya, hasil: dict) -> None:
 
 
 def cek_dns_semua(sesi, sekarang: datetime, penanya=None) -> dict:
-    """Setiap baris `menunggu_dns`: cek DNS; bila lolos, backoff mengizinkan, dan tidak ada
-    job hosting aktif, antrekan `pindah_aktifkan` (spec §15). Juga menyapu nisan hosting."""
+    """Setiap baris `menunggu_dns`: cek DNS; bila lolos, backoff sertifikat dan jeda aktivasi
+    otomatis (`aktivasi_otomatis_pada`) mengizinkan, dan tidak ada job hosting aktif, antrekan
+    `pindah_aktifkan` (spec §15). Juga menyapu nisan hosting."""
     hasil = {"diperiksa": 0, "diantrekan": 0}
     ids = sesi.scalars(select(HostingVps.id).where(HostingVps.status == StatusHosting.menunggu_dns)
                        .order_by(HostingVps.nama)).all()

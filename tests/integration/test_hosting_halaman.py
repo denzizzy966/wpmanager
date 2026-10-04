@@ -85,6 +85,18 @@ def test_hosting_tanpa_storage_dan_innerhtml():
     assert "{{ site.nama" not in tpl and "{{ site.url" not in tpl
 
 
+def test_konfirmasi_tanpa_salin_ulang_dan_batalkan_pindah_memperingatkan_kehilangan_data():
+    # Final review I2: Aktifkan tanpa salin ulang boleh dari gagal 'salinan' bila salinan lengkap pernah
+    # ada (cermin route dan job); konfirmasinya menyebut salinan dari `ditarik_pada` dan data yang
+    # hilang. Batalkan pindah memperingatkan bahwa salinan VPS mungkin satu-satunya yang tersisa.
+    js = (AKAR / "static" / "app" / "hosting.js").read_text(encoding="utf-8")
+    assert "hanya salin ulang yang bisa merampungkannya" not in js
+    assert "if (!h.ditarik_pada) return 'Belum ada salinan utuh; salin dulu.';" in js
+    assert "perubahan di site lama sejak itu hilang" in js and "this.waktu(h.ditarik_pada)" in js
+    assert "satu-satunya salinan site yang tersisa" in js
+    assert "window.prompt(TEKS_BATAL_PINDAH)" in js
+
+
 def test_tombol_backup_sekarang():
     # Task 14: tombol di bagian situs aktif, nonaktif selagi ada job hosting; pesan galat dari server
     # (teks tetap) tampil lewat `aksi` -> x-text.

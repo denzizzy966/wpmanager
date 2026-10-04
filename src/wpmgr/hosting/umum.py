@@ -157,6 +157,12 @@ PESAN_TERHENTI = "Proses terhenti tak terduga; coba lagi."
 PESAN_PRODUKSI_GAGAL = ("Situs sudah dilayani VPS tetapi pemeriksaan akhir gagal. Periksa situs; bila rusak, "
                         "arahkan DNS kembali ke hosting lama (masih utuh).")
 PESAN_BATAL_TENGAH = "Salin ke VPS dibatalkan di tengah; salinan VPS belum utuh, salin ulang."
+# Akhiran pesan kegagalan final tarik terakhir aktivasi yang tidak menyentuh salinan VPS (final
+# review I2): hosting lama tidak terjangkau/connector-nya tidak menjawab, jadi satu-satunya jalan
+# ke depan bila hosting lama sudah mati adalah tombol ini.
+PESAN_SALINAN_TIDAK_BERUBAH = ("Salinan VPS tidak berubah. Aktivasi otomatis dicoba lagi nanti; bila hosting lama "
+                               "sudah tidak dapat dihubungi, pilih 'Aktifkan tanpa salin ulang' (perubahan di site "
+                               "lama sejak salinan terakhir tidak ikut).")
 PESAN_LAIN = "Pindah hosting gagal; lihat log server."
 # Global Constraints / Koreksi #7: teks respons connector tidak pernah tampil di UI.
 PESAN_KELAS = {
@@ -253,8 +259,9 @@ def kelas_pembantu(job: Job) -> str:
 
     Backup dan pindah_aktifkan sesudah tukar: sementara (F26/R26), karena
     setiap subperintah idempoten dan produksi tidak boleh ditinggal setengah
-    beralih. Selain itu final, seperti staging. Penolakan sibuk (keluar 3)
-    ditangani terpisah (`_tangani_sibuk`).
+    beralih. Selain itu final, seperti staging. Keluar 3 sebelum tukar
+    ditangani terpisah: kunci sibuk lewat `_tangani_sibuk`, sisanya
+    penolakan pasti (`GalatDitolakTanpaUbah`).
     """
     if job.tipe == JobType.backup_hosting or menyentuh_produksi(job):
         return TRANSIENT
@@ -344,11 +351,21 @@ def status_gagal_final(job: Job, h: HostingVps, pesan: str) -> tuple[StatusHosti
     """(status, asal, galat) untuk kegagalan FINAL (pembungkus dan reaper).
 
     Sudah dilayani VPS (tukar dikirim): 'produksi' dengan pesan tetap yang
-    menyuruh memeriksa situs atau mengembalikan DNS. Belum: 'salinan' (site
-    lama masih produksi bagi resolver yang belum berpindah).
+    menyuruh memeriksa situs atau mengembalikan DNS. Belum, dan job ini
+    belum menyentuh salinan VPS (`salinan_belum_disentuh`, spec §10.3):
+    status sebelum job (final review I2) -- mis. hosting lama mati saat
+    tarik terakhir aktivasi gagal di manifest; `gagal` 'salinan' akan
+    menyembunyikan salinan yang utuh dan menolak Aktifkan tanpa salin ulang.
+    Selain itu: 'salinan' (site lama masih produksi bagi resolver yang belum
+    berpindah).
     """
     if h.dilayani_vps_pada is not None:
         return StatusHosting.gagal, ASAL_PRODUKSI, PESAN_PRODUKSI_GAGAL
+    if job.tipe in STATUS_KERJA and stg.salinan_belum_disentuh(job):
+        status, asal = status_sebelum(job, h)
+        if job.tipe == JobType.pindah_aktifkan and stg.kemajuan(job).get("langkah_aktifkan") == "tarik":
+            pesan = f"{pesan} {PESAN_SALINAN_TIDAK_BERUBAH}"
+        return status, asal, pesan
     return StatusHosting.gagal, ASAL_SALINAN, pesan
 
 
@@ -467,10 +484,11 @@ def _langkah_sekarang(job: Job) -> str:
 
 def _tangani_sibuk(sesi: Session, job: Job, hosting_id, site_id, exc: GalatPembantu, status_kerja,
                    batal_berlaku, nama: str) -> SiteError:
-    """Skrip pembantu menolak tanpa perubahan (keluar 3): dijadwalkan ulang, bukan gagal.
+    """Kunci skrip pembantu sibuk (keluar 3 dengan `GalatPembantu.sibuk`): dijadwalkan ulang, bukan gagal.
 
     Kunci router dipegang selama `prod-db-impor` situs lain (sampai 3 jam),
-    dan kunci nginx yang sibuk juga keluar 3. Selama `queue.BATAS_SIBUK`
+    dan kunci nginx yang sibuk juga keluar 3. Keluar 3 lainnya pasti dan
+    tidak sampai ke sini (final review I1). Selama `queue.BATAS_SIBUK`
     sejak penolakan pertama rentetan ini (rentetan dimulai ulang bila job
     maju ke langkah yang belum pernah sibuk di rentetan ini), job diulang dengan jeda yang bertambah
     (queue.selesai_gagal), jatah percobaannya dikembalikan (pola
@@ -617,7 +635,18 @@ def jalankan_hosting(sesi: Session, job: Job, inti, nama: str, boleh_batal=None)
         # GalatPembantu.pesan sudah teks tetap (F20).
         sesi.rollback()
         if exc.tanpa_ubah and not menyentuh_produksi(job):
-            raise _tangani_sibuk(sesi, job, hosting_id, site_id, exc, status_kerja, batal_berlaku, nama) from None
+            if exc.sibuk:
+                raise _tangani_sibuk(sesi, job, hosting_id, site_id, exc, status_kerja, batal_berlaku,
+                                     nama) from None
+            # Keluar 3 yang BUKAN kunci sibuk (vhost sisa, direktori tidak aman, prod-siapkan belum
+            # dijalankan, domain dipakai situs lain, prasyarat prod-aktifkan) bersifat pasti (R15,
+            # pola `backup._tolak_permanen`; final review I1): gagal sekarang dengan pesan tetap
+            # skrip pembantu, bukan diulang 4 jam sebagai "menunggu proses lain". Status seperti
+            # penolakan tanpa ubah (salinan setengah jadi tetap `gagal` 'salinan'); cron
+            # menjadwalkan ulang aktivasi dengan jeda (`hosting.cron.aktivasi_otomatis_pada`).
+            galat = stg.GalatDitolakTanpaUbah(exc.pesan)
+            _kembali_tanpa_ubah(sesi, job, hosting_id, galat.pesan)
+            raise galat from None
         # Sesudah tukar, penolakan sibuk pun mengikuti R26 (TRANSIENT, 24 jam).
         galat = SiteError(kelas_pembantu(job), exc.pesan)
         _putuskan(sesi, job, hosting_id, site_id, galat, status_kerja, batal_berlaku, nama)

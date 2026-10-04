@@ -129,7 +129,13 @@ def _files(hosting_aktif, h):
 
 
 def _ditolak_sibuk() -> GalatPembantu:
-    return GalatPembantu("ditolak", "Mengaktifkan situs gagal. Skrip pembantu menolak permintaan ini.")
+    # Kunci router/nginx sibuk (`GalatPembantu.sibuk`): satu-satunya keluar 3 yang diulang sebagai sibuk.
+    return GalatPembantu("ditolak", "Mengaktifkan situs gagal. Skrip pembantu menolak permintaan ini.", sibuk=True)
+
+
+def _ditolak_permanen(pesan="Mengaktifkan situs gagal. Skrip pembantu menolak permintaan ini.") -> GalatPembantu:
+    # Keluar 3 tanpa penanda kunci sibuk: prasyarat yang ditolak (final review I1).
+    return GalatPembantu("ditolak", pesan)
 
 
 def _ubah_kemajuan(sesi, job, **ubah) -> Job:
@@ -216,15 +222,35 @@ def test_prod_aktifkan_keluar_3_menghapus_penanda(sesi, siap, hosting_aktif, pb)
     assert k["langkah_aktifkan"] == "dns" and k["tukar_pada"] is None and k["tukar_dikirim"] is False
     assert akan_diulang(job, TRANSIENT) is True
     # Lewat jendela sibuk (4 jam): berakhir seperti spec §10.4, status sebelum
-    # job (menunggu DNS) dengan pesan tetap.
+    # job (menunggu DNS) dengan pesan tetap untuk kunci sibuk (review Task 10 M5).
     _ubah_kemajuan(sesi, job, sibuk_sejak=(datetime.now(timezone.utc) - timedelta(hours=5)).isoformat())
     with pytest.raises(umum.GalatDitolakTanpaUbah):
         _aktifkan(sesi, siap, job=job)
     h = _h(sesi, siap)
     assert h.dilayani_vps_pada is None
-    assert (h.status, h.galat) == (StatusHosting.menunggu_dns, pindah.PESAN_TUKAR_DITOLAK)
+    assert (h.status, h.galat) == (StatusHosting.menunggu_dns, pindah.PESAN_SERVER_SIBUK)
     k = umum.kemajuan(sesi.get(Job, job.id, populate_existing=True))
     assert k["langkah_aktifkan"] == "dns" and k["tukar_pada"] is None and k["tukar_dikirim"] is False
+
+
+def test_prod_aktifkan_keluar_3_bukan_sibuk_langsung_ditolak_tanpa_ubah(sesi, siap, hosting_aktif, pb):
+    # Final review I1: prasyarat prod-aktifkan yang ditolak (bukan kunci sibuk) bersifat pasti (R15):
+    # tidak diulang 4 jam sebagai "Menunggu proses lain", status langsung kembali ke menunggu DNS.
+    pb.gagal["prod_aktifkan"] = _ditolak_permanen()
+    job = buat_job(sesi, siap.site_id, JobType.pindah_aktifkan)
+    with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
+        _aktifkan(sesi, siap, job=job)
+    assert not isinstance(e.value, hu.GalatSibuk) and e.value.pesan == pindah.PESAN_TUKAR_DITOLAK
+    job = sesi.get(Job, job.id, populate_existing=True)
+    assert akan_diulang(job, e.value.error_class) is False
+    h = _h(sesi, siap)
+    assert h.dilayani_vps_pada is None and h.gagal_asal is None
+    assert (h.status, h.galat) == (StatusHosting.menunggu_dns, pindah.PESAN_TUKAR_DITOLAK)
+    k = umum.kemajuan(job)
+    assert k["langkah_aktifkan"] == "dns" and k["tukar_pada"] is None and k["tukar_dikirim"] is False
+    assert not k.get("sibuk_kali")
+    # Situs masih pratinjau: pemblokir email dipasang lagi.
+    assert (_files(hosting_aktif, siap) / MU).exists()
 
 
 def test_tukar_ditolak_memasang_ulang_mu_plugin(sesi, siap, hosting_aktif, pb):
@@ -452,9 +478,13 @@ def test_dns_menolak_sesudah_tarik_terakhir_terputus_menandai_salinan(sesi, siap
     job.status = JobStatus.failed
     sesi.commit()
     pb.panggilan.clear()
+    # Final review I2: salinan lengkap pernah ada (`ditarik_pada`), jadi Aktifkan tanpa salin ulang
+    # tidak lagi ditolak di gerbang; DNS (yang dikembalikan pengguna) tetap menahannya.
     with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
         _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
-    assert e.value.pesan == pindah.PESAN_SALINAN_BELUM_UTUH and pb.panggilan == []
+    assert e.value.pesan == dns_mod.PESAN_BELUM and pb.panggilan == []
+    h = _h(sesi, siap)
+    assert (h.status, h.gagal_asal) == (StatusHosting.gagal, "salinan")
 
 
 def test_ambil_halaman_verifikasi_dipatok_ke_localhost_dengan_sni(monkeypatch):
@@ -540,9 +570,11 @@ def test_tanpa_tarik_ulang_melewati_tarik(sesi, siap, prod, pb, lama, halaman):
     assert _h(sesi, siap).status == StatusHosting.aktif
 
 
-def test_tanpa_tarik_ulang_ditolak_untuk_salinan_setengah_jadi(sesi, siap, pb, lama):
+def test_tanpa_tarik_ulang_ditolak_tanpa_salinan_lengkap(sesi, siap, pb, lama):
+    # Belum pernah ada salinan lengkap (`ditarik_pada` kosong): hanya salin yang bisa membuatnya.
     siap.status = StatusHosting.gagal
     siap.gagal_asal = "salinan"
+    siap.ditarik_pada = None
     sesi.commit()
     with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
         _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
@@ -550,6 +582,77 @@ def test_tanpa_tarik_ulang_ditolak_untuk_salinan_setengah_jadi(sesi, siap, pb, l
     h = _h(sesi, siap)
     assert (h.status, h.gagal_asal) == (StatusHosting.gagal, "salinan")
     assert pb.panggilan == [] and lama == []
+
+
+def test_tanpa_tarik_ulang_boleh_dari_gagal_salinan_bila_pernah_disalin_lengkap(sesi, siap, pb, lama, halaman):
+    # Final review I2: hosting lama mati sesudah salinan lengkap (`ditarik_pada`): situs tidak boleh
+    # terjebak di pratinjau. Operator mengonfirmasi bahwa data sejak `ditarik_pada` hilang.
+    siap.status = StatusHosting.gagal
+    siap.gagal_asal = "salinan"
+    sesi.commit()
+    _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
+    assert lama == [] and "prod_db_impor" not in pb.nama_panggilan()
+    h = _h(sesi, siap)
+    assert (h.status, h.gagal_asal) == (StatusHosting.aktif, None)
+
+
+@pytest.mark.parametrize("jawaban", ["putus", "tanpa_connector"])
+def test_hosting_lama_tak_terjangkau_saat_aktivasi_kembali_menunggu_dns(sesi, siap, hosting_aktif, pb, halaman,
+                                                                         monkeypatch, jawaban):
+    # Final review I2: tarik terakhir gagal final di manifest (salinan VPS belum disentuh): bukan
+    # `gagal` 'salinan' (yang menolak Aktifkan tanpa salin ulang), tetapi kembali menunggu DNS
+    # dengan pesan tetap yang menunjuk tombol itu.
+    def tangani(r):
+        if jawaban == "putus":
+            raise httpx.ConnectError("hosting lama mati", request=r)
+        return httpx.Response(404, text="<html>Not Found /home/u1/public_html</html>")
+
+    monkeypatch.setattr(hu, "buat_http_lama", lambda: httpx.Client(transport=httpx.MockTransport(tangani)))
+    ditarik = siap.ditarik_pada
+    isi = (_files(hosting_aktif, siap) / "index.php").read_bytes()
+    job = buat_job(sesi, siap.site_id, JobType.pindah_aktifkan)
+    job.attempts = job.max_attempts  # kegagalan ini final
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _aktifkan(sesi, siap, job=job)
+    assert not isinstance(e.value, hu.GalatSibuk)
+    job = sesi.get(Job, job.id, populate_existing=True)
+    assert akan_diulang(job, e.value.error_class) is False
+    assert umum.kemajuan(job)["tahap"] == "manifest" and umum.kemajuan(job)["langkah_aktifkan"] == "tarik"
+    h = _h(sesi, siap)
+    assert (h.status, h.gagal_asal, h.dilayani_vps_pada) == (StatusHosting.menunggu_dns, None, None)
+    assert h.galat == f"{hu.pesan_ui(e.value)} {hu.PESAN_SALINAN_TIDAK_BERUBAH}"
+    assert "Aktifkan tanpa salin ulang" in h.galat and "public_html" not in h.galat
+    assert h.ditarik_pada == ditarik and (_files(hosting_aktif, siap) / "index.php").read_bytes() == isi
+    assert "prod_aktifkan" not in pb.nama_panggilan()
+    # Jalan keluarnya: Aktifkan tanpa salin ulang dari menunggu DNS.
+    job.status = JobStatus.failed
+    sesi.commit()
+    _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
+    assert _h(sesi, siap).status == StatusHosting.aktif
+
+
+def test_hosting_lama_terputus_sesudah_salinan_disentuh_tetap_gagal_salinan(sesi, siap, prod, pb, monkeypatch):
+    # Batas I2: salinan yang sudah mulai ditimpa tarik terakhir tidak disembunyikan di balik menunggu DNS.
+    prod.berkas["index.php"] = (b"<?php // baru", MTIME + 3)
+
+    def http_putus():
+        def tangani(r):
+            if r.url.path.endswith("/staging/tabel"):
+                raise httpx.ConnectError("putus", request=r)
+            return prod.tangani(r)
+
+        return httpx.Client(transport=httpx.MockTransport(tangani))
+
+    monkeypatch.setattr(hu, "buat_http_lama", http_putus)
+    job = buat_job(sesi, siap.site_id, JobType.pindah_aktifkan)
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError):
+        _aktifkan(sesi, siap, job=job)
+    h = _h(sesi, siap)
+    assert (h.status, h.gagal_asal) == (StatusHosting.gagal, "salinan")
+    assert hu.PESAN_SALINAN_TIDAK_BERUBAH not in (h.galat or "")
 
 
 def test_ip_lama_kosong_ditolak_sebelum_dns_dan_sertifikat(sesi, siap, pb, lama, dns_palsu):
@@ -582,15 +685,32 @@ def test_backoff_sertifikat_menahan_certbot(sesi, siap, pb, lama):
     assert _h(sesi, siap).status == StatusHosting.aktif and _h(sesi, siap).sertifikat_gagal_kali == 0
 
 
-@pytest.mark.parametrize("langkah", ["prod_domain", "prod_sertifikat"])
-def test_keluar_3_sebelum_tukar_diulang_sebagai_sibuk(sesi, siap, pb, lama, langkah):
-    pb.gagal[langkah] = GalatPembantu("ditolak", "Skrip pembantu menolak permintaan ini.")
-    with pytest.raises(hu.GalatSibuk):
-        _aktifkan(sesi, siap)
-    h = _h(sesi, siap)
-    assert (h.status, h.galat) == (StatusHosting.mengaktifkan, hu.PESAN_MENUNGGU_SIBUK)
-    # Kunci nginx sibuk bukan kegagalan CA: tidak menambah backoff sertifikat.
-    assert not h.sertifikat_gagal_kali and lama == []
+@pytest.mark.parametrize("langkah,pesan", [
+    ("prod_domain", "Memasang konfigurasi nginx domain gagal. Skrip pembantu menolak permintaan ini."),
+    ("prod_sertifikat", "Menerbitkan sertifikat domain gagal. Skrip pembantu menolak permintaan ini."),
+])
+@pytest.mark.parametrize("sibuk", [True, False])
+def test_keluar_3_sebelum_tukar_sibuk_diulang_lainnya_ditolak(sesi, siap, pb, lama, langkah, pesan, sibuk):
+    # Final review I1: hanya kunci sibuk (`GalatPembantu.sibuk`) yang diulang sebagai sibuk.
+    # Keluar 3 lainnya (vhost sisa, direktori tidak aman, prod-siapkan belum jalan, prasyarat)
+    # pasti: gagal sekarang dengan pesan tetap skrip pembantu (tanpa path), tidak 4 jam "menunggu".
+    pb.gagal[langkah] = GalatPembantu("ditolak", pesan, sibuk=sibuk)
+    job = buat_job(sesi, siap.site_id, JobType.pindah_aktifkan)
+    if sibuk:
+        with pytest.raises(hu.GalatSibuk):
+            _aktifkan(sesi, siap, job=job)
+        h = _h(sesi, siap)
+        assert (h.status, h.galat) == (StatusHosting.mengaktifkan, hu.PESAN_MENUNGGU_SIBUK)
+    else:
+        with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
+            _aktifkan(sesi, siap, job=job)
+        assert not isinstance(e.value, hu.GalatSibuk) and e.value.pesan == pesan
+        assert akan_diulang(sesi.get(Job, job.id, populate_existing=True), e.value.error_class) is False
+        h = _h(sesi, siap)
+        assert (h.status, h.galat, h.gagal_asal) == (StatusHosting.menunggu_dns, pesan, None)
+        assert "/" not in h.galat
+    # Bukan kegagalan CA: tidak menambah backoff sertifikat; produksi tidak tersentuh.
+    assert not h.sertifikat_gagal_kali and lama == [] and h.dilayani_vps_pada is None
 
 
 def test_prod_domain_gagal_ditolak_tanpa_ubah(sesi, siap, pb, lama):
@@ -628,6 +748,35 @@ def test_verifikasi_gagal_bila_wpmgr_pratinjau_tersisa(sesi, siap, pb, halaman):
     h = _h(sesi, siap)
     assert h.status == StatusHosting.mengaktifkan
     assert h.galat == f"Terputus, dilanjutkan otomatis: {pindah.PESAN_VERIFIKASI}"
+
+
+@pytest.mark.parametrize("lokasi", ["https://toko.co.id/", "https://TOKO.co.id:443/", "/", "https://toko.co.id",
+                                    "https://toko.co.id/?dari=htaccess"])
+def test_verifikasi_gagal_untuk_alihan_ke_alamat_sendiri(sesi, siap, monkeypatch, lokasi):
+    # Final review M1: .htaccess paksa-HTTPS lewat %{HTTPS} berputar di dalam container (TLS
+    # berhenti di nginx host); 3xx ke URL yang sama (skema, host, path) bukan situs yang menjawab.
+    def halaman(host):
+        return 301, {"location": lokasi if host == "toko.co.id" else "https://toko.co.id/"}
+
+    monkeypatch.setattr(pindah, "ambil_halaman_verifikasi", halaman)
+    with pytest.raises(SiteError) as e:
+        _aktifkan(sesi, siap)
+    assert e.value.error_class == TRANSIENT and e.value.pesan == pindah.PESAN_ALIHAN_BERPUTAR
+    assert ".htaccess" in pindah.PESAN_ALIHAN_BERPUTAR
+    h = _h(sesi, siap)
+    assert h.status == StatusHosting.mengaktifkan
+    assert h.galat == f"Terputus, dilanjutkan otomatis: {pindah.PESAN_ALIHAN_BERPUTAR}"
+
+
+def test_verifikasi_menerima_alihan_ke_alamat_lain(sesi, siap, monkeypatch):
+    # www -> apex dan apex -> halaman lain bukan putaran.
+    def halaman(host):
+        return (301, {"location": "https://toko.co.id/"}) if host == "www.toko.co.id" \
+            else (302, {"location": "https://toko.co.id/beranda/"})
+
+    monkeypatch.setattr(pindah, "ambil_halaman_verifikasi", halaman)
+    _aktifkan(sesi, siap)
+    assert _h(sesi, siap).status == StatusHosting.aktif
 
 
 @pytest.mark.parametrize("jawaban", [(401, {}), (500, {}), (200, {"x-robots-tag": "noindex, nofollow"}), None])

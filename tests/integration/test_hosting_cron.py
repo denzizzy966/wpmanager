@@ -10,7 +10,8 @@ from wpmgr.hosting import cron
 from wpmgr.hosting import dns as dns_mod
 from wpmgr.hosting.dns import Jawaban
 from wpmgr.jobs.queue import buat_job
-from wpmgr.models import ActivityLog, HostingVps, Job, JobType, StatusHosting
+from wpmgr.models import ActivityLog, HostingVps, Job, JobStatus, JobType, StatusHosting
+from wpmgr.staging import umum
 from wpmgr.staging.pembantu import GalatPembantu
 
 pytestmark = pytest.mark.integration
@@ -67,6 +68,54 @@ def test_cek_dns_menghormati_backoff_sertifikat(sesi, site_hosting):
     assert cron.cek_dns_semua(sesi, SEKARANG, penanya=PenanyaPalsu())["diantrekan"] == 0
     _status(sesi, site_hosting, StatusHosting.menunggu_dns, sertifikat_gagal_pada=SEKARANG - timedelta(hours=1))
     assert cron.cek_dns_semua(sesi, SEKARANG, penanya=PenanyaPalsu())["diantrekan"] == 1
+
+
+def _job_selesai(sesi, h, selesai, tipe=JobType.pindah_aktifkan, status=JobStatus.failed,
+                 error="Memasang konfigurasi nginx domain gagal. Skrip pembantu menolak permintaan ini."):
+    job = buat_job(sesi, h.site_id, tipe)
+    job.status = status
+    job.finished_at = selesai
+    job.error = error
+    sesi.commit()
+    return job
+
+
+@pytest.mark.parametrize("kali,jam", [(1, 1), (2, 2), (3, 4), (4, 6), (7, 6)])
+def test_cek_dns_menjeda_aktivasi_otomatis_sesudah_aktivasi_gagal(sesi, site_hosting, kali, jam):
+    # Final review I1/I2: aktivasi yang gagal (penolakan pasti skrip pembantu, hosting lama tidak
+    # terjangkau saat tarik terakhir) mengembalikan baris ke menunggu_dns. Tanpa jeda, cron
+    # mengantrekannya lagi tiap 10 menit selamanya (dan mengekspor ulang dari hosting lama).
+    # Jadwal jeda sama dengan backoff sertifikat (§8.4): 1 -> 2 -> 4 -> 6 jam.
+    _status(sesi, site_hosting, StatusHosting.menunggu_dns)
+    for i in range(kali):
+        _job_selesai(sesi, site_hosting, SEKARANG - timedelta(hours=3 * (kali - i)))
+    terakhir = SEKARANG - timedelta(hours=3)
+    sebelum = terakhir + timedelta(hours=jam) - timedelta(minutes=1)
+    assert cron.cek_dns_semua(sesi, sebelum, penanya=PenanyaPalsu()) == {"diperiksa": 1, "diantrekan": 0}
+    # Hasil DNS tetap disimpan selama jeda.
+    assert _h(sesi, site_hosting).dns_dicek_pada == sebelum
+    assert cron.cek_dns_semua(sesi, terakhir + timedelta(hours=jam), penanya=PenanyaPalsu())["diantrekan"] == 1
+
+
+def test_cek_dns_jeda_aktivasi_hanya_rentetan_gagal_terakhir(sesi, site_hosting):
+    _status(sesi, site_hosting, StatusHosting.menunggu_dns)
+    _job_selesai(sesi, site_hosting, SEKARANG - timedelta(minutes=30))
+    # Salin ulang yang sukses sesudahnya memutus rentetan.
+    _job_selesai(sesi, site_hosting, SEKARANG - timedelta(minutes=20), tipe=JobType.pindah_tarik,
+                 status=JobStatus.success, error=None)
+    assert cron.cek_dns_semua(sesi, SEKARANG, penanya=PenanyaPalsu())["diantrekan"] == 1
+    sesi.query(Job).filter(Job.status == JobStatus.pending).one().status = JobStatus.success
+    sesi.commit()
+    # Aktivasi yang dibatalkan pengguna bukan kegagalan.
+    _job_selesai(sesi, site_hosting, SEKARANG - timedelta(minutes=5), error=umum.PESAN_DIBATALKAN)
+    assert cron.cek_dns_semua(sesi, SEKARANG, penanya=PenanyaPalsu())["diantrekan"] == 1
+    sesi.query(Job).filter(Job.status == JobStatus.pending).one().status = JobStatus.success
+    sesi.commit()
+    # Aktivasi yatim yang ditandai reaper (`unknown`, tanpa finished_at) dihitung gagal.
+    yatim = _job_selesai(sesi, site_hosting, None, status=JobStatus.unknown)
+    yatim.scheduled_for = SEKARANG - timedelta(minutes=5)
+    sesi.commit()
+    assert cron.cek_dns_semua(sesi, SEKARANG, penanya=PenanyaPalsu())["diantrekan"] == 0
 
 
 def test_cek_dns_hanya_baris_menunggu_dns_dan_tanpa_job_hosting(sesi, site_hosting):

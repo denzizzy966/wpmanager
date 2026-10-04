@@ -12,7 +12,7 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from sqlalchemy import select
@@ -264,6 +264,12 @@ PESAN_SERTIFIKAT = "Sertifikat domain belum dapat diterbitkan; dicoba lagi otoma
 PESAN_TUKAR_DITOLAK = ("VPS menolak mengaktifkan situs (sertifikat, database, atau container belum siap); "
                        "tidak ada yang diubah.")
 PESAN_VERIFIKASI = "Situs belum menjawab HTTPS dengan benar lewat VPS; diperiksa lagi otomatis."
+PESAN_ALIHAN_BERPUTAR = ("Situs di VPS mengalihkan ke alamatnya sendiri tanpa henti (pengalihan berputar), biasanya "
+                         "aturan paksa-HTTPS di .htaccess yang memeriksa %{HTTPS}: di VPS HTTPS diakhiri nginx, "
+                         "jadi nilainya selalu mati. Ganti syaratnya dengan %{HTTP:X-Forwarded-Proto} !https atau "
+                         "hapus aturan itu; diperiksa lagi otomatis.")
+# Penanda masalah alihan berputar di daftar `verifikasi` (yang hanya ke log server).
+MASALAH_ALIHAN = "mengalihkan ke alamatnya sendiri"
 PESAN_SALINAN_BELUM_UTUH = ("Salinan VPS belum utuh; aktivasi tanpa tarik ulang dari hosting lama ditolak. "
                             "Salin ke VPS lagi dulu.")
 PESAN_SERVER_SIBUK = ("Server VPS sedang sibuk dengan proses lain sehingga aktivasi belum dijalankan; "
@@ -299,8 +305,29 @@ def ambil_halaman_verifikasi(host: str) -> tuple[int, dict] | None:
     return status, {str(k).lower(): str(v) for k, v in header.items()}
 
 
+def alihan_ke_diri(host: str, header: dict) -> bool:
+    """3xx yang `Location`-nya kembali ke URL yang diminta (`https://<host>/`; skema, host, path sama).
+
+    Final review M1: alihan tidak diikuti, jadi tanpa pemeriksaan ini situs
+    yang berputar tanpa henti lolos verifikasi. Kasus umumnya .htaccess
+    paksa-HTTPS lewat `%{HTTPS}`, yang di container selalu mati (TLS
+    diakhiri nginx host). Kueri diabaikan (`/?x=1` tetap halaman yang sama).
+    """
+    lokasi = (header.get("location") or "").strip()
+    if not lokasi:
+        return False
+    try:
+        tujuan = urlsplit(urljoin(f"https://{host}/", lokasi))
+        port = tujuan.port
+    except ValueError:
+        return False
+    return (tujuan.scheme.lower() == "https" and (tujuan.hostname or "") == host.lower()
+            and port in (None, 443) and (tujuan.path or "/") == "/")
+
+
 def verifikasi(h, akar: Path) -> list[str]:
-    """Masalah aktivasi (kosong = lolos): HTTPS 2xx/3xx tanpa 401 dan tanpa noindex, wp-config tanpa pratinjau."""
+    """Masalah aktivasi (kosong = lolos): HTTPS 2xx/3xx (bukan alihan ke diri sendiri) tanpa 401 dan tanpa
+    noindex, wp-config tanpa pratinjau."""
     masalah = []
     for host in [h.domain] + ([f"www.{h.domain}"] if h.dengan_www else []):
         jawab = ambil_halaman_verifikasi(host)
@@ -312,6 +339,8 @@ def verifikasi(h, akar: Path) -> list[str]:
             masalah.append(f"{host}: masih meminta kata sandi pratinjau")
         elif not 200 <= status < 400:
             masalah.append(f"{host}: HTTP {status}")
+        elif 300 <= status < 400 and alihan_ke_diri(host, header):
+            masalah.append(f"{host}: {MASALAH_ALIHAN} (HTTP {status})")
         elif "noindex" in header.get("x-robots-tag", "").lower():
             masalah.append(f"{host}: masih mengirim X-Robots-Tag noindex")
     try:
@@ -343,10 +372,13 @@ def _periksa_awal(job, h: HostingVps) -> None:
     if awal not in STATUS_BOLEH_AKTIFKAN:
         raise stg.GalatDitolakTanpaUbah(PESAN_STATUS_AKTIFKAN)
     if (job.payload or {}).get("tanpa_tarik_ulang"):
-        # Salinan setengah jadi hanya bisa dirampungkan tarik (spec §10.3);
-        # mengaktifkannya tanpa tarik menyajikan situs rusak.
-        if h.ditarik_pada is None or (awal == StatusHosting.gagal.value
-                                      and k.get("gagal_asal_awal") == hu.ASAL_SALINAN):
+        # Tanpa salinan lengkap yang pernah ada (`ditarik_pada`), hanya tarik
+        # yang bisa membuatnya. Dari `gagal` 'salinan' dengan `ditarik_pada`
+        # terisi boleh (final review I2, spec §16/§21): hosting lama bisa sudah
+        # mati, dan tanpa jalan ini situs terjebak di pratinjau. Pengguna
+        # mengetik domain untuk konfirmasi; UI menyebut bahwa salinan dari
+        # `ditarik_pada` yang dipakai dan perubahan di site lama sejak itu hilang.
+        if h.ditarik_pada is None:
             raise stg.GalatDitolakTanpaUbah(PESAN_SALINAN_BELUM_UTUH)
     elif not hu.alamat_lama_sah(h.ip_lama):
         # Tarik terakhir hanya lewat IP lama yang TERSIMPAN (RF4): DNS domain
@@ -381,8 +413,10 @@ def _sertifikat(sesi, job, h: HostingVps, pb) -> None:
             pb.prod_domain(h.nama)
     except GalatPembantu as exc:
         if exc.tanpa_ubah:
-            # Kunci nginx/router sibuk (putusan L4/L8): dijadwalkan ulang
-            # sebagai sibuk oleh pembungkus (putusan L10), bukan gagal.
+            # Keluar 3 diteruskan ke pembungkus: kunci nginx/router sibuk
+            # (putusan L4/L8) dijadwalkan ulang sebagai sibuk (putusan L10);
+            # penolakan lain (vhost sisa, domain dipakai situs lain) pasti
+            # dengan pesan tetap skrip pembantu (final review I1).
             raise
         log.warning("prod-domain %s gagal sebelum sertifikat: %s", h.nama, exc.kode)
         raise stg.GalatDitolakTanpaUbah(PESAN_NGINX) from None
@@ -391,8 +425,9 @@ def _sertifikat(sesi, job, h: HostingVps, pb) -> None:
             pb.prod_sertifikat(h.nama)
     except GalatPembantu as exc:
         if exc.tanpa_ubah:
-            # Keluar 3 bukan penolakan CA (kunci nginx sibuk sesudah certbot,
-            # atau prasyarat): sibuk, tanpa menambah backoff. Percobaan ulang
+            # Keluar 3 bukan penolakan CA, jadi tanpa menambah backoff: kunci
+            # nginx sibuk sesudah certbot diulang sebagai sibuk; prasyarat yang
+            # ditolak pasti (pembungkus, final review I1). Percobaan ulang
             # tidak memvalidasi lagi sertifikat yang sudah terbit
             # (certbot --keep-until-expiring).
             raise
@@ -532,11 +567,12 @@ def _kirim_tukar(sesi, job, site, h: HostingVps, pb) -> None:
             # (putusan L12).
             raise
         _cabut_tukar(sesi, job, akar, h)
-        # Dilempar ulang sebagai GalatPembantu keluar 3: pembungkus
-        # menjadwalkannya ulang sebagai sibuk (putusan L10; kunci router
-        # dipegang impor situs lain sampai 3 jam). Lewat jendela sibuk, status
-        # kembali seperti sebelum job dengan pesan tetap ini (spec §10.4);
-        # kunci yang sibuk tidak menyalahkan sertifikat/database/container (M5).
+        # Dilempar ulang sebagai GalatPembantu keluar 3. Kunci sibuk:
+        # pembungkus menjadwalkannya ulang sebagai sibuk (putusan L10; kunci
+        # router dipegang impor situs lain sampai 3 jam), dan lewat jendela
+        # sibuk status kembali seperti sebelum job dengan pesan netral (M5).
+        # Prasyarat yang ditolak: pasti, langsung kembali ke status sebelum
+        # job dengan pesan tetap ini (spec §10.4, final review I1).
         pesan = PESAN_SERVER_SIBUK if exc.sibuk else PESAN_TUKAR_DITOLAK
         raise GalatPembantu(exc.kode, pesan, sibuk=exc.sibuk) from None
     # Kemajuan sungguhan: rentetan sibuk sebelum tukar selesai (M4).
@@ -550,7 +586,8 @@ def _verifikasi(sesi, job, site, h: HostingVps) -> None:
     if masalah:
         # Rincian (nama host milik dashboard, kode HTTP) hanya ke log server.
         log.warning("Verifikasi aktivasi %s gagal: %s", h.domain, "; ".join(masalah))
-        raise hu.GalatHosting(TRANSIENT, PESAN_VERIFIKASI)
+        berputar = any(MASALAH_ALIHAN in m for m in masalah)
+        raise hu.GalatHosting(TRANSIENT, PESAN_ALIHAN_BERPUTAR if berputar else PESAN_VERIFIKASI)
     try:
         baca_terbatas(akar / "files", MU_PLUGIN_PRATINJAU, 1)
     except (PathTidakAman, OSError):

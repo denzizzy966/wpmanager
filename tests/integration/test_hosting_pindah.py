@@ -315,8 +315,9 @@ def test_prod_domain_sibuk_tidak_mengulang_sertifikat(sesi, site_hosting, prod, 
     if sertifikat_gagal:
         pb.gagal["sertifikat"] = GalatPembantu("sertifikat", "Menerbitkan sertifikat staging gagal. Sertifikat "
                                                              "staging belum dapat diterbitkan.")
+    # Kunci nginx sibuk (penanda di stderr skrip): satu-satunya keluar 3 yang diulang (final review I1).
     pb.gagal["prod_domain"] = GalatPembantu("ditolak", "Memasang konfigurasi nginx domain gagal. Skrip pembantu "
-                                                       "menolak permintaan ini.")
+                                                       "menolak permintaan ini.", sibuk=True)
     job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
     for _ in range(2):
         with pytest.raises(hu.GalatSibuk):
@@ -334,3 +335,17 @@ def test_prod_domain_sibuk_tidak_mengulang_sertifikat(sesi, site_hosting, prod, 
         assert [p for p in hasil["peringatan"] if p.startswith("Sertifikat pratinjau belum terbit")]
     else:
         assert h.pratinjau_sertifikat_pada is not None and hasil["peringatan"] == []
+
+
+def test_prod_domain_menolak_bukan_sibuk_langsung_gagal(sesi, site_hosting, prod, pb, lama):
+    # Final review I1: "domain sudah dipakai situs lain"/vhost sisa (keluar 3 tanpa penanda kunci
+    # sibuk) pasti; salinan pertama yang belum rampung tetap `gagal` 'salinan', tidak 4 jam menunggu.
+    pesan = "Memasang konfigurasi nginx domain gagal. Skrip pembantu menolak permintaan ini."
+    pb.gagal["prod_domain"] = GalatPembantu("ditolak", pesan)
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+    with pytest.raises(SiteError) as e:
+        pindah.tangani_pindah_tarik(sesi, job, None)
+    assert not isinstance(e.value, hu.GalatSibuk)
+    assert pb.nama_panggilan().count("prod_domain") == 1
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "salinan", pesan)

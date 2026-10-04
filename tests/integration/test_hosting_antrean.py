@@ -176,7 +176,8 @@ def test_galat_pembantu_sebelum_tukar_final_gagal_salinan(sesi, site_hosting):
     job = buat_job(sesi, site_hosting.site_id, JobType.pindah_aktifkan)
 
     def inti(sesi, job, site, h):
-        stg.simpan_kemajuan(sesi, job, langkah_aktifkan="tarik")
+        # prod-buat gagal di tahap impor tarik terakhir: salinan VPS sudah disentuh.
+        stg.simpan_kemajuan(sesi, job, langkah_aktifkan="tarik", tahap="impor")
         raise GalatPembantu("docker", "Membuat container situs gagal. Perintah Docker di server staging gagal.")
 
     with pytest.raises(SiteError) as e:
@@ -185,6 +186,50 @@ def test_galat_pembantu_sebelum_tukar_final_gagal_salinan(sesi, site_hosting):
     h = _h(sesi, site_hosting)
     assert (h.status, h.gagal_asal) == (StatusHosting.gagal, "salinan")
     assert h.galat == "Membuat container situs gagal. Perintah Docker di server staging gagal."
+
+
+@pytest.mark.parametrize("langkah,tahap,akhiran", [("dns", None, False), ("tarik", None, True),
+                                                   ("tarik", "manifest", True)])
+def test_gagal_final_sebelum_salinan_disentuh_kembali_ke_status_awal(sesi, site_hosting, langkah, tahap, akhiran):
+    # Final review I2: kegagalan final sebelum tukar yang tidak menyentuh salinan VPS bukan `gagal`
+    # 'salinan' (yang menolak Aktifkan tanpa salin ulang); status kembali seperti sebelum job.
+    site_hosting.status = StatusHosting.menunggu_dns
+    site_hosting.ditarik_pada = SEKARANG
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_aktifkan)
+    job.attempts = job.max_attempts
+    sesi.commit()
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, langkah_aktifkan=langkah, tahap=tahap)
+        raise SiteError(TRANSIENT, "koneksi ke 10.0.0.5 putus")
+
+    with pytest.raises(SiteError):
+        hu.jalankan_hosting(sesi, job, inti, "Aktivasi hosting VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal) == (StatusHosting.menunggu_dns, None)
+    harapan = hu.PESAN_KELAS[TRANSIENT]
+    if akhiran:
+        harapan = f"{harapan} {hu.PESAN_SALINAN_TIDAK_BERUBAH}"
+    assert h.galat == harapan
+
+
+def test_salin_ulang_gagal_final_sebelum_salinan_disentuh_tetap_pratinjau(sesi, site_hosting):
+    site_hosting.status = StatusHosting.pratinjau
+    site_hosting.ditarik_pada = SEKARANG
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+    job.attempts = job.max_attempts
+    sesi.commit()
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, tahap="manifest")
+        raise SiteError(TRANSIENT, "koneksi putus")
+
+    with pytest.raises(SiteError):
+        hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.pratinjau, None, hu.PESAN_KELAS[TRANSIENT])
 
 
 def _sesudah_tukar(sesi, site_hosting, jam_lalu=0.0, attempts=3):
@@ -339,6 +384,21 @@ def test_reaper_melepas_hosting_menyalin(sesi, site_hosting):
     assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "salinan", hu.PESAN_TERHENTI)
 
 
+def test_reaper_aktifkan_sebelum_salinan_disentuh_kembali_menunggu_dns(sesi, site_hosting):
+    # Final review I2: aturan status reaper sama dengan pembungkus (`status_gagal_final`).
+    site_hosting.status = StatusHosting.mengaktifkan
+    site_hosting.ditarik_pada = SEKARANG
+    sesi.commit()
+    job = _yatim(sesi, site_hosting, JobType.pindah_aktifkan, {"kemajuan": {
+        "langkah_aktifkan": "tarik", "tahap": "manifest", "status_hosting_awal": "menunggu_dns"}})
+    assert pulihkan_job_yatim(sesi) == 1
+    sesi.expire_all()
+    assert sesi.get(Job, job.id).status == JobStatus.unknown
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal) == (StatusHosting.menunggu_dns, None)
+    assert h.galat == f"{hu.PESAN_TERHENTI} {hu.PESAN_SALINAN_TIDAK_BERUBAH}"
+
+
 def test_reaper_aktifkan_sesudah_tukar_dalam_24_jam_diulang(sesi, site_hosting):
     site_hosting.status = StatusHosting.mengaktifkan
     site_hosting.dilayani_vps_pada = SEKARANG
@@ -435,7 +495,8 @@ SIBUK = "Mengimpor database situs gagal. Skrip pembantu menolak permintaan ini."
 
 
 def _sibuk():
-    return GalatPembantu("ditolak", SIBUK)
+    # Penanda kunci sibuk di stderr skrip (`GalatPembantu.sibuk`); keluar 3 lainnya pasti (final review I1).
+    return GalatPembantu("ditolak", SIBUK, sibuk=True)
 
 
 def _lewat_worker(monkeypatch, tipe, inti, nama="Salin ke VPS"):
@@ -483,6 +544,52 @@ def test_pembantu_sibuk_dijadwalkan_ulang_tanpa_menghabiskan_jatah(sesi, site_ho
     assert h.galat == hu.PESAN_MENUNGGU_SIBUK
     site = sesi.get(Site, site_hosting.site_id)
     assert site.status == SiteStatus.active and site.last_error is None
+
+
+@pytest.mark.parametrize("tipe,status_awal", [
+    (JobType.pindah_tarik, StatusHosting.pratinjau),
+    (JobType.pindah_aktifkan, StatusHosting.menunggu_dns),
+])
+def test_pembantu_menolak_bukan_sibuk_langsung_final_tanpa_ubah(sesi, site_hosting, monkeypatch, tipe,
+                                                                 status_awal):
+    # Final review I1 (pola backup._tolak_permanen): keluar 3 tanpa penanda kunci sibuk (vhost sisa,
+    # direktori tidak aman, prod-siapkan belum jalan, domain dipakai situs lain) pasti; tidak
+    # diulang 4 jam dengan pesan "menunggu proses lain".
+    site_hosting.status = status_awal
+    site_hosting.ditarik_pada = SEKARANG
+    sesi.commit()
+    pesan = "Membuat container situs gagal. Skrip pembantu menolak permintaan ini."
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, langkah_aktifkan="sertifikat")
+        raise GalatPembantu("ditolak", pesan)
+
+    _lewat_worker(monkeypatch, tipe, inti)
+    job = buat_job(sesi, site_hosting.site_id, tipe)
+    assert proses_satu(sesi, "w1", buat_klien_fn=lambda s: None, jenis="staging")
+    sesi.expire_all()
+    j = sesi.get(Job, job.id)
+    assert j.status == JobStatus.failed and j.attempts == 1 and j.error == pesan
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (status_awal, None, pesan)
+    assert not stg.kemajuan(j).get("sibuk_kali")
+
+
+def test_pembantu_menolak_bukan_sibuk_sesudah_salinan_disentuh_gagal_salinan(sesi, site_hosting):
+    # Penolakan pasti tidak menyembunyikan salinan setengah jadi di balik status siap.
+    site_hosting.status = StatusHosting.pratinjau
+    site_hosting.ditarik_pada = SEKARANG
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_tarik)
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, tahap="impor")
+        raise GalatPembantu("ditolak", SIBUK)
+
+    with pytest.raises(SiteError):
+        hu.jalankan_hosting(sesi, job, inti, "Salin ke VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.gagal, "salinan", SIBUK)
 
 
 @pytest.mark.parametrize("kali,menit", [(1, 2), (2, 4), (3, 8), (4, 15), (9, 15)])
@@ -684,7 +791,10 @@ def test_aktifkan_tertunda_sesudah_tukar_menahan_di_pemeriksaan_ulang(sesi, site
 def test_reaper_aktifkan_sebelum_tukar_gagal_salinan(sesi, site_hosting):
     site_hosting.status = StatusHosting.mengaktifkan
     sesi.commit()
-    job = _yatim(sesi, site_hosting, JobType.pindah_aktifkan, {"kemajuan": {"langkah_aktifkan": "tarik"}})
+    # Tarik terakhir sudah menulis ke salinan VPS (tahap berkas). Yang belum menyentuh salinan
+    # kembali ke status sebelum job (final review I2, test_reaper_aktifkan_sebelum_salinan_disentuh_...).
+    job = _yatim(sesi, site_hosting, JobType.pindah_aktifkan, {"kemajuan": {"langkah_aktifkan": "tarik",
+                                                                           "tahap": "berkas"}})
     assert pulihkan_job_yatim(sesi) == 1
     sesi.expire_all()
     assert sesi.get(Job, job.id).status == JobStatus.unknown
