@@ -188,3 +188,25 @@ def test_readme_menjelaskan_pindah_hosting():
         assert wajib in readme, wajib
     assert "CRON_TZ=Asia/Jakarta" not in readme
 
+def test_readme_pemulihan_aman_diikuti_baris_demi_baris():
+    readme = (AKAR / "README.md").read_text(encoding="utf-8")
+    awal = readme.index("### Pemulihan backup manual")
+    bagian = readme[awal:readme.index("### Melepas site aktif secara manual")]
+    drop = bagian.index("DROP DATABASE")
+    # verifikasi sebelum apa pun yang merusak, dan peringatannya di depan blok kode
+    assert bagian.index("sha256sum") < drop
+    assert bagian.index("gunzip -t") < drop and bagian.index("tar -tzf") < drop
+    assert bagian.index("jangan dipulihkan") < bagian.index("```bash")
+    # dump pengaman sebelum DROP, dan database harus ada
+    assert bagian.index("sebelum-pulih-$(date") < drop
+    assert bagian.index("mariadb-dump") < drop
+    assert bagian.index("SHOW DATABASES LIKE") < drop
+    # berhenti di galat pertama dan berkas kredensial selalu dibersihkan
+    assert "set -euo pipefail" in bagian
+    assert bagian.index("trap ") < drop
+
+
+def test_readme_unit_siapkan_dijalankan_ulang_sesudah_dipasang():
+    readme = (AKAR / "README.md").read_text(encoding="utf-8")
+    assert "sudo systemctl enable wpmgr-staging-siapkan" in readme
+    assert "sudo systemctl restart wpmgr-staging-siapkan" in readme

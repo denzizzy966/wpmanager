@@ -700,7 +700,8 @@ atau kredensial FTP yang perlu ditulis di berkas mana pun di repo ini.
 5. Jalankan `sudo wpmgr-staging prod-siapkan` (membuat `KONF_DIR/prod`, `php.ini`, jaringan `wpmgr-prod`,
    aturan iptables, `wpmgr-prod-db`, `wpmgr-prod-router`). Pasang ulang
    `deploy/staging/wpmgr-staging-siapkan.service` (kini punya `ExecStart` kedua `prod-siapkan`), lalu
-   `sudo systemctl daemon-reload`. Lapis 4 juga memperbaiki aturan INPUT staging dengan
+   `sudo systemctl daemon-reload && sudo systemctl enable wpmgr-staging-siapkan` (`enable` sama dengan Lapis 3;
+   aman diulang), lalu `sudo systemctl restart wpmgr-staging-siapkan` supaya kedua `ExecStart` jalan sekarang. Lapis 4 juga memperbaiki aturan INPUT staging dengan
    `ESTABLISHED,RELATED` di atas `DROP`, supaya balasan router ke nginx host tidak dibuang; jalankan
    `sudo wpmgr-staging siapkan` sekali lagi sesudah memasang skrip baru.
 6. Pasang include nginx hosting: salin `deploy/staging/nginx-wpmgr-hosting.conf` ke
@@ -782,31 +783,56 @@ sudah aktif (batas satu arah) dan hanya membaca dump dari stdin; karena itu data
 `docker exec` ke `wpmgr-prod-db` memakai kredensial root database.
 
 Cari nama situs, `site_id`, dan domain dari state root: `sudo ls /etc/wpmgr-staging/prod/situs/` dan
-`sudo cat /etc/wpmgr-staging/prod/situs/<nama>` (`SITE_ID=`, `DOMAIN=`). Lalu sebagai root dengan
+`sudo cat /etc/wpmgr-staging/prod/situs/<nama>` (`SITE_ID=`, `DOMAIN=`).
+
+**Peringatan:** bila `sha256sum`, `gunzip -t`, atau `tar -tzf` gagal atau tidak cocok dengan manifest,
+jangan dipulihkan dari backup itu; pakai stempel lain. Blok di bawah memverifikasi dulu, membuat dump
+pengaman database yang sekarang, baru mengubah apa pun, dan berhenti di galat pertama. Jalankan sebagai root,
+tempel utuh sekali jalan (jangan melompati baris), dengan
 `S=<site_id> N=<nama> T=<stempel> D=prd_<nama dengan - menjadi _>`:
 
 ```bash
+S=... N=... T=... D=prd_...
 B=/var/lib/wpmgr/backup/$S/$T
-cd "$B" && cat manifest.json && sha256sum db.sql.gz files.tar.gz   # cocokkan dengan manifest
-docker stop wpp-$N
-# Berkas: yang sekarang disisihkan, bukan dihapus
-mv /var/lib/wpmgr/hosting/$S/files /var/lib/wpmgr/hosting/$S/files.sebelum-pulih-$(date +%s)
-cat "$B/files.tar.gz" | sudo -u wpmgr tar -xzf - -C /var/lib/wpmgr/hosting/$S
-# Database
+H=/var/lib/wpmgr/hosting/$S
+(
+set -euo pipefail
+umask 077
+cd "$B"
+# 1. Verifikasi backup SEBELUM menyentuh apa pun
+[ "$(sha256sum db.sql.gz | cut -d' ' -f1)" = "$(grep -o '"sha256_db":"[0-9a-f]*"' manifest.json | cut -d'"' -f4)" ]
+[ "$(sha256sum files.tar.gz | cut -d' ' -f1)" = "$(grep -o '"sha256_file":"[0-9a-f]*"' manifest.json | cut -d'"' -f4)" ]
+gunzip -t db.sql.gz
+tar -tzf files.tar.gz >/dev/null
+# 2. Berkas kredensial root database, selalu dihapus (juga bila langkah di bawah gagal)
+trap 'docker exec wpmgr-prod-db rm -f /run/pulih.cnf' EXIT
 printf '[client]\nuser=root\npassword=%s\n' "$(cat /etc/wpmgr-staging/prod/db-root)" \
   | docker exec -i wpmgr-prod-db sh -c 'umask 077; cat > /run/pulih.cnf'
+# 3. Database yang dimaksud harus ada (salah $N gagal di sini); lalu dump pengaman kondisi sekarang
+docker exec wpmgr-prod-db mariadb --defaults-extra-file=/run/pulih.cnf -N -e "SHOW DATABASES LIKE '$D'" | grep -qx "$D"
+docker exec wpmgr-prod-db mariadb-dump --defaults-extra-file=/run/pulih.cnf --single-transaction --quick \
+  --hex-blob --no-tablespaces --default-character-set=utf8mb4 "$D" | gzip -c > "/var/lib/wpmgr/backup/$S/sebelum-pulih-$(date +%s).sql.gz"
+# 4. Baru sekarang situs dihentikan dan data diganti
+docker stop "wpp-$N"
+mv "$H/files" "$H/files.sebelum-pulih-$(date +%s)"
+cat "$B/files.tar.gz" | sudo -u wpmgr tar -xzf - -C "$H"
 docker exec wpmgr-prod-db mariadb --defaults-extra-file=/run/pulih.cnf \
   -e "DROP DATABASE \`$D\`; CREATE DATABASE \`$D\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 gunzip -c "$B/db.sql.gz" | docker exec -i wpmgr-prod-db mariadb --defaults-extra-file=/run/pulih.cnf "$D"
-docker exec wpmgr-prod-db rm -f /run/pulih.cnf
-wpmgr-staging prod-jalan $N
+wpmgr-staging prod-jalan "$N"
+)
 ```
 
+Blok di dalam `( ... )` berhenti pada galat pertama; kata sandi di `/run/pulih.cnf` dihapus oleh `trap`
+walau gagal. **Bila berhenti di langkah 4,** situs mungkin sudah berhenti dan berkasnya sudah disisihkan:
+jangan menjalankan ulang membabi buta. Baca galatnya, kembalikan `files.sebelum-pulih-*` ke `files` bila
+perlu, dan pulihkan database dari `sebelum-pulih-*.sql.gz` (diimpor dengan cara yang sama seperti `db.sql.gz`)
+bila `DROP` sudah jalan, lalu `wpmgr-staging prod-jalan <nama>`.
+
 `tar` diekstrak sebagai `wpmgr`, sehingga kepemilikan sesuai pemeriksaan skrip. Hak user database situs
-tetap ada sesudah `DROP DATABASE`, jadi tidak perlu dibuat ulang. Hapus direktori `files.sebelum-pulih-*`
-manual sesudah situs diperiksa. Bila `sha256sum` tidak cocok dengan manifest, jangan pulihkan dari backup
-itu; pakai stempel lain. Lakukan satu kali latihan pemulihan pada situs pertama sebelum hosting lamanya
-dimatikan.
+tetap ada sesudah penghapusan database, jadi tidak perlu dibuat ulang. Hapus direktori
+`files.sebelum-pulih-*` dan dump pengaman manual sesudah situs diperiksa. Lakukan satu kali latihan
+pemulihan pada situs pertama sebelum hosting lamanya dimatikan.
 
 Karena backup berada di disk yang sama dengan situs, salin keluar VPS secara berkala, mis.
 `rsync -a /var/lib/wpmgr/backup/ <tujuan-lain>:/backup-wpmgr/` dari crontab root.
