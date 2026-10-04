@@ -46,6 +46,7 @@ def test_tanda_tangan_salah_ditolak_401(sesi, site_terpasang):
 
     klien = SiteClient("https://placeholder.test", str(site_terpasang.id), "f" * 64)
     klien.base_url = site_terpasang.url
+    klien._url_kirim = site_terpasang.url  # sejak Lapis 4 permintaan dikirim ke _url_kirim
     with pytest.raises(SiteError) as exc:
         klien.ping()
     assert exc.value.error_class == AUTH_ERROR

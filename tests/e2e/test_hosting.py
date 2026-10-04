@@ -8,6 +8,9 @@ WordPress e2e berbicara HTTP polos di localhost:8081, jadi klien hosting lama
 memakai `klien_http` (Koreksi #17), DNS publik diganti penanya tiruan, dan
 verifikasi aktivasi lewat router produksi 127.0.0.1:8091 karena tidak ada
 nginx host.
+
+Disk: tarik menolak bila sisa disk sesudahnya < 15%. Bila drive repo sesempit itu, set
+`WPMGR_E2E_STG_AKAR` ke direktori di drive lain (path pendek), mis. C:/Users/<anda>/AppData/Local/Temp/wpmgr-e2e-stg.
 """
 
 import hashlib
@@ -119,38 +122,47 @@ def _chown_dashboard(*relatif: str) -> None:
 def runtime_hosting():
     _bersihkan_runtime()
     _hapus_akar_e2e()
-    for d in ("staging", "hosting"):
-        (AKAR_E2E / d).mkdir(parents=True)
-    (AKAR_E2E / PENANDA_AKAR).write_bytes(b"")
-    subprocess.run(["docker", "compose", "--profile", "staging", "up", "-d", "--build", "pembantu"],
-                   check=True, capture_output=True, timeout=900)
-    konf = "\n".join([
-        f"DOMAIN={DOMAIN_STAGING}", "STAGING_DIR=/srv/wpmgr/staging", "KONF_DIR=/srv/wpmgr/etc",
-        "CERT_DIR=/srv/wpmgr/certs", "ACME_DIR=/srv/wpmgr/acme", "LE_DIR=/srv/wpmgr/le", "LOG_DIR=/srv/wpmgr/log",
-        "ROUTER_PORT=127.0.0.1:8090", "MAIL_PORT=127.0.0.1:8025", "SUBNET=172.31.250.0/24",
-        f"PENGGUNA_UID={UID_DASHBOARD}", f"PENGGUNA_GID={UID_DASHBOARD}", "AKAR_LOKAL=/srv/wpmgr",
-        f"AKAR_DAEMON={_akar_daemon()}", "TANPA_IPTABLES=1", "TANPA_SERTIFIKAT=1",
-        "HOSTING_DIR=/srv/wpmgr/hosting", "PROD_CERT_DIR=/srv/wpmgr/hosting-certs",
-        "NGINX_HOSTING_DIR=/srv/wpmgr/nginx-hosting", "BACKUP_DIR=/srv/wpmgr/backup", "IP_PUBLIK=127.0.0.1",
-        "NGINX_UJI_SAJA=1", "SERTIFIKAT_SENDIRI=1",
-    ]) + "\n"
-    (AKAR_E2E / "staging.conf").write_bytes(konf.encode("ascii"))
-    _chown_dashboard("staging", "hosting")
-    _docker("pull", "--quiet", "wordpress:php8.1-apache")
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("WPMGR_STAGING_DOMAIN", DOMAIN_STAGING)
-        mp.setenv("WPMGR_STAGING_DIR", str(AKAR_E2E / "staging"))
-        mp.setenv("WPMGR_STAGING_PEMBANTU_AWALAN", AWALAN)
-        mp.setenv("WPMGR_HOSTING_IPV4", VPS)
-        mp.setenv("WPMGR_HOSTING_DIR", str(AKAR_E2E / "hosting"))
-        get_settings.cache_clear()
-        pb = Pembantu.dari_setelan()
-        pb.siapkan()
-        pb.prod_siapkan()
-        yield
-        get_settings.cache_clear()
-    _bersihkan_runtime()
-    _hapus_akar_e2e()
+    try:
+        for d in ("staging", "hosting"):
+            (AKAR_E2E / d).mkdir(parents=True)
+        (AKAR_E2E / PENANDA_AKAR).write_bytes(b"")
+        subprocess.run(["docker", "compose", "--profile", "staging", "up", "-d", "--build", "pembantu"],
+                       check=True, capture_output=True, timeout=900)
+        konf = "\n".join([
+            f"DOMAIN={DOMAIN_STAGING}", "STAGING_DIR=/srv/wpmgr/staging", "KONF_DIR=/srv/wpmgr/etc",
+            "CERT_DIR=/srv/wpmgr/certs", "ACME_DIR=/srv/wpmgr/acme", "LE_DIR=/srv/wpmgr/le", "LOG_DIR=/srv/wpmgr/log",
+            "ROUTER_PORT=127.0.0.1:8090", "MAIL_PORT=127.0.0.1:8025", "SUBNET=172.31.250.0/24",
+            f"PENGGUNA_UID={UID_DASHBOARD}", f"PENGGUNA_GID={UID_DASHBOARD}", "AKAR_LOKAL=/srv/wpmgr",
+            f"AKAR_DAEMON={_akar_daemon()}", "TANPA_IPTABLES=1", "TANPA_SERTIFIKAT=1",
+            "HOSTING_DIR=/srv/wpmgr/hosting", "PROD_CERT_DIR=/srv/wpmgr/hosting-certs",
+            "NGINX_HOSTING_DIR=/srv/wpmgr/nginx-hosting", "BACKUP_DIR=/srv/wpmgr/backup", "IP_PUBLIK=127.0.0.1",
+            "NGINX_UJI_SAJA=1", "SERTIFIKAT_SENDIRI=1",
+        ]) + "\n"
+        (AKAR_E2E / "staging.conf").write_bytes(konf.encode("ascii"))
+        _chown_dashboard("staging", "hosting")
+        _docker("pull", "--quiet", "wordpress:php8.1-apache")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("WPMGR_STAGING_DOMAIN", DOMAIN_STAGING)
+            mp.setenv("WPMGR_STAGING_DIR", str(AKAR_E2E / "staging"))
+            mp.setenv("WPMGR_STAGING_PEMBANTU_AWALAN", AWALAN)
+            mp.setenv("WPMGR_HOSTING_IPV4", VPS)
+            mp.setenv("WPMGR_HOSTING_DIR", str(AKAR_E2E / "hosting"))
+            get_settings.cache_clear()
+            pb = Pembantu.dari_setelan()
+            pb.siapkan()
+            pb.prod_siapkan()
+            yield
+            get_settings.cache_clear()
+    finally:
+        # Setiap langkah teardown berdiri sendiri: galat satu tidak melewati yang lain.
+        try:
+            _bersihkan_runtime()
+        finally:
+            try:
+                _hapus_akar_e2e()
+            finally:
+                subprocess.run(["docker", "compose", "--profile", "staging", "rm", "-sf", "pembantu"],
+                               capture_output=True, check=False, timeout=120)
 
 
 @pytest.fixture
@@ -270,7 +282,8 @@ def test_alur_pindah_hosting_lengkap(sesi, site_terpasang, runtime_hosting, tiru
 
     # 5. Pengaman pratinjau tercabut; IP pengunjung asli sampai ke PHP (A2).
     r = _router(DOMAIN)
-    assert r.status_code in (200, 301, 302) and r.status_code != 401
+    assert r.status_code in (200, 301, 302)
+    status_aktif = r.status_code
     assert "noindex" not in r.headers.get("x-robots-tag", "")
     assert not (akar / "files" / pindah.MU_PLUGIN_PRATINJAU).exists()
     assert b"WPMGR_PRATINJAU" not in (akar / "files" / "wp-config.php").read_bytes()
@@ -291,4 +304,4 @@ def test_alur_pindah_hosting_lengkap(sesi, site_terpasang, runtime_hosting, tiru
     assert job.status == JobStatus.failed and pindah.PESAN_SUDAH_DILAYANI in (job.error or ""), job.error
     hasil = _di_pembantu("/usr/local/sbin/wpmgr-staging", "prod-db-impor", NAMA, masukan=b"DROP TABLE wp_options;")
     assert hasil.returncode == 3
-    assert _router(DOMAIN).status_code != 500
+    assert _router(DOMAIN).status_code == status_aktif
