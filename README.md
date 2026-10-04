@@ -683,6 +683,10 @@ atau kredensial FTP yang perlu ditulis di berkas mana pun di repo ini.
    (`HOSTING_DIR`, `PROD_SUBNET`, `PROD_ROUTER_PORT`, `PROD_CERT_DIR`, `NGINX_HOSTING_DIR`, `BACKUP_DIR`,
    `IP_PUBLIK`), lalu siapkan direktori data:
    `sudo install -d -o wpmgr -g wpmgr -m 0700 /var/lib/wpmgr/hosting`.
+   **Ketik kuncinya dengan teliti:** `muat_konf` memvalidasi setiap kunci dan nilai `staging.conf` untuk
+   *setiap* subperintah, jadi salah ketik di satu kunci hosting (nama kunci tak dikenal, path atau nilai tidak
+   sah) juga menghentikan staging Lapis 3 (`buat`, `jalan`, `sertifikat`, ...), bukan hanya `prod-*`. Sesudah
+   mengubah berkas ini, jalankan `sudo wpmgr-staging status` dan pastikan tidak ada `GALAT konfigurasi`.
 4. **Pra-cek nginx host** (jangan dilewati). Container produksi tinggal di `172.31.251.0/24` dan boleh
    membuka port 80/443 IP publik VPS. Vhost lain di VPS (sekitar 19 situs) tidak boleh memercayai rentang
    privat, atau container yang diretas diperlakukan sebagai proxy tepercaya. Periksa semuanya:
