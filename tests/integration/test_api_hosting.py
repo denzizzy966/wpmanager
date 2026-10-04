@@ -269,21 +269,10 @@ def test_aktifkan_tanpa_tarik_ulang_ditolak_bila_salinan_belum_utuh(klien_web, s
     _status(sesi, site_hosting, StatusHosting.menunggu_dns)
     r = klien_web.post(url, json=badan)
     assert r.status_code == 409 and r.json()["detail"] == pindah.PESAN_SALINAN_BELUM_UTUH
-    # Gagal 'salinan' tanpa salinan lengkap yang pernah ada (`ditarik_pada` kosong).
-    _status(sesi, site_hosting, StatusHosting.gagal, gagal_asal="salinan")
+    _status(sesi, site_hosting, StatusHosting.gagal, gagal_asal="salinan", ditarik_pada=datetime.now(timezone.utc))
     r = klien_web.post(url, json=badan)
     assert r.status_code == 409 and r.json()["detail"] == pindah.PESAN_SALINAN_BELUM_UTUH
     assert cek_dns["n"] == 0 and sesi.query(Job).count() == 0
-
-
-def test_aktifkan_tanpa_tarik_ulang_boleh_dari_gagal_salinan_dengan_salinan_lengkap(klien_web, sesi, site_hosting,
-                                                                                     cek_dns):
-    # Final review I2: hosting lama mati sesudah salinan lengkap; satu-satunya jalan ke depan.
-    _status(sesi, site_hosting, StatusHosting.gagal, gagal_asal="salinan", ditarik_pada=datetime.now(timezone.utc))
-    r = klien_web.post(f"/api/sites/{site_hosting.site_id}/hosting/aktifkan",
-                       json={"tanpa_tarik_ulang": True, "konfirmasi": "toko.co.id"})
-    assert r.status_code == 200
-    assert sesi.get(Job, r.json()["job_id"]).payload == {"tanpa_tarik_ulang": True, "manual": True}
 
 
 def test_aktifkan_menghormati_backoff_sertifikat(klien_web, sesi, site_hosting, cek_dns):

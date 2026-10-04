@@ -163,6 +163,9 @@ PESAN_BATAL_TENGAH = "Salin ke VPS dibatalkan di tengah; salinan VPS belum utuh,
 PESAN_SALINAN_TIDAK_BERUBAH = ("Salinan VPS tidak berubah. Aktivasi otomatis dicoba lagi nanti; bila hosting lama "
                                "sudah tidak dapat dihubungi, pilih 'Aktifkan tanpa salin ulang' (perubahan di site "
                                "lama sejak salinan terakhir tidak ikut).")
+# Akhiran yang sama untuk aktivasi yang dimulai dari `gagal` 'salinan' (salinan VPS belum utuh).
+PESAN_SALIN_ULANG_DULU = ("Salinan VPS masih belum utuh dan tidak bisa diaktifkan; pilih 'Salin ulang' begitu "
+                          "hosting lama dapat dihubungi lagi.")
 PESAN_LAIN = "Pindah hosting gagal; lihat log server."
 # Global Constraints / Koreksi #7: teks respons connector tidak pernah tampil di UI.
 PESAN_KELAS = {
@@ -351,22 +354,31 @@ def status_gagal_final(job: Job, h: HostingVps, pesan: str) -> tuple[StatusHosti
     """(status, asal, galat) untuk kegagalan FINAL (pembungkus dan reaper).
 
     Sudah dilayani VPS (tukar dikirim): 'produksi' dengan pesan tetap yang
-    menyuruh memeriksa situs atau mengembalikan DNS. Belum, dan job ini
-    belum menyentuh salinan VPS (`salinan_belum_disentuh`, spec §10.3):
-    status sebelum job (final review I2) -- mis. hosting lama mati saat
-    tarik terakhir aktivasi gagal di manifest; `gagal` 'salinan' akan
-    menyembunyikan salinan yang utuh dan menolak Aktifkan tanpa salin ulang.
-    Selain itu: 'salinan' (site lama masih produksi bagi resolver yang belum
-    berpindah).
+    menyuruh memeriksa situs atau mengembalikan DNS. Belum: salinan VPS yang
+    utuh -- belum disentuh job ini, atau disalin utuh oleh job ini
+    (`status_tanpa_salinan_rusak`, spec §10.3) -- tidak ditandai rusak:
+    status sebelum job, atau status siapnya (final review I2 + Koreksi
+    I2.3). Contoh: hosting lama mati saat tarik terakhir aktivasi gagal di
+    manifest -> kembali menunggu DNS. Selain itu (salinan setengah jadi):
+    'salinan'. Akibatnya `gagal` 'salinan' SELALU berarti salinan VPS belum
+    utuh, dan aktivasi tanpa tarik ulang dari status itu ditolak.
     """
     if h.dilayani_vps_pada is not None:
         return StatusHosting.gagal, ASAL_PRODUKSI, PESAN_PRODUKSI_GAGAL
-    if job.tipe in STATUS_KERJA and stg.salinan_belum_disentuh(job):
-        status, asal = status_sebelum(job, h)
-        if job.tipe == JobType.pindah_aktifkan and stg.kemajuan(job).get("langkah_aktifkan") == "tarik":
+    hasil = status_tanpa_salinan_rusak(job, h) if job.tipe in STATUS_KERJA else None
+    if hasil is None:
+        return StatusHosting.gagal, ASAL_SALINAN, pesan
+    status, asal = hasil
+    if job.tipe == JobType.pindah_aktifkan and stg.kemajuan(job).get("langkah_aktifkan") == "tarik" \
+            and stg.salinan_belum_disentuh(job):
+        # Tarik terakhir gagal sebelum menyentuh salinan (hosting lama tidak terjangkau).
+        if status == StatusHosting.gagal:
+            # Aktivasi dimulai dari `gagal` 'salinan': salinannya tetap belum utuh, jadi jalan ke
+            # depan adalah Salin ulang, bukan aktivasi (Koreksi I2.3).
+            pesan = f"{pesan} {PESAN_SALIN_ULANG_DULU}"
+        else:
             pesan = f"{pesan} {PESAN_SALINAN_TIDAK_BERUBAH}"
-        return status, asal, pesan
-    return StatusHosting.gagal, ASAL_SALINAN, pesan
+    return status, asal, pesan
 
 
 def _tandai(sesi: Session, hosting_id, status: StatusHosting, galat: str | None, asal=_TETAP,

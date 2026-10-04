@@ -478,13 +478,9 @@ def test_dns_menolak_sesudah_tarik_terakhir_terputus_menandai_salinan(sesi, siap
     job.status = JobStatus.failed
     sesi.commit()
     pb.panggilan.clear()
-    # Final review I2: salinan lengkap pernah ada (`ditarik_pada`), jadi Aktifkan tanpa salin ulang
-    # tidak lagi ditolak di gerbang; DNS (yang dikembalikan pengguna) tetap menahannya.
     with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
         _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
-    assert e.value.pesan == dns_mod.PESAN_BELUM and pb.panggilan == []
-    h = _h(sesi, siap)
-    assert (h.status, h.gagal_asal) == (StatusHosting.gagal, "salinan")
+    assert e.value.pesan == pindah.PESAN_SALINAN_BELUM_UTUH and pb.panggilan == []
 
 
 def test_ambil_halaman_verifikasi_dipatok_ke_localhost_dengan_sni(monkeypatch):
@@ -570,11 +566,9 @@ def test_tanpa_tarik_ulang_melewati_tarik(sesi, siap, prod, pb, lama, halaman):
     assert _h(sesi, siap).status == StatusHosting.aktif
 
 
-def test_tanpa_tarik_ulang_ditolak_tanpa_salinan_lengkap(sesi, siap, pb, lama):
-    # Belum pernah ada salinan lengkap (`ditarik_pada` kosong): hanya salin yang bisa membuatnya.
+def test_tanpa_tarik_ulang_ditolak_untuk_salinan_setengah_jadi(sesi, siap, pb, lama):
     siap.status = StatusHosting.gagal
     siap.gagal_asal = "salinan"
-    siap.ditarik_pada = None
     sesi.commit()
     with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
         _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
@@ -584,16 +578,37 @@ def test_tanpa_tarik_ulang_ditolak_tanpa_salinan_lengkap(sesi, siap, pb, lama):
     assert pb.panggilan == [] and lama == []
 
 
-def test_tanpa_tarik_ulang_boleh_dari_gagal_salinan_bila_pernah_disalin_lengkap(sesi, siap, pb, lama, halaman):
-    # Final review I2: hosting lama mati sesudah salinan lengkap (`ditarik_pada`): situs tidak boleh
-    # terjebak di pratinjau. Operator mengonfirmasi bahwa data sejak `ditarik_pada` hilang.
+def test_tanpa_tarik_ulang_ditolak_tanpa_salinan_lengkap(sesi, siap, pb, lama):
+    # Belum pernah ada salinan lengkap (`ditarik_pada` kosong): hanya salin yang bisa membuatnya.
+    siap.ditarik_pada = None
+    sesi.commit()
+    with pytest.raises(umum.GalatDitolakTanpaUbah) as e:
+        _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
+    assert e.value.pesan == pindah.PESAN_SALINAN_BELUM_UTUH
+    assert _h(sesi, siap).status == StatusHosting.menunggu_dns
+    assert pb.panggilan == [] and lama == []
+
+
+def test_hosting_lama_tak_terjangkau_dari_gagal_salinan_menunjuk_salin_ulang(sesi, siap, monkeypatch):
+    # Koreksi I2.3: aktivasi yang dimulai dari `gagal` 'salinan' (salinan belum utuh) dan gagal sebelum
+    # menyentuh salinan tetap `gagal` 'salinan', dengan pesan yang menunjuk Salin ulang -- bukan aktivasi.
     siap.status = StatusHosting.gagal
     siap.gagal_asal = "salinan"
     sesi.commit()
-    _aktifkan(sesi, siap, {"tanpa_tarik_ulang": True})
-    assert lama == [] and "prod_db_impor" not in pb.nama_panggilan()
+
+    def tangani(r):
+        raise httpx.ConnectError("hosting lama mati", request=r)
+
+    monkeypatch.setattr(hu, "buat_http_lama", lambda: httpx.Client(transport=httpx.MockTransport(tangani)))
+    job = buat_job(sesi, siap.site_id, JobType.pindah_aktifkan)
+    job.attempts = job.max_attempts
+    sesi.commit()
+    with pytest.raises(SiteError) as e:
+        _aktifkan(sesi, siap, job=job)
     h = _h(sesi, siap)
-    assert (h.status, h.gagal_asal) == (StatusHosting.aktif, None)
+    assert (h.status, h.gagal_asal) == (StatusHosting.gagal, "salinan")
+    assert h.galat == f"{hu.pesan_ui(e.value)} {hu.PESAN_SALIN_ULANG_DULU}"
+    assert "Aktifkan tanpa salin ulang" not in h.galat and "Salin ulang" in h.galat
 
 
 @pytest.mark.parametrize("jawaban", ["putus", "tanpa_connector"])

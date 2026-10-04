@@ -86,15 +86,21 @@ def test_hosting_tanpa_storage_dan_innerhtml():
 
 
 def test_konfirmasi_tanpa_salin_ulang_dan_batalkan_pindah_memperingatkan_kehilangan_data():
-    # Final review I2: Aktifkan tanpa salin ulang boleh dari gagal 'salinan' bila salinan lengkap pernah
-    # ada (cermin route dan job); konfirmasinya menyebut salinan dari `ditarik_pada` dan data yang
-    # hilang. Batalkan pindah memperingatkan bahwa salinan VPS mungkin satu-satunya yang tersisa.
+    # Koreksi I2.3: Aktifkan tanpa salin ulang tetap ditolak dari gagal 'salinan' (cermin route dan
+    # job); konfirmasinya (hanya dari salinan utuh) menyebut tanggal salinan dan data yang hilang.
+    # Final review I2.4: Batalkan pindah memperingatkan bahwa salinan VPS mungkin satu-satunya.
     js = (AKAR / "static" / "app" / "hosting.js").read_text(encoding="utf-8")
-    assert "hanya salin ulang yang bisa merampungkannya" not in js
+    tpl = (AKAR / "templates" / "_tab_hosting.html").read_text(encoding="utf-8")
     assert "if (!h.ditarik_pada) return 'Belum ada salinan utuh; salin dulu.';" in js
+    assert "if (h.status === 'gagal' && h.gagal_asal === 'salinan') {" in js
+    assert "hanya salin ulang yang bisa merampungkannya" in js
     assert "perubahan di site lama sejak itu hilang" in js and "this.waktu(h.ditarik_pada)" in js
     assert "satu-satunya salinan site yang tersisa" in js
     assert "window.prompt(TEKS_BATAL_PINDAH)" in js
+    # Panel gagal 'salinan' tidak menyebut "salinan lengkap terakhir": salinannya belum utuh.
+    assert "salinan lengkap terakhir" not in tpl
+    assert "VPS belum utuh dan tidak bisa diaktifkan; Salin ulang diperlukan." in tpl
+    assert "Salinan VPS belum utuh dan hosting lama mati" in tpl
 
 
 def test_tombol_backup_sekarang():

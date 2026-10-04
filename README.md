@@ -776,6 +776,20 @@ sepakat. CAA yang ada wajib mengizinkan `letsencrypt.org`.
 **Rollback:** sampai hosting lama dimatikan, kembalikan DNS ke nilai lama. Data yang masuk di VPS sesudah
 aktivasi tidak ikut kembali.
 
+### Salinan VPS belum utuh dan hosting lama mati
+
+Status **gagal** dengan asal salinan selalu berarti salinan VPS belum utuh (salin terakhir terputus di
+tengah: database bisa setengah terimpor, atau berkas lebih baru dari database). Dashboard menolak
+mengaktifkan salinan seperti itu, juga lewat **Aktifkan tanpa salin ulang**, karena aktivasi satu arah dan
+situs setengah jadi bisa lolos verifikasi. Jalan satu-satunya adalah **Salin ulang** dari hosting lama.
+Bila hosting lama sudah mati, dashboard tidak punya jalan ke depan; pulihkan manual:
+
+1. Hidupkan kembali site lama di hosting lama dengan IP yang sama (mis. perpanjang paket, atau pulihkan
+   backup hPanel), pastikan connector 3.0 dan *Izinkan staging* aktif, lalu **Salin ulang**.
+2. Bila itu tidak mungkin: **jangan** tekan *Batalkan pindah* (menghapus salinan VPS, yang mungkin
+   satu-satunya yang tersisa). Salin dulu `HOSTING_DIR/<site_id>/files` dan dump database situs
+   (`wpmgr-prod-db`) ke tempat aman sebagai root, lalu perbaiki dan pasang situs secara manual.
+
 ### Pemulihan backup manual
 
 Backup harian (tujuan `lokal`) ada di `/var/lib/wpmgr/backup/<site_id>/<stempel>/` (root-only):

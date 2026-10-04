@@ -151,10 +151,11 @@
           <p class="redup" x-show="data.hosting.dilayani_vps_pada">Periksa ulang hanya mengirim ulang
              pengaktifan dan memverifikasi situs; tidak menyalin ulang dan tidak mengubah DNS.</p>
           <p class="redup" x-show="!data.hosting.dilayani_vps_pada && alasanTanpaSalin()" x-text="alasanTanpaSalin()"></p>
-          <p class="redup" x-show="!data.hosting.dilayani_vps_pada && data.hosting.ditarik_pada">Aktifkan tanpa salin
-             ulang hanya bila hosting lama sudah tidak terjangkau: situs memakai salinan lengkap terakhir
-             (<span x-text="waktu(data.hosting.ditarik_pada)"></span>), dan perubahan di site lama sejak itu hilang.
-             Batalkan pindah menghapus salinan VPS, yang mungkin satu-satunya salinan bila hosting lama sudah mati.</p>
+          <p class="redup" x-show="!data.hosting.dilayani_vps_pada && data.hosting.gagal_asal === 'salinan'">Salinan
+             VPS belum utuh dan tidak bisa diaktifkan; Salin ulang diperlukan. Bila hosting lama sudah tidak dapat
+             dihubungi, salinan ini tidak bisa dirampungkan dari dashboard: pulihkan manual (README, bagian "Pindah
+             hosting (Lapis 4)", "Salinan VPS belum utuh dan hosting lama mati"). Batalkan pindah menghapus salinan
+             VPS, yang mungkin satu-satunya salinan bila hosting lama sudah mati.</p>
         </div>
       </div>
     </template>

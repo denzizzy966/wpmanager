@@ -214,6 +214,30 @@ def test_gagal_final_sebelum_salinan_disentuh_kembali_ke_status_awal(sesi, site_
     assert h.galat == harapan
 
 
+@pytest.mark.parametrize("status_awal,asal_awal", [(StatusHosting.menunggu_dns, None),
+                                                   (StatusHosting.gagal, "salinan")])
+def test_gagal_final_sesudah_job_ini_menyalin_utuh_tidak_menandai_rusak(sesi, site_hosting, status_awal, asal_awal):
+    # Koreksi I2.3: `gagal` 'salinan' SELALU berarti salinan belum utuh. Tarik terakhir job ini sudah
+    # rampung (tahap pratinjau, `ditarik_pada` terisi), lalu galat final sebelum tukar: salinan utuh,
+    # jadi status siapnya (menunggu DNS) -- juga bila aktivasi dimulai dari `gagal` 'salinan'.
+    site_hosting.status = status_awal
+    site_hosting.gagal_asal = asal_awal
+    site_hosting.ditarik_pada = SEKARANG
+    sesi.commit()
+    job = buat_job(sesi, site_hosting.site_id, JobType.pindah_aktifkan)
+    job.attempts = job.max_attempts
+    sesi.commit()
+
+    def inti(sesi, job, site, h):
+        stg.simpan_kemajuan(sesi, job, langkah_aktifkan="tarik", tahap="pratinjau")
+        raise RuntimeError("bug sesudah tarik terakhir /var/lib/wpmgr")
+
+    with pytest.raises(RuntimeError):
+        hu.jalankan_hosting(sesi, job, inti, "Aktivasi hosting VPS")
+    h = _h(sesi, site_hosting)
+    assert (h.status, h.gagal_asal, h.galat) == (StatusHosting.menunggu_dns, None, stg.PESAN_TAK_TERDUGA)
+
+
 def test_salin_ulang_gagal_final_sebelum_salinan_disentuh_tetap_pratinjau(sesi, site_hosting):
     site_hosting.status = StatusHosting.pratinjau
     site_hosting.ditarik_pada = SEKARANG

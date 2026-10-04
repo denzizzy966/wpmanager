@@ -170,12 +170,10 @@ function tabHosting(siteId) {
     async aktifkanTanpaSalin() {
       if (this.alasanTanpaSalin()) return;
       const h = this.data.hosting;
-      // Final review I2: juga dari gagal 'salinan' (salinan lengkap dari ditarik_pada); bila salin ulang
-      // terakhir terputus, sebagian berkas di VPS bisa lebih baru dari tanggal itu.
+      // Hanya dari status dengan salinan utuh (menunggu DNS), jadi salinannya memang dari ditarik_pada.
       const domain = window.prompt(`Aktifkan memakai salinan VPS dari ${this.waktu(h.ditarik_pada)} tanpa menyalin `
         + 'ulang dari hosting lama. Semua perubahan di site lama sejak itu hilang (pos, halaman, isian form, '
-        + 'pengguna) dan tidak bisa diambil lagi bila hosting lama sudah mati. '
-        + 'Periksa pratinjau lebih dulu bila salin ulang terakhir terputus. Ketik domain untuk konfirmasi:');
+        + 'pengguna) dan tidak bisa diambil lagi bila hosting lama sudah mati. Ketik domain untuk konfirmasi:');
       if (domain === null) return;
       await this.aktifkan(true, domain);
     },
@@ -208,8 +206,11 @@ function tabHosting(siteId) {
       const h = this.data ? this.data.hosting : null;
       if (!h) return '';
       if (this.data.job) return TEKS_SIBUK_HOSTING;
-      // Cermin route/job: cukup salinan lengkap yang pernah ada, juga dari gagal 'salinan' (final review I2).
+      // Cermin route/job: hanya salinan yang diketahui utuh (Koreksi I2.3).
       if (!h.ditarik_pada) return 'Belum ada salinan utuh; salin dulu.';
+      if (h.status === 'gagal' && h.gagal_asal === 'salinan') {
+        return 'Salinan terakhir setengah jadi; hanya salin ulang yang bisa merampungkannya.';
+      }
       return '';
     },
 

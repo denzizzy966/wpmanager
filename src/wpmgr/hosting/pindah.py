@@ -372,13 +372,16 @@ def _periksa_awal(job, h: HostingVps) -> None:
     if awal not in STATUS_BOLEH_AKTIFKAN:
         raise stg.GalatDitolakTanpaUbah(PESAN_STATUS_AKTIFKAN)
     if (job.payload or {}).get("tanpa_tarik_ulang"):
-        # Tanpa salinan lengkap yang pernah ada (`ditarik_pada`), hanya tarik
-        # yang bisa membuatnya. Dari `gagal` 'salinan' dengan `ditarik_pada`
-        # terisi boleh (final review I2, spec §16/§21): hosting lama bisa sudah
-        # mati, dan tanpa jalan ini situs terjebak di pratinjau. Pengguna
-        # mengetik domain untuk konfirmasi; UI menyebut bahwa salinan dari
-        # `ditarik_pada` yang dipakai dan perubahan di site lama sejak itu hilang.
-        if h.ditarik_pada is None:
+        # Hanya salinan yang diketahui utuh boleh diaktifkan (Koreksi I2.3).
+        # `ditarik_pada` tidak pernah dikosongkan, jadi tidak membuktikan
+        # salinan SEKARANG utuh; `gagal` 'salinan' selalu berarti salin ulang
+        # sesudahnya menyentuh salinan dan tidak rampung (database terputus di
+        # tengah impor, atau berkas lebih baru dari database). Aktivasi itu
+        # satu arah (RF2), dan verifikasi bisa meloloskan WordPress rusak
+        # (302 ke install.php). Salinan setengah jadi hanya bisa dirampungkan
+        # tarik (spec §10.3).
+        if h.ditarik_pada is None or (awal == StatusHosting.gagal.value
+                                      and k.get("gagal_asal_awal") == hu.ASAL_SALINAN):
             raise stg.GalatDitolakTanpaUbah(PESAN_SALINAN_BELUM_UTUH)
     elif not hu.alamat_lama_sah(h.ip_lama):
         # Tarik terakhir hanya lewat IP lama yang TERSIMPAN (RF4): DNS domain
