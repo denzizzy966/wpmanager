@@ -1,8 +1,12 @@
 {% extends "base.html" %}
 {% block judul %}Site — WP Manager{% endblock %}
 {% block isi %}
+{% from "_ikon.html" import ikon %}
 <div x-data="layarSite()" x-init="muat()">
-  <h1>Site</h1>
+  <div class="kepala-halaman">
+    <h1>Site</h1>
+    <a href="/sites/new" class="tombol-tautan utama">{{ ikon('plus') }}<span>Tambah Site</span></a>
+  </div>
   <div class="toolbar">
     <button @click="perbaruiConnector()" :disabled="terpilih.length === 0 || mengirim">
       <span x-text="`Perbarui connector (${terpilih.length} terpilih)`"></span>

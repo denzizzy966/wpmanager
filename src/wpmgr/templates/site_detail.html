@@ -2,15 +2,16 @@
 {% block judul %}{{ site.nama }} — WP Manager{% endblock %}
 {% block judul_halaman %}<a href="/sites">Site</a><span class="remah-pisah" aria-hidden="true">/</span>{{ site.nama }}{% endblock %}
 {% block isi %}
+{% from "_ikon.html" import ikon %}
 {# Hanya site.id (UUID buatan server) dan tab (daftar putih di route) yang
    boleh masuk ke ekspresi Alpine. Nilai lain dibaca lewat data-* atau API. #}
 <div x-data="detailSite('{{ site.id }}', '{{ tab }}')" x-init="mulai()">
   <h1>{{ site.nama }}</h1>
   <p><a href="{{ site.url }}" target="_blank" rel="noopener">{{ site.url }}</a></p>
   <div class="toolbar">
-    <button type="button" @click="sso()">Masuk wp-admin</button>
-    <button type="button" @click="scan()">Scan</button>
-    <a href="/sites/{{ site.id }}/laporan/{{ bulan_lalu }}" target="_blank" rel="noopener">Laporan bulanan</a>
+    <button type="button" @click="sso()">{{ ikon('masuk') }}<span>Masuk wp-admin</span></button>
+    <button type="button" @click="scan()">{{ ikon('kaca-pembesar') }}<span>Scan</span></button>
+    <a href="/sites/{{ site.id }}/laporan/{{ bulan_lalu }}" target="_blank" rel="noopener">{{ ikon('berkas') }}<span>Laporan bulanan</span></a>
   </div>
   <p class="galat" x-show="galat" x-text="galat" role="alert"></p>
   <p class="info" x-show="info" x-text="info" role="status"></p>

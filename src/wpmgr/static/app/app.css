@@ -191,7 +191,27 @@ p{margin:.55rem 0}
 .menu a,.sisi-tombol{position:relative;display:flex;align-items:center;gap:.75rem;min-height:44px;padding:.55rem .75rem;
   border-radius:12px;color:var(--teks-2);font-size:.95rem;font-weight:550;white-space:nowrap;
   transition:background-color var(--gerak),color var(--gerak)}
-.menu a svg,.sisi-tombol svg,.tombol-ikon svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+/* Ikon inline (macro ikon di _ikon.html): isi currentColor, ukuran 1em, sejajar teks. */
+.ikon{width:1em;height:1em;flex:none;fill:currentColor;vertical-align:-.125em}
+.menu a svg,.sisi-tombol svg,.tombol-ikon svg{width:20px;height:20px;fill:currentColor;stroke:none}
+.kepala-halaman{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.75rem}
+.kepala-halaman > h1{margin:0}
+/* Tautan bergaya tombol (mis. + Tambah Site). */
+a.tombol-tautan{display:inline-flex;align-items:center;justify-content:center;gap:.45rem;min-height:var(--tinggi-tombol);padding:.5rem 1rem;
+  font-size:.92rem;font-weight:600;line-height:1.25;border-radius:var(--radius-kecil);border:1px solid var(--garis-kuat);color:var(--teks);
+  background:var(--kaca-kuat);text-decoration:none}
+a.tombol-tautan.utama{color:#fff;background:var(--aksen-gradien);border-color:transparent;box-shadow:0 8px 20px -10px rgba(79,70,229,.8)}
+a.tombol-tautan.utama:hover{background:var(--aksen-gradien-hover);color:#fff}
+a.tombol-tautan:focus-visible{outline:none;box-shadow:var(--cincin)}
+/* Tombol aksi ikon di sel tabel (juga di dalam .dg, jadi tanpa :not(.dg *)). */
+.tombol-aksi{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;width:36px;height:36px;min-width:36px;min-height:0;padding:0;margin:0 .15rem;
+  font-size:1rem;line-height:1;color:var(--teks-2);background:transparent;border:1px solid var(--garis-kuat);border-radius:var(--radius-kecil);
+  cursor:pointer;text-decoration:none;vertical-align:middle;touch-action:manipulation}
+.tombol-aksi:hover{color:var(--aksen-teks);background:var(--aksen-lembut);border-color:var(--aksen);text-decoration:none}
+.tombol-aksi:focus-visible{outline:none;box-shadow:var(--cincin)}
+.tombol-aksi .ikon{width:1.05em;height:1.05em;vertical-align:0;pointer-events:none}
+@media (pointer:coarse),(max-width:640px){.tombol-aksi{width:40px;height:40px;min-width:40px;min-height:40px}}
+@media (max-width:640px){.kepala-halaman > a.tombol-tautan{flex:1 1 100%}}
 .menu a:hover{background:var(--aksen-lembut);color:var(--teks);text-decoration:none}
 .menu a.aktif{color:var(--aksen-teks);background:linear-gradient(90deg,var(--aksen-lembut),transparent 140%);font-weight:650}
 /* Garis terang di tepi kiri item aktif: satu-satunya hiasan menu. */
@@ -324,7 +344,7 @@ button.utama[aria-busy="true"]::after,button.bahaya-penuh[aria-busy="true"]::aft
 @keyframes putar{to{transform:rotate(360deg)}}
 
 .toolbar{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:.6rem 0 1rem}
-.toolbar > a{display:inline-flex;align-items:center;min-height:var(--tinggi-tombol);padding:0 .5rem;font-weight:600;border-radius:var(--radius-kecil)}
+.toolbar > a{display:inline-flex;align-items:center;gap:.45rem;min-height:var(--tinggi-tombol);padding:0 .5rem;font-weight:600;border-radius:var(--radius-kecil)}
 
 /* ============================================================
  * Form (tidak menyentuh datagrid)

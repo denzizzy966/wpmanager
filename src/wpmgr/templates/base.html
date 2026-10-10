@@ -29,6 +29,7 @@
 </head>
 <body>
 {% block kerangka %}
+  {% from "_ikon.html" import ikon %}
   <a class="lewati" href="#isi">Lewati ke konten</a>
   {% set jalur = request.url.path %}
   <div class="kerangka">
@@ -39,37 +40,33 @@
         </a>
         <button type="button" class="tombol-ikon hantu sisi-ciutkan" data-aksi="ciutkan"
                 aria-controls="sisi" aria-expanded="true" aria-label="Ciutkan sidebar">
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M9.5 4.5v15"/><path d="m15.5 10-2 2 2 2"/></svg>
+          {{ ikon('panah-ganda') }}
         </button>
         <button type="button" class="tombol-ikon hantu sisi-tutup" data-aksi="tutup-menu" aria-label="Tutup menu">
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"/></svg>
+          {{ ikon('xmark') }}
         </button>
       </div>
 
       <nav class="menu" aria-label="Menu">
         <a href="/"{% if jalur == '/' %} class="aktif" aria-current="page"{% endif %}>
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 12h3.5l2.5-6 4 12 2.5-6H21"/></svg>
+          {{ ikon('heart') }}
           <span class="menu-label">Kesehatan</span>
         </a>
         <a href="/updates"{% if jalur.startswith('/updates') %} class="aktif" aria-current="page"{% endif %}>
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.34-5.66L20 8.5"/><path d="M20 4v4.5h-4.5"/><path d="M12 8v5l3 2"/></svg>
+          {{ ikon('unduh') }}
           <span class="menu-label">Update</span>
         </a>
-        <a href="/sites"{% if jalur.startswith('/sites') and not jalur.startswith('/sites/new') %} class="aktif" aria-current="page"{% endif %}>
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18"/><path d="M6.5 6.5h.01M9 6.5h.01"/></svg>
+        <a href="/sites"{% if jalur.startswith('/sites') %} class="aktif" aria-current="page"{% endif %}>
+          {{ ikon('server') }}
           <span class="menu-label">Site</span>
         </a>
         <a href="/keamanan"{% if jalur.startswith('/keamanan') %} class="aktif" aria-current="page"{% endif %}>
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3 19.5 6v5.5c0 4.6-3.2 8.3-7.5 9.5-4.3-1.2-7.5-4.9-7.5-9.5V6z"/><path d="m9 12 2 2 4-4"/></svg>
+          {{ ikon('perisai') }}
           <span class="menu-label">Keamanan</span>
         </a>
         <a href="/activity"{% if jalur.startswith('/activity') %} class="aktif" aria-current="page"{% endif %}>
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 6h12M8 12h12M8 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01"/></svg>
+          {{ ikon('daftar') }}
           <span class="menu-label">Aktivitas</span>
-        </a>
-        <a href="/sites/new"{% if jalur.startswith('/sites/new') %} class="aktif" aria-current="page"{% endif %}>
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3.5" y="3.5" width="17" height="17" rx="4"/><path d="M12 8.5v7M8.5 12h7"/></svg>
-          <span class="menu-label">Tambah Site</span>
         </a>
       </nav>
 
@@ -81,13 +78,13 @@
         </div>
         {% endif %}
         <button type="button" class="hantu sisi-tombol" data-aksi="tema" aria-pressed="false">
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+          {{ ikon('moon') }}
           <span class="menu-label">Mode gelap</span>
           <span class="saklar" aria-hidden="true"></span>
         </button>
         <form method="post" action="/logout">
           <button type="submit" class="hantu sisi-tombol sisi-keluar">
-            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M9.5 16.5 5 12l4.5-4.5"/><path d="M5 12h11"/></svg>
+            {{ ikon('keluar') }}
             <span class="menu-label">Keluar</span>
           </button>
         </form>
@@ -99,7 +96,7 @@
       <header class="bilah-atas">
         <button type="button" class="tombol-ikon hantu buka-menu" data-aksi="buka-menu"
                 aria-controls="sisi" aria-expanded="false" aria-label="Buka menu">
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+          {{ ikon('bars') }}
         </button>
         <a href="/" class="bilah-logo" aria-label="WP Manager, ke halaman Kesehatan">
           {% with logo_id = 'logo-atas' %}{% include "_logo.html" %}{% endwith %}
