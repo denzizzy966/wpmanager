@@ -746,7 +746,10 @@ pastikan_wpcli() {
 # $1: direktori conf.d router (staging bila kosong).
 tulis_router_bawaan() {
   local dir="${1:-$KONF_DIR/router/conf.d}"
+  # server_names_hash_bucket_size: bawaan 32/64 menolak nama panjang seperti
+  # vps-<nama>.staging.halosocia.my.id (nginx -t gagal "could not build server_names_hash").
   cat > "$dir/00-bawaan.conf" <<'KONF'
+server_names_hash_bucket_size 128;
 log_format wpmgr_akses '$msec';
 resolver 127.0.0.11 valid=10s ipv6=off;
 server {

@@ -681,6 +681,7 @@ tulis_mounts() {
   grep -qF "[-v][$S/etc/router/htpasswd:/etc/nginx/wpmgr-htpasswd:ro]" "$PALSU/docker.log"
   ! grep -qF "[-v][$S/staging" "$PALSU/docker.log" || false
   grep -qF 'return 444;' "$S/etc/router/conf.d/00-bawaan.conf"
+  grep -qxF 'server_names_hash_bucket_size 128;' "$S/etc/router/conf.d/00-bawaan.conf"
 }
 
 @test "digest.lock yang sudah ada dipakai tanpa unduh ulang" {
@@ -1114,6 +1115,7 @@ KONF
   done
   [ "$(stat -c %a "$S/etc/prod/php.ini")" = 644 ]
   grep -qF 'return 444;' "$S/etc/prod/router/conf.d/00-bawaan.conf"
+  grep -qxF 'server_names_hash_bucket_size 128;' "$S/etc/prod/router/conf.d/00-bawaan.conf"
   [ -d "$S/hosting/router" ]
   grep -qxF "[network][create][--driver][bridge][--subnet][172.31.251.0/24][--opt][com.docker.network.bridge.name=br-wpmgrprod][--label][wpmgr.hosting=layanan:jaringan][wpmgr-prod]" "$PALSU/docker.log"
   grep -q '^\[run\]\[-d\]\[--name\]\[wpmgr-prod-db\]\[--label\]\[wpmgr.hosting=layanan:db\]\[--network\]\[wpmgr-prod\]\[--ip\]\[172.31.251.252\]\[--restart\]\[unless-stopped\]\[--memory\]\[768m\]\[--env-file\]\[[^]]*\]\[-v\]\[wpmgr-prod-db:/var/lib/mysql\]\[m@sha256:b\{64\}\]\[--innodb-buffer-pool-size=256M\]\[--max-allowed-packet=64M\]\[--local-infile=0\]$' "$PALSU/docker.log"
