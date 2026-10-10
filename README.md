@@ -711,6 +711,13 @@ atau kredensial FTP yang perlu ditulis di berkas mana pun di repo ini.
 6. Pasang include nginx hosting: salin `deploy/staging/nginx-wpmgr-hosting.conf` ke
    `/etc/nginx/sites-enabled/wpmgr-hosting.conf`, jalankan `sudo install -d -m 0755 /etc/nginx/wpmgr-hosting`,
    lalu `sudo nginx -t && sudo systemctl reload nginx`.
+   Host pratinjau `vps-<nama>.staging.halosocia.my.id` bisa lebih dari 48 karakter; dengan
+   `server_names_hash_bucket_size` bawaan (64) nginx host menolaknya ("could not build server_names_hash")
+   dan pindah gagal di langkah konfigurasi domain. Bila `sudo grep -rn server_names_hash /etc/nginx/` tidak
+   menemukan setelan aktif, pasang sekali:
+   `echo "server_names_hash_bucket_size 128;" | sudo tee /etc/nginx/conf.d/00-wpmgr-server-names.conf`, lalu
+   `sudo nginx -t && sudo systemctl reload nginx` (hapus berkas itu bila `nginx -t` gagal). Router container
+   staging dan produksi sudah memuat setelan yang sama.
 7. Isi variabel di `.env`:
 
    | Variabel | Nilai di VPS ini |
