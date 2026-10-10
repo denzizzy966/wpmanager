@@ -360,11 +360,36 @@ final class StagingDasarTest extends TestCase {
         $this->assertSame( 'application/octet-stream', $r->get_headers()['Content-Type'] );
         $this->assertSame( hash( 'sha256', "isi\0biner" ), $r->get_headers()['X-Wpmgr-Sha256'] );
         ob_start();
-        $disajikan = WPMGR_Staging::sajikan_biner( false, $r, null, null );
-        $keluar    = ob_get_clean();
+        WPMGR_Staging::$ob_dasar = ob_get_level();
+        try {
+            $disajikan = WPMGR_Staging::sajikan_biner( false, $r, null, null );
+        } finally {
+            WPMGR_Staging::$ob_dasar = 0;
+        }
+        $keluar = ob_get_clean();
         $this->assertTrue( $disajikan );
         $this->assertSame( "isi\0biner", $keluar );
         // Respons JSON biasa tidak disentuh.
         $this->assertFalse( WPMGR_Staging::sajikan_biner( false, new WP_REST_Response( array( 'a' => 1 ) ), null, null ) );
+    }
+
+    public function test_respons_biner_melewati_buffer_plugin_yang_mengubah_keluaran(): void {
+        // Plugin seperti pengubah mixed content (http -> https) memasang ob_start dengan
+        // callback; isi biner tidak boleh ikut diubah, atau hash potongannya tidak cocok.
+        $isi = "url http://contoh.test/a.css\0biner";
+        $r   = WPMGR_Staging::respons_biner( $isi );
+        ob_start();
+        WPMGR_Staging::$ob_dasar = ob_get_level();
+        ob_start( function ( $s ) { return str_replace( 'http://', 'https://', $s ); } );
+        ob_start();
+        try {
+            $disajikan = WPMGR_Staging::sajikan_biner( false, $r, null, null );
+        } finally {
+            WPMGR_Staging::$ob_dasar = 0;
+        }
+        $keluar = ob_get_clean();
+        $this->assertTrue( $disajikan );
+        $this->assertSame( $isi, $keluar );
+        $this->assertSame( hash( 'sha256', $keluar ), $r->get_headers()['X-Wpmgr-Sha256'] );
     }
 }

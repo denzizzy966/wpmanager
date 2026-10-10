@@ -14,6 +14,8 @@ class WPMGR_Staging {
     const HOOK_BERSIHKAN = 'wpmgr_staging_bersihkan';
 
     private static $biner = null;
+    /** Tingkat buffer keluaran yang dipertahankan sajikan_biner() (0 di produksi; test menaikkannya). */
+    public static $ob_dasar = 0;
 
     public static function mode_staging() {
         return defined( 'WPMGR_STAGING' ) && WPMGR_STAGING;
@@ -359,6 +361,15 @@ class WPMGR_Staging {
         $data = $result->get_data();
         if ( ! is_array( $data ) || empty( $data[ self::KUNCI_BINER ] ) ) {
             return $served;
+        }
+        // Buffer keluaran milik plugin lain (mis. pengubah "mixed content" http->https,
+        // minify, optimasi) akan mengubah isi biner sesudah hash-nya dihitung, sehingga
+        // dashboard menolak paket ("hash potongan tidak cocok"). Buang semua buffer di
+        // atas tingkat dasar sebelum mencetak; buffer yang tidak bisa dilepas dibiarkan.
+        while ( ob_get_level() > self::$ob_dasar ) {
+            if ( ! @ob_end_clean() ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors -- buffer tak terlepas
+                break;
+            }
         }
         echo self::$biner; // phpcs:ignore WordPress.Security.EscapeOutput -- isi biner, bukan HTML
         self::$biner = null;

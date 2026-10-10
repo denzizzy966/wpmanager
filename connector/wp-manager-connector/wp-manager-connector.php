@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Manager Connector
  * Description: Menghubungkan site ini ke dashboard WP Manager untuk pemindaian, update, dan pemantauan terpusat.
- * Version:     3.0.0
+ * Version:     3.0.1
  * Requires at least: 5.5
  * Requires PHP: 7.4
  * License:     GPL-2.0-or-later
@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'WPMGR_VERSION', '3.0.0' );
+define( 'WPMGR_VERSION', '3.0.1' );
 define( 'WPMGR_VERSI_SKEMA', 3 );
 define( 'WPMGR_JENDELA_DETIK', 300 );
 define( 'WPMGR_NONCE_TTL', 600 );
