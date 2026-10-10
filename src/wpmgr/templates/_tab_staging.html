@@ -38,7 +38,7 @@
     <template x-if="data && !data.staging">
       <div>
         <p>Site ini belum punya staging.</p>
-        <button type="button" @click="buatAtauSegarkan(false)" :disabled="!data.izin_connector || !!data.job">Buat staging</button>
+        <button type="button" class="utama" @click="buatAtauSegarkan(false)" :disabled="!data.izin_connector || !!data.job">Buat staging</button>
       </div>
     </template>
 
@@ -68,9 +68,9 @@
           <button type="button" x-show="!data.staging.aktif" @click="aksi('jalan', 'Staging dijalankan.')"
                   :disabled="!data.staging.ditarik_pada">Jalankan</button>
           <button type="button" @click="sso()" :disabled="!data.staging.ditarik_pada || !data.staging.aktif">Masuk admin staging</button>
-          <button type="button" @click="bukaDorong()" :disabled="!!alasanDorong()">Dorong ke produksi</button>
+          <button type="button" class="bahaya" @click="bukaDorong()" :disabled="!!alasanDorong()">Dorong ke produksi</button>
           <button type="button" @click="sandiBaru()" :disabled="!!data.job">Buat ulang kata sandi</button>
-          <button type="button" @click="hapus()" :disabled="!!data.job">Hapus staging</button>
+          <button type="button" class="bahaya" @click="hapus()" :disabled="!!data.job">Hapus staging</button>
         </div>
         <p x-show="urlSso">Tautan masuk admin staging (bila jendela baru tidak terbuka):
            <a :href="aman(urlSso)" target="_blank" rel="noopener noreferrer" @click="urlSso = ''">buka admin staging</a></p>
@@ -95,7 +95,7 @@
           <p x-show="mode === 'timpa_penuh'">
             <label>Ketik nama site bila produksi punya data baru (data itu akan terhapus):
               <input x-model="konfirmasiNama" autocomplete="off"></label></p>
-          <button type="button" @click="dorong()" :disabled="!bolehDorong()">Dorong</button>
+          <button type="button" class="bahaya" @click="dorong()" :disabled="!bolehDorong()">Dorong</button>
           <button type="button" @click="dialogDorong = false">Batal</button>
         </div>
 
@@ -147,7 +147,7 @@
           <td x-text="waktu(s.dibuat_pada)"></td>
           <td x-text="teksMode(s.mode)"></td>
           <td x-text="s.ukuran_teks"></td><td x-text="s.status"></td>
-          <td><button type="button" x-show="snapshotSah(s)" @click="kembalikan(s.id, s.mode)" :disabled="!!(data && data.job)">Kembalikan</button></td>
+          <td><button type="button" class="bahaya" x-show="snapshotSah(s)" @click="kembalikan(s.id, s.mode)" :disabled="!!(data && data.job)">Kembalikan</button></td>
         </tr>
       </template>
     </table>

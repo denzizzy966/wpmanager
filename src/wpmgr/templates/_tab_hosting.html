@@ -39,7 +39,7 @@
         <p class="redup">Syarat: connector 3.0 terpasang di site lama, pairing sukses, dan <em>Izinkan staging</em>
            menyala di <em>Pengaturan → WP Manager</em>.</p>
         <p class="galat" x-show="!data.izin_connector">Connector site ini belum mengizinkan staging.</p>
-        <button type="button" @click="pindahkan()" :disabled="!!alasanPindah()">Pindahkan ke VPS</button>
+        <button type="button" class="utama" @click="pindahkan()" :disabled="!!alasanPindah()">Pindahkan ke VPS</button>
         <span class="redup" x-show="alasanPindah()" x-text="alasanPindah()"></span>
       </div>
     </template>
@@ -62,11 +62,11 @@
              (sertifikat pratinjau), lanjutkan saja. Hapus barisnya sesudah selesai.</p>
           <pre class="pesan-detail" x-text="barisHosts()"></pre>
           <div class="toolbar">
-            <button type="button" @click="aksi('lanjut-dns', 'Menunggu DNS; dashboard memeriksa tiap 10 menit.')"
+            <button type="button" class="utama" @click="aksi('lanjut-dns', 'Menunggu DNS; dashboard memeriksa tiap 10 menit.')"
                     :disabled="!!data.job">Pratinjau sudah benar, lanjut ke DNS</button>
             <button type="button" @click="salinUlang()" :disabled="!!data.job">Salin ulang</button>
             <button type="button" @click="sandiBaru()" :disabled="!!data.job">Buat ulang kata sandi</button>
-            <button type="button" @click="batalkanPindah()" :disabled="!!data.job">Batalkan pindah</button>
+            <button type="button" class="bahaya" @click="batalkanPindah()" :disabled="!!data.job">Batalkan pindah</button>
           </div>
         </div>
 
@@ -92,7 +92,7 @@
           <p class="redup" x-show="data.hosting.coba_lagi_pada">Sertifikat domain gagal terakhir kali; aktivasi
              otomatis menunggu sampai <span x-text="waktu(data.hosting.coba_lagi_pada)"></span>.</p>
           <div class="toolbar">
-            <button type="button" @click="aktifkan(false)" :disabled="!!data.job">Periksa DNS &amp; aktifkan sekarang</button>
+            <button type="button" class="utama" @click="aktifkan(false)" :disabled="!!data.job">Periksa DNS &amp; aktifkan sekarang</button>
             <button type="button" @click="aksi('kembali-pratinjau', 'Kembali ke pratinjau; aktivasi otomatis dihentikan.')"
                     :disabled="!!data.job">Kembali ke pratinjau</button>
             <button type="button" @click="aktifkanTanpaSalin()" :disabled="!!alasanTanpaSalin()">Aktifkan tanpa salin ulang</button>
@@ -139,13 +139,13 @@
           <div class="toolbar">
             <button type="button" x-show="data.hosting.gagal_asal === 'salinan' && !data.hosting.dilayani_vps_pada"
                     @click="salinUlang()" :disabled="!!data.job">Salin ulang</button>
-            <button type="button" x-show="!data.hosting.dilayani_vps_pada" @click="aktifkan(false)"
+            <button type="button" class="utama" x-show="!data.hosting.dilayani_vps_pada" @click="aktifkan(false)"
                     :disabled="!!data.job">Periksa DNS &amp; aktifkan sekarang</button>
             <button type="button" x-show="data.hosting.dilayani_vps_pada" @click="aktifkan(false)"
                     :disabled="!!data.job">Periksa ulang</button>
             <button type="button" x-show="!data.hosting.dilayani_vps_pada" @click="aktifkanTanpaSalin()"
                     :disabled="!!alasanTanpaSalin()">Aktifkan tanpa salin ulang</button>
-            <button type="button" x-show="!data.hosting.dilayani_vps_pada" @click="batalkanPindah()"
+            <button type="button" class="bahaya" x-show="!data.hosting.dilayani_vps_pada" @click="batalkanPindah()"
                     :disabled="!!data.job">Batalkan pindah</button>
           </div>
           <p class="redup" x-show="data.hosting.dilayani_vps_pada">Periksa ulang hanya mengirim ulang

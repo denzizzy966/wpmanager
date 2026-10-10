@@ -14,12 +14,13 @@
 <body>
   <nav class="bilah">
     <strong>WP Manager</strong>
-    <a href="/">Kesehatan</a>
-    <a href="/updates">Update</a>
-    <a href="/sites">Site</a>
-    <a href="/keamanan">Keamanan</a>
-    <a href="/activity">Aktivitas</a>
-    <a href="/sites/new">Tambah Site</a>
+    {% set jalur = request.url.path %}
+    <a href="/"{% if jalur == '/' %} class="aktif" aria-current="page"{% endif %}>Kesehatan</a>
+    <a href="/updates"{% if jalur.startswith('/updates') %} class="aktif" aria-current="page"{% endif %}>Update</a>
+    <a href="/sites"{% if jalur.startswith('/sites') and not jalur.startswith('/sites/new') %} class="aktif" aria-current="page"{% endif %}>Site</a>
+    <a href="/keamanan"{% if jalur.startswith('/keamanan') %} class="aktif" aria-current="page"{% endif %}>Keamanan</a>
+    <a href="/activity"{% if jalur.startswith('/activity') %} class="aktif" aria-current="page"{% endif %}>Aktivitas</a>
+    <a href="/sites/new"{% if jalur.startswith('/sites/new') %} class="aktif" aria-current="page"{% endif %}>Tambah Site</a>
     <form method="post" action="/logout" class="kanan">
       <button type="submit">Keluar</button>
     </form>

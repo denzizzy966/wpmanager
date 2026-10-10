@@ -50,10 +50,10 @@
       <p>Mencabut site menghapus datanya dari dashboard berikut secret-nya. Plugin
          <code>wp-manager-connector</code> dan user <code>wpmgr</code> di site itu harus dihapus
          manual lewat wp-admin.</p>
-      <button type="button" x-show="!konfirmasi" @click="konfirmasi = true">Cabut site ini</button>
+      <button type="button" class="bahaya" x-show="!konfirmasi" @click="konfirmasi = true">Cabut site ini</button>
       <div x-show="konfirmasi">
         <p><strong>Yakin mencabut {{ site.nama }}?</strong></p>
-        <button type="button" @click="
+        <button type="button" class="bahaya" @click="
           galatCabut = '';
           fetch('/api/sites/{{ site.id }}', { method: 'DELETE' })
             .then(async (r) => {
@@ -70,7 +70,7 @@
              dari connector dan dicatat di log aktivitas. Pekerjaan staging yang sedang berjalan tetap
              menolak. Ketik nama site persis untuk melanjutkan.</p>
           <input x-model="namaPaksa" placeholder="{{ site.nama }}" aria-label="Nama site untuk pencabutan paksa">
-          <button type="button" :disabled="namaPaksa !== $el.parentElement.dataset.nama" @click="
+          <button type="button" class="bahaya" :disabled="namaPaksa !== $el.parentElement.dataset.nama" @click="
             galatCabut = '';
             fetch('/api/sites/{{ site.id }}?paksa=1', {
               method: 'DELETE', headers: { 'Content-Type': 'application/json' },
