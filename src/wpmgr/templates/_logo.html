@@ -1,0 +1,24 @@
+{# Logo WP Manager: tanda SVG + wordmark. Ganti berkas ini untuk mengganti logo.
+   `logo_id` membedakan id gradien bila logo tampil lebih dari sekali di satu
+   halaman (id ganda membuat gradien gagal bila salinan pertama tersembunyi). #}
+{% set _lid = logo_id | default('logo') %}
+<span class="logo">
+  <svg class="logo-tanda" viewBox="0 0 32 32" width="32" height="32" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="{{ _lid }}-gradien" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#3b82f6"/>
+        <stop offset=".55" stop-color="#6366f1"/>
+        <stop offset="1" stop-color="#8b5cf6"/>
+      </linearGradient>
+      <linearGradient id="{{ _lid }}-kilau" x1="0" y1="0" x2="0" y2="16" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#fff" stop-opacity=".35"/>
+        <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <rect width="32" height="32" rx="9" fill="url(#{{ _lid }}-gradien)"/>
+    <rect x="1" y="1" width="30" height="15" rx="8" fill="url(#{{ _lid }}-kilau)"/>
+    <path d="M7.5 10.5 11.2 22 16 13.6 20.8 22 24.5 10.5" fill="none" stroke="#fff"
+          stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <span class="logo-kata">WP Manager</span>
+</span>

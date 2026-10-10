@@ -139,7 +139,12 @@ function tabStaging(siteId) {
 
     async buatAtauSegarkan(perluKonfirmasi) {
       this.mulaiAksi();
-      if (perluKonfirmasi && !window.confirm('Staging diubah sejak tarik terakhir. Perubahan di staging akan tertimpa. Lanjutkan?')) return;
+      if (perluKonfirmasi && !(await dialogKonfirmasi({
+        judul: 'Segarkan dari produksi',
+        pesan: 'Staging diubah sejak tarik terakhir. Perubahan di staging akan tertimpa. Lanjutkan?',
+        teksYa: 'Timpa dan segarkan',
+        bahaya: true,
+      }))) return;
       try {
         const d = await this.kirim('POST', this.dasar(), { konfirmasi: !!perluKonfirmasi });
         if (d.sandi) this.sandi = d.sandi;
@@ -184,7 +189,12 @@ function tabStaging(siteId) {
     },
 
     async sandiBaru() {
-      if (!window.confirm('Kata sandi preview lama langsung tidak berlaku. Lanjutkan?')) return;
+      if (!(await dialogKonfirmasi({
+        judul: 'Buat ulang kata sandi',
+        pesan: 'Kata sandi preview lama langsung tidak berlaku. Lanjutkan?',
+        teksYa: 'Buat ulang',
+        bahaya: true,
+      }))) return;
       this.mulaiAksi();
       try {
         this.sandi = (await this.kirim('POST', `${this.dasar()}/sandi`)).sandi;
@@ -196,7 +206,12 @@ function tabStaging(siteId) {
     tutupSandi() { this.sandi = ''; },
 
     async hapus() {
-      if (!window.confirm('Hapus staging ini? Snapshot produksi tetap disimpan.')) return;
+      if (!(await dialogKonfirmasi({
+        judul: 'Hapus staging',
+        pesan: 'Hapus staging ini? Snapshot produksi tetap disimpan.',
+        teksYa: 'Hapus staging',
+        bahaya: true,
+      }))) return;
       this.mulaiAksi();
       try {
         await this.kirim('DELETE', this.dasar());
@@ -274,7 +289,12 @@ function tabStaging(siteId) {
       const catatan = mode === 'timpa_penuh'
         ? 'Berkas dan database produksi akan dikembalikan ke kondisi sebelum dorongan.'
         : 'Hanya berkas yang dikembalikan; database tidak disentuh (ekspor database tetap ada di snapshot untuk pemulihan manual).';
-      const nama = window.prompt(`${catatan}\nKetik nama site untuk melanjutkan:`);
+      const nama = await dialogTanya({
+        judul: 'Kembalikan snapshot',
+        pesan: `${catatan}\nKetik nama site untuk melanjutkan:`,
+        teksYa: 'Kembalikan',
+        bahaya: true,
+      });
       if (nama === null) return;
       this.mulaiAksi();
       try {

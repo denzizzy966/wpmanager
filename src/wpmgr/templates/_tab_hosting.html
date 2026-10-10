@@ -46,7 +46,7 @@
 
     <template x-if="data && data.hosting">
       <div>
-        <p>Status: <strong x-text="data.hosting.status_teks"></strong> · domain <code x-text="data.hosting.domain"></code>
+        <p>Status: <strong class="lencana-status lencana-status-netral" x-text="data.hosting.status_teks"></strong> · domain <code x-text="data.hosting.domain"></code>
            <span class="redup" x-show="data.hosting.ditarik_pada">· disalin <span x-text="waktu(data.hosting.ditarik_pada)"></span>
            (berkas <span x-text="data.hosting.ukuran_file_teks"></span>, database <span x-text="data.hosting.ukuran_db_teks"></span>,
            PHP <span x-text="data.hosting.versi_php || '—'"></span>)</span></p>

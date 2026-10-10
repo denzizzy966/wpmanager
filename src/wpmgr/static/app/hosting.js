@@ -125,7 +125,13 @@ function tabHosting(siteId) {
 
     async pindahkan() {
       if (this.alasanPindah()) return;
-      if (!window.confirm('Salin seluruh berkas dan database site ini ke VPS? Site lama tidak diubah.')) return;
+      if (!(await dialogKonfirmasi({
+        judul: 'Pindahkan ke VPS',
+        pesan: 'Salin seluruh berkas dan database site ini ke VPS? Site lama tidak diubah.',
+        teksYa: 'Mulai salin',
+      }))) return;
+      // Polling tetap berjalan selama dialog terbuka: periksa ulang prasyaratnya.
+      if (this.alasanPindah()) return;
       this.mulaiAksi();
       try {
         const d = await this.kirim('POST', this.dasar(), {});
@@ -138,12 +144,22 @@ function tabHosting(siteId) {
     },
 
     async salinUlang() {
-      if (!window.confirm('Salin ulang dari hosting lama? Perubahan di salinan VPS akan tertimpa.')) return;
+      if (!(await dialogKonfirmasi({
+        judul: 'Salin ulang',
+        pesan: 'Salin ulang dari hosting lama? Perubahan di salinan VPS akan tertimpa.',
+        teksYa: 'Salin ulang',
+        bahaya: true,
+      }))) return;
       await this.aksi('tarik', 'Salin ulang diantrekan.');
     },
 
     async sandiBaru() {
-      if (!window.confirm('Kata sandi pratinjau lama langsung tidak berlaku. Lanjutkan?')) return;
+      if (!(await dialogKonfirmasi({
+        judul: 'Buat ulang kata sandi',
+        pesan: 'Kata sandi pratinjau lama langsung tidak berlaku. Lanjutkan?',
+        teksYa: 'Buat ulang',
+        bahaya: true,
+      }))) return;
       this.mulaiAksi();
       try {
         this.sandi = (await this.kirim('POST', `${this.dasar()}/sandi`)).sandi;
@@ -171,15 +187,22 @@ function tabHosting(siteId) {
       if (this.alasanTanpaSalin()) return;
       const h = this.data.hosting;
       // Hanya dari status dengan salinan utuh (menunggu DNS), jadi salinannya memang dari ditarik_pada.
-      const domain = window.prompt(`Aktifkan memakai salinan VPS dari ${this.waktu(h.ditarik_pada)} tanpa menyalin `
-        + 'ulang dari hosting lama. Semua perubahan di site lama sejak itu hilang (pos, halaman, isian form, '
-        + 'pengguna) dan tidak bisa diambil lagi bila hosting lama sudah mati. Ketik domain untuk konfirmasi:');
+      const domain = await dialogTanya({
+        judul: 'Aktifkan tanpa salin ulang',
+        pesan: `Aktifkan memakai salinan VPS dari ${this.waktu(h.ditarik_pada)} tanpa menyalin `
+          + 'ulang dari hosting lama. Semua perubahan di site lama sejak itu hilang (pos, halaman, isian form, '
+          + 'pengguna) dan tidak bisa diambil lagi bila hosting lama sudah mati. Ketik domain untuk konfirmasi:',
+        teksYa: 'Aktifkan',
+        bahaya: true,
+      });
       if (domain === null) return;
+      // Polling tetap berjalan selama dialog terbuka: periksa ulang prasyaratnya.
+      if (this.alasanTanpaSalin()) return;
       await this.aktifkan(true, domain);
     },
 
     async batalkanPindah() {
-      const domain = window.prompt(TEKS_BATAL_PINDAH);
+      const domain = await dialogTanya({ judul: 'Batalkan pindah', pesan: TEKS_BATAL_PINDAH, teksYa: 'Batalkan pindah', bahaya: true });
       if (domain === null) return;
       this.mulaiAksi();
       try {

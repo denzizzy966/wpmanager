@@ -44,7 +44,7 @@
 
     <template x-if="data && data.staging">
       <div>
-        <p>Status: <strong x-text="data.staging.status_teks"></strong>
+        <p>Status: <strong class="lencana-status lencana-status-netral" x-text="data.staging.status_teks"></strong>
            <span x-show="data.staging.galat" class="galat" x-text="'— ' + data.staging.galat"></span></p>
         <p class="galat" x-show="data.staging.gagal_asal === 'salinan'">
           Salinan staging belum utuh (penyegaran terakhir gagal); segarkan ulang sebelum mendorong.</p>
@@ -131,7 +131,7 @@
         <tr>
           <td x-text="waktu(u.dibuat_pada)"></td>
           <td x-text="teksPaket(u.paket)"></td>
-          <td><span :class="u.hasil === 'lolos' ? 'dg-badge-success' : 'dg-badge-danger'" x-text="u.hasil === 'lolos' ? 'Lolos' : 'Gagal'"></span></td>
+          <td><span class="lencana-status" :class="u.hasil === 'lolos' ? 'dg-badge-success' : 'dg-badge-danger'" x-text="u.hasil === 'lolos' ? 'Lolos' : 'Gagal'"></span></td>
           <td x-text="u.alasan.join('; ') || '—'"></td>
           <td class="redup" x-text="(u.catatan || []).join('; ') || '—'"></td>
         </tr>

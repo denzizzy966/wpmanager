@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block judul %}{{ site.nama }} — WP Manager{% endblock %}
+{% block judul_halaman %}<a href="/sites">Site</a><span class="remah-pisah" aria-hidden="true">/</span>{{ site.nama }}{% endblock %}
 {% block isi %}
 {# Hanya site.id (UUID buatan server) dan tab (daftar putih di route) yang
    boleh masuk ke ekspresi Alpine. Nilai lain dibaca lewat data-* atau API. #}
@@ -23,7 +24,7 @@
   </nav>
 
   <section x-show="tab === 'ringkasan'">
-    <p>Status koneksi: <strong>{{ site.status.value }}</strong> ·
+    <p>Status koneksi: <strong class="lencana-status lencana-status-{{ {'active': 'ok', 'pending_pair': 'proses', 'disabled': 'netral'}.get(site.status.value, 'gagal') }}">{{ site.status.value }}</strong> ·
        WP {{ site.wp_version or '—' }} · PHP {{ site.php_version or '—' }} ·
        Connector {{ site.connector_version or '—' }}</p>
     {% if site.last_error %}<p class="galat">{{ site.last_error }}</p>{% endif %}

@@ -96,7 +96,7 @@ def test_konfirmasi_tanpa_salin_ulang_dan_batalkan_pindah_memperingatkan_kehilan
     assert "hanya salin ulang yang bisa merampungkannya" in js
     assert "perubahan di site lama sejak itu hilang" in js and "this.waktu(h.ditarik_pada)" in js
     assert "satu-satunya salinan site yang tersisa" in js
-    assert "window.prompt(TEKS_BATAL_PINDAH)" in js
+    assert "dialogTanya({ judul: 'Batalkan pindah', pesan: TEKS_BATAL_PINDAH" in js
     # Panel gagal 'salinan' tidak menyebut "salinan lengkap terakhir": salinannya belum utuh.
     assert "salinan lengkap terakhir" not in tpl
     assert "VPS belum utuh dan tidak bisa diaktifkan; Salin ulang diperlukan." in tpl

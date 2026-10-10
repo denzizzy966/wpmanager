@@ -131,7 +131,9 @@ function layarUpdate() {
         // substring), karena nama site ikut di awal teks galat.
         const minta = respons.status === 409 && !konfirmasi && this.pesanKonfirmasiUji
           && pesan.endsWith(`: ${this.pesanKonfirmasiUji}`);
-        if (minta && window.confirm(pesan)) {
+        if (minta && await dialogKonfirmasi({
+          judul: 'Uji di staging', pesan, teksYa: 'Lanjutkan uji', bahaya: true,
+        })) {
           await this.ujiStaging(true);
           return;
         }
