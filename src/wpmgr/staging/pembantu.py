@@ -561,7 +561,9 @@ class Pembantu:
         return self.jalankan("db-hapus", _cek_nama(nama))
 
     def db_impor(self, nama: str, berkas: list[Path]) -> str:
-        return self.jalankan("db-impor", _cek_nama(nama), masukan=berkas, timeout=TIMEOUT_IMPOR)
+        # Sukses pun bisa membawa PERINGATAN (pembersihan cache CSS Elementor
+        # sesudah impor gagal): stderr-nya dicatat ke log server.
+        return self.jalankan("db-impor", _cek_nama(nama), masukan=berkas, timeout=TIMEOUT_IMPOR, catat_stderr=True)
 
     def wpcli(self, nama: str, *argumen: str) -> str:
         return self.jalankan("wpcli", _cek_nama(nama), *argumen, timeout=TIMEOUT_WPCLI)
@@ -614,7 +616,9 @@ class Pembantu:
         return self.jalankan("prod-db-buat", nama, prefix)
 
     def prod_db_impor(self, nama: str, berkas: list[Path]) -> str:
-        return self.jalankan("prod-db-impor", _cek_nama_prod(nama), masukan=berkas, timeout=TIMEOUT_IMPOR)
+        # Seperti db_impor: PERINGATAN pembersihan cache CSS Elementor dicatat.
+        return self.jalankan("prod-db-impor", _cek_nama_prod(nama), masukan=berkas, timeout=TIMEOUT_IMPOR,
+                             catat_stderr=True)
 
     def prod_router_muat(self) -> str:
         return self.jalankan("prod-router-muat")

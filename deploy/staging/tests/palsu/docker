@@ -68,6 +68,9 @@ case "${1-}" in
       n=$(( $(cat "$PALSU/n" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$PALSU/n"
       cat > "$PALSU/stdin-$n"
+      # gagal-stdin-<n>: hanya exec -i ke-n yang gagal (mis. pembersihan
+      # sesudah impor), panggilan lain tetap berhasil.
+      [[ -f "$PALSU/gagal-stdin-$n" ]] && exit 1
     fi
     if [[ "$*" == *"nginx -t"* && -f "$PALSU/nginx-gagal" ]]; then
       exit 1

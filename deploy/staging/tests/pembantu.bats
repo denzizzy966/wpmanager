@@ -49,6 +49,20 @@ docker_log() {
   cat "$PALSU/docker.log" 2>/dev/null || true
 }
 
+# Berkas opsi klien yang dipakai baris docker.log berpola $1 (path /run/...).
+opsi_dipakai() {
+  grep "$1" "$PALSU/docker.log" | grep -o 'defaults-extra-file=/run/wpmgr-klien-[0-9-]*\.cnf'
+}
+
+# SQL pembersihan cache CSS Elementor untuk prefix $1 (sama persis dengan skrip).
+sql_css_elementor() {
+  printf '%s\n' \
+    "SET @wpmgr_q := IF(EXISTS(SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '$1postmeta'), 'DELETE FROM \`$1postmeta\` WHERE meta_key = ''_elementor_css''', 'DO 0');" \
+    "PREPARE wpmgr_s FROM @wpmgr_q;" "EXECUTE wpmgr_s;" "DEALLOCATE PREPARE wpmgr_s;" \
+    "SET @wpmgr_q := IF(EXISTS(SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '$1options'), 'DELETE FROM \`$1options\` WHERE option_name IN (''_elementor_global_css'', ''_elementor_assets_data'', ''elementor-custom-breakpoints-files'')', 'DO 0');" \
+    "PREPARE wpmgr_s FROM @wpmgr_q;" "EXECUTE wpmgr_s;" "DEALLOCATE PREPARE wpmgr_s;"
+}
+
 # Direktori staging milik user dashboard (UID 1000), seperti dibuat `buat`.
 buat_situs() {
   mkdir -p "$S/staging/$ID/files" "$S/staging/$ID/ekspor" "$S/staging/$ID/log"
@@ -394,6 +408,61 @@ tulis_mounts() {
 @test "db-impor ditolak bila db-buat belum dijalankan" {
   run "$SKRIP" db-impor toko
   [ "$status" -eq 3 ]
+}
+
+@test "db-buat menyimpan prefix untuk db-impor dan db-hapus menghapusnya" {
+  printf 'layanan:db' > "$PALSU/wadah/wpmgr-stg-db"
+  mkdir -p "$S/staging/$ID/files"
+  run "$SKRIP" db-buat toko "$ID" wpx_
+  [ "$status" -eq 0 ]
+  [ "$(cat "$S/etc/db/toko.prefix")" = wpx_ ]
+  [ "$(stat -c %a "$S/etc/db/toko.prefix")" = 600 ]
+  run "$SKRIP" db-hapus toko
+  [ "$status" -eq 0 ]
+  [ ! -e "$S/etc/db/toko" ] && [ ! -e "$S/etc/db/toko.prefix" ]
+}
+
+@test "db-impor membersihkan cache CSS Elementor salinan staging sebagai user staging" {
+  printf 'layanan:db' > "$PALSU/wadah/wpmgr-stg-db"
+  printf 'sandi-user' > "$S/etc/db/toko"
+  printf 'wpx_' > "$S/etc/db/toko.prefix"
+  run bash -c "printf 'INSERT INTO t VALUES (1);' | '$SKRIP' db-impor toko"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PALSU/stdin-4")" = "INSERT INTO t VALUES (1);" ]
+  [ "$(cat "$PALSU/stdin-5")" = "$(sql_css_elementor wpx_)" ]
+  [ ! -e "$PALSU/stdin-6" ]
+  grep -q '^\[exec\]\[-i\]\[wpmgr-stg-db\]\[mariadb\]\[--defaults-extra-file=/run/wpmgr-klien-[0-9-]*\.cnf\]\[--local-infile=0\]\[stg_toko\]$' "$PALSU/docker.log"
+  [[ "$(cat "$PALSU/stdin-3")" == *"user=stg_toko"* ]]
+  impor="$(opsi_dipakai '\[--binary-mode\]')"
+  bersih="$(opsi_dipakai '\[--local-infile=0\]\[stg_toko\]$')"
+  [ -n "$impor" ] && [ "$impor" = "$bersih" ]
+  [ "$(cat "$PALSU"/stdin-* | grep -c 'user=root')" -eq 1 ]
+}
+
+@test "db-impor staging tetap berhasil bila pembersihan gagal, prefix rusak, atau prefix belum ada" {
+  printf 'layanan:db' > "$PALSU/wadah/wpmgr-stg-db"
+  printf 'sandi-user' > "$S/etc/db/toko"
+  printf 'wp_' > "$S/etc/db/toko.prefix"
+  touch "$PALSU/gagal-stdin-5"
+  run bash -c "printf 'SELECT 1;' | '$SKRIP' db-impor toko"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PALSU/stdin-5")" = "$(sql_css_elementor wp_)" ]
+  [[ "$output" == *"PERINGATAN: cache CSS Elementor"* && "$output" != *GALAT* ]]
+
+  # Prefix rusak tidak pernah disisipkan ke SQL.
+  rm -f "$PALSU"/stdin-* "$PALSU/n" "$PALSU/gagal-stdin-5"
+  printf "wp_'; DROP TABLE x; --" > "$S/etc/db/toko.prefix"
+  run bash -c "printf 'SELECT 1;' | '$SKRIP' db-impor toko"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PERINGATAN: cache CSS Elementor"* ]]
+  [ ! -e "$PALSU/stdin-5" ]
+  ! grep -q 'DROP TABLE' "$PALSU"/stdin-* || false
+
+  # Database dari db-buat versi lama (tanpa berkas prefix): impor saja.
+  rm -f "$PALSU"/stdin-* "$PALSU/n" "$S/etc/db/toko.prefix"
+  run bash -c "printf 'SELECT 1;' | '$SKRIP' db-impor toko"
+  [ "$status" -eq 0 ]
+  [ ! -e "$PALSU/stdin-5" ]
 }
 
 @test "exec ke layanan bersama ditolak bila labelnya bukan milik staging" {
@@ -1561,6 +1630,56 @@ mounts_prod() {
   ! grep -q 'sandi-situs\|prodrahasia' "$PALSU/docker.log" || false
   # Berkas opsi klien dihapus dari container produksi, bukan staging.
   grep -q '^\[exec\]\[wpmgr-prod-db\]\[rm\]\[-f\]\[/run/wpmgr-klien-' "$PALSU/docker.log"
+}
+
+@test "prod-db-impor membersihkan cache CSS Elementor salinan sebagai user situs dengan prefix state" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  sed -i 's/^PREFIX=.*/PREFIX=wpx_/' "$S/etc/prod/situs/toko"
+  printf 'sandi-situs' > "$S/etc/prod/db/toko"
+  run bash -c "printf 'INSERT INTO t VALUES (1);' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PALSU/stdin-4")" = "INSERT INTO t VALUES (1);" ]
+  # Sesudah impor: SQL pembersihan lewat stdin, bukan argumen proses.
+  [ "$(cat "$PALSU/stdin-5")" = "$(sql_css_elementor wpx_)" ]
+  [ ! -e "$PALSU/stdin-6" ]
+  [[ "$(cat "$PALSU/stdin-5")" != *'`wp_'* ]]
+  grep -q '^\[exec\]\[-i\]\[wpmgr-prod-db\]\[mariadb\]\[--defaults-extra-file=/run/wpmgr-klien-[0-9-]*\.cnf\]\[--local-infile=0\]\[prd_toko\]$' "$PALSU/docker.log"
+  # Sebagai user situs: berkas opsi yang sama dengan impor (user=prd_toko),
+  # bukan berkas opsi root dari sql_root.
+  [[ "$(cat "$PALSU/stdin-3")" == *"user=prd_toko"* ]]
+  impor="$(opsi_dipakai '\[--binary-mode\]')"
+  bersih="$(opsi_dipakai '\[--local-infile=0\]\[prd_toko\]$')"
+  [ -n "$impor" ] && [ "$impor" = "$bersih" ]
+  [ "$(cat "$PALSU"/stdin-* | grep -c 'user=root')" -eq 1 ]
+  [[ "$(cat "$PALSU/stdin-1")" == *"user=root"* ]]
+}
+
+@test "prod-db-impor tetap berhasil bila pembersihan cache CSS Elementor gagal" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  printf 'sandi-situs' > "$S/etc/prod/db/toko"
+  touch "$PALSU/gagal-stdin-5"
+  run bash -c "printf 'INSERT INTO t VALUES (1);' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PALSU/stdin-5")" = "$(sql_css_elementor wp_)" ]
+  [[ "$output" == *"PERINGATAN: cache CSS Elementor"* ]]
+  [[ "$output" != *GALAT* ]]
+  # Berkas opsi klien tetap dihapus.
+  grep -q '^\[exec\]\[wpmgr-prod-db\]\[rm\]\[-f\]\[/run/wpmgr-klien-' "$PALSU/docker.log"
+}
+
+@test "prod-db-impor yang gagal tidak menjalankan pembersihan cache CSS Elementor" {
+  aktifkan_hosting
+  buat_situs_prod
+  tulis_state_prod toko pratinjau
+  printf 'sandi-situs' > "$S/etc/prod/db/toko"
+  touch "$PALSU/gagal-stdin-4"
+  run bash -c "printf 'INSERT INTO t VALUES (1);' | '$SKRIP' prod-db-impor toko"
+  [ "$status" -eq 6 ]
+  [ ! -e "$PALSU/stdin-5" ]
 }
 
 @test "prod-router-muat merender pratinjau dengan Basic Auth dan aktif tanpa pengaman" {

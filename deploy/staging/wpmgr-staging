@@ -638,6 +638,43 @@ sql_root() {
   hapus_opsi_klien
 }
 
+# Elementor di hosting lama bisa menulis ulang berkas CSS-nya
+# (uploads/elementor/css/post-<id>.css) sesudah manifest berkas diambil:
+# database yang disalin belakangan mencatat berkas itu sudah ada (postmeta
+# _elementor_css berstatus file), padahal salinannya tidak punya, sehingga
+# halaman memuatnya 404 dan tampilannya rusak. Sesudah impor, penanda cache CSS
+# di salinan dihapus seperti "Regenerate CSS" Elementor (Files\Manager::
+# clear_cache), dan Elementor membuat ulang berkasnya pada kunjungan berikutnya.
+# Tabel yang tidak ada dilewati (DO 0), jadi aman tanpa Elementor. Prefix
+# disisipkan ke SQL: pemanggil wajib sudah memeriksanya dengan pola cek_prefix.
+sql_cache_css_elementor() {
+  local p="$1"
+  printf '%s\n' \
+    "SET @wpmgr_q := IF(EXISTS(SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '${p}postmeta'), 'DELETE FROM \`${p}postmeta\` WHERE meta_key = ''_elementor_css''', 'DO 0');" \
+    "PREPARE wpmgr_s FROM @wpmgr_q;" "EXECUTE wpmgr_s;" "DEALLOCATE PREPARE wpmgr_s;" \
+    "SET @wpmgr_q := IF(EXISTS(SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '${p}options'), 'DELETE FROM \`${p}options\` WHERE option_name IN (''_elementor_global_css'', ''_elementor_assets_data'', ''elementor-custom-breakpoints-files'')', 'DO 0');" \
+    "PREPARE wpmgr_s FROM @wpmgr_q;" "EXECUTE wpmgr_s;" "DEALLOCATE PREPARE wpmgr_s;"
+}
+
+# Dijalankan sesudah impor yang berhasil, dengan berkas opsi klien user
+# situs/staging yang dipakai impor ($OPSI_KLIEN), tidak pernah sebagai root.
+# Best-effort: salinan tetap layak dipakai tanpa ini, jadi kegagalan (juga
+# prefix yang tidak lolos pola cek_prefix) hanya PERINGATAN di stderr dan
+# tidak menggagalkan impor. $1 container db, $2 database, $3 prefix tabel.
+bersihkan_cache_css_elementor() {
+  local wadah="$1" db="$2" prefix="$3"
+  if [[ ! "$prefix" =~ ^[A-Za-z0-9_]{1,20}$ ]]; then
+    printf 'PERINGATAN: cache CSS Elementor salinan tidak dibersihkan (prefix tabel tidak sah); jalankan Regenerate CSS di Elementor\n' >&2
+    return 0
+  fi
+  # Tenggat yang sudah habis tidak boleh menjadi GALAT sesudah impor berhasil.
+  if (( TENGGAT - SECONDS <= 0 )) || ! sql_cache_css_elementor "$prefix" \
+    | dk exec -i "$wadah" mariadb --defaults-extra-file="$OPSI_KLIEN" --local-infile=0 "$db" >/dev/null; then
+    printf 'PERINGATAN: cache CSS Elementor salinan tidak dapat dibersihkan; jalankan Regenerate CSS di Elementor\n' >&2
+  fi
+  return 0
+}
+
 pastikan_siap() {
   dk network inspect "$JARINGAN" >/dev/null 2>&1 || galat ditolak "jalankan 'wpmgr-staging siapkan' dulu"
   [[ -s "$KONF_DIR/wp-cli.phar" ]] || galat ditolak "jalankan 'wpmgr-staging siapkan' dulu"
@@ -1051,6 +1088,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, LOCK TABLES, C
   install -d -m 0700 "$KONF_DIR/db"
   printf '%s' "$pw" > "$KONF_DIR/db/$nama"
   chmod 0600 "$KONF_DIR/db/$nama"
+  # Prefix untuk pembersihan cache CSS Elementor di db-impor (staging tidak
+  # punya berkas state seperti produksi).
+  printf '%s' "$3" > "$KONF_DIR/db/$nama.prefix"
+  chmod 0600 "$KONF_DIR/db/$nama.prefix"
   tulis_wp_config wp_config "$STAGING_DIR/$2/files" "$nama" "$db" "$pw" "$3"
 }
 
@@ -1079,7 +1120,7 @@ cmd_db_hapus() {
   local db
   db="$(nama_db "$1")"
   sql_root "DROP DATABASE IF EXISTS \`$db\`; DROP USER IF EXISTS '$db'@'%';"
-  rm -f "$KONF_DIR/db/$1"
+  rm -f "$KONF_DIR/db/$1" "$KONF_DIR/db/$1.prefix"
 }
 
 cmd_db_impor() {
@@ -1100,6 +1141,11 @@ cmd_db_impor() {
   opsi_klien "$db" "$sandi"
   dk exec -i wpmgr-stg-db mariadb --defaults-extra-file="$OPSI_KLIEN" --binary-mode --local-infile=0 \
     --max-allowed-packet=64M "$db" || galat impor "impor database staging gagal"
+  # Berkas prefix ditulis db-buat; database dari db-buat versi lama belum
+  # punya, dan impornya tetap berjalan seperti dulu.
+  if [[ -f "$KONF_DIR/db/$nama.prefix" ]]; then
+    bersihkan_cache_css_elementor wpmgr-stg-db "$db" "$(head -c 64 -- "$KONF_DIR/db/$nama.prefix" || true)"
+  fi
 }
 
 # ---- wp-cli --------------------------------------------------------------
@@ -1793,6 +1839,7 @@ cmd_prod_db_impor() {
   opsi_klien "$db" "$sandi" wpmgr-prod-db
   dk exec -i wpmgr-prod-db mariadb --defaults-extra-file="$OPSI_KLIEN" --binary-mode --local-infile=0 \
     --max-allowed-packet=64M "$db" || galat impor "impor database situs gagal"
+  bersihkan_cache_css_elementor wpmgr-prod-db "$db" "$S_PREFIX"
 }
 
 # ---- router produksi ----------------------------------------------------------

@@ -646,6 +646,25 @@ def test_prod_hapus_sukses_tanpa_stderr_tidak_mencatat(pembantu, catatan, caplog
     assert not [r for r in caplog.records if "prod-hapus" in r.getMessage()]
 
 
+@pytest.mark.parametrize("subperintah", ["db-impor", "prod-db-impor"])
+def test_impor_sukses_mencatat_peringatan_cache_css_elementor(pembantu, catatan, monkeypatch, caplog, tmp_path,
+                                                             subperintah):
+    # Pembersihan cache CSS Elementor sesudah impor best-effort: gagal = keluar
+    # 0 dengan PERINGATAN di stderr, yang harus sampai ke log server.
+    caplog.set_level(logging.WARNING, logger="wpmgr.staging.pembantu")
+    monkeypatch.setenv("PALSU_KELUAR", "0")
+    monkeypatch.setenv("PALSU_STDERR", "PERINGATAN: cache CSS Elementor salinan tidak dapat dibersihkan; "
+                       "jalankan Regenerate CSS di Elementor\n")
+    sql = tmp_path / "a.sql"
+    sql.write_bytes(b"SELECT 1;\n")
+    if subperintah == "db-impor":
+        pembantu.db_impor("toko", [sql])
+    else:
+        pembantu.prod_db_impor("toko", [sql])
+    pesan = [r.getMessage() for r in caplog.records if f" {subperintah} " in r.getMessage()]
+    assert len(pesan) == 1 and "PERINGATAN: cache CSS Elementor" in pesan[0]
+
+
 # ---- review Task 10: keluaran prod-aktifkan (M7) dan kunci sibuk (M5) ----------------
 
 
