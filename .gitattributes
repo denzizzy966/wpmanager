@@ -4,3 +4,4 @@ deploy/staging/tests/palsu/* text eol=lf
 deploy/staging/*.conf text eol=lf
 deploy/staging/*.contoh text eol=lf
 deploy/crontab text eol=lf
+deploy/vps/*.sh text eol=lf
