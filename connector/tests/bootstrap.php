@@ -89,6 +89,17 @@ if ( ! function_exists( 'doing_filter' ) ) {
     }
 }
 
+// do_action() tiruan: hanya MENCATAT nama hook dan argumennya ke
+// $GLOBALS['wpmgr_test_aksi'], dipakai RestAntiCacheTest untuk memastikan
+// API no-cache LiteSpeed Cache dipanggil. Test yang memakainya wajib
+// mengosongkannya sendiri.
+if ( ! function_exists( 'do_action' ) ) {
+    $GLOBALS['wpmgr_test_aksi'] = array();
+    function do_action( $hook_name, ...$arg ) {
+        $GLOBALS['wpmgr_test_aksi'][] = array_merge( array( $hook_name ), $arg );
+    }
+}
+
 // Respons REST minimal untuk WPMGR_Staging::respons_biner()/sajikan_biner().
 if ( ! class_exists( 'WP_HTTP_Response' ) ) {
     class WP_HTTP_Response {

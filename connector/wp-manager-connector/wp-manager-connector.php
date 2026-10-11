@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Manager Connector
  * Description: Menghubungkan site ini ke dashboard WP Manager untuk pemindaian, update, dan pemantauan terpusat.
- * Version:     3.0.1
+ * Version:     3.0.2
  * Requires at least: 5.5
  * Requires PHP: 7.4
  * License:     GPL-2.0-or-later
@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'WPMGR_VERSION', '3.0.1' );
+define( 'WPMGR_VERSION', '3.0.2' );
 define( 'WPMGR_VERSI_SKEMA', 3 );
 define( 'WPMGR_JENDELA_DETIK', 300 );
 define( 'WPMGR_NONCE_TTL', 600 );
@@ -49,6 +49,7 @@ add_action( 'plugins_loaded', array( 'WPMGR_Skema', 'pastikan' ) );
 add_action( WPMGR_Skema::HOOK_PANGKAS, array( 'WPMGR_Skema', 'pangkas' ) );
 add_action( WPMGR_Staging::HOOK_BERSIHKAN, array( 'WPMGR_Staging', 'cron_bersihkan' ) );
 add_action( 'rest_api_init', array( 'WPMGR_REST', 'daftarkan_route' ) );
+add_filter( 'rest_pre_dispatch', array( 'WPMGR_REST', 'minta_tanpa_cache' ), 10, 3 );
 add_filter( 'rest_post_dispatch', array( 'WPMGR_REST', 'tambah_header_anti_cache' ), 10, 3 );
 add_filter( 'rest_pre_serve_request', array( 'WPMGR_Staging', 'sajikan_biner' ), 10, 4 );
 add_action( 'admin_menu', array( 'WPMGR_Settings', 'daftarkan_menu' ) );

@@ -94,6 +94,27 @@ class WPMGR_REST {
         return $result;
     }
 
+    /**
+     * Header di atas belum cukup bila opsi "Cache REST API" LiteSpeed Cache
+     * aktif: plugin itu tetap menyimpan respons bertanda tangan dan
+     * menyajikannya basi kepada siapa pun. Karena itu plugin cache diminta
+     * langsung untuk tidak menyimpan respons route wpmgr (termasuk
+     * /staging/*), sedini mungkin di rest_pre_dispatch, sebelum guard()
+     * dan callback berjalan: lewat API no-cache LiteSpeed Cache yang
+     * terdokumentasi (tanpa efek bila plugin itu tidak ada) dan DONOTCACHEPAGE
+     * yang dihormati kebanyakan plugin cache WordPress. Route plugin lain
+     * tidak disentuh; $result diteruskan apa adanya.
+     */
+    public static function minta_tanpa_cache( $result, $server, $request ) {
+        if ( self::perlu_anti_cache( $request->get_route() ) ) {
+            do_action( 'litespeed_control_set_nocache', 'wpmgr connector' );
+            if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+                define( 'DONOTCACHEPAGE', true );
+            }
+        }
+        return $result;
+    }
+
     public static function guard( $request ) {
         if ( ! WPMGR_Settings::terpasang() ) {
             return self::tolak( 'Connector belum dipasangkan.' );
