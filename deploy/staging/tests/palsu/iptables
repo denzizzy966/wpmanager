@@ -5,5 +5,39 @@ printf '\n' >> "$PALSU/iptables.log"
 # tidak ada -F pada rantai yang diganti atomik.
 printf '[%s]' "$@" >> "$PALSU/iptables-langsung.log"
 printf '\n' >> "$PALSU/iptables-langsung.log"
+# Mode berkeadaan (hanya bila direktori $PALSU/iptables-keadaan ada): setiap
+# rantai filter adalah berkas <RANTAI> berisi satu aturan per baris (tanpa
+# nama rantai), urut dari atas. Rantai bawaan INPUT/FORWARD/OUTPUT selalu ada;
+# rantai lain (mis. DOCKER-USER sebelum dockerd start) baru ada sesudah -N.
+# Seperti iptables sungguhan: -I/-A/-C/-D/-S/-L pada rantai yang tidak ada
+# gagal, -N pada rantai yang sudah ada gagal.
+K="$PALSU/iptables-keadaan"
+if [[ -d "$K" ]]; then
+  for r in INPUT FORWARD OUTPUT; do
+    [[ -e "$K/$r" ]] || : > "$K/$r"
+  done
+  op="${1-}" rantai="${2-}"
+  shift 2 || true
+  aturan="$*"
+  f="$K/$rantai"
+  if [[ "$op" == -N ]]; then
+    [[ ! -e "$f" ]] || { echo "iptables: Chain already exists." >&2; exit 1; }
+    : > "$f"
+    exit 0
+  fi
+  [[ -e "$f" ]] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; }
+  case "$op" in
+    -C) grep -qxF -- "$aturan" "$f" ;;
+    -I) { printf '%s\n' "$aturan"; cat "$f"; } > "$f.baru"; cat "$f.baru" > "$f"; rm -f "$f.baru" ;;
+    -A) printf '%s\n' "$aturan" >> "$f" ;;
+    -D)
+      grep -qxF -- "$aturan" "$f" || exit 1
+      grep -vxF -- "$aturan" "$f" > "$f.baru" || true
+      cat "$f.baru" > "$f"; rm -f "$f.baru" ;;
+    -S) sed "s/^/-A $rantai /" "$f" ;;
+    -L) cat "$f" ;;
+  esac
+  exit
+fi
 [[ "${1-}" == "-C" ]] && exit 1
 exit 0

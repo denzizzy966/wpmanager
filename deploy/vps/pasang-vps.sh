@@ -206,7 +206,13 @@ langkah "9. Siapkan staging dan produksi (Docker, iptables, MariaDB, router)"
 wpmgr-staging siapkan
 wpmgr-staging prod-siapkan
 install -m 0644 "$R/deploy/staging/wpmgr-staging-siapkan.service" /etc/systemd/system/
+# Lapis pertama isolasi saat boot (putusan L21): aturan iptables dipasang sebelum dockerd
+# menjalankan ulang container. Docker TIDAK direstart di sini (container lain di VPS ikut mati);
+# drop-in berlaku pada start Docker/reboot berikutnya. `isolasi` idempoten, jadi aman dijalankan.
+install -d -m 0755 /etc/systemd/system/docker.service.d
+install -m 0644 "$R/deploy/staging/docker-wpmgr-isolasi.conf" /etc/systemd/system/docker.service.d/10-wpmgr-isolasi.conf
 systemctl daemon-reload
+wpmgr-staging isolasi
 systemctl enable wpmgr-staging-siapkan
 systemctl restart wpmgr-staging-siapkan
 

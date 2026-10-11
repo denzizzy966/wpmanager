@@ -484,6 +484,10 @@ modprobe br_netfilter && sysctl --system
 # 3. Jaringan, isolasi iptables, MariaDB, Mailpit, router, wp-cli (idempoten)
 wpmgr-staging siapkan
 cp deploy/staging/wpmgr-staging-siapkan.service /etc/systemd/system/
+# 3b. Isolasi sebelum dockerd start sesudah reboot (lihat "Sesudah reboot VPS" di Lapis 4).
+#     Tidak me-restart Docker; berlaku pada start Docker/reboot berikutnya.
+install -d -m 0755 /etc/systemd/system/docker.service.d
+install -m 0644 deploy/staging/docker-wpmgr-isolasi.conf /etc/systemd/system/docker.service.d/10-wpmgr-isolasi.conf
 systemctl daemon-reload && systemctl enable wpmgr-staging-siapkan
 
 # 4. nginx host (SEKALI; staging baru tidak butuh reload). Pra-cek dulu: pastikan tidak ada site
@@ -584,9 +588,12 @@ Catatan:
   pernah membersihkan rantai `DOCKER-USER`/`INPUT`). Yang benar-benar MENGHAPUS aturan ini hanya
   **reboot host**, atau **firewall di-reload/ditulis ulang total** (`ufw reload`, `firewalld
   reload`, `iptables-restore` dari berkas yang tidak menyertakan rantai kustom ini) — keduanya
-  menimpa seluruh tabel netfilter, bukan cuma milik Docker. Sesudah salah satu dari itu, jalankan
-  `systemctl restart wpmgr-staging-siapkan` secara manual untuk memasang ulang isolasi jaringan
-  staging.
+  menimpa seluruh tabel netfilter, bukan cuma milik Docker. Sesudah **reboot**, aturan dipasang
+  ulang otomatis SEBELUM dockerd menjalankan ulang container, oleh drop-in `docker.service`
+  (`ExecStartPre=-/usr/local/sbin/wpmgr-staging isolasi`, langkah 3b), lalu sekali lagi oleh
+  `wpmgr-staging-siapkan.service` sesudah Docker hidup (lihat "Sesudah reboot VPS" di Lapis 4).
+  Sesudah **firewall di-reload**, jalankan `sudo wpmgr-staging isolasi` (tanpa docker, idempoten) atau
+  `systemctl restart wpmgr-staging-siapkan` secara manual untuk memasang ulang isolasi jaringan.
 - **`listen [::]:80`/`listen [::]:443`** di `nginx-wpmgr-staging.conf` menjadikan berkas ini
   *default* untuk IPv6 bila belum ada site lain di `sites-enabled` yang mendengarkan IPv6 di port
   itu (nginx menandai `listen` IPv6 pertama sebagai default secara implisit). Ini tidak berbahaya
@@ -757,12 +764,37 @@ atau kredensial FTP yang perlu ditulis di berkas mana pun di repo ini.
 9. Restart `wpmgr-web`, `wpmgr-worker@1`, `wpmgr-worker@2`, dan `wpmgr-worker@staging` (job hosting
    diproses worker staging).
 
-**Sesudah reboot VPS:** Docker menjalankan ulang container produksi (kebijakan restart) sebelum
-`wpmgr-staging-siapkan.service` memasang ulang aturan iptables isolasi. Unit itu memerlukan Docker berjalan
-(`siapkan` dan `prod-siapkan` memanggil `docker`, dan rantai `DOCKER-USER` baru ada sesudah dockerd hidup),
-jadi urutannya tidak bisa dibalik dengan `Before=docker.service`. Akibatnya ada jendela beberapa detik saat
-boot ketika isolasi container produksi belum terpasang. Risiko ini diterima dan didokumentasikan. Sesudah
-reboot, pastikan unit sukses: `systemctl status wpmgr-staging-siapkan` dan `sudo iptables -S WPMGR-PROD-MASUK`.
+**Sesudah reboot VPS:** container staging dan produksi berkebijakan restart, jadi dockerd menjalankannya
+ulang segera saat start, sebelum `wpmgr-staging-siapkan.service` (yang memerlukan Docker berjalan karena
+`siapkan` dan `prod-siapkan` memanggil `docker`) sempat memasang aturan iptables isolasi. Jendela beberapa
+detik itu (putusan L21) ditutup dengan dua lapis:
+
+1. **Sebelum dockerd start:** drop-in `docker.service` `10-wpmgr-isolasi.conf`
+   (`ExecStartPre=-/usr/local/sbin/wpmgr-staging isolasi`). Subperintah `isolasi` hanya memakai `iptables` dan
+   nilai dari `staging.conf` (nama jembatan, alamat subnet, `IP_PUBLIK`), tanpa satu pun panggilan `docker`.
+   Ia membuat rantai `DOCKER-USER` bila belum ada (dockerd memakai rantai yang sudah ada apa adanya), lalu
+   memasang aturan `INPUT`/`DOCKER-USER` dan rantai `WPMGR-STG-ANTAR` untuk staging, ditambah `WPMGR-PROD-*`
+   bila `HOSTING_DIR` diisi. Tanda `-` membuat Docker tetap start walau langkah ini gagal, supaya container
+   lain di VPS tidak ikut mati.
+2. **Sesudah Docker hidup:** `wpmgr-staging-siapkan.service` memasang ulang aturan yang sama (idempoten),
+   juga bila lapis pertama gagal.
+
+`pasang-vps.sh` memasang drop-in ini. Untuk VPS yang sudah terpasang sebelumnya, pasang manual dari clone
+milik root (bukan `/opt/wpmgr`), sesudah memasang ulang `/usr/local/sbin/wpmgr-staging` versi baru:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/docker.service.d
+sudo install -m 0644 /root/wpmgr-src/deploy/staging/docker-wpmgr-isolasi.conf /etc/systemd/system/docker.service.d/10-wpmgr-isolasi.conf
+sudo systemctl daemon-reload
+sudo wpmgr-staging isolasi   # sekali sekarang; idempoten, tanpa docker
+```
+
+Docker tidak perlu (dan sebaiknya tidak) direstart: drop-in berlaku pada start Docker atau reboot berikutnya.
+`systemctl cat docker` harus menampilkan baris `ExecStartPre` itu. Sesudah reboot berikutnya, verifikasi:
+`sudo iptables -S DOCKER-USER` dan `sudo iptables -S INPUT | grep br-wpmgr` menampilkan aturan
+`br-wpmgrstg`/`br-wpmgrprod`, `journalctl -u docker -b | grep isolasi` menampilkan `isolasi terpasang`
+(bukan baris galat) sementara `journalctl -u docker -b | grep GALAT` kosong, dan
+`systemctl status wpmgr-staging-siapkan` sukses (`sudo iptables -S WPMGR-PROD-MASUK` berisi tiga aturan).
 
 ### Alur pengguna
 
@@ -953,8 +985,9 @@ Keterbatasan pemantauan (Lapis 2):
   `src/wpmgr/keamanan.py`, bukan setelan yang bisa diubah lewat UI.
 
 Keterbatasan hosting VPS (Lapis 4): pemulihan backup hanya manual (lihat "Pemulihan backup manual"),
-backup hanya ke disk VPS sendiri (off-site belum dibuat), jendela beberapa detik saat reboot sebelum isolasi
-iptables produksi terpasang (lihat "Sesudah reboot VPS"), dan pra-cek `nginx -T` membaca `server_name` per
+backup hanya ke disk VPS sendiri (off-site belum dibuat), isolasi saat boot yang bergantung pada drop-in
+`docker.service` terpasang (tanpanya kembali ada jendela beberapa detik sebelum isolasi terpasang, lihat
+"Sesudah reboot VPS"), dan pra-cek `nginx -T` membaca `server_name` per
 baris (direktif yang dipecah ke beberapa baris di berkas milik site lain hanya terbaca baris pertamanya;
 deteksi `conflicting server name` saat `nginx -t` tetap menjadi lapis kedua).
 

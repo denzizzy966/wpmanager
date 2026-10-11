@@ -2833,3 +2833,141 @@ baris_docker() { grep -nE "$1" "$PALSU/docker.log" | head -n 1 | cut -d: -f1; }
   [ ! -e "$S/backup/$ID/20261004T023000Z" ]
   [ ! -e "$S/backup/$ID/.20261004T023000Z.tmp" ]
 }
+
+# ---- isolasi sebelum dockerd (putusan L21) ---------------------------------------
+
+# iptables tiruan berkeadaan dengan hanya rantai bawaan, seperti sesudah boot
+# sebelum dockerd start (DOCKER-USER belum ada).
+siap_isolasi() {
+  sed -i '/^TANPA_IPTABLES=/d' "$WPMGR_STG_KONF"
+  K="$PALSU/iptables-keadaan"
+  mkdir -p "$K"
+}
+
+# Isi semua rantai iptables tiruan (aturan diurutkan per rantai), untuk
+# dibandingkan antar-putaran. Diurutkan karena aturan balasan koneksi INPUT
+# staging sengaja dicabut lalu dipasang ulang di puncak setiap putaran
+# (Koreksi #4), sehingga posisinya relatif terhadap lompatan produksi bergeser.
+keadaan_iptables() {
+  local f
+  for f in "$K"/*; do
+    printf '== %s\n' "${f##*/}"
+    sort "$f"
+  done
+}
+
+@test "isolasi tidak memanggil docker sama sekali dan mencetak satu baris" {
+  siap_isolasi
+  aktifkan_hosting
+  rm -f "$PALSU/docker.log"
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  [ "$output" = "isolasi terpasang" ]
+  [ ! -e "$PALSU/docker.log" ]
+}
+
+@test "isolasi membuat rantai DOCKER-USER bila belum ada sebelum memasang aturan" {
+  siap_isolasi
+  [ ! -e "$K/DOCKER-USER" ]
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  n="$(grep -n '^\[-N\]\[DOCKER-USER\]$' "$PALSU/iptables-langsung.log" | cut -d: -f1)"
+  i="$(grep -n '^\[-I\]\[DOCKER-USER\]' "$PALSU/iptables-langsung.log" | head -1 | cut -d: -f1)"
+  [ -n "$n" ] && [ "$n" -lt "$i" ]
+  grep -qxF -- "-i br-wpmgrstg ! -o br-wpmgrstg -d 10.0.0.0/8 -j DROP" "$K/DOCKER-USER"
+}
+
+@test "isolasi memakai DOCKER-USER yang sudah ada apa adanya" {
+  siap_isolasi
+  printf -- '-j RETURN\n' > "$K/DOCKER-USER"
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  ! grep -q '^\[-N\]' "$PALSU/iptables-langsung.log" || false
+  grep -qxF -- "-j RETURN" "$K/DOCKER-USER"
+  grep -qxF -- "-i br-wpmgrstg -o br-wpmgrstg -j WPMGR-STG-ANTAR" "$K/DOCKER-USER"
+}
+
+@test "isolasi memasang aturan staging dan, dengan hosting, aturan produksi" {
+  siap_isolasi
+  aktifkan_hosting
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  # INPUT: balasan koneksi host di atas DROP staging; lompatan produksi.
+  [ "$(head -1 "$K/INPUT")" = "-i br-wpmgrprod -j WPMGR-PROD-MASUK" ]
+  grep -qxF -- "-i br-wpmgrstg -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" "$K/INPUT"
+  grep -qxF -- "-i br-wpmgrstg -j DROP" "$K/INPUT"
+  [ "$(grep -n -- '-i br-wpmgrstg -m conntrack' "$K/INPUT" | cut -d: -f1)" -lt \
+    "$(grep -n -- '-i br-wpmgrstg -j DROP' "$K/INPUT" | cut -d: -f1)" ]
+  for jem in br-wpmgrstg br-wpmgrprod; do
+    for j in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+      grep -qxF -- "-i $jem ! -o $jem -d $j -j DROP" "$K/DOCKER-USER"
+    done
+  done
+  grep -qxF -- "-i br-wpmgrstg -o br-wpmgrstg -j WPMGR-STG-ANTAR" "$K/DOCKER-USER"
+  grep -qxF -- "-i br-wpmgrprod -o br-wpmgrprod -j WPMGR-PROD-ANTAR" "$K/DOCKER-USER"
+  [ "$(cat "$K/WPMGR-STG-ANTAR")" = "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-s 172.31.250.254 -p tcp --dport 80 -j ACCEPT
+-d 172.31.250.252 -p tcp --dport 3306 -j ACCEPT
+-d 172.31.250.253 -p tcp --dport 1025 -j ACCEPT
+-j DROP" ]
+  [ "$(cat "$K/WPMGR-PROD-MASUK")" = "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-d 169.58.91.181 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-j DROP" ]
+  [ "$(cat "$K/WPMGR-PROD-ANTAR")" = "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-s 172.31.251.254 -p tcp --dport 80 -j ACCEPT
+-d 172.31.251.252 -p tcp --dport 3306 -j ACCEPT
+-j DROP" ]
+}
+
+@test "isolasi tanpa hosting hanya memasang aturan staging dan keluar 0" {
+  siap_isolasi
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  [ "$output" = "isolasi terpasang" ]
+  grep -qxF -- "-i br-wpmgrstg -j DROP" "$K/INPUT"
+  ! grep -rq 'br-wpmgrprod\|WPMGR-PROD' "$K" "$PALSU/iptables.log" || false
+  [ ! -e "$K/WPMGR-PROD-MASUK" ]
+  [ ! -e "$PALSU/docker.log" ]
+}
+
+@test "isolasi idempoten: putaran kedua tidak menambah aturan" {
+  siap_isolasi
+  aktifkan_hosting
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  pertama="$(keadaan_iptables)"
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  [ "$(keadaan_iptables)" = "$pertama" ]
+  for f in "$K"/*; do
+    [ -z "$(sort "$f" | uniq -d)" ]
+  done
+  # Balasan koneksi host tetap di atas DROP staging.
+  [ "$(grep -n -- '-i br-wpmgrstg -m conntrack' "$K/INPUT" | cut -d: -f1)" -lt \
+    "$(grep -n -- '-i br-wpmgrstg -j DROP' "$K/INPUT" | cut -d: -f1)" ]
+  [ "$(grep -c '^\[-N\]\[DOCKER-USER\]$' "$PALSU/iptables-langsung.log")" -eq 1 ]
+}
+
+@test "isolasi dilewati dengan TANPA_IPTABLES=1 tanpa menyentuh iptables" {
+  run "$SKRIP" isolasi
+  [ "$status" -eq 0 ]
+  [ ! -e "$PALSU/iptables.log" ]
+  [ ! -e "$PALSU/docker.log" ]
+}
+
+@test "isolasi memasang aturan dulu lalu menolak br_netfilter mati dengan kode 7" {
+  siap_isolasi
+  printf '0\n' > "$S/brnf"
+  run "$SKRIP" isolasi
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"br_netfilter/bridge-nf-call-iptables harus aktif"* ]]
+  grep -qxF -- "-i br-wpmgrstg -j DROP" "$K/INPUT"
+  grep -qxF -- "-i br-wpmgrstg -o br-wpmgrstg -j WPMGR-STG-ANTAR" "$K/DOCKER-USER"
+  [ ! -e "$PALSU/docker.log" ]
+}
+
+@test "isolasi tidak menerima argumen" {
+  run "$SKRIP" isolasi tambahan
+  [ "$status" -eq 2 ]
+  [ ! -e "$PALSU/iptables.log" ]
+}

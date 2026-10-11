@@ -149,7 +149,8 @@ def test_unit_siapkan_juga_menyiapkan_produksi():
 
 def test_unit_siapkan_berurutan_sesudah_docker():
     """siapkan/prod-siapkan memanggil docker, jadi unit WAJIB sesudah Docker (tidak mungkin Before=).
-    Jendela reboot (container hidup sebelum iptables) didokumentasikan, bukan ditutup."""
+    Jendela reboot (container hidup sebelum iptables) ditutup drop-in docker.service (putusan L21);
+    unit ini tetap lapis kedua."""
     t = _teks("wpmgr-staging-siapkan.service")
     baris = [b.strip() for b in t.splitlines() if b.strip() and not b.strip().startswith("#")]
     assert "After=docker.service network-online.target" in baris
@@ -210,3 +211,40 @@ def test_readme_unit_siapkan_dijalankan_ulang_sesudah_dipasang():
     readme = (AKAR / "README.md").read_text(encoding="utf-8")
     assert "sudo systemctl enable wpmgr-staging-siapkan" in readme
     assert "sudo systemctl restart wpmgr-staging-siapkan" in readme
+
+
+def test_dropin_docker_memasang_isolasi_sebelum_dockerd():
+    """Putusan L21: aturan isolasi dipasang di ExecStartPre= docker.service, sebelum dockerd
+    menjalankan ulang container; awalan '-' supaya kegagalannya tidak menghentikan Docker."""
+    t = _teks("docker-wpmgr-isolasi.conf")
+    baris = [b.strip() for b in t.splitlines() if b.strip() and not b.strip().startswith("#")]
+    assert baris == ["[Service]", "ExecStartPre=-/usr/local/sbin/wpmgr-staging isolasi"]
+    assert b"\r" not in (STAGING / "docker-wpmgr-isolasi.conf").read_bytes()
+    assert "deploy/staging/*.conf text eol=lf" in (AKAR / ".gitattributes").read_text(encoding="utf-8").splitlines()
+
+
+def test_pasang_vps_memasang_dropin_isolasi_tanpa_restart_docker():
+    t = (AKAR / "deploy" / "vps" / "pasang-vps.sh").read_text(encoding="utf-8")
+    for wajib in ("install -d -m 0755 /etc/systemd/system/docker.service.d",
+                  'install -m 0644 "$R/deploy/staging/docker-wpmgr-isolasi.conf" '
+                  "/etc/systemd/system/docker.service.d/10-wpmgr-isolasi.conf",
+                  "wpmgr-staging isolasi"):
+        assert wajib in t, wajib
+    # Drop-in dari clone milik root, dipasang di langkah 9 bersama unit siapkan.
+    langkah9 = t[t.index('langkah "9.'):t.index('langkah "10.')]
+    assert "10-wpmgr-isolasi.conf" in langkah9 and "systemctl daemon-reload" in langkah9
+    # Restart Docker akan ikut mematikan container lain di VPS.
+    assert not re.search(r"systemctl\s+(re)?start\s+(--now\s+)?docker\b", t)
+    assert not re.search(r"systemctl\s+(re)?start\s+docker\.service", t)
+
+
+def test_readme_isolasi_sebelum_dockerd():
+    readme = (AKAR / "README.md").read_text(encoding="utf-8")
+    for wajib in ("ExecStartPre", "wpmgr-staging isolasi",
+                  "sudo install -d -m 0755 /etc/systemd/system/docker.service.d",
+                  "sudo install -m 0644 /root/wpmgr-src/deploy/staging/docker-wpmgr-isolasi.conf "
+                  "/etc/systemd/system/docker.service.d/10-wpmgr-isolasi.conf",
+                  "sudo systemctl daemon-reload",
+                  "sudo iptables -S DOCKER-USER", "sudo iptables -S INPUT | grep br-wpmgr",
+                  "journalctl -u docker -b | grep isolasi"):
+        assert wajib in readme, wajib

@@ -34,12 +34,20 @@ After=docker.service network-online.target
 # satu dari itu, jalankan `systemctl restart wpmgr-staging-siapkan` secara
 # manual untuk memasang ulang isolasi jaringan staging.
 #
-# JENDELA SESUDAH REBOOT (Lapis 4): container produksi berkebijakan restart, jadi
-# dockerd menjalankannya ulang SEBELUM unit ini memasang rantai iptables isolasi
-# (WPMGR-PROD-*). Jendela itu tidak bisa ditutup dengan Before=docker.service:
-# siapkan dan prod-siapkan memanggil `docker` (membuat jaringan, menjalankan
-# layanan) dan rantai DOCKER-USER baru ada setelah dockerd hidup. Karena itu
-# urutan After=docker.service dipertahankan dan risikonya didokumentasikan di README.
+# JENDELA SESUDAH REBOOT (putusan L21): container staging dan produksi
+# berkebijakan restart, jadi dockerd menjalankannya ulang SEBELUM unit ini jalan.
+# Unit ini tidak bisa dipindah ke Before=docker.service: siapkan dan prod-siapkan
+# memanggil `docker` (membuat jaringan, menjalankan layanan). Jendela itu kini
+# ditutup LAPIS PERTAMA: drop-in docker.service
+# /etc/systemd/system/docker.service.d/10-wpmgr-isolasi.conf
+# (deploy/staging/docker-wpmgr-isolasi.conf) menjalankan
+# `wpmgr-staging isolasi` sebagai ExecStartPre=, sebelum dockerd start. Subperintah
+# itu hanya memakai iptables dan nilai dari staging.conf (tanpa docker), membuat
+# rantai DOCKER-USER bila belum ada, lalu memasang aturan INPUT/DOCKER-USER dan
+# rantai WPMGR-STG-ANTAR serta WPMGR-PROD-* (bila hosting dikonfigurasi). Awalan
+# '-' di drop-in membuat Docker tetap start walau isolasi gagal. Unit ini tetap
+# LAPIS KEDUA: memasang ulang aturan yang sama (idempoten) sesudah Docker hidup,
+# termasuk bila lapis pertama gagal atau drop-in belum dipasang.
 Requires=docker.service
 PartOf=docker.service
 Wants=network-online.target

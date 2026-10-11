@@ -3,7 +3,8 @@
 # muatan (stdin) apa adanya ke iptables-restore.log, lalu menerjemahkannya ke
 # iptables.log seperti efeknya pada kernel: header `:RANTAI - [0:0]` dengan
 # --noflush mengosongkan/membuat rantai itu ([-F][RANTAI]) dan setiap
-# `-A ...` menjadi satu panggilan -A.
+# `-A ...` menjadi satu panggilan -A. Dalam mode berkeadaan iptables tiruan
+# ($PALSU/iptables-keadaan) efek yang sama juga diterapkan pada berkas rantai.
 printf '[%s]' "$@" >> "$PALSU/iptables-restore.args"
 printf '\n' >> "$PALSU/iptables-restore.args"
 muatan="$(cat)"
@@ -12,11 +13,15 @@ while IFS= read -r baris; do
   case "$baris" in
     :*)
       rantai="${baris%% *}"
-      printf '[-F][%s]\n' "${rantai#:}" >> "$PALSU/iptables.log" ;;
+      printf '[-F][%s]\n' "${rantai#:}" >> "$PALSU/iptables.log"
+      [[ -d "$PALSU/iptables-keadaan" ]] && : > "$PALSU/iptables-keadaan/${rantai#:}" ;;
     "-A "*)
       read -ra kata <<< "$baris"
       printf '[%s]' "${kata[@]}" >> "$PALSU/iptables.log"
-      printf '\n' >> "$PALSU/iptables.log" ;;
+      printf '\n' >> "$PALSU/iptables.log"
+      if [[ -d "$PALSU/iptables-keadaan" ]]; then
+        printf '%s\n' "${kata[*]:2}" >> "$PALSU/iptables-keadaan/${kata[1]}"
+      fi ;;
   esac
 done <<< "$muatan"
 exit 0
