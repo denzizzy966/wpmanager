@@ -590,7 +590,7 @@ Catatan:
   reload`, `iptables-restore` dari berkas yang tidak menyertakan rantai kustom ini) — keduanya
   menimpa seluruh tabel netfilter, bukan cuma milik Docker. Sesudah **reboot**, aturan dipasang
   ulang otomatis SEBELUM dockerd menjalankan ulang container, oleh drop-in `docker.service`
-  (`ExecStartPre=-/usr/local/sbin/wpmgr-staging isolasi`, langkah 3b), lalu sekali lagi oleh
+  (`ExecStartPre=-/usr/bin/timeout 60 /usr/local/sbin/wpmgr-staging isolasi`, langkah 3b), lalu sekali lagi oleh
   `wpmgr-staging-siapkan.service` sesudah Docker hidup (lihat "Sesudah reboot VPS" di Lapis 4).
   Sesudah **firewall di-reload**, jalankan `sudo wpmgr-staging isolasi` (tanpa docker, idempoten) atau
   `systemctl restart wpmgr-staging-siapkan` secara manual untuk memasang ulang isolasi jaringan.
@@ -770,7 +770,7 @@ ulang segera saat start, sebelum `wpmgr-staging-siapkan.service` (yang memerluka
 detik itu (putusan L21) ditutup dengan dua lapis:
 
 1. **Sebelum dockerd start:** drop-in `docker.service` `10-wpmgr-isolasi.conf`
-   (`ExecStartPre=-/usr/local/sbin/wpmgr-staging isolasi`). Subperintah `isolasi` hanya memakai `iptables` dan
+   (`ExecStartPre=-/usr/bin/timeout 60 /usr/local/sbin/wpmgr-staging isolasi`). Subperintah `isolasi` hanya memakai `iptables` dan
    nilai dari `staging.conf` (nama jembatan, alamat subnet, `IP_PUBLIK`), tanpa satu pun panggilan `docker`.
    Ia membuat rantai `DOCKER-USER` bila belum ada (dockerd memakai rantai yang sudah ada apa adanya), lalu
    memasang aturan `INPUT`/`DOCKER-USER` dan rantai `WPMGR-STG-ANTAR` untuk staging, ditambah `WPMGR-PROD-*`

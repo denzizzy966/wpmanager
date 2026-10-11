@@ -218,7 +218,7 @@ def test_dropin_docker_memasang_isolasi_sebelum_dockerd():
     menjalankan ulang container; awalan '-' supaya kegagalannya tidak menghentikan Docker."""
     t = _teks("docker-wpmgr-isolasi.conf")
     baris = [b.strip() for b in t.splitlines() if b.strip() and not b.strip().startswith("#")]
-    assert baris == ["[Service]", "ExecStartPre=-/usr/local/sbin/wpmgr-staging isolasi"]
+    assert baris == ["[Service]", "ExecStartPre=-/usr/bin/timeout 60 /usr/local/sbin/wpmgr-staging isolasi"]
     assert b"\r" not in (STAGING / "docker-wpmgr-isolasi.conf").read_bytes()
     assert "deploy/staging/*.conf text eol=lf" in (AKAR / ".gitattributes").read_text(encoding="utf-8").splitlines()
 
