@@ -1,22 +1,40 @@
 #!/usr/bin/env bash
 # Mengganti WPMGR_SECRET_KEY, WPMGR_SESSION_SECRET, dan password database wpmgr.
 # Aman HANYA selama belum ada site terdaftar (secret site dienkripsi dengan WPMGR_SECRET_KEY).
-# Jalankan: sudo bash deploy/vps/putar-rahasia.sh   (nilai baru tidak pernah dicetak)
+# Jalankan dari clone milik root: sudo bash /root/wpmgr-src/deploy/vps/putar-rahasia.sh
+# (nilai baru tidak pernah dicetak)
 #
-# Keamanan: semua pekerjaan dilakukan satu proses python3 SISTEM milik root (bukan venv di
-# /opt/wpmgr yang dapat ditulis wpmgr). Rahasia baru tidak pernah menjadi argumen proses:
-# SQL dikirim ke psql lewat stdin dan .env ditulis ulang secara atomik dari dalam Python.
+# Keamanan: rahasia dibangkitkan python3 SISTEM dalam mode terisolasi (-I, direktori kerja tidak
+# masuk sys.path), bukan venv di /opt/wpmgr yang dapat ditulis wpmgr. Rahasia baru tidak pernah
+# menjadi argumen proses: SQL ke psql dan isi .env lewat stdin. Root tidak pernah membuka path di
+# /opt/wpmgr: .env dibaca dan ditulis ulang SEBAGAI wpmgr (symlink di sana tidak bisa dipakai
+# untuk membaca/menimpa berkas root).
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "jalankan dengan sudo" >&2; exit 1; }
+# Berkas milik root dan tidak dapat ditulis grup/lain, begitu pula setiap direktori induknya.
+cek_milik_root() {
+  local p="$1" m
+  while :; do
+    m=$(stat -c "%u %a" -- "$p")
+    [[ "${m%% *}" == 0 ]] || return 1
+    (( (8#${m##* } & 8#022) == 0 )) || return 1
+    [[ "$p" == / ]] && return 0
+    p=$(dirname -- "$p")
+  done
+}
+cek_milik_root "$(readlink -f -- "$0")" \
+  || { echo "GAGAL: skrip harus berada di clone milik root yang tidak dapat ditulis pengguna lain" >&2; exit 1; }
 APP=/opt/wpmgr
+cd /
 
 jumlah=$(sudo -u postgres psql -d wpmgr -tAc "SELECT count(*) FROM sites")
 [[ "$jumlah" == "0" ]] || { echo "GAGAL: sudah ada $jumlah site; WPMGR_SECRET_KEY tidak boleh diganti begitu saja" >&2; exit 1; }
 
-/usr/bin/python3 - "$APP/.env" <<'PY'
-import base64, os, pwd, re, secrets, subprocess, sys, tempfile
+/usr/bin/python3 -I - <<'PY'
+import base64, os, re, secrets, subprocess, sys
 
-jalur = sys.argv[1]
+JALUR = "/opt/wpmgr/.env"
+SEBAGAI = ["sudo", "-u", "wpmgr", "--"]
 db = secrets.token_urlsafe(32)
 kunci = base64.urlsafe_b64encode(os.urandom(32)).decode()
 sesi = secrets.token_urlsafe(48)
@@ -24,8 +42,8 @@ sesi = secrets.token_urlsafe(48)
 subprocess.run(["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-q"],
                input=f"ALTER ROLE wpmgr WITH PASSWORD '{db}';\n", text=True, check=True)
 
-with open(jalur, encoding="utf-8") as f:
-    isi = f.read()
+# Dibaca sebagai wpmgr: root tidak membuka path yang dikendalikan wpmgr.
+isi = subprocess.run(SEBAGAI + ["cat", JALUR], capture_output=True, text=True, check=True).stdout
 ganti = {
     "DATABASE_URL": f"postgresql+psycopg://wpmgr:{db}@127.0.0.1:5432/wpmgr",
     "WPMGR_SECRET_KEY": kunci,
@@ -36,17 +54,10 @@ for nama, nilai in ganti.items():
     if n != 1:
         sys.exit(f"GAGAL: {nama} tidak ditemukan tepat satu kali di .env")
 
-w = pwd.getpwnam("wpmgr")
-fd, sementara = tempfile.mkstemp(dir=os.path.dirname(jalur), prefix=".env.")
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(isi)
-    os.chmod(sementara, 0o600)
-    os.chown(sementara, w.pw_uid, w.pw_gid)
-    os.replace(sementara, jalur)
-except BaseException:
-    os.unlink(sementara)
-    raise
+# Ditulis sebagai wpmgr lewat stdin ke berkas sementara, lalu diganti atomik (mv).
+subprocess.run(SEBAGAI + ["sh", "-c", 'umask 077 && t=$(mktemp /opt/wpmgr/.env.XXXXXX) '
+                          '&& cat > "$t" && mv -f "$t" /opt/wpmgr/.env'],
+               input=isi, text=True, check=True)
 PY
 
 systemctl restart wpmgr-web 'wpmgr-worker@*'

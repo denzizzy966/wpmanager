@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # Pemasang wp-manager Lapis 1-4 di VPS ini (sekali; aman diulang bila berhenti di tengah).
-# Jalankan dari salinan repo:  sudo bash deploy/vps/pasang-vps.sh
+# Jalankan dari clone MILIK ROOT (bukan /opt/wpmgr, yang dapat ditulis pengguna wpmgr):
+#   sudo git clone https://github.com/denzizzy966/wpmanager.git /root/wpmgr-src
+#   sudo bash /root/wpmgr-src/deploy/vps/pasang-vps.sh
 # Nilai di bawah adalah VPS halosocia; timpa lewat variabel lingkungan untuk VPS lain, mis.
-#   sudo WPMGR_DOM=wpmgr.contoh.id WPMGR_IP4=1.2.3.4 bash deploy/vps/pasang-vps.sh
+#   sudo WPMGR_DOM=wpmgr.contoh.id WPMGR_IP4=1.2.3.4 bash /root/wpmgr-src/deploy/vps/pasang-vps.sh
 # Rahasia (kunci, password DB) dibangkitkan di VPS ini dan hanya ditulis ke /opt/wpmgr/.env (0600).
 #
 # Keamanan:
 # - Root tidak pernah menjalankan atau memasang berkas yang dapat ditulis pengguna wpmgr
 #   (/opt/wpmgr). Berkas milik root (skrip pembantu, sudoers, unit systemd, nginx, crontab)
 #   dipasang dari clone baru milik root di direktori sementara; git di /opt/wpmgr dijalankan
-#   sebagai wpmgr.
+#   sebagai wpmgr. Semua berkas di dalam /opt/wpmgr (.env, penanda akun) ditulis SEBAGAI wpmgr,
+#   sehingga symlink yang ditanam di sana tidak pernah diikuti dengan hak root.
+# - Skrip ini sendiri harus milik root dan tidak dapat ditulis pengguna lain (diperiksa di awal).
+# - python3 sistem dijalankan dengan -I (mode terisolasi): direktori kerja dan PYTHON* tidak
+#   masuk sys.path, jadi modul palsu tidak dapat dimuat.
 # - Rahasia dibangkitkan dengan python3 sistem dan tidak pernah muncul di argumen proses
 #   (yang terlihat lewat ps); password admin dikirim lewat stdin.
 set -euo pipefail
@@ -29,9 +35,23 @@ PORT_MAIL="${WPMGR_PORT_MAIL:-8025}"
 langkah() { echo; echo "=== $*"; }
 mati()    { echo "GAGAL: $*" >&2; exit 1; }
 sebagai() { sudo -u wpmgr -H bash -c "cd $APP && $1"; }
-acak()    { /usr/bin/python3 -c "import secrets; print(secrets.token_urlsafe($1))"; }
+acak()    { /usr/bin/python3 -I -c "import secrets; print(secrets.token_urlsafe($1))"; }
+# Berkas milik root dan tidak dapat ditulis grup/lain, begitu pula setiap direktori induknya.
+cek_milik_root() {
+  local p="$1" m
+  while :; do
+    m=$(stat -c "%u %a" -- "$p")
+    [[ "${m%% *}" == 0 ]] || return 1
+    (( (8#${m##* } & 8#022) == 0 )) || return 1
+    [[ "$p" == / ]] && return 0
+    p=$(dirname -- "$p")
+  done
+}
 
 [[ $EUID -eq 0 ]] || mati "jalankan dengan: sudo bash $0"
+cek_milik_root "$(readlink -f -- "$0")" \
+  || mati "skrip harus berada di clone milik root yang tidak dapat ditulis pengguna lain (lihat kepala berkas)"
+cd /
 SRC="$(mktemp -d)"
 trap 'rm -rf "$SRC"' EXIT
 
@@ -89,10 +109,10 @@ SQL
 
   langkah "3. Berkas .env"
   # Kunci Fernet = base64 urlsafe dari 32 byte acak.
-  SECRET=$(/usr/bin/python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
+  SECRET=$(/usr/bin/python3 -I -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
   SESI=$(acak 48)
-  ( umask 077
-    cat > "$APP/.env" <<ENV
+  # Ditulis SEBAGAI wpmgr (isi lewat stdin): root tidak pernah membuka path di /opt/wpmgr.
+  sudo -u wpmgr bash -c 'umask 077 && cat > /opt/wpmgr/.env' <<ENV
 DATABASE_URL=postgresql+psycopg://wpmgr:$DBPASS@127.0.0.1:5432/wpmgr
 WPMGR_SECRET_KEY=$SECRET
 WPMGR_BASE_URL=https://$DOM
@@ -113,8 +133,6 @@ WPMGR_BACKUP_TUJUAN=lokal
 WPMGR_BACKUP_HARIAN=7
 WPMGR_BACKUP_MINGGUAN=4
 ENV
-  )
-  chown wpmgr:wpmgr "$APP/.env"; chmod 600 "$APP/.env"
   unset DBPASS SECRET SESI
   echo "PENTING: simpan salinan $APP/.env di tempat aman (WPMGR_SECRET_KEY hilang = semua secret site hilang)."
 fi
@@ -131,7 +149,7 @@ email = sys.stdin.readline().rstrip(\"\\n\")
 sandi = sys.stdin.readline().rstrip(\"\\n\")
 create_user(email, \"Admin\", sandi)
 '"
-  touch "$APP/.akun-dibuat"; chown wpmgr:wpmgr "$APP/.akun-dibuat"
+  sudo -u wpmgr touch "$APP/.akun-dibuat"
 fi
 unset PASS
 install -d -o wpmgr -g wpmgr -m 0755 /var/log/wpmgr

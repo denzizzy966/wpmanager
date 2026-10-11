@@ -37,4 +37,5 @@ printf '%s' "$html" | grep -o 'data-optimized="[0-9]*"' | sort | uniq -c
 
 echo "=== 4. Log PHP situs (20 baris terakhir)"
 SID=$(grep '^SITE_ID=' "/etc/wpmgr-staging/prod/situs/$N" | cut -d= -f2)
-tail -20 "/var/lib/wpmgr/hosting/$SID/log/php-error.log" 2>&1
+# Dibaca sebagai wpmgr: direktori log milik wpmgr, symlink di sana tidak boleh dibaca dengan hak root.
+sudo -u wpmgr tail -20 "/var/lib/wpmgr/hosting/$SID/log/php-error.log" 2>&1

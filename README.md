@@ -194,7 +194,14 @@ aman diulang bila berhenti di tengah. Nilai bawaannya untuk VPS halosocia; untuk
 `WPMGR_DOM`, `WPMGR_STG_DOM`, `WPMGR_IP4`, `WPMGR_IP6`, dan `WPMGR_PORT_*`. Di folder yang sama:
 `putar-rahasia.sh` (ganti `WPMGR_SECRET_KEY`, session secret, dan password DB; hanya selama belum ada
 site), `diag-router.sh` (router hosting gagal dimuat ulang), dan `diag-css.sh <nama-situs>` (CSS
-pratinjau 404). Semuanya dijalankan dengan `sudo bash deploy/vps/<skrip>`.
+pratinjau 404). Jalankan dari clone **milik root**, jangan dari `/opt/wpmgr` (dapat ditulis pengguna
+`wpmgr`, jadi skrip di sana bisa diubah untuk mendapat hak root); skrip menolak berjalan bila
+berkasnya atau salah satu direktori induknya dapat ditulis selain root:
+
+```bash
+sudo git clone https://github.com/denzizzy966/wpmanager.git /root/wpmgr-src   # sekali; perbarui: sudo git -C /root/wpmgr-src pull
+sudo bash /root/wpmgr-src/deploy/vps/<skrip>
+```
 
 **Bootstrap awal (manual).** Server baru tidak punya
 clone, virtualenv, skema database, atau akun dashboard sampai langkah-langkah
