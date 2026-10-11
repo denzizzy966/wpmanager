@@ -187,7 +187,16 @@ Berkas siap pakai ada di `deploy/`. Bagian ini ditulis untuk Linux — target
 deploy sesungguhnya — sehingga setiap path venv di bawah memakai
 `.venv/bin/`, bukan `.venv/Scripts/` seperti bagian setup lokal di atas.
 
-**Bootstrap awal.** Ini belum ada cara otomatis; server baru tidak punya
+**Pemasang sekali jalan (Lapis 1–4).** `deploy/vps/pasang-vps.sh` menjalankan seluruh langkah di
+bawah (pengguna `wpmgr`, clone, venv, database, `.env` dengan rahasia yang dibangkitkan di VPS, migrasi,
+akun admin, sertifikat dan nginx dashboard, layanan, skrip pembantu, staging dan hosting, cron) dan
+aman diulang bila berhenti di tengah. Nilai bawaannya untuk VPS halosocia; untuk VPS lain timpa lewat
+`WPMGR_DOM`, `WPMGR_STG_DOM`, `WPMGR_IP4`, `WPMGR_IP6`, dan `WPMGR_PORT_*`. Di folder yang sama:
+`putar-rahasia.sh` (ganti `WPMGR_SECRET_KEY`, session secret, dan password DB; hanya selama belum ada
+site), `diag-router.sh` (router hosting gagal dimuat ulang), dan `diag-css.sh <nama-situs>` (CSS
+pratinjau 404). Semuanya dijalankan dengan `sudo bash deploy/vps/<skrip>`.
+
+**Bootstrap awal (manual).** Server baru tidak punya
 clone, virtualenv, skema database, atau akun dashboard sampai langkah-langkah
 berikut dijalankan sekali secara manual:
 
