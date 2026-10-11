@@ -228,6 +228,11 @@ cp .env.example .env
 chown -R wpmgr:wpmgr /opt/wpmgr
 ```
 
+**Catatan keamanan:** `--password` di baris perintah tersimpan di riwayat shell dan sesaat terlihat
+lewat `ps` oleh pengguna lain di server. Di VPS bersama, pakai `deploy/vps/pasang-vps.sh` (password
+dikirim lewat stdin), atau ganti password akun segera sesudahnya (lihat "Mengganti password akun
+dashboard") dan hapus barisnya dari riwayat shell.
+
 Kedua perintah terakhir sebelum `chown` — `alembic upgrade head` dan
 `create-user` — butuh `DATABASE_URL` dkk. yang baru saja diisi di `.env`.
 Keduanya membaca setting lewat `wpmgr.config.Settings`
